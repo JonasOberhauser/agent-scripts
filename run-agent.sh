@@ -9,36 +9,38 @@ AGENT_FOLDER="$3"
 # Validate that all 3 required script parameters are present
 if [ -z "$USER_ARG" ] || [ -z "$USER_FILENAME" ] || [ -z "$AGENT_FOLDER" ]; then
     echo "Error: Missing required arguments."
-    echo "Usage: $0 <agent_binary_checksum> <secret_filename> <agent_config_subfolder> [arguments_for_container...]"
+    echo "Usage: $0 <agent_binary_checksum> <HOST_CONFIG_filename> <guest_config_subfolder> [arguments_for_container...]"
     echo ""
     echo "Example:"
-    echo "  $0 0ccX4ffa production.yaml goose_agent --some-container-flag"
+    echo "  $0 0ccX4ffa production.yaml goose --some-container-flag"
+    echo " will map host's $pwd/production.yaml into guest's ~/.config/goose/production.yaml, only accessible to a binary with checksum 0ccX4ffa"
     exit 1
 fi
 
 
 # 2. Determine Paths
 AGENT_PATH=$(pwd)
-AGENT_CONFIG="/root/.config"
-LOCAL_FUSE="$AGENT_PATH/fuse_mnt"
-LOCAL_SECRET="$AGENT_PATH/secrets"
-LOCAL_WORKSPACE="$AGENT_PATH/workspace"
+GUEST_CONFIG="/root/.config"
+HOST_HOME="$AGENT_PATH/home"
+HOST_FUSE="$AGENT_PATH/fuse_mnt"
+HOST_CONFIG="$AGENT_PATH/config"
+HOST_WORKSPACE="$AGENT_PATH/workspace"
 
-CONT_CONFIG="$AGENT_CONFIG/$AGENT_FOLDER"
+CONT_CONFIG="$GUEST_CONFIG/$AGENT_FOLDER"
 CONT_WORKSPACE="/workspace"
 
-echo "$LOCAL_SECRET -> $CONT_CONFIG"
-echo "$LOCAL_WORKSPACE -> $CONT_WORKSPACE"
+echo "$HOST_CONFIG -> $CONT_CONFIG"
+echo "$HOST_WORKSPACE -> $CONT_WORKSPACE"
 
 # 3. Validation
-for dir in "$LOCAL_SECRET" "$LOCAL_WORKSPACE"; do
+for dir in "$HOST_CONFIG" "$HOST_WORKSPACE"; do
     if [ ! -d "$dir" ]; then
         echo -e "\e[31mError: Directory $dir not found. Is this really a Goose agent workspace?\033[0m"
         exit 1
     fi
 done
 
-mkdir -p "$LOCAL_FUSE"
+mkdir -p "$HOST_FUSE"
 
 # 4. Find the EXACT Python executable
 PYTHON_EXEC=$(command -v python || command -v python3)
@@ -62,7 +64,7 @@ sudo bash -c "
   exec 3<\"$PIPE_FILE\"
   
   echo \"starting FUSE.\"
-  $PYTHON_EXEC -I \"$SCRIPT_DIR/config_fuse.py\" -s \"$USER_ARG\" \"$LOCAL_FUSE\" -f \"$USER_FILENAME\" &
+  $PYTHON_EXEC -I \"$SCRIPT_DIR/config_fuse.py\" -s \"$USER_ARG\" \"$HOST_FUSE\" -f \"$USER_FILENAME\" &
   
   CHILD_PID=\$!
   
@@ -76,12 +78,12 @@ exec 3>"$PIPE_FILE"
 rm "$PIPE_FILE" 
 
 # 6. Wait for file
-LOCAL_FUSE_FILE="$LOCAL_FUSE/$CONT_USER_FILENAME" # mount as this in host
+HOST_FUSE_FILE="$HOST_FUSE/$CONT_USER_FILENAME" # mount as this in host
 CONT_FUSE_FILE="/fuse/$CONT_USER_FILENAME" # mount as fuse/... in container
-CONT_AGENT_FILE="$LOCAL_SECRET/$CONT_USER_FILENAME" # symlink as this in container
+CONT_AGENT_FILE="$HOST_CONFIG/$CONT_USER_FILENAME" # symlink as this in container
 
-echo -n "Waiting for $LOCAL_FUSE_FILE to be generated..."
-while [ ! -f "$LOCAL_FUSE_FILE" ]; do
+echo -n "Waiting for $HOST_FUSE_FILE to be generated..."
+while [ ! -f "$HOST_FUSE_FILE" ]; do
     echo -n "."
     sleep 1
     if ! kill -0 $PYTHON_MONITOR_PID 2>/dev/null; then
@@ -92,7 +94,7 @@ done
 echo -e "\nFile found!"
 
 # 7. Create Symlink
-sudo ln -sf "$CONT_FUSE_FILE" "$CONT_AGENT_FILE" || { echo -e "\e[31mSymlink failed\033[0m"; exit 1; } 
+ln -sf "$CONT_FUSE_FILE" "$CONT_AGENT_FILE" || { echo -e "\e[31mSymlink failed\033[0m"; exit 1; } 
 echo "Symlink created: $CONT_AGENT_FILE -> $CONT_FUSE_FILE"
 
 # Cleanup function
@@ -142,7 +144,8 @@ else
 fi
 
 
-NAME=$(basename "$PWD")_$(date +%Y_%m_%d-%H_%M_%S)
+AGENT_NAME=$(basename "$PWD")
+NAME=${AGENT_NAME}_$(date +%Y_%m_%d-%H_%M_%S)
 echo "Launching '$NAME' Docker session..."
 
 
@@ -150,9 +153,11 @@ echo "Launching '$NAME' Docker session..."
   --rm \
   --name $NAME \
   -m 224G --cpus="90" \
-  -v "$LOCAL_SECRET:$CONT_CONFIG:slave" \
-  -v "$LOCAL_WORKSPACE:$CONT_WORKSPACE:slave" \
-  -v "./plans/shared:$CONT_WORKSPACE/plans" \
-  -v "$LOCAL_FUSE:/fuse:ro" \
+  --user root \
+  -v "$HOST_CONFIG:$CONT_CONFIG:slave,Z" \
+  -v "$HOST_WORKSPACE:$CONT_WORKSPACE:slave,Z" \
+  -v "./plans/shared:$CONT_WORKSPACE/plans,Z" \
+  -v ${AGENT_NAME}_home:/root \
+  -v "$HOST_FUSE:/fuse:ro" \
   --workdir "$CONT_WORKSPACE" \
   agentbox "$@"
