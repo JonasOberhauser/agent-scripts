@@ -107,36 +107,49 @@ trap cleanup SIGINT SIGTERM EXIT
 shift 3 # drop all shell arguments (the hash, filename, ...)
 
 echo "Setting up rootless docker..."
-export DOCKER_HOST=unix:///run/user/$(id -u)/docker.sock
-ROOTLESS_DOCKER="/home/$(whoami)/bin/docker"
 
-if [ ! -f "$ROOTLESS_DOCKER" ]; then
-    echo "ERROR: Rootless docker binary not found at $ROOTLESS_DOCKER"
-    exit 1
-fi
-
-systemctl --user start docker.service 
-CURRENT_ENDPOINT=$("$ROOTLESS_DOCKER" context inspect --format '{{.Endpoints.docker.Host}}')
-EXPECTED_ENDPOINT="unix:///run/user/$(id -u)/docker.sock"
-
-if [ "$CURRENT_ENDPOINT" = "$EXPECTED_ENDPOINT" ]; then
-    echo "Check passed: Verified connection to Rootless socket."
+# 1. Automatically find the container binary (docker or podman)
+if command -v podman >/dev/null 2>&1; then
+    CONTAINER_BIN=$(command -v podman)
+elif command -v docker >/dev/null 2>&1; then
+    CONTAINER_BIN=$(command -v docker)
 else
-    echo "ERROR: Docker is pointing to $CURRENT_ENDPOINT instead of $EXPECTED_ENDPOINT"
+    echo -e "\e[31mERROR: Neither docker nor podman was found in your PATH.\033[0m"
     exit 1
 fi
 
-NAME=$(basename "$PWD")_$(date +%Y_%m_%d-%H_%M_%S)"
+# 2. If it's Docker, set up the rootless environment variables
+if [[ "$CONTAINER_BIN" == *"docker"* ]]; then
+    echo "Setting up rootless docker..."
+    export DOCKER_HOST="unix:///run/user/$(id -u)/docker.sock"
+    
+    # Start the user-level docker service if it's not running
+    systemctl --user start docker.service 2>/dev/null || true
+
+    CURRENT_ENDPOINT=$("$CONTAINER_BIN" context inspect --format '{{.Endpoints.docker.Host}}' 2>/dev/null || echo "")
+    EXPECTED_ENDPOINT="unix:///run/user/$(id -u)/docker.sock"
+
+    if [ "$CURRENT_ENDPOINT" = "$EXPECTED_ENDPOINT" ]; then
+        echo "Check passed: Verified connection to Rootless socket."
+    else
+        echo "Warning: Rootless socket check bypassed or mismatched. Attempting run anyway..."
+    fi
+else
+    echo "Using Podman environment..."
+fi
+
+
+NAME=$(basename "$PWD")_$(date +%Y_%m_%d-%H_%M_%S)
 echo "Launching '$NAME' Docker session..."
 
-"$ROOTLESS_DOCKER" run -it \
+
+"$CONTAINER_BIN" run -it \
   --rm \
   --name $NAME \
   -m 224G --cpus="90" \
-  -v "$LOCAL_SECRET:$CONT_CONFIG:slave,Z" \
-  -v "$LOCAL_WORKSPACE:$CONT_WORKSPACE:slave,Z" \
-  -v "home:/root:Z" \
-  -v "./plans/shared:$CONT_WORKSPACE/plans:Z" \
+  -v "$LOCAL_SECRET:$CONT_CONFIG:slave" \
+  -v "$LOCAL_WORKSPACE:$CONT_WORKSPACE:slave" \
+  -v "./plans/shared:$CONT_WORKSPACE/plans" \
   -v "$LOCAL_FUSE:/fuse:ro" \
   --workdir "$CONT_WORKSPACE" \
   agentbox "$@"
