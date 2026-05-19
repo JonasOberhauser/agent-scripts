@@ -4,15 +4,18 @@
 USER_ARG="$1"
 USER_FILENAME="$2"  # New argument for the filename
 CONT_USER_FILENAME=$(basename "$2")  # New argument for the filename
+AGENT_FOLDER="$3"
 
-if [ -z "$USER_ARG" ] || [ -z "$USER_FILENAME" ]; then
-    echo "Error: Missing arguments."
-    echo "Usage: $0 <argument_for_python_s_flag> <filename>"
-    echo "Example: $0 my_secret_key production.yaml"
+# Validate that all 3 required script parameters are present
+if [ -z "$USER_ARG" ] || [ -z "$USER_FILENAME" ] || [ -z "$AGENT_FOLDER" ]; then
+    echo "Error: Missing required arguments."
+    echo "Usage: $0 <agent_binary_checksum> <secret_filename> <agent_config_subfolder> [arguments_for_container...]"
+    echo ""
+    echo "Example:"
+    echo "  $0 0ccX4ffa production.yaml goose_agent --some-container-flag"
     exit 1
 fi
 
-AGENT_FOLDER=$3
 
 # 2. Determine Paths
 AGENT_PATH=$(pwd)
