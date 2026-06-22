@@ -13,7 +13,7 @@ pub fn handle_command(cmd: Command, state: &mut ServerState) -> Response {
             let n = state.reset(name.as_deref());
             if name.is_some() && n == 0 {
                 Response::Error {
-                    message: format!("secret not found"),
+                    message: "secret not found".into(),
                 }
             } else {
                 Response::Ok

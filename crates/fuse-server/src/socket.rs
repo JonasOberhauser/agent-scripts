@@ -1,13 +1,15 @@
 use std::os::unix::net::UnixListener;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use fuse_protocol::{Command, Response};
 use tracing::{error, info};
-use uuid::Uuid;
 
 use crate::handler::handle_command;
 use crate::state::ServerState;
+
+static CONN_ID: AtomicU64 = AtomicU64::new(0);
 
 /// Run the CRUD socket server.  Blocks the calling thread.
 ///
@@ -35,7 +37,7 @@ pub fn run_socket_server(
             Ok(mut stream) => {
                 let state = Arc::clone(&state);
                 std::thread::spawn(move || {
-                    let conn_id = Uuid::new_v4().to_string()[..8].to_string();
+                    let conn_id = CONN_ID.fetch_add(1, Ordering::Relaxed);
                     if let Err(e) = handle_connection(&mut stream, state) {
                         error!("[{conn_id}] connection error: {e}");
                     }

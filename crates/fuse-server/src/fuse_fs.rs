@@ -238,17 +238,3 @@ impl<S: SystemIo> Filesystem for GatekeeperFs<S> {
     }
 }
 
-/// Helper to expose just the inode-mapping logic for unit testing without a
-/// real mount.
-#[cfg(test)]
-pub(crate) fn test_inode_roundtrip() {
-    use fuse_protocol::RealSystemIo;
-    let state = std::sync::Arc::new(Mutex::new(ServerState::new()));
-    let fs = GatekeeperFs::new(state, RealSystemIo::new());
-    let ino_a = fs.assign_inode("a");
-    let ino_b = fs.assign_inode("b");
-    assert_ne!(ino_a, ino_b);
-    // Re-assigning "a" returns the same inode.
-    assert_eq!(fs.assign_inode("a"), ino_a);
-    assert_eq!(fs.inode_name(ino_a), Some("a".into()));
-}

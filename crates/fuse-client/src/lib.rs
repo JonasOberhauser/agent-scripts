@@ -2,31 +2,14 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 
-use fuse_protocol::{Command, IoError, Response, SystemIo, Transport};
+use fuse_protocol::{Command, IoError, Response, Transport};
 
 /// Connect to the fuse-server's Unix domain socket and run a single
 /// command, returning the response.
 pub fn send_command(socket_path: &Path, cmd: Command) -> Result<Response, IoError> {
-    let mut stream = UnixStream::connect(socket_path)
-        .map_err(|e| IoError(format!("connect {}: {e}", socket_path.display())))?;
-    let json = serde_json::to_string(&cmd)?;
-    stream
-        .write_all(json.as_bytes())
-        .map_err(|e| IoError(format!("write: {e}")))?;
-    stream
-        .write_all(b"\n")
-        .map_err(|e| IoError(format!("write: {e}")))?;
-    stream
-        .flush()
-        .map_err(|e| IoError(format!("flush: {e}")))?;
-
-    let mut reader = BufReader::new(&stream);
-    let mut line = String::new();
-    reader
-        .read_line(&mut line)
-        .map_err(|e| IoError(format!("read: {e}")))?;
-    let resp: Response = serde_json::from_str(line.trim())?;
-    Ok(resp)
+    let mut transport = UnixTransport::connect(socket_path)?;
+    transport.send(cmd)?;
+    transport.recv()
 }
 
 /// [`Transport`] wrapper around a [`UnixStream`] for clients that want the
@@ -63,56 +46,17 @@ impl Transport<Command, Response> for UnixTransport {
     }
 }
 
-/// High-level helper: read a file from disk and add it as a secret on the
-/// server via the socket.
-pub fn add_secret_from_file<S: SystemIo>(
-    io: &S,
-    socket_path: &Path,
-    name: &str,
-    file_path: &Path,
-    hash: &str,
-) -> Result<Response, IoError> {
-    let content = io.read_file(file_path)?;
-    send_command(
-        socket_path,
-        Command::AddSecret {
-            name: name.to_string(),
-            content,
-            hash: hash.to_string(),
-        },
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fuse_protocol::{Command, Response};
 
     #[test]
-    fn transport_send_recv_round_trip() {
-        // We can't easily test UnixTransport without a real socket, so test
-        // the serialization logic instead.
+    fn command_serialization_round_trip() {
         let cmd = Command::Reset {
             name: Some("x".into()),
         };
         let json = serde_json::to_string(&cmd).unwrap();
         let parsed: Command = serde_json::from_str(&json).unwrap();
         assert_eq!(cmd, parsed);
-
-        let resp = Response::Ok;
-        let json = serde_json::to_string(&resp).unwrap();
-        let parsed: Response = serde_json::from_str(&json).unwrap();
-        assert_eq!(resp, parsed);
-    }
-
-    #[test]
-    fn add_secret_from_file_uses_io() {
-        let mock = fuse_protocol::MockSystemIo::new().with_file("/secret", b"DATA");
-        let resp = add_secret_from_file(&mock, Path::new("/nonexistent.sock"), "s", Path::new("/secret"), "h");
-        // Connection will fail since there's no real socket, but we verify
-        // the file was read (no "file not found" error).
-        assert!(resp.is_err());
-        let err = resp.unwrap_err().0;
-        assert!(err.contains("connect"), "got: {err}");
     }
 }

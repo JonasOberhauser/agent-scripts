@@ -77,6 +77,26 @@ impl SystemIo for RealSystemIo {
         Ok(child.id())
     }
 
+    fn spawn_independent(&mut self, program: &str, args: &[&str]) -> Result<u32, IoError> {
+        use std::os::unix::process::CommandExt;
+        let mut cmd = std::process::Command::new(program);
+        cmd.args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .process_group(0);
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+        let child = cmd
+            .spawn()
+            .map_err(|e| IoError(format!("spawn_independent {program}: {e}")))?;
+        Ok(child.id())
+    }
+
     fn run_interactive(&self, program: &str, args: &[&str]) -> Result<i32, IoError> {
         let status = std::process::Command::new(program)
             .args(args)
@@ -134,6 +154,11 @@ impl MockSystemIo {
         self.process_hashes.insert(pid, hash.to_string());
         self
     }
+
+    fn record_spawn(&mut self, program: &str, args: &[&str]) {
+        self.spawned
+            .push((program.to_string(), args.iter().map(|s| s.to_string()).collect()));
+    }
 }
 
 impl SystemIo for MockSystemIo {
@@ -180,9 +205,13 @@ impl SystemIo for MockSystemIo {
     }
 
     fn spawn_detached(&mut self, program: &str, args: &[&str]) -> Result<u32, IoError> {
-        self.spawned
-            .push((program.to_string(), args.iter().map(|s| s.to_string()).collect()));
+        self.record_spawn(program, args);
         Ok(12345)
+    }
+
+    fn spawn_independent(&mut self, program: &str, args: &[&str]) -> Result<u32, IoError> {
+        self.record_spawn(program, args);
+        Ok(54321)
     }
 
     fn run_interactive(&self, _program: &str, _args: &[&str]) -> Result<i32, IoError> {

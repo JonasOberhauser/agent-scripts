@@ -27,6 +27,10 @@ pub trait SystemIo {
     fn create_symlink(&self, original: &Path, link: &Path) -> Result<(), IoError>;
     fn run_command(&self, program: &str, args: &[&str]) -> Result<CommandOutput, IoError>;
     fn spawn_detached(&mut self, program: &str, args: &[&str]) -> Result<u32, IoError>;
+    /// Spawn a process that is **fully independent** of the caller — it
+    /// survives the caller's death (new session via `setsid`, new process
+    /// group, no shared stdio).  Returns the child PID.
+    fn spawn_independent(&mut self, program: &str, args: &[&str]) -> Result<u32, IoError>;
     /// Run a process inheriting the caller's stdin/stdout/stderr (foreground).
     /// Returns the exit code.
     fn run_interactive(&self, program: &str, args: &[&str]) -> Result<i32, IoError>;

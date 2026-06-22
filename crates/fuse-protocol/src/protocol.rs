@@ -1,16 +1,5 @@
 use serde::{Deserialize, Serialize};
 
-/// A single secret file served by the FUSE filesystem.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SecretEntry {
-    /// Base filename visible inside the mount (e.g. `secrets.yaml`).
-    pub name: String,
-    /// Raw file content.
-    pub content: Vec<u8>,
-    /// SHA-256 of the only binary allowed to read this secret.
-    pub allowed_hash: String,
-}
-
 /// Read-only status snapshot for a secret.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SecretStatus {

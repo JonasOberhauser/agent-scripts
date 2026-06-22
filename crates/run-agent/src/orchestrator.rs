@@ -142,14 +142,12 @@ pub fn run_agent<S: SystemIo>(io: &mut S, config: &AgentConfig) -> Result<RunRes
     })
 }
 
-fn setup_rootless_docker<S: SystemIo>(_io: &S) {
+fn setup_rootless_docker<S: SystemIo>(io: &S) {
     let uid = std::process::id();
     let sock = format!("unix:///run/user/{uid}/docker.sock");
     std::env::set_var("DOCKER_HOST", &sock);
     // Best-effort: start the user docker service.
-    let _ = std::process::Command::new("systemctl")
-        .args(["--user", "start", "docker.service"])
-        .status();
+    let _ = io.run_command("systemctl", &["--user", "start", "docker.service"]);
     info!("Docker rootless socket: {sock}");
 }
 

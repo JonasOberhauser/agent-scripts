@@ -1,5 +1,4 @@
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 use clap::Parser;
@@ -61,13 +60,10 @@ fn main() {
     // Start socket server in background.
     let socket_path = cli.socket.clone();
     let socket_state = Arc::clone(&state);
-    let running = Arc::new(AtomicBool::new(true));
-    let running_clone = Arc::clone(&running);
 
     std::thread::spawn(move || {
         if let Err(e) = fuse_server::run_socket_server(&socket_path, socket_state) {
             error!("Socket server error: {e}");
-            running_clone.store(false, std::sync::atomic::Ordering::SeqCst);
         }
     });
 
