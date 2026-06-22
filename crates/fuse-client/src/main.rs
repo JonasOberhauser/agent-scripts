@@ -34,7 +34,7 @@ enum Commands {
         #[arg(short, long)]
         file: PathBuf,
         /// SHA-256 of the allowed binary.
-        #[arg(short, long)]
+        #[arg(long)]
         hash: String,
     },
     /// Remove a secret from the mount.
@@ -42,7 +42,7 @@ enum Commands {
     /// Replace the allowed binary hash for a secret.
     RotateHash {
         name: String,
-        #[arg(short, long)]
+        #[arg(long)]
         hash: String,
     },
     /// List all mounted secrets.
