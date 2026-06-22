@@ -242,7 +242,7 @@ impl<S: SystemIo> Filesystem for GatekeeperFs<S> {
 /// real mount.
 #[cfg(test)]
 pub(crate) fn test_inode_roundtrip() {
-    use crate::real_io::RealSystemIo;
+    use fuse_protocol::RealSystemIo;
     let state = std::sync::Arc::new(Mutex::new(ServerState::new()));
     let fs = GatekeeperFs::new(state, RealSystemIo::new());
     let ino_a = fs.assign_inode("a");

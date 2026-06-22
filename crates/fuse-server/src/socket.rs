@@ -89,7 +89,7 @@ fn handle_connection(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fuse_protocol::SecretStatus;
+    use fuse_protocol::Command;
 
     #[test]
     fn socket_round_trip_reset() {
