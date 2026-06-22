@@ -1,0 +1,8 @@
+# Rust build artifacts
+target/
+
+# Logs
+*.log
+
+# FUSE mount temp dirs
+fuse_mnt/
