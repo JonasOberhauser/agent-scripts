@@ -90,5 +90,13 @@ RUN mv /root/.local/bin/goose /usr/local/bin/goose
 
 RUN curl -fsSL https://opencode.ai/install | bash
 
+# Download and run the rustup installer script
+# -sSf ensures curl fails quietly but safely on server errors
+# -y bypasses the interactive confirmation prompt
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+
+# Add the Rust binaries to the system PATH environment variable
+ENV PATH="/root/.cargo/bin:${PATH}"
+
 WORKDIR /workspace
 #ENTRYPOINT ["goose"]

@@ -156,8 +156,8 @@ echo "Launching '$NAME' Docker session..."
   --user root \
   -v "$HOST_CONFIG:$CONT_CONFIG:slave,Z" \
   -v "$HOST_WORKSPACE:$CONT_WORKSPACE:slave,Z" \
-  -v "./plans/shared:$CONT_WORKSPACE/plans,Z" \
-  -v ${AGENT_NAME}_home:/root \
+  -v "./plans/shared:$CONT_WORKSPACE/plans:Z" \
+  -v ${AGENT_NAME}_home:/root:z \
   -v "$HOST_FUSE:/fuse:ro" \
   --workdir "$CONT_WORKSPACE" \
   agentbox "$@"
