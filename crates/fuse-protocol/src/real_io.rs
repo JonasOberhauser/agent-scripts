@@ -77,6 +77,14 @@ impl SystemIo for RealSystemIo {
         Ok(child.id())
     }
 
+    fn run_interactive(&self, program: &str, args: &[&str]) -> Result<i32, IoError> {
+        let status = std::process::Command::new(program)
+            .args(args)
+            .status()
+            .map_err(|e| IoError(format!("run {program}: {e}")))?;
+        Ok(status.code().unwrap_or(-1))
+    }
+
     fn sha256_file(&self, path: &Path) -> Result<String, IoError> {
         let data = std::fs::read(path)?;
         Ok(hex_sha256(&data))
@@ -99,12 +107,15 @@ pub struct MockSystemIo {
     pub process_hashes: HashMap<u32, String>,
     pub command_stdout: String,
     pub command_status: Option<i32>,
+    pub interactive_exit: i32,
+    pub spawned: Vec<(String, Vec<String>)>,
 }
 
 impl MockSystemIo {
     pub fn new() -> Self {
         Self {
             command_status: Some(0),
+            interactive_exit: 0,
             ..Default::default()
         }
     }
@@ -168,8 +179,14 @@ impl SystemIo for MockSystemIo {
         })
     }
 
-    fn spawn_detached(&mut self, _program: &str, _args: &[&str]) -> Result<u32, IoError> {
+    fn spawn_detached(&mut self, program: &str, args: &[&str]) -> Result<u32, IoError> {
+        self.spawned
+            .push((program.to_string(), args.iter().map(|s| s.to_string()).collect()));
         Ok(12345)
+    }
+
+    fn run_interactive(&self, _program: &str, _args: &[&str]) -> Result<i32, IoError> {
+        Ok(self.interactive_exit)
     }
 
     fn sha256_file(&self, path: &Path) -> Result<String, IoError> {
