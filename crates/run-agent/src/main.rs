@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::Parser;
-use run_agent::{run_agent, AgentConfig};
+use run_agent::{run_agent, AgentConfig, DEFAULT_MOUNT_POINT, DEFAULT_SOCKET};
 use tracing::error;
 use tracing_subscriber::EnvFilter;
 
@@ -24,6 +24,14 @@ struct Cli {
     /// Path to the fuse-server binary.
     #[arg(long, default_value = "fuse-server")]
     fuse_server: PathBuf,
+
+    /// Unix socket path for the shared fuse-server.
+    #[arg(long, default_value = DEFAULT_SOCKET, env = "FUSE_GATEKEEPER_SOCKET")]
+    socket: PathBuf,
+
+    /// FUSE mount point (shared across projects).
+    #[arg(long, default_value = DEFAULT_MOUNT_POINT)]
+    mount_point: PathBuf,
 
     /// Container image name.
     #[arg(long, default_value = "agentbox")]
@@ -56,6 +64,8 @@ fn main() -> ExitCode {
         &cli.container_args,
     );
     config.fuse_server_path = cli.fuse_server;
+    config.socket_path = cli.socket;
+    config.mount_point = cli.mount_point;
     config.image_name = cli.image;
     config.memory = cli.memory;
     config.cpus = cli.cpus;

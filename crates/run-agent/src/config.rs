@@ -1,5 +1,11 @@
 use std::path::PathBuf;
 
+/// Well-known default Unix socket path for the shared fuse-server.
+pub const DEFAULT_SOCKET: &str = "/tmp/fuse-gatekeeper.sock";
+
+/// Well-known default FUSE mount point for the shared fuse-server.
+pub const DEFAULT_MOUNT_POINT: &str = "/tmp/fuse-gatekeeper-mnt";
+
 /// All parameters needed to launch an agent session.
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
@@ -21,6 +27,10 @@ pub struct AgentConfig {
     pub memory: String,
     /// Container CPU limit.
     pub cpus: String,
+    /// Unix socket path for the shared fuse-server.
+    pub socket_path: PathBuf,
+    /// FUSE mount point (shared across projects).
+    pub mount_point: PathBuf,
 }
 
 impl AgentConfig {
@@ -42,6 +52,8 @@ impl AgentConfig {
             image_name: "agentbox".to_string(),
             memory: "224G".to_string(),
             cpus: "90".to_string(),
+            socket_path: PathBuf::from(DEFAULT_SOCKET),
+            mount_point: PathBuf::from(DEFAULT_MOUNT_POINT),
         }
     }
 
@@ -63,11 +75,7 @@ impl AgentConfig {
     }
 
     pub fn host_fuse(&self) -> PathBuf {
-        self.agent_path.join("fuse_mnt")
-    }
-
-    pub fn socket_path(&self) -> PathBuf {
-        self.agent_path.join("fuse-gatekeeper.sock")
+        self.mount_point.clone()
     }
 
     pub fn agent_name(&self) -> String {
@@ -193,6 +201,8 @@ mod tests {
             image_name: "myimg".into(),
             memory: "16G".into(),
             cpus: "4".into(),
+            socket_path: PathBuf::from("/tmp/fuse-gatekeeper.sock"),
+            mount_point: PathBuf::from("/tmp/fuse-gatekeeper-mnt"),
         };
         let args = build_container_args(&cfg);
         assert!(args.contains(&"run".to_string()));

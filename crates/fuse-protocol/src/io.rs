@@ -36,6 +36,15 @@ pub trait SystemIo {
     fn run_interactive(&self, program: &str, args: &[&str]) -> Result<i32, IoError>;
     fn sha256_file(&self, path: &Path) -> Result<String, IoError>;
     fn sha256_process_exe(&self, pid: u32) -> Result<String, IoError>;
+
+    // ── Unix domain socket helpers ───────────────────────────────
+
+    /// Try to connect to a Unix domain socket.  Returns `true` if the
+    /// connection succeeds (i.e. a server is listening).
+    fn try_unix_connect(&self, path: &Path) -> bool;
+    /// Send a blob over a Unix domain socket (newline-terminated) and read
+    /// one line of response.
+    fn unix_send_recv(&self, path: &Path, data: &[u8]) -> Result<Vec<u8>, IoError>;
 }
 
 /// Bidirectional message transport, generic over input `I` and output `O`.

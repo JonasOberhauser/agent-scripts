@@ -116,6 +116,23 @@ impl SystemIo for RealSystemIo {
         let data = std::fs::read(&exe_path)?;
         Ok(hex_sha256(&data))
     }
+
+    fn try_unix_connect(&self, path: &Path) -> bool {
+        std::os::unix::net::UnixStream::connect(path).is_ok()
+    }
+
+    fn unix_send_recv(&self, path: &Path, data: &[u8]) -> Result<Vec<u8>, IoError> {
+        use std::io::{BufRead, BufReader, Write};
+        let mut stream = std::os::unix::net::UnixStream::connect(path)
+            .map_err(|e| IoError(format!("connect {}: {e}", path.display())))?;
+        stream.write_all(data)?;
+        stream.write_all(b"\n")?;
+        stream.flush()?;
+        let mut reader = BufReader::new(&stream);
+        let mut line = String::new();
+        reader.read_line(&mut line)?;
+        Ok(line.into_bytes())
+    }
 }
 
 /// In-memory mock [`SystemIo`] for tests.  All operations are deterministic and
@@ -129,6 +146,8 @@ pub struct MockSystemIo {
     pub command_status: Option<i32>,
     pub interactive_exit: i32,
     pub spawned: Vec<(String, Vec<String>)>,
+    pub unix_connected: bool,
+    pub unix_responses: std::cell::RefCell<std::collections::VecDeque<Vec<u8>>>,
 }
 
 impl MockSystemIo {
@@ -152,6 +171,11 @@ impl MockSystemIo {
 
     pub fn with_process_hash(mut self, pid: u32, hash: &str) -> Self {
         self.process_hashes.insert(pid, hash.to_string());
+        self
+    }
+
+    pub fn with_unix_response(self, response: &[u8]) -> Self {
+        self.unix_responses.borrow_mut().push_back(response.to_vec());
         self
     }
 
@@ -211,6 +235,7 @@ impl SystemIo for MockSystemIo {
 
     fn spawn_independent(&mut self, program: &str, args: &[&str]) -> Result<u32, IoError> {
         self.record_spawn(program, args);
+        self.unix_connected = true;
         Ok(54321)
     }
 
@@ -230,6 +255,17 @@ impl SystemIo for MockSystemIo {
             .get(&pid)
             .cloned()
             .ok_or_else(|| IoError(format!("no hash for pid {pid}")))
+    }
+
+    fn try_unix_connect(&self, _path: &Path) -> bool {
+        self.unix_connected
+    }
+
+    fn unix_send_recv(&self, _path: &Path, _data: &[u8]) -> Result<Vec<u8>, IoError> {
+        self.unix_responses
+            .borrow_mut()
+            .pop_front()
+            .ok_or_else(|| IoError("no queued unix response".into()))
     }
 }
 

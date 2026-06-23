@@ -55,7 +55,8 @@ fn main() {
     ).init();
 
     let cli = Cli::parse();
-    let cmd = build_command(&cli.command, &fuse_protocol::RealSystemIo::new());
+    let io = fuse_protocol::RealSystemIo::new();
+    let cmd = build_command(&cli.command, &io);
 
     let cmd = match cmd {
         Ok(c) => c,
@@ -65,7 +66,7 @@ fn main() {
         }
     };
 
-    match send_command(&cli.socket, cmd) {
+    match send_command(&io, &cli.socket, cmd) {
         Ok(resp) => {
             print_response(&resp);
             if matches!(resp, Response::Error { .. }) {

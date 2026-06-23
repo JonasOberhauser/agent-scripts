@@ -11,20 +11,26 @@ use crate::config::{build_container_args, detect_container_runtime_name, AgentCo
 pub struct RunResult {
     pub container_exit_code: i32,
     pub reset_ok: bool,
+    pub server_was_spawned: bool,
 }
 
-/// Full orchestration loop.  This is the Rust replacement for `run-agent.sh`.
+/// Full orchestration loop — the Rust replacement for `run-agent.sh`.
+///
+/// The fuse-server is **shared**: `run-agent` probes for an existing server
+/// at the well-known socket path.  If none is found it spawns one as an
+/// independent daemon (survives `run-agent`'s exit).  The secret is then
+/// added at runtime via the socket, not via a `--secret` CLI flag.
 ///
 /// Steps:
 /// 1. Validate workspace directories.
-/// 2. Create the FUSE mount-point directory.
-/// 3. Spawn `fuse-server` as a background process.
-/// 4. Wait for the Unix socket to appear.
+/// 2. Probe for an existing fuse-server (discovery).
+/// 3. If none: spawn independent server, wait for socket.
+/// 4. Add the secret via `fuse-client add-secret`.
 /// 5. Create the config symlink.
-/// 6. Detect the container runtime.
-/// 7. Run the container (foreground, inheriting stdio).
-/// 8. **Auto-reset** the FUSE gatekeeper counter via the socket.
-/// 9. Clean up: remove symlink, shut down fuse-server.
+/// 6. Detect container runtime.
+/// 7. Run the container (foreground).
+/// 8. **Auto-reset** this secret's counter.
+/// 9. Clean up symlink (server is left running).
 pub fn run_agent<S: SystemIo>(io: &mut S, config: &AgentConfig) -> Result<RunResult, String> {
     // ── 1. Validate ──────────────────────────────────────────────
     let host_config = config.host_config_dir();
@@ -40,55 +46,71 @@ pub fn run_agent<S: SystemIo>(io: &mut S, config: &AgentConfig) -> Result<RunRes
     }
     info!("Workspace validated.");
 
-    // ── 2. Create FUSE mount-point ────────────────────────────────
-    let host_fuse = config.host_fuse();
-    io.create_dir_all(&host_fuse)
-        .map_err(|e| format!("create {}: {e}", host_fuse.display()))?;
+    // ── 2. Probe for existing server ─────────────────────────────
+    let socket = &config.socket_path;
+    let mut server_was_spawned = false;
 
-    // ── 3. Spawn fuse-server ──────────────────────────────────────
-    let socket_path = config.socket_path();
-    let secret_spec = format!(
-        "{}:{}:{}",
-        config.filename(),
-        config.host_config_file.display(),
-        config.binary_hash
-    );
+    if fuse_client::server_exists(io, socket) {
+        info!("Reusing existing fuse-server at {}", socket.display());
+    } else {
+        // ── 3. Spawn independent server ───────────────────────────
+        server_was_spawned = true;
+        info!("No fuse-server found — spawning a new one.");
 
-    let fuse_args: Vec<&str> = vec![
-        "--mount-point",
-        host_fuse.to_str().unwrap(),
-        "--socket",
-        socket_path.to_str().unwrap(),
-        "--secret",
-        &secret_spec,
-        "--allow-other",
-    ];
+        io.create_dir_all(&config.mount_point)
+            .map_err(|e| format!("create mount point: {e}"))?;
 
-    let fuse_pid = io
-        .spawn_detached(
-            config.fuse_server_path.to_str().unwrap(),
-            &fuse_args,
-        )
-        .map_err(|e| format!("spawn fuse-server: {e}"))?;
-    info!("fuse-server spawned (pid {fuse_pid}).");
+        let mount = config.mount_point.to_str().unwrap();
+        let sock = socket.to_str().unwrap();
+        let args: Vec<&str> = vec![
+            "--mount-point", mount,
+            "--socket", sock,
+            "--allow-other",
+        ];
 
-    // ── 4. Wait for socket ────────────────────────────────────────
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        if io.file_exists(&socket_path) {
-            break;
+        let pid = io
+            .spawn_independent(config.fuse_server_path.to_str().unwrap(), &args)
+            .map_err(|e| format!("spawn fuse-server: {e}"))?;
+        info!("fuse-server spawned as independent daemon (pid {pid}).");
+
+        // Wait for socket.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if io.try_unix_connect(socket) {
+                break;
+            }
+            if Instant::now() > deadline {
+                return Err("fuse-server socket did not appear within 10s".into());
+            }
+            std::thread::sleep(Duration::from_millis(100));
         }
-        if Instant::now() > deadline {
-            return Err("fuse-server socket did not appear within 10s".into());
-        }
-        std::thread::sleep(Duration::from_millis(100));
+        info!("Socket ready at {}", socket.display());
     }
-    info!("Socket ready at {}", socket_path.display());
+
+    // ── 4. Add secret via socket ─────────────────────────────────
+    let content = io
+        .read_file(&config.host_config_file)
+        .map_err(|e| format!("read secret file: {e}"))?;
+
+    match fuse_client::send_command(io, socket, Command::AddSecret {
+        name: config.filename(),
+        content: content.clone(),
+        hash: config.binary_hash.clone(),
+    }) {
+        Ok(fuse_protocol::Response::Ok) => {
+            info!("Secret '{}' added to server.", config.filename());
+        }
+        Ok(other) => {
+            return Err(format!("unexpected response adding secret: {other:?}"));
+        }
+        Err(e) => {
+            return Err(format!("failed to add secret: {e}"));
+        }
+    }
 
     // ── 5. Symlink config → /fuse/<file> ─────────────────────────
     let cont_fuse_file = config.container_fuse_file();
     let host_link = config.host_config_link();
-    // Remove stale symlink if present.
     let _ = io.remove_path(&host_link);
     io.create_symlink(Path::new(&cont_fuse_file), &host_link)
         .map_err(|e| format!("symlink: {e}"))?;
@@ -104,7 +126,6 @@ pub fn run_agent<S: SystemIo>(io: &mut S, config: &AgentConfig) -> Result<RunRes
     };
     info!("Using container runtime: {container_bin}");
 
-    // Docker rootless setup.
     if container_bin == "docker" {
         setup_rootless_docker(io);
     }
@@ -112,15 +133,15 @@ pub fn run_agent<S: SystemIo>(io: &mut S, config: &AgentConfig) -> Result<RunRes
     // ── 7. Run container ─────────────────────────────────────────
     let args = build_container_args(config);
     let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    let exit_code = io
-        .run_interactive(container_bin, &arg_refs)
-        .unwrap_or(-1);
+    let exit_code = io.run_interactive(container_bin, &arg_refs).unwrap_or(-1);
     info!("Container exited with code {exit_code}.");
 
-    // ── 8. Auto-reset ────────────────────────────────────────────
-    let reset_ok = match fuse_client::send_command(&socket_path, Command::Reset { name: None }) {
+    // ── 8. Auto-reset this secret ────────────────────────────────
+    let reset_ok = match fuse_client::send_command(io, socket, Command::Reset {
+        name: Some(config.filename()),
+    }) {
         Ok(fuse_protocol::Response::Ok) => {
-            info!("Auto-reset successful.");
+            info!("Auto-reset successful for '{}'.", config.filename());
             true
         }
         Ok(other) => {
@@ -133,12 +154,13 @@ pub fn run_agent<S: SystemIo>(io: &mut S, config: &AgentConfig) -> Result<RunRes
         }
     };
 
-    // ── 9. Cleanup ───────────────────────────────────────────────
+    // ── 9. Cleanup symlink (server stays running) ────────────────
     cleanup(io, &host_link);
 
     Ok(RunResult {
         container_exit_code: exit_code,
         reset_ok,
+        server_was_spawned,
     })
 }
 
@@ -146,7 +168,6 @@ fn setup_rootless_docker<S: SystemIo>(io: &S) {
     let uid = std::process::id();
     let sock = format!("unix:///run/user/{uid}/docker.sock");
     std::env::set_var("DOCKER_HOST", &sock);
-    // Best-effort: start the user docker service.
     let _ = io.run_command("systemctl", &["--user", "start", "docker.service"]);
     info!("Docker rootless socket: {sock}");
 }
@@ -174,42 +195,62 @@ mod tests {
             image_name: "agentbox".into(),
             memory: "16G".into(),
             cpus: "4".into(),
+            socket_path: PathBuf::from("/tmp/fgk.sock"),
+            mount_point: PathBuf::from("/tmp/fgk-mnt"),
         }
     }
 
     #[test]
     fn missing_workspace_dirs_errors() {
-        let mut mock = MockSystemIo::new(); // no files
+        let mut mock = MockSystemIo::new();
         let cfg = test_config();
         let result = run_agent(&mut mock, &cfg);
         assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(err.contains("not found") || err.contains("workspace"));
+        assert!(result.unwrap_err().contains("not found"));
     }
 
     #[test]
-    fn full_flow_with_mock() {
+    fn spawns_server_when_none_exists() {
         let mut mock = MockSystemIo::new()
-            .with_file("/work/agent1/config", b"") // config dir "exists"
-            .with_file("/work/agent1/workspace", b""); // workspace "exists"
-        // socket needs to "appear" — the mock returns true for file_exists
-        // only for files we've added, so pre-add the socket path too.
-        mock = mock.with_file("/work/agent1/fuse-gatekeeper.sock", b"");
+            .with_file("/work/agent1/config", b"")
+            .with_file("/work/agent1/workspace", b"")
+            .with_file("secrets.yaml", b"DATA")
+            // unix_connected defaults to false → server doesn't exist → spawn
+            .with_unix_response(br#"{"type":"ok"}"#)  // AddSecret response
+            .with_unix_response(br#"{"type":"ok"}"#); // Reset response
 
         let cfg = test_config();
         let result = run_agent(&mut mock, &cfg);
 
-        // The mock's send_command will fail (no real socket), but the flow
-        // should still complete because auto-reset failures are non-fatal.
         assert!(result.is_ok(), "got: {:?}", result.err());
         let run = result.unwrap();
+        assert!(run.server_was_spawned);
+        assert!(run.reset_ok);
         assert_eq!(run.container_exit_code, 0);
-        // auto-reset fails because there's no real socket → false
-        assert!(!run.reset_ok);
 
-        // fuse-server was spawned
+        // fuse-server was spawned independently
         assert_eq!(mock.spawned.len(), 1);
         assert_eq!(mock.spawned[0].0, "fuse-server");
+    }
+
+    #[test]
+    fn reuses_existing_server() {
+        let mut mock = MockSystemIo::new()
+            .with_file("/work/agent1/config", b"")
+            .with_file("/work/agent1/workspace", b"")
+            .with_file("secrets.yaml", b"DATA");
+        mock.unix_connected = true; // server already running
+        mock = mock
+            .with_unix_response(br#"{"type":"ok"}"#)  // AddSecret
+            .with_unix_response(br#"{"type":"ok"}"#); // Reset
+
+        let cfg = test_config();
+        let result = run_agent(&mut mock, &cfg);
+
+        assert!(result.is_ok(), "got: {:?}", result.err());
+        let run = result.unwrap();
+        assert!(!run.server_was_spawned); // didn't spawn
+        assert_eq!(mock.spawned.len(), 0); // no spawn calls
     }
 
     #[test]
@@ -217,12 +258,13 @@ mod tests {
         let mut mock = MockSystemIo::new()
             .with_file("/work/agent1/config", b"")
             .with_file("/work/agent1/workspace", b"")
-            .with_file("/work/agent1/fuse-gatekeeper.sock", b"");
+            .with_file("secrets.yaml", b"DATA")
+            .with_unix_response(br#"{"type":"ok"}"#)
+            .with_unix_response(br#"{"type":"ok"}"#);
 
         let cfg = test_config();
         let _ = run_agent(&mut mock, &cfg);
 
-        // The symlink file should have been removed during cleanup.
         let link = cfg.host_config_link();
         assert!(!mock.files.contains_key(&link.to_string_lossy().to_string()));
     }
