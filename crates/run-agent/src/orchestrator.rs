@@ -82,10 +82,23 @@ pub fn run_agent<S: SystemIo>(io: &mut S, config: &AgentConfig) -> Result<RunRes
         let log_str = log_path.to_str()
             .ok_or_else(|| format!("log path is not valid UTF-8: {}", log_path.display()))?;
 
+        // Build the full argv.  When sudo is requested, we spawn
+        // `sudo <fuse-server> <args...>` so the FUSE mount has root
+        // privileges (required for `allow_other` without editing fuse.conf).
+        let mut spawn_args: Vec<&str> = Vec::new();
+        let spawn_prog: &str;
+        if config.use_sudo {
+            spawn_prog = "sudo";
+            spawn_args.push(server_bin);
+        } else {
+            spawn_prog = server_bin;
+        }
+        spawn_args.extend_from_slice(&args);
+
         let pid = io
-            .spawn_independent(server_bin, &args, Some(std::path::Path::new(log_str)))
+            .spawn_independent(spawn_prog, &spawn_args, Some(std::path::Path::new(log_str)))
             .map_err(|e| format!("spawn fuse-server: {e}"))?;
-        info!("fuse-server spawned as independent daemon (pid {pid}).");
+        info!("fuse-server spawned as independent daemon (pid {pid}, sudo={}).", config.use_sudo);
 
         // Wait for socket.
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -220,6 +233,7 @@ mod tests {
             cpus: "4".into(),
             socket_path: PathBuf::from("/tmp/fgk.sock"),
             mount_point: PathBuf::from("/tmp/fgk-mnt"),
+            use_sudo: false,
         }
     }
 

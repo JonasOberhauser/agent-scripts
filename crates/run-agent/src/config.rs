@@ -31,6 +31,9 @@ pub struct AgentConfig {
     pub socket_path: PathBuf,
     /// FUSE mount point (shared across projects).
     pub mount_point: PathBuf,
+    /// Run fuse-server under `sudo` (needed for `allow_other` without
+    /// editing `/etc/fuse.conf`).
+    pub use_sudo: bool,
 }
 
 impl AgentConfig {
@@ -54,6 +57,7 @@ impl AgentConfig {
             cpus: "90".to_string(),
             socket_path: PathBuf::from(DEFAULT_SOCKET),
             mount_point: PathBuf::from(DEFAULT_MOUNT_POINT),
+            use_sudo: false,
         }
     }
 
@@ -203,6 +207,7 @@ mod tests {
             cpus: "4".into(),
             socket_path: PathBuf::from("/tmp/fuse-gatekeeper.sock"),
             mount_point: PathBuf::from("/tmp/fuse-gatekeeper-mnt"),
+            use_sudo: false,
         };
         let args = build_container_args(&cfg);
         assert!(args.contains(&"run".to_string()));

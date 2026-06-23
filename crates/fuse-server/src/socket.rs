@@ -23,11 +23,13 @@ pub fn run_socket_server(
     let _ = std::fs::remove_file(socket_path);
 
     let listener = UnixListener::bind(socket_path)?;
-    // Restrict to owner only.
+    // World-accessible so non-root fuse-client can connect when the server
+    // runs under sudo.  Security is enforced by the FUSE binary-hash check,
+    // not by socket permissions.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))?;
+        std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o666))?;
     }
 
     info!("Socket server listening at {}", socket_path.display());

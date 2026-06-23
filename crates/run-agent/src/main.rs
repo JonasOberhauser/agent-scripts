@@ -33,6 +33,10 @@ struct Cli {
     #[arg(long, default_value = DEFAULT_MOUNT_POINT)]
     mount_point: PathBuf,
 
+    /// Run fuse-server under sudo (needed for allow_other without fuse.conf edit).
+    #[arg(long)]
+    sudo: bool,
+
     /// Container image name.
     #[arg(long, default_value = "agentbox")]
     image: String,
@@ -66,6 +70,7 @@ fn main() -> ExitCode {
     config.fuse_server_path = resolve_fuse_server(&cli.fuse_server);
     config.socket_path = cli.socket;
     config.mount_point = cli.mount_point;
+    config.use_sudo = cli.sudo;
     config.image_name = cli.image;
     config.memory = cli.memory;
     config.cpus = cli.cpus;
