@@ -77,8 +77,13 @@ pub fn run_agent<S: SystemIo>(io: &mut S, config: &AgentConfig) -> Result<RunRes
             .fuse_server_path
             .to_str()
             .ok_or_else(|| format!("fuse-server path is not valid UTF-8: {}", config.fuse_server_path.display()))?;
+
+        let log_path = config.agent_path.join("fuse-server.log");
+        let log_str = log_path.to_str()
+            .ok_or_else(|| format!("log path is not valid UTF-8: {}", log_path.display()))?;
+
         let pid = io
-            .spawn_independent(server_bin, &args)
+            .spawn_independent(server_bin, &args, Some(std::path::Path::new(log_str)))
             .map_err(|e| format!("spawn fuse-server: {e}"))?;
         info!("fuse-server spawned as independent daemon (pid {pid}).");
 
@@ -89,7 +94,16 @@ pub fn run_agent<S: SystemIo>(io: &mut S, config: &AgentConfig) -> Result<RunRes
                 break;
             }
             if Instant::now() > deadline {
-                return Err("fuse-server socket did not appear within 10s".into());
+                let mut detail = String::new();
+                if let Ok(log) = io.read_file(&log_path) {
+                    let log_str = String::from_utf8_lossy(&log);
+                    if !log_str.trim().is_empty() {
+                        detail = format!("\nfuse-server log:\n{log_str}");
+                    }
+                }
+                return Err(format!(
+                    "fuse-server socket did not appear within 10s (pid {pid} may have crashed){detail}"
+                ));
             }
             std::thread::sleep(Duration::from_millis(100));
         }

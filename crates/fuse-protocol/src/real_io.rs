@@ -77,14 +77,34 @@ impl SystemIo for RealSystemIo {
         Ok(child.id())
     }
 
-    fn spawn_independent(&mut self, program: &str, args: &[&str]) -> Result<u32, IoError> {
+    fn spawn_independent(
+        &mut self,
+        program: &str,
+        args: &[&str],
+        stderr_to: Option<&Path>,
+    ) -> Result<u32, IoError> {
         use std::os::unix::process::CommandExt;
         let mut cmd = std::process::Command::new(program);
         cmd.args(args)
             .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
             .process_group(0);
+
+        match stderr_to {
+            Some(path) => {
+                let f = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                    .map_err(|e| IoError(format!("open log {path:?}: {e}")))?;
+                cmd.stdout(std::process::Stdio::from(f.try_clone().map_err(|e| IoError(e.to_string()))?))
+                    .stderr(std::process::Stdio::from(f));
+            }
+            None => {
+                cmd.stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null());
+            }
+        }
+
         unsafe {
             cmd.pre_exec(|| {
                 libc::setsid();
@@ -233,7 +253,12 @@ impl SystemIo for MockSystemIo {
         Ok(12345)
     }
 
-    fn spawn_independent(&mut self, program: &str, args: &[&str]) -> Result<u32, IoError> {
+    fn spawn_independent(
+        &mut self,
+        program: &str,
+        args: &[&str],
+        _stderr_to: Option<&Path>,
+    ) -> Result<u32, IoError> {
         self.record_spawn(program, args);
         self.unix_connected = true;
         Ok(54321)

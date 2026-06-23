@@ -29,8 +29,15 @@ pub trait SystemIo {
     fn spawn_detached(&mut self, program: &str, args: &[&str]) -> Result<u32, IoError>;
     /// Spawn a process that is **fully independent** of the caller — it
     /// survives the caller's death (new session via `setsid`, new process
-    /// group, no shared stdio).  Returns the child PID.
-    fn spawn_independent(&mut self, program: &str, args: &[&str]) -> Result<u32, IoError>;
+    /// group).  When `stderr_to` is `Some(path)`, both stdout and stderr are
+    /// redirected to that file; otherwise they go to `/dev/null`.
+    /// Returns the child PID.
+    fn spawn_independent(
+        &mut self,
+        program: &str,
+        args: &[&str],
+        stderr_to: Option<&Path>,
+    ) -> Result<u32, IoError>;
     /// Run a process inheriting the caller's stdin/stdout/stderr (foreground).
     /// Returns the exit code.
     fn run_interactive(&self, program: &str, args: &[&str]) -> Result<i32, IoError>;
