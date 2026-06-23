@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::Parser;
@@ -63,7 +63,7 @@ fn main() -> ExitCode {
         &cli.agent_subfolder,
         &cli.container_args,
     );
-    config.fuse_server_path = cli.fuse_server;
+    config.fuse_server_path = resolve_fuse_server(&cli.fuse_server);
     config.socket_path = cli.socket;
     config.mount_point = cli.mount_point;
     config.image_name = cli.image;
@@ -83,4 +83,27 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Resolve the fuse-server binary path.
+///
+/// 1. If the user gave an absolute path, use it as-is.
+/// 2. Otherwise, look for `fuse-server` next to the current executable
+///    (handles the common case where all binaries live in `target/release/`).
+/// 3. Fall back to PATH lookup.
+fn resolve_fuse_server(configured: &Path) -> PathBuf {
+    if configured.is_absolute() {
+        return configured.to_path_buf();
+    }
+
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let candidate = dir.join(configured);
+            if candidate.exists() {
+                return candidate;
+            }
+        }
+    }
+
+    configured.to_path_buf()
 }
