@@ -35,7 +35,7 @@ impl<S: SystemIo> GatekeeperFs<S> {
     }
 
     fn assign_inode(&self, name: &str) -> u64 {
-        let mut map = self.inodes.lock().unwrap();
+        let mut map = self.inodes.lock().expect("inode map mutex poisoned");
         if let Some(&ino) = map.iter().find(|(_, n)| n.as_str() == name).map(|(k, _)| k) {
             return ino;
         }
@@ -48,7 +48,7 @@ impl<S: SystemIo> GatekeeperFs<S> {
         if ino == ROOT_INO {
             return None;
         }
-        self.inodes.lock().unwrap().get(&ino).cloned()
+        self.inodes.lock().expect("inode map mutex poisoned").get(&ino).cloned()
     }
 
     fn file_attr(&self, ino: u64, size: u64, uid: u32, gid: u32) -> FileAttr {
@@ -111,7 +111,7 @@ impl<S: SystemIo> Filesystem for GatekeeperFs<S> {
                 return;
             }
         };
-        let state = self.state.lock().unwrap();
+        let state = self.state.lock().expect("ServerState mutex poisoned");
         if let Some(rec) = state.secrets.get(name_str) {
             let ino = self.assign_inode(name_str);
             let attr = self.file_attr(ino, rec.content.len() as u64, req.uid(), req.gid());
@@ -133,7 +133,7 @@ impl<S: SystemIo> Filesystem for GatekeeperFs<S> {
                 return;
             }
         };
-        let state = self.state.lock().unwrap();
+        let state = self.state.lock().expect("ServerState mutex poisoned");
         if let Some(rec) = state.secrets.get(&name) {
             reply.attr(&TTL, &self.file_attr(ino, rec.content.len() as u64, req.uid(), req.gid()));
         } else {
@@ -174,7 +174,7 @@ impl<S: SystemIo> Filesystem for GatekeeperFs<S> {
         };
 
         let outcome = {
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.state.lock().expect("ServerState mutex poisoned");
             state.attempt_read(&name, pid_hash.as_deref())
         };
 
@@ -211,7 +211,7 @@ impl<S: SystemIo> Filesystem for GatekeeperFs<S> {
             reply.error(libc::ENOTDIR);
             return;
         }
-        let state = self.state.lock().unwrap();
+        let state = self.state.lock().expect("ServerState mutex poisoned");
         let names: Vec<(u64, String, usize)> = state
             .secrets
             .iter()

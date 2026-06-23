@@ -54,7 +54,10 @@ fn main() {
 
     // Ensure mount point exists.
     if !cli.mount_point.exists() {
-        std::fs::create_dir_all(&cli.mount_point).expect("create mount point");
+        if let Err(e) = std::fs::create_dir_all(&cli.mount_point) {
+            error!("Failed to create mount point {}: {e}", cli.mount_point.display());
+            std::process::exit(1);
+        }
     }
 
     // Start socket server in background.

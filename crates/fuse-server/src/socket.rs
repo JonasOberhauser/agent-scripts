@@ -68,7 +68,9 @@ fn handle_connection(
                 let err = Response::Error {
                     message: format!("invalid command: {e}"),
                 };
-                writeln!(stream, "{}", serde_json::to_string(&err).unwrap())?;
+                let json = serde_json::to_string(&err)
+                    .unwrap_or_else(|_| r#"{"type":"error","message":"internal error"}"#.into());
+                writeln!(stream, "{json}")?;
                 return Ok(());
             }
         };
@@ -76,7 +78,9 @@ fn handle_connection(
         info!("Command received: {:?}", cmd);
 
         let resp = {
-            let mut s = state.lock().unwrap();
+            let mut s = state
+                .lock()
+                .expect("ServerState mutex poisoned");
             handle_command(cmd, &mut s)
         };
 

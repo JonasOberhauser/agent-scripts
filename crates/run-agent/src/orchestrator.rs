@@ -60,16 +60,25 @@ pub fn run_agent<S: SystemIo>(io: &mut S, config: &AgentConfig) -> Result<RunRes
         io.create_dir_all(&config.mount_point)
             .map_err(|e| format!("create mount point: {e}"))?;
 
-        let mount = config.mount_point.to_str().unwrap();
-        let sock = socket.to_str().unwrap();
+        let mount = config
+            .mount_point
+            .to_str()
+            .ok_or_else(|| format!("mount point is not valid UTF-8: {}", config.mount_point.display()))?;
+        let sock = socket
+            .to_str()
+            .ok_or_else(|| format!("socket path is not valid UTF-8: {}", socket.display()))?;
         let args: Vec<&str> = vec![
             "--mount-point", mount,
             "--socket", sock,
             "--allow-other",
         ];
 
+        let server_bin = config
+            .fuse_server_path
+            .to_str()
+            .ok_or_else(|| format!("fuse-server path is not valid UTF-8: {}", config.fuse_server_path.display()))?;
         let pid = io
-            .spawn_independent(config.fuse_server_path.to_str().unwrap(), &args)
+            .spawn_independent(server_bin, &args)
             .map_err(|e| format!("spawn fuse-server: {e}"))?;
         info!("fuse-server spawned as independent daemon (pid {pid}).");
 
