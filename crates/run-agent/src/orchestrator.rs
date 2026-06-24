@@ -174,7 +174,7 @@ pub fn run_agent<S: SystemIo>(io: &mut S, config: &AgentConfig) -> Result<RunRes
     info!("Using container runtime: {container_bin}");
 
     if container_bin == "docker" {
-        setup_rootless_docker(io);
+        setup_rootless_docker();
     }
 
     // ── 7. Run container ─────────────────────────────────────────
@@ -209,11 +209,9 @@ pub fn run_agent<S: SystemIo>(io: &mut S, config: &AgentConfig) -> Result<RunRes
     })
 }
 
-fn setup_rootless_docker<S: SystemIo>(io: &S) {
-    let uid = std::process::id();
-    let sock = format!("unix:///run/user/{uid}/docker.sock");
+fn setup_rootless_docker() {
+    let sock = format!("unix://{}", crate::config::rootless_docker_socket());
     std::env::set_var("DOCKER_HOST", &sock);
-    let _ = io.run_command("systemctl", &["--user", "start", "docker.service"]);
     info!("Docker rootless socket: {sock}");
 }
 

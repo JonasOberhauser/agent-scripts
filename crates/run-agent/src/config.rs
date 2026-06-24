@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use fuse_protocol::SystemIo;
 
@@ -11,35 +11,45 @@ pub const DEFAULT_MOUNT_POINT: &str = "/tmp/fuse-gatekeeper-mnt";
 /// Which container runtime to use.
 #[derive(Debug, Clone, Copy, PartialEq, clap::ValueEnum)]
 pub enum Runtime {
-    /// Auto-detect (prefer podman, fall back to docker).
+    /// Auto-detect: rootless podman first, then rootless docker.
     Auto,
     Docker,
     Podman,
 }
 
+/// Returns the Unix UID of the current process.
+fn current_uid() -> u32 {
+    unsafe { libc::getuid() }
+}
+
+/// Path to the rootless Docker socket for the current user.
+pub fn rootless_docker_socket() -> String {
+    format!("/run/user/{}/docker.sock", current_uid())
+}
+
 impl Runtime {
-    /// Resolve `Auto` to a concrete binary name, probing the system.
-    /// Returns `None` if neither runtime is available.
+    /// Resolve to a concrete binary name, probing the system.
+    /// Returns `None` if the runtime is not available.
     pub fn resolve<S: SystemIo>(&self, io: &S) -> Option<&'static str> {
         match self {
             Runtime::Podman => {
-                if io.run_command("podman", &["--version"]).map(|o| o.success()).unwrap_or(false) {
+                if podman_available(io) {
                     Some("podman")
                 } else {
                     None
                 }
             }
             Runtime::Docker => {
-                if io.run_command("docker", &["--version"]).map(|o| o.success()).unwrap_or(false) {
+                if docker_available(io) {
                     Some("docker")
                 } else {
                     None
                 }
             }
             Runtime::Auto => {
-                if io.run_command("podman", &["--version"]).map(|o| o.success()).unwrap_or(false) {
+                if podman_available(io) {
                     Some("podman")
-                } else if io.run_command("docker", &["--version"]).map(|o| o.success()).unwrap_or(false) {
+                } else if docker_available(io) {
                     Some("docker")
                 } else {
                     None
@@ -47,6 +57,19 @@ impl Runtime {
             }
         }
     }
+}
+
+/// Podman is inherently rootless — just check it exists.
+fn podman_available<S: SystemIo>(io: &S) -> bool {
+    io.run_command("podman", &["--version"])
+        .map(|o| o.success())
+        .unwrap_or(false)
+}
+
+/// For Docker, require the rootless socket to be live.
+fn docker_available<S: SystemIo>(io: &S) -> bool {
+    let sock = rootless_docker_socket();
+    io.try_unix_connect(Path::new(&sock))
 }
 
 /// All parameters needed to launch an agent session.
@@ -265,6 +288,22 @@ mod tests {
     }
 
     #[test]
+    fn runtime_auto_falls_back_to_docker() {
+        let mut mock = MockSystemIo::new();
+        mock.command_status = None; // podman --version fails
+        mock.unix_connected = true; // rootless docker socket live
+        assert_eq!(Runtime::Auto.resolve(&mock), Some("docker"));
+    }
+
+    #[test]
+    fn runtime_auto_none_when_nothing_available() {
+        let mut mock = MockSystemIo::new();
+        mock.command_status = None; // no podman
+        // unix_connected defaults to false → no rootless docker
+        assert_eq!(Runtime::Auto.resolve(&mock), None);
+    }
+
+    #[test]
     fn runtime_podman_forces_podman() {
         let mock = MockSystemIo::new();
         assert_eq!(Runtime::Podman.resolve(&mock), Some("podman"));
@@ -272,7 +311,8 @@ mod tests {
 
     #[test]
     fn runtime_docker_forces_docker() {
-        let mock = MockSystemIo::new();
+        let mut mock = MockSystemIo::new();
+        mock.unix_connected = true;
         assert_eq!(Runtime::Docker.resolve(&mock), Some("docker"));
     }
 
