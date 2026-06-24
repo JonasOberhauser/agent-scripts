@@ -137,6 +137,9 @@ pub struct AgentConfig {
     /// Optional prefix command for the container runtime (e.g.
     /// `flatpak-spawn --host` to reach the host's podman from a toolbox).
     pub runtime_wrapper: Option<String>,
+
+    /// Log level for the fuse-server (e.g. "info", "debug", "warn").
+    pub log_level: String,
 }
 
 impl AgentConfig {
@@ -163,6 +166,7 @@ impl AgentConfig {
             use_sudo: false,
             runtime: Runtime::Auto,
             runtime_wrapper: None,
+            log_level: "info".to_string(),
         }
     }
 
@@ -294,6 +298,7 @@ mod tests {
             use_sudo: false,
             runtime: Runtime::Auto,
             runtime_wrapper: None,
+            log_level: "info".to_string(),
         };
         let args = build_container_args(&cfg);
         assert!(args.contains(&"run".to_string()));

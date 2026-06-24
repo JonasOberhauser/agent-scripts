@@ -26,14 +26,23 @@ struct Cli {
     /// Allow other users to access the mount.
     #[arg(long)]
     allow_other: bool,
+
+    /// Log level (e.g. "info", "debug", "warn").
+    /// Only used when RUST_LOG is not set, since spawn_independent + sudo
+    /// strips environment variables.
+    #[arg(long, default_value = "info")]
+    log_level: String,
 }
 
 fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
-
     let cli = Cli::parse();
+
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::builder()
+                .parse_lossy(&cli.log_level),
+        )
+        .init();
     let io = RealSystemIo::new();
 
     // Build initial state.

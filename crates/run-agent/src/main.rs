@@ -58,6 +58,10 @@ struct Cli {
     #[arg(long, default_value = "90")]
     cpus: String,
 
+    /// Log level for the fuse-server (e.g. "info", "debug", "warn").
+    #[arg(long, default_value = "info")]
+    log_level: String,
+
     /// Extra arguments passed to the container command.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     container_args: Vec<String>,
@@ -85,6 +89,7 @@ fn main() -> ExitCode {
     config.image_name = cli.image;
     config.memory = cli.memory;
     config.cpus = cli.cpus;
+    config.log_level = cli.log_level;
 
     let mut io = fuse_protocol::RealSystemIo::new();
     match run_agent(&mut io, &config) {

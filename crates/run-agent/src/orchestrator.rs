@@ -71,6 +71,7 @@ pub fn run_agent<S: SystemIo>(io: &mut S, config: &AgentConfig) -> Result<RunRes
             "--mount-point", mount,
             "--socket", sock,
             "--allow-other",
+            "--log-level", &config.log_level,
         ];
 
         let server_bin = config
@@ -279,6 +280,7 @@ mod tests {
             use_sudo: false,
             runtime: Runtime::Auto,
             runtime_wrapper: None,
+            log_level: "info".to_string(),
         }
     }
 
