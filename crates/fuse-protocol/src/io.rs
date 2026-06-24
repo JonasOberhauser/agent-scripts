@@ -45,6 +45,9 @@ pub trait SystemIo {
     fn sha256_process_exe(&self, pid: u32) -> Result<String, IoError>;
     fn is_symlink(&self, path: &Path) -> bool;
 
+    /// Rename (move) a file or symlink from `from` to `to`.
+    fn rename_path(&mut self, from: &Path, to: &Path) -> Result<(), IoError>;
+
     // ── Unix domain socket helpers ───────────────────────────────
 
     /// Try to connect to a Unix domain socket.  Returns `true` if the

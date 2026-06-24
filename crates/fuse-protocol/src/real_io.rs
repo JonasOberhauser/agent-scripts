@@ -143,6 +143,11 @@ impl SystemIo for RealSystemIo {
             .unwrap_or(false)
     }
 
+    fn rename_path(&mut self, from: &Path, to: &Path) -> Result<(), IoError> {
+        std::fs::rename(from, to)?;
+        Ok(())
+    }
+
     fn try_unix_connect(&self, path: &Path) -> bool {
         std::os::unix::net::UnixStream::connect(path).is_ok()
     }
@@ -307,6 +312,20 @@ impl SystemIo for MockSystemIo {
     fn is_symlink(&self, path: &Path) -> bool {
         self.symlinks
             .contains(&path.to_string_lossy().to_string())
+    }
+
+    fn rename_path(&mut self, from: &Path, to: &Path) -> Result<(), IoError> {
+        let from_key = from.to_string_lossy().to_string();
+        let to_key = to.to_string_lossy().to_string();
+        if let Some(data) = self.files.remove(&from_key) {
+            self.files.insert(to_key, data);
+            Ok(())
+        } else if self.symlinks.remove(&from_key) {
+            self.symlinks.insert(to_key);
+            Ok(())
+        } else {
+            Err(IoError(format!("rename: source not found: {from_key}")))
+        }
     }
 }
 

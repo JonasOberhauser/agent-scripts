@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use fuse_protocol::{Command, SystemIo};
@@ -151,16 +151,37 @@ pub fn run_agent<S: SystemIo>(io: &mut S, config: &AgentConfig) -> Result<RunRes
     // ── 5. Symlink config → /fuse/<file> ─────────────────────────
     let cont_fuse_file = config.container_fuse_file();
     let host_link = config.host_config_link();
+    let mut backup_path: Option<PathBuf> = None;
+
     if io.is_symlink(&host_link) {
         info!("Symlink already exists: {}", host_link.display());
     } else {
+        // Collision: the symlink path is occupied by the original file.
+        if io.file_exists(&host_link) {
+            let backup = PathBuf::from(format!("{}.orig", host_link.display()));
+            info!(
+                "Collision at {} — moving original to {}",
+                host_link.display(),
+                backup.display()
+            );
+            io.rename_path(&host_link, &backup)
+                .map_err(|e| format!("rename original aside: {e}"))?;
+            backup_path = Some(backup);
+        }
+
         match io.create_symlink(Path::new(&cont_fuse_file), &host_link) {
             Ok(()) => info!("Symlink: {} -> {cont_fuse_file}", host_link.display()),
-            Err(e) => warn!(
-                "Could not create symlink at {} ({}). \
-                 The FUSE mount is still available at {cont_fuse_file}.",
-                host_link.display(), e
-            ),
+            Err(e) => {
+                // Symlink failed; restore original if we moved it.
+                if let Some(backup) = backup_path.take() {
+                    let _ = io.rename_path(&backup, &host_link);
+                }
+                warn!(
+                    "Could not create symlink at {} ({}). \
+                     The FUSE mount is still available at {cont_fuse_file}.",
+                    host_link.display(), e
+                );
+            }
         }
     }
 
@@ -210,7 +231,18 @@ pub fn run_agent<S: SystemIo>(io: &mut S, config: &AgentConfig) -> Result<RunRes
         }
     };
 
-    // ── 9. Done (server stays running, symlink persists) ─────────
+    // ── 9. Restore original file if it was moved aside ─────────
+    if let Some(backup) = backup_path {
+        info!(
+            "Restoring original config file from {} to {}",
+            backup.display(),
+            host_link.display()
+        );
+        let _ = io.remove_path(&host_link);
+        let _ = io.rename_path(&backup, &host_link);
+    }
+
+    // ── 10. Done (server stays running) ──────────────────────
     Ok(RunResult {
         container_exit_code: exit_code,
         reset_ok,
@@ -317,5 +349,47 @@ mod tests {
 
         let link = cfg.host_config_link();
         assert!(mock.is_symlink(&link), "symlink should persist after run");
+    }
+
+    #[test]
+    fn symlink_collision_restores_original() {
+        let mut mock = MockSystemIo::new()
+            .with_file("/work/agent1/config", b"")
+            .with_file("/work/agent1/workspace", b"")
+            // Both relative (for read_file) and absolute (for file_exists collision check)
+            .with_file("config/secrets.yaml", b"SECRET_DATA")
+            .with_file("/work/agent1/config/secrets.yaml", b"SECRET_DATA")
+            .with_unix_response(br#"{"type":"ok"}"#)
+            .with_unix_response(br#"{"type":"ok"}"#);
+
+        let mut cfg = test_config();
+        cfg.host_config_file = PathBuf::from("config/secrets.yaml");
+        let result = run_agent(&mut mock, &cfg);
+        assert!(result.is_ok(), "got: {:?}", result.err());
+
+        let link = cfg.host_config_link();
+        assert!(
+            !mock.is_symlink(&link),
+            "symlink should not persist after collision restore"
+        );
+        assert!(
+            mock.file_exists(&link),
+            "original file should be restored at link path"
+        );
+        assert_eq!(
+            mock.read_file(&link).unwrap(),
+            b"SECRET_DATA",
+            "restored content must match original"
+        );
+
+        let backup = PathBuf::from(format!("{}.orig", link.display()));
+        assert!(
+            !mock.file_exists(&backup),
+            "backup .orig file should not remain"
+        );
+        assert!(
+            !mock.is_symlink(&backup),
+            "backup path should not exist as symlink"
+        );
     }
 }
