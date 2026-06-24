@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::Parser;
-use run_agent::{run_agent, AgentConfig, DEFAULT_MOUNT_POINT, DEFAULT_SOCKET};
+use run_agent::{run_agent, AgentConfig, Runtime, DEFAULT_MOUNT_POINT, DEFAULT_SOCKET};
 use tracing::error;
 use tracing_subscriber::EnvFilter;
 
@@ -36,6 +36,10 @@ struct Cli {
     /// Run fuse-server under sudo (needed for allow_other without fuse.conf edit).
     #[arg(long)]
     sudo: bool,
+
+    /// Container runtime to use.
+    #[arg(long, default_value = "auto")]
+    runtime: Runtime,
 
     /// Container image name.
     #[arg(long, default_value = "agentbox")]
@@ -71,6 +75,7 @@ fn main() -> ExitCode {
     config.socket_path = cli.socket;
     config.mount_point = cli.mount_point;
     config.use_sudo = cli.sudo;
+    config.runtime = cli.runtime;
     config.image_name = cli.image;
     config.memory = cli.memory;
     config.cpus = cli.cpus;

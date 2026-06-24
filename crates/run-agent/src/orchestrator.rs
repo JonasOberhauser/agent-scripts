@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use fuse_protocol::{Command, SystemIo};
 use tracing::{info, warn};
 
-use crate::config::{build_container_args, detect_container_runtime_name, AgentConfig};
+use crate::config::{build_container_args, AgentConfig};
 
 /// Result of a completed agent session.
 #[derive(Debug)]
@@ -165,10 +165,10 @@ pub fn run_agent<S: SystemIo>(io: &mut S, config: &AgentConfig) -> Result<RunRes
     }
 
     // ── 6. Detect container runtime ──────────────────────────────
-    let container_bin = match detect_container_runtime_name(io) {
+    let container_bin = match config.runtime.resolve(io) {
         Some(bin) => bin,
         None => {
-            return Err("Neither docker nor podman found in PATH.".into());
+            return Err("Specified container runtime not available.".into());
         }
     };
     info!("Using container runtime: {container_bin}");
@@ -220,7 +220,7 @@ fn setup_rootless_docker<S: SystemIo>(io: &S) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::AgentConfig;
+    use crate::config::{AgentConfig, Runtime};
     use fuse_protocol::MockSystemIo;
     use std::path::PathBuf;
 
@@ -238,6 +238,7 @@ mod tests {
             socket_path: PathBuf::from("/tmp/fgk.sock"),
             mount_point: PathBuf::from("/tmp/fgk-mnt"),
             use_sudo: false,
+            runtime: Runtime::Auto,
         }
     }
 

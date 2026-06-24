@@ -1,10 +1,53 @@
 use std::path::PathBuf;
 
+use fuse_protocol::SystemIo;
+
 /// Well-known default Unix socket path for the shared fuse-server.
 pub const DEFAULT_SOCKET: &str = "/tmp/fuse-gatekeeper.sock";
 
 /// Well-known default FUSE mount point for the shared fuse-server.
 pub const DEFAULT_MOUNT_POINT: &str = "/tmp/fuse-gatekeeper-mnt";
+
+/// Which container runtime to use.
+#[derive(Debug, Clone, Copy, PartialEq, clap::ValueEnum)]
+pub enum Runtime {
+    /// Auto-detect (prefer podman, fall back to docker).
+    Auto,
+    Docker,
+    Podman,
+}
+
+impl Runtime {
+    /// Resolve `Auto` to a concrete binary name, probing the system.
+    /// Returns `None` if neither runtime is available.
+    pub fn resolve<S: SystemIo>(&self, io: &S) -> Option<&'static str> {
+        match self {
+            Runtime::Podman => {
+                if io.run_command("podman", &["--version"]).map(|o| o.success()).unwrap_or(false) {
+                    Some("podman")
+                } else {
+                    None
+                }
+            }
+            Runtime::Docker => {
+                if io.run_command("docker", &["--version"]).map(|o| o.success()).unwrap_or(false) {
+                    Some("docker")
+                } else {
+                    None
+                }
+            }
+            Runtime::Auto => {
+                if io.run_command("podman", &["--version"]).map(|o| o.success()).unwrap_or(false) {
+                    Some("podman")
+                } else if io.run_command("docker", &["--version"]).map(|o| o.success()).unwrap_or(false) {
+                    Some("docker")
+                } else {
+                    None
+                }
+            }
+        }
+    }
+}
 
 /// All parameters needed to launch an agent session.
 #[derive(Debug, Clone)]
@@ -34,6 +77,8 @@ pub struct AgentConfig {
     /// Run fuse-server under `sudo` (needed for `allow_other` without
     /// editing `/etc/fuse.conf`).
     pub use_sudo: bool,
+    /// Container runtime preference.
+    pub runtime: Runtime,
 }
 
 impl AgentConfig {
@@ -58,6 +103,7 @@ impl AgentConfig {
             socket_path: PathBuf::from(DEFAULT_SOCKET),
             mount_point: PathBuf::from(DEFAULT_MOUNT_POINT),
             use_sudo: false,
+            runtime: Runtime::Auto,
         }
     }
 
@@ -161,27 +207,6 @@ pub fn build_container_args(config: &AgentConfig) -> Vec<String> {
     args
 }
 
-/// Detect whether `podman` or `docker` is available.
-pub fn detect_container_runtime_name<S: fuse_protocol::SystemIo>(
-    io: &S,
-) -> Option<&'static str> {
-    if io
-        .run_command("podman", &["--version"])
-        .map(|o| o.success())
-        .unwrap_or(false)
-    {
-        return Some("podman");
-    }
-    if io
-        .run_command("docker", &["--version"])
-        .map(|o| o.success())
-        .unwrap_or(false)
-    {
-        return Some("docker");
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -208,6 +233,7 @@ mod tests {
             socket_path: PathBuf::from("/tmp/fuse-gatekeeper.sock"),
             mount_point: PathBuf::from("/tmp/fuse-gatekeeper-mnt"),
             use_sudo: false,
+            runtime: Runtime::Auto,
         };
         let args = build_container_args(&cfg);
         assert!(args.contains(&"run".to_string()));
@@ -233,17 +259,21 @@ mod tests {
     }
 
     #[test]
-    fn detect_runtime_with_mock() {
-        let mut mock = MockSystemIo::new();
-        mock.command_stdout = "podman version 4.0".into();
-        assert_eq!(detect_container_runtime_name(&mock), Some("podman"));
+    fn runtime_auto_prefers_podman() {
+        let mock = MockSystemIo::new();
+        assert_eq!(Runtime::Auto.resolve(&mock), Some("podman"));
     }
 
     #[test]
-    fn detect_runtime_prefers_podman() {
+    fn runtime_podman_forces_podman() {
         let mock = MockSystemIo::new();
-        // Both succeed — podman should win.
-        assert_eq!(detect_container_runtime_name(&mock), Some("podman"));
+        assert_eq!(Runtime::Podman.resolve(&mock), Some("podman"));
+    }
+
+    #[test]
+    fn runtime_docker_forces_docker() {
+        let mock = MockSystemIo::new();
+        assert_eq!(Runtime::Docker.resolve(&mock), Some("docker"));
     }
 
     #[test]
