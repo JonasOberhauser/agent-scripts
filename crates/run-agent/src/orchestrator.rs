@@ -83,23 +83,32 @@ pub fn run_agent<S: SystemIo>(io: &mut S, config: &AgentConfig) -> Result<RunRes
         let log_str = log_path.to_str()
             .ok_or_else(|| format!("log path is not valid UTF-8: {}", log_path.display()))?;
 
-        // Build the full argv.  When sudo is requested, we spawn
-        // `sudo <fuse-server> <args...>` so the FUSE mount has root
-        // privileges (required for `allow_other` without editing fuse.conf).
-        let mut spawn_args: Vec<&str> = Vec::new();
-        let spawn_prog: &str;
-        if config.use_sudo {
-            spawn_prog = "sudo";
-            spawn_args.push(server_bin);
-        } else {
-            spawn_prog = server_bin;
+        // Build the full argv.  The fuse-server must run in the same
+        // mount namespace as the container, so when a runtime wrapper
+        // (e.g. `flatpak-spawn --host`) is set we prepend it here too.
+        let mut cmd_parts: Vec<String> = Vec::new();
+        if let Some(w) = &config.runtime_wrapper {
+            let (prog, prefix) = crate::config::split_wrapper(w);
+            cmd_parts.push(prog);
+            cmd_parts.extend(prefix);
         }
-        spawn_args.extend_from_slice(&args);
+        if config.use_sudo {
+            cmd_parts.push("sudo".into());
+        }
+        cmd_parts.push(server_bin.to_string());
+        cmd_parts.extend(args.iter().map(|s| s.to_string()));
+
+        let spawn_prog = cmd_parts[0].clone();
+        let spawn_args: Vec<&str> = cmd_parts[1..].iter().map(|s| s.as_str()).collect();
 
         let pid = io
-            .spawn_independent(spawn_prog, &spawn_args, Some(std::path::Path::new(log_str)))
+            .spawn_independent(&spawn_prog, &spawn_args, Some(std::path::Path::new(log_str)))
             .map_err(|e| format!("spawn fuse-server: {e}"))?;
-        info!("fuse-server spawned as independent daemon (pid {pid}, sudo={}).", config.use_sudo);
+        info!(
+            "fuse-server spawned as independent daemon (pid {pid}, wrapper={}, sudo={}).",
+            config.runtime_wrapper.is_some(),
+            config.use_sudo,
+        );
 
         // Wait for socket.
         let deadline = Instant::now() + Duration::from_secs(10);
