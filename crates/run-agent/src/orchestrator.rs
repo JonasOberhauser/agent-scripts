@@ -151,16 +151,23 @@ pub fn run_agent<S: SystemIo>(io: &mut S, config: &AgentConfig) -> Result<RunRes
     // ── 5. Symlink config → /fuse/<file> ─────────────────────────
     let cont_fuse_file = config.container_fuse_file();
     let host_link = config.host_config_link();
-    let _ = io.remove_path(&host_link);
-    io.create_symlink(Path::new(&cont_fuse_file), &host_link)
-        .map_err(|e| format!("symlink: {e}"))?;
-    info!("Symlink: {} -> {cont_fuse_file}", host_link.display());
+    if io.is_symlink(&host_link) {
+        info!("Symlink already exists: {}", host_link.display());
+    } else {
+        match io.create_symlink(Path::new(&cont_fuse_file), &host_link) {
+            Ok(()) => info!("Symlink: {} -> {cont_fuse_file}", host_link.display()),
+            Err(e) => warn!(
+                "Could not create symlink at {} ({}). \
+                 The FUSE mount is still available at {cont_fuse_file}.",
+                host_link.display(), e
+            ),
+        }
+    }
 
     // ── 6. Detect container runtime ──────────────────────────────
     let container_bin = match detect_container_runtime_name(io) {
         Some(bin) => bin,
         None => {
-            cleanup(io, &host_link);
             return Err("Neither docker nor podman found in PATH.".into());
         }
     };
@@ -194,9 +201,7 @@ pub fn run_agent<S: SystemIo>(io: &mut S, config: &AgentConfig) -> Result<RunRes
         }
     };
 
-    // ── 9. Cleanup symlink (server stays running) ────────────────
-    cleanup(io, &host_link);
-
+    // ── 9. Done (server stays running, symlink persists) ─────────
     Ok(RunResult {
         container_exit_code: exit_code,
         reset_ok,
@@ -210,11 +215,6 @@ fn setup_rootless_docker<S: SystemIo>(io: &S) {
     std::env::set_var("DOCKER_HOST", &sock);
     let _ = io.run_command("systemctl", &["--user", "start", "docker.service"]);
     info!("Docker rootless socket: {sock}");
-}
-
-fn cleanup<S: SystemIo>(io: &mut S, link: &Path) {
-    let _ = io.remove_path(link);
-    info!("Symlink removed.");
 }
 
 #[cfg(test)]
@@ -295,7 +295,7 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_removes_symlink() {
+    fn symlink_persists_after_run() {
         let mut mock = MockSystemIo::new()
             .with_file("/work/agent1/config", b"")
             .with_file("/work/agent1/workspace", b"")
@@ -307,6 +307,6 @@ mod tests {
         let _ = run_agent(&mut mock, &cfg);
 
         let link = cfg.host_config_link();
-        assert!(!mock.files.contains_key(&link.to_string_lossy().to_string()));
+        assert!(mock.is_symlink(&link), "symlink should persist after run");
     }
 }

@@ -52,7 +52,7 @@ impl SystemIo for RealSystemIo {
         Ok(())
     }
 
-    fn create_symlink(&self, original: &Path, link: &Path) -> Result<(), IoError> {
+    fn create_symlink(&mut self, original: &Path, link: &Path) -> Result<(), IoError> {
         std::os::unix::fs::symlink(original, link)?;
         Ok(())
     }
@@ -137,6 +137,12 @@ impl SystemIo for RealSystemIo {
         Ok(hex_sha256(&data))
     }
 
+    fn is_symlink(&self, path: &Path) -> bool {
+        std::fs::symlink_metadata(path)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false)
+    }
+
     fn try_unix_connect(&self, path: &Path) -> bool {
         std::os::unix::net::UnixStream::connect(path).is_ok()
     }
@@ -168,6 +174,7 @@ pub struct MockSystemIo {
     pub spawned: Vec<(String, Vec<String>)>,
     pub unix_connected: bool,
     pub unix_responses: std::cell::RefCell<std::collections::VecDeque<Vec<u8>>>,
+    pub symlinks: std::collections::HashSet<String>,
 }
 
 impl MockSystemIo {
@@ -229,14 +236,18 @@ impl SystemIo for MockSystemIo {
 
     fn remove_path(&mut self, path: &Path) -> Result<(), IoError> {
         let key = path.to_string_lossy().to_string();
-        if self.files.remove(&key).is_some() {
+        let removed_file = self.files.remove(&key).is_some();
+        let removed_link = self.symlinks.remove(&key);
+        if removed_file || removed_link {
             Ok(())
         } else {
             Err(IoError(format!("not found: {key}")))
         }
     }
 
-    fn create_symlink(&self, _original: &Path, _link: &Path) -> Result<(), IoError> {
+    fn create_symlink(&mut self, _original: &Path, link: &Path) -> Result<(), IoError> {
+        self.symlinks
+            .insert(link.to_string_lossy().to_string());
         Ok(())
     }
 
@@ -291,6 +302,11 @@ impl SystemIo for MockSystemIo {
             .borrow_mut()
             .pop_front()
             .ok_or_else(|| IoError("no queued unix response".into()))
+    }
+
+    fn is_symlink(&self, path: &Path) -> bool {
+        self.symlinks
+            .contains(&path.to_string_lossy().to_string())
     }
 }
 
