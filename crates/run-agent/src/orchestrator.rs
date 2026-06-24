@@ -124,9 +124,13 @@ pub fn run_agent<S: SystemIo>(io: &mut S, config: &AgentConfig) -> Result<RunRes
     }
 
     // ── 4. Add secret via socket ─────────────────────────────────
+    let secret_abs = config
+        .host_config_file
+        .canonicalize()
+        .unwrap_or_else(|_| config.host_config_file.clone());
     let content = io
         .read_file(&config.host_config_file)
-        .map_err(|e| format!("read secret file: {e}"))?;
+        .map_err(|e| format!("read secret file {}: {e}", secret_abs.display()))?;
 
     match fuse_client::send_command(io, socket, Command::AddSecret {
         name: config.filename(),
