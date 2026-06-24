@@ -41,6 +41,11 @@ struct Cli {
     #[arg(long, default_value = "auto")]
     runtime: Runtime,
 
+    /// Wrapper command for the container runtime (e.g. "flatpak-spawn --host"
+    /// to use the host's podman from inside a toolbox).
+    #[arg(long)]
+    runtime_wrapper: Option<String>,
+
     /// Container image name.
     #[arg(long, default_value = "agentbox")]
     image: String,
@@ -76,6 +81,7 @@ fn main() -> ExitCode {
     config.mount_point = cli.mount_point;
     config.use_sudo = cli.sudo;
     config.runtime = cli.runtime;
+    config.runtime_wrapper = cli.runtime_wrapper;
     config.image_name = cli.image;
     config.memory = cli.memory;
     config.cpus = cli.cpus;

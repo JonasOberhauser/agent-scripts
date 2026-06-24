@@ -28,28 +28,33 @@ pub fn rootless_docker_socket() -> String {
 }
 
 impl Runtime {
-    /// Resolve to a concrete binary name, probing the system.
+    /// Resolve to a concrete runtime name, probing the system.
     /// Returns `None` if the runtime is not available.
-    pub fn resolve<S: SystemIo>(&self, io: &S) -> Option<&'static str> {
+    /// When `wrapper` is set, detection runs `<wrapper> <runtime> --version`.
+    pub fn resolve<S: SystemIo>(
+        &self,
+        io: &S,
+        wrapper: Option<&str>,
+    ) -> Option<&'static str> {
         match self {
             Runtime::Podman => {
-                if podman_available(io) {
+                if runtime_available(io, wrapper, "podman") {
                     Some("podman")
                 } else {
                     None
                 }
             }
             Runtime::Docker => {
-                if docker_available(io) {
+                if runtime_available(io, wrapper, "docker") {
                     Some("docker")
                 } else {
                     None
                 }
             }
             Runtime::Auto => {
-                if podman_available(io) {
+                if runtime_available(io, wrapper, "podman") {
                     Some("podman")
-                } else if docker_available(io) {
+                } else if runtime_available(io, wrapper, "docker") {
                     Some("docker")
                 } else {
                     None
@@ -59,17 +64,44 @@ impl Runtime {
     }
 }
 
-/// Podman is inherently rootless — just check it exists.
-fn podman_available<S: SystemIo>(io: &S) -> bool {
-    io.run_command("podman", &["--version"])
-        .map(|o| o.success())
-        .unwrap_or(false)
+/// Check whether `<wrapper>? <runtime> --version` succeeds.
+fn runtime_available<S: SystemIo>(
+    io: &S,
+    wrapper: Option<&str>,
+    runtime: &str,
+) -> bool {
+    match wrapper {
+        Some(w) => {
+            let parts: Vec<&str> = w.split_whitespace().collect();
+            if parts.is_empty() {
+                return false;
+            }
+            let mut args: Vec<&str> = parts[1..].to_vec();
+            args.push(runtime);
+            args.push("--version");
+            io.run_command(parts[0], &args)
+                .map(|o| o.success())
+                .unwrap_or(false)
+        }
+        None => {
+            // Podman: just check the binary. Docker: require rootless socket.
+            if runtime == "docker" {
+                let sock = rootless_docker_socket();
+                io.try_unix_connect(Path::new(&sock))
+            } else {
+                io.run_command(runtime, &["--version"])
+                    .map(|o| o.success())
+                    .unwrap_or(false)
+            }
+        }
+    }
 }
 
-/// For Docker, require the rootless socket to be live.
-fn docker_available<S: SystemIo>(io: &S) -> bool {
-    let sock = rootless_docker_socket();
-    io.try_unix_connect(Path::new(&sock))
+/// Split a wrapper string like `"flatpak-spawn --host"` into
+/// `("flatpak-spawn", ["--host"])`.
+pub fn split_wrapper(wrapper: &str) -> (String, Vec<String>) {
+    let parts: Vec<String> = wrapper.split_whitespace().map(|s| s.to_string()).collect();
+    (parts[0].clone(), parts[1..].to_vec())
 }
 
 /// All parameters needed to launch an agent session.
@@ -102,6 +134,9 @@ pub struct AgentConfig {
     pub use_sudo: bool,
     /// Container runtime preference.
     pub runtime: Runtime,
+    /// Optional prefix command for the container runtime (e.g.
+    /// `flatpak-spawn --host` to reach the host's podman from a toolbox).
+    pub runtime_wrapper: Option<String>,
 }
 
 impl AgentConfig {
@@ -127,6 +162,7 @@ impl AgentConfig {
             mount_point: PathBuf::from(DEFAULT_MOUNT_POINT),
             use_sudo: false,
             runtime: Runtime::Auto,
+            runtime_wrapper: None,
         }
     }
 
@@ -257,6 +293,7 @@ mod tests {
             mount_point: PathBuf::from("/tmp/fuse-gatekeeper-mnt"),
             use_sudo: false,
             runtime: Runtime::Auto,
+            runtime_wrapper: None,
         };
         let args = build_container_args(&cfg);
         assert!(args.contains(&"run".to_string()));
@@ -284,36 +321,51 @@ mod tests {
     #[test]
     fn runtime_auto_prefers_podman() {
         let mock = MockSystemIo::new();
-        assert_eq!(Runtime::Auto.resolve(&mock), Some("podman"));
+        assert_eq!(Runtime::Auto.resolve(&mock, None), Some("podman"));
     }
 
     #[test]
     fn runtime_auto_falls_back_to_docker() {
         let mut mock = MockSystemIo::new();
-        mock.command_status = None; // podman --version fails
-        mock.unix_connected = true; // rootless docker socket live
-        assert_eq!(Runtime::Auto.resolve(&mock), Some("docker"));
+        mock.command_status = None;
+        mock.unix_connected = true;
+        assert_eq!(Runtime::Auto.resolve(&mock, None), Some("docker"));
     }
 
     #[test]
     fn runtime_auto_none_when_nothing_available() {
         let mut mock = MockSystemIo::new();
-        mock.command_status = None; // no podman
-        // unix_connected defaults to false → no rootless docker
-        assert_eq!(Runtime::Auto.resolve(&mock), None);
+        mock.command_status = None;
+        assert_eq!(Runtime::Auto.resolve(&mock, None), None);
     }
 
     #[test]
     fn runtime_podman_forces_podman() {
         let mock = MockSystemIo::new();
-        assert_eq!(Runtime::Podman.resolve(&mock), Some("podman"));
+        assert_eq!(Runtime::Podman.resolve(&mock, None), Some("podman"));
     }
 
     #[test]
     fn runtime_docker_forces_docker() {
         let mut mock = MockSystemIo::new();
         mock.unix_connected = true;
-        assert_eq!(Runtime::Docker.resolve(&mock), Some("docker"));
+        assert_eq!(Runtime::Docker.resolve(&mock, None), Some("docker"));
+    }
+
+    #[test]
+    fn runtime_with_wrapper() {
+        let mock = MockSystemIo::new();
+        assert_eq!(
+            Runtime::Podman.resolve(&mock, Some("flatpak-spawn --host")),
+            Some("podman")
+        );
+    }
+
+    #[test]
+    fn split_wrapper_parses() {
+        let (prog, args) = super::split_wrapper("flatpak-spawn --host");
+        assert_eq!(prog, "flatpak-spawn");
+        assert_eq!(args, vec!["--host"]);
     }
 
     #[test]

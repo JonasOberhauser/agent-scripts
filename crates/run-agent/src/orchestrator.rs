@@ -165,7 +165,8 @@ pub fn run_agent<S: SystemIo>(io: &mut S, config: &AgentConfig) -> Result<RunRes
     }
 
     // ── 6. Detect container runtime ──────────────────────────────
-    let container_bin = match config.runtime.resolve(io) {
+    let wrapper = config.runtime_wrapper.as_deref();
+    let container_bin = match config.runtime.resolve(io, wrapper) {
         Some(bin) => bin,
         None => {
             return Err("Specified container runtime not available.".into());
@@ -173,14 +174,22 @@ pub fn run_agent<S: SystemIo>(io: &mut S, config: &AgentConfig) -> Result<RunRes
     };
     info!("Using container runtime: {container_bin}");
 
-    if container_bin == "docker" {
+    if container_bin == "docker" && wrapper.is_none() {
         setup_rootless_docker();
     }
 
     // ── 7. Run container ─────────────────────────────────────────
     let args = build_container_args(config);
-    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    let exit_code = io.run_interactive(container_bin, &arg_refs).unwrap_or(-1);
+    let exit_code = if let Some(w) = wrapper {
+        let (prog, prefix) = crate::config::split_wrapper(w);
+        let mut full: Vec<&str> = prefix.iter().map(|s| s.as_str()).collect();
+        full.push(container_bin);
+        full.extend(args.iter().map(|s| s.as_str()));
+        io.run_interactive(&prog, &full).unwrap_or(-1)
+    } else {
+        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        io.run_interactive(container_bin, &arg_refs).unwrap_or(-1)
+    };
     info!("Container exited with code {exit_code}.");
 
     // ── 8. Auto-reset this secret ────────────────────────────────
@@ -237,6 +246,7 @@ mod tests {
             mount_point: PathBuf::from("/tmp/fgk-mnt"),
             use_sudo: false,
             runtime: Runtime::Auto,
+            runtime_wrapper: None,
         }
     }
 
