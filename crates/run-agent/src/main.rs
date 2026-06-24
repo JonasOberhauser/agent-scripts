@@ -91,6 +91,11 @@ fn main() -> ExitCode {
     config.cpus = cli.cpus;
     config.log_level = cli.log_level;
 
+    let plans_candidate = std::path::Path::new("./plans/shared");
+    if plans_candidate.exists() {
+        config.plans_path = Some(plans_candidate.to_path_buf());
+    }
+
     let mut io = fuse_protocol::RealSystemIo::new();
     match run_agent(&mut io, &config) {
         Ok(result) => {

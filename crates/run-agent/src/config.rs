@@ -140,6 +140,9 @@ pub struct AgentConfig {
 
     /// Log level for the fuse-server (e.g. "info", "debug", "warn").
     pub log_level: String,
+
+    /// Host path to the plans directory (optional – only mounted when set).
+    pub plans_path: Option<PathBuf>,
 }
 
 impl AgentConfig {
@@ -167,6 +170,7 @@ impl AgentConfig {
             runtime: Runtime::Auto,
             runtime_wrapper: None,
             log_level: "info".to_string(),
+            plans_path: None,
         }
     }
 
@@ -256,15 +260,21 @@ pub fn build_container_args(config: &AgentConfig) -> Vec<String> {
             "{}:/workspace:slave,Z",
             config.host_workspace().display()
         ),
-        "-v".into(),
-        "./plans/shared:/workspace/plans:Z".into(),
+    ];
+
+    if let Some(plans) = &config.plans_path {
+        args.push("-v".into());
+        args.push(format!("{}:/workspace/plans:Z", plans.display()));
+    }
+
+    args.extend_from_slice(&[
         "-v".into(),
         format!("{}_home:/root:z", config.agent_name()),
         "-v".into(),
         format!("{}:/fuse:ro", config.host_fuse().display()),
         "--workdir".into(),
         "/workspace".into(),
-    ];
+    ]);
     args.push(config.image_name.clone());
     args.extend(config.container_args.iter().cloned());
     args
@@ -299,6 +309,7 @@ mod tests {
             runtime: Runtime::Auto,
             runtime_wrapper: None,
             log_level: "info".to_string(),
+            plans_path: None,
         };
         let args = build_container_args(&cfg);
         assert!(args.contains(&"run".to_string()));

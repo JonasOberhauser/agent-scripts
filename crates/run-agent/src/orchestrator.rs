@@ -39,7 +39,7 @@ pub fn run_agent<S: SystemIo>(io: &mut S, config: &AgentConfig) -> Result<RunRes
     for dir in [&host_config, &host_workspace] {
         if !io.file_exists(dir) {
             return Err(format!(
-                "Directory {} not found. Is this really a Goose agent workspace?",
+                "Directory {} not found. Is this really an agent workspace?",
                 dir.display()
             ));
         }
@@ -212,7 +212,11 @@ pub fn run_agent<S: SystemIo>(io: &mut S, config: &AgentConfig) -> Result<RunRes
         let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
         io.run_interactive(container_bin, &arg_refs).unwrap_or(-1)
     };
-    info!("Container exited with code {exit_code}.");
+    if exit_code == 0 {
+        info!("Container exited with code 0.");
+    } else {
+        warn!("Container exited with code {exit_code}.");
+    }
 
     // ── 8. Auto-reset this secret ────────────────────────────────
     let reset_ok = match fuse_client::send_command(io, socket, Command::Reset {
@@ -281,6 +285,7 @@ mod tests {
             runtime: Runtime::Auto,
             runtime_wrapper: None,
             log_level: "info".to_string(),
+            plans_path: None,
         }
     }
 
