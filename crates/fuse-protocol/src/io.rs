@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::error::IoError;
 
@@ -44,6 +44,9 @@ pub trait SystemIo {
     fn sha256_file(&self, path: &Path) -> Result<String, IoError>;
     fn sha256_process_exe(&self, pid: u32) -> Result<String, IoError>;
     fn is_symlink(&self, path: &Path) -> bool;
+
+    /// Read the target of a symlink.
+    fn read_link(&self, path: &Path) -> Result<PathBuf, IoError>;
 
     /// Rename (move) a file or symlink from `from` to `to`.
     fn rename_path(&mut self, from: &Path, to: &Path) -> Result<(), IoError>;

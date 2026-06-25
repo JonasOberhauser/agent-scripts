@@ -26,11 +26,11 @@ pub struct RunResult {
 /// 2. Probe for an existing fuse-server (discovery).
 /// 3. If none: spawn independent server, wait for socket.
 /// 4. Add the secret via `fuse-client add-secret`.
-/// 5. Create the config symlink.
-/// 6. Detect container runtime.
+/// 5. Detect container runtime.
+/// 6. Create the config symlink (with wrong-target / collision handling).
 /// 7. Run the container (foreground).
 /// 8. **Auto-reset** this secret's counter.
-/// 9. Clean up symlink (server is left running).
+/// 9. Done (server stays running, symlink persists — no cleanup).
 pub fn run_agent<S: SystemIo>(io: &mut S, config: &AgentConfig) -> Result<RunResult, String> {
     // ── 1. Validate ──────────────────────────────────────────────
     let host_config = config.host_config_dir();
@@ -158,44 +158,7 @@ pub fn run_agent<S: SystemIo>(io: &mut S, config: &AgentConfig) -> Result<RunRes
         }
     }
 
-    // ── 5. Symlink config → /fuse/<file> ─────────────────────────
-    let cont_fuse_file = config.container_fuse_file();
-    let host_link = config.host_config_link();
-    let mut backup_path: Option<PathBuf> = None;
-
-    if io.is_symlink(&host_link) {
-        info!("Symlink already exists: {}", host_link.display());
-    } else {
-        // Collision: the symlink path is occupied by the original file.
-        if io.file_exists(&host_link) {
-            let backup = PathBuf::from(format!("{}.orig", host_link.display()));
-            info!(
-                "Collision at {} — moving original to {}",
-                host_link.display(),
-                backup.display()
-            );
-            io.rename_path(&host_link, &backup)
-                .map_err(|e| format!("rename original aside: {e}"))?;
-            backup_path = Some(backup);
-        }
-
-        match io.create_symlink(Path::new(&cont_fuse_file), &host_link) {
-            Ok(()) => info!("Symlink: {} -> {cont_fuse_file}", host_link.display()),
-            Err(e) => {
-                // Symlink failed; restore original if we moved it.
-                if let Some(backup) = backup_path.take() {
-                    let _ = io.rename_path(&backup, &host_link);
-                }
-                warn!(
-                    "Could not create symlink at {} ({}). \
-                     The FUSE mount is still available at {cont_fuse_file}.",
-                    host_link.display(), e
-                );
-            }
-        }
-    }
-
-    // ── 6. Detect container runtime ──────────────────────────────
+    // ── 5. Detect container runtime ──────────────────────────────
     let wrapper = config.runtime_wrapper.as_deref();
     let container_bin = match config.runtime.resolve(io, wrapper) {
         Some(bin) => bin,
@@ -207,6 +170,35 @@ pub fn run_agent<S: SystemIo>(io: &mut S, config: &AgentConfig) -> Result<RunRes
 
     if container_bin == "docker" && wrapper.is_none() {
         setup_rootless_docker();
+    }
+
+    // ── 6. Symlink config → /fuse/<file> ─────────────────────────
+    let cont_fuse_file = config.container_fuse_file();
+    let host_link = config.host_config_link();
+
+    if io.is_symlink(&host_link) {
+        match io.read_link(&host_link) {
+            Ok(target) if target == PathBuf::from(&cont_fuse_file) => {
+                info!("Symlink already exists and points to correct target: {}", host_link.display());
+            }
+            _ => {
+                let agent_name = config.agent_name();
+                let running = probe_running_agents(io, container_bin, wrapper, &agent_name);
+                if running {
+                    return Err(format!(
+                        "Symlink at {} points to wrong target and agent '{}' appears to be running. \
+                         Cannot override symlink while agent is active.",
+                        host_link.display(), agent_name
+                    ));
+                }
+                warn!("Symlink target mismatch — no running agents, overriding symlink.");
+                io.remove_path(&host_link)
+                    .map_err(|e| format!("remove stale symlink: {e}"))?;
+                create_symlink_with_collision(io, &host_link, &cont_fuse_file)?;
+            }
+        }
+    } else {
+        create_symlink_with_collision(io, &host_link, &cont_fuse_file)?;
     }
 
     // ── 7. Run container ─────────────────────────────────────────
@@ -245,18 +237,7 @@ pub fn run_agent<S: SystemIo>(io: &mut S, config: &AgentConfig) -> Result<RunRes
         }
     };
 
-    // ── 9. Restore original file if it was moved aside ─────────
-    if let Some(backup) = backup_path {
-        info!(
-            "Restoring original config file from {} to {}",
-            backup.display(),
-            host_link.display()
-        );
-        let _ = io.remove_path(&host_link);
-        let _ = io.rename_path(&backup, &host_link);
-    }
-
-    // ── 10. Done (server stays running) ──────────────────────
+    // ── 9. Done (server stays running, symlink persists) ──────
     Ok(RunResult {
         container_exit_code: exit_code,
         reset_ok,
@@ -264,10 +245,99 @@ pub fn run_agent<S: SystemIo>(io: &mut S, config: &AgentConfig) -> Result<RunRes
     })
 }
 
+/// Create symlink at `link` pointing to `target`, handling collision
+/// with an existing regular file by moving it aside to `<link>.orig`.
+fn create_symlink_with_collision<S: SystemIo>(
+    io: &mut S,
+    link: &Path,
+    target: &str,
+) -> Result<(), String> {
+    if io.file_exists(link) {
+        let backup = PathBuf::from(format!("{}.orig", link.display()));
+        info!(
+            "Collision at {} — moving original to {}",
+            link.display(),
+            backup.display()
+        );
+        io.rename_path(link, &backup)
+            .map_err(|e| format!("rename original aside: {e}"))?;
+    }
+
+    match io.create_symlink(Path::new(target), link) {
+        Ok(()) => {
+            info!("Symlink: {} -> {target}", link.display());
+            Ok(())
+        }
+        Err(e) => {
+            warn!(
+                "Could not create symlink at {} ({}). \
+                 The FUSE mount is still available at {target}.",
+                link.display(), e
+            );
+            Ok(())
+        }
+    }
+}
+
 fn setup_rootless_docker() {
     let sock = format!("unix://{}", crate::config::rootless_docker_socket());
     std::env::set_var("DOCKER_HOST", &sock);
     info!("Docker rootless socket: {sock}");
+}
+
+/// Check whether any container whose name matches `agent_name` is currently
+/// running, by querying `<wrapper>? <container_bin> ps`.  Returns `false`
+/// when the command fails or when no containers match (safe default: do not
+/// block the user on a transient runtime error).
+fn probe_running_agents<S: SystemIo>(
+    io: &S,
+    container_bin: &str,
+    wrapper: Option<&str>,
+    agent_name: &str,
+) -> bool {
+    let filter = format!("name={}", agent_name);
+    let ps_args: Vec<&str> = vec![
+        "ps",
+        "--filter", &filter,
+        "--format", "{{.Names}}",
+        "--no-trunc",
+    ];
+
+    let result = match wrapper {
+        Some(w) => {
+            let (prog, prefix) = crate::config::split_wrapper(w);
+            let mut full: Vec<&str> = prefix.iter().map(|s| s.as_str()).collect();
+            full.push(container_bin);
+            full.extend(ps_args.iter().copied());
+            io.run_command(&prog, &full)
+        }
+        None => {
+            io.run_command(container_bin, &ps_args)
+        }
+    };
+
+    match result {
+        Ok(o) if o.success() => {
+            let count = o.stdout.lines().filter(|l| !l.trim().is_empty()).count();
+            if count > 0 {
+                info!("Found {count} running container(s) matching '{agent_name}'.");
+                true
+            } else {
+                false
+            }
+        }
+        Ok(o) => {
+            warn!(
+                "Container ps query returned non-zero status {:?} — assuming no agents running.",
+                o.status
+            );
+            false
+        }
+        Err(e) => {
+            warn!("Could not probe for running agents: {e} — proceeding with override.");
+            false
+        }
+    }
 }
 
 #[cfg(test)]
@@ -368,11 +438,10 @@ mod tests {
     }
 
     #[test]
-    fn symlink_collision_restores_original() {
+    fn symlink_collision_persists_symlink() {
         let mut mock = MockSystemIo::new()
             .with_file("/work/agent1/config", b"")
             .with_file("/work/agent1/workspace", b"")
-            // Both relative (for read_file) and absolute (for file_exists collision check)
             .with_file("config/secrets.yaml", b"SECRET_DATA")
             .with_file("/work/agent1/config/secrets.yaml", b"SECRET_DATA")
             .with_unix_response(br#"{"type":"ok"}"#)
@@ -385,27 +454,108 @@ mod tests {
 
         let link = cfg.host_config_link();
         assert!(
-            !mock.is_symlink(&link),
-            "symlink should not persist after collision restore"
-        );
-        assert!(
-            mock.file_exists(&link),
-            "original file should be restored at link path"
-        );
-        assert_eq!(
-            mock.read_file(&link).unwrap(),
-            b"SECRET_DATA",
-            "restored content must match original"
+            mock.is_symlink(&link),
+            "symlink should persist after collision (not restored)"
         );
 
         let backup = PathBuf::from(format!("{}.orig", link.display()));
         assert!(
-            !mock.file_exists(&backup),
-            "backup .orig file should not remain"
+            mock.file_exists(&backup),
+            "original file should remain at .orig"
         );
+        assert_eq!(
+            mock.read_file(&backup).unwrap(),
+            b"SECRET_DATA",
+            ".orig content must match original"
+        );
+    }
+
+    #[test]
+    fn symlink_correct_target_skips_creation() {
+        let cfg = test_config();
+        let link = cfg.host_config_link();
+        let correct_target = cfg.container_fuse_file();
+
+        let mut mock = MockSystemIo::new()
+            .with_file("/work/agent1/config", b"")
+            .with_file("/work/agent1/workspace", b"")
+            .with_file("secrets.yaml", b"DATA")
+            .with_unix_response(br#"{"type":"ok"}"#)
+            .with_unix_response(br#"{"type":"ok"}"#);
+        // Pre-populate symlink with the correct target.
+        mock.symlinks
+            .insert(link.to_string_lossy().to_string(), correct_target.clone());
+
+        let result = run_agent(&mut mock, &cfg);
+        assert!(result.is_ok(), "got: {:?}", result.err());
+
+        // Symlink should still exist and point to the correct target.
+        assert!(mock.is_symlink(&link));
+        assert_eq!(
+            mock.read_link(&link).unwrap(),
+            PathBuf::from(&correct_target),
+            "symlink target should be unchanged"
+        );
+    }
+
+    #[test]
+    fn symlink_wrong_target_overrides_when_no_agents_running() {
+        let cfg = test_config();
+        let link = cfg.host_config_link();
+        let correct_target = cfg.container_fuse_file();
+
+        let mut mock = MockSystemIo::new()
+            .with_file("/work/agent1/config", b"")
+            .with_file("/work/agent1/workspace", b"")
+            .with_file("secrets.yaml", b"DATA")
+            .with_unix_response(br#"{"type":"ok"}"#)
+            .with_unix_response(br#"{"type":"ok"}"#);
+        // Pre-populate symlink with a WRONG target.
+        mock.symlinks
+            .insert(link.to_string_lossy().to_string(), "/wrong/target".to_string());
+        // command_stdout defaults to "" → no containers running.
+
+        let result = run_agent(&mut mock, &cfg);
+        assert!(result.is_ok(), "got: {:?}", result.err());
+
+        // Symlink should now point to the correct target.
+        assert_eq!(
+            mock.read_link(&link).unwrap(),
+            PathBuf::from(&correct_target),
+            "symlink should be overridden to correct target"
+        );
+    }
+
+    #[test]
+    fn symlink_wrong_target_errors_when_agents_running() {
+        let cfg = test_config();
+        let link = cfg.host_config_link();
+
+        let mut mock = MockSystemIo::new()
+            .with_file("/work/agent1/config", b"")
+            .with_file("/work/agent1/workspace", b"")
+            .with_file("secrets.yaml", b"DATA")
+            .with_unix_response(br#"{"type":"ok"}"#)
+            .with_unix_response(br#"{"type":"ok"}"#);
+        // Pre-populate symlink with a WRONG target.
+        mock.symlinks
+            .insert(link.to_string_lossy().to_string(), "/wrong/target".to_string());
+        // Simulate a running container in the ps output.
+        mock.command_stdout = "agent1_12345\n".to_string();
+
+        let result = run_agent(&mut mock, &cfg);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
         assert!(
-            !mock.is_symlink(&backup),
-            "backup path should not exist as symlink"
+            err.contains("appears to be running"),
+            "error should mention running agent: {err}"
+        );
+
+        // Symlink should NOT have been changed.
+        assert_eq!(
+            mock.read_link(&link).unwrap(),
+            PathBuf::from("/wrong/target"),
+            "symlink should not be overridden when agents are running"
         );
     }
 }

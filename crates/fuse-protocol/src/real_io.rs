@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::io::{CommandOutput, SystemIo};
 use crate::IoError;
@@ -143,6 +143,10 @@ impl SystemIo for RealSystemIo {
             .unwrap_or(false)
     }
 
+    fn read_link(&self, path: &Path) -> Result<PathBuf, IoError> {
+        Ok(std::fs::read_link(path)?)
+    }
+
     fn rename_path(&mut self, from: &Path, to: &Path) -> Result<(), IoError> {
         std::fs::rename(from, to)?;
         Ok(())
@@ -179,7 +183,7 @@ pub struct MockSystemIo {
     pub spawned: Vec<(String, Vec<String>)>,
     pub unix_connected: bool,
     pub unix_responses: std::cell::RefCell<std::collections::VecDeque<Vec<u8>>>,
-    pub symlinks: std::collections::HashSet<String>,
+    pub symlinks: std::collections::HashMap<String, String>,
 }
 
 impl MockSystemIo {
@@ -242,7 +246,7 @@ impl SystemIo for MockSystemIo {
     fn remove_path(&mut self, path: &Path) -> Result<(), IoError> {
         let key = path.to_string_lossy().to_string();
         let removed_file = self.files.remove(&key).is_some();
-        let removed_link = self.symlinks.remove(&key);
+        let removed_link = self.symlinks.remove(&key).is_some();
         if removed_file || removed_link {
             Ok(())
         } else {
@@ -250,9 +254,9 @@ impl SystemIo for MockSystemIo {
         }
     }
 
-    fn create_symlink(&mut self, _original: &Path, link: &Path) -> Result<(), IoError> {
+    fn create_symlink(&mut self, original: &Path, link: &Path) -> Result<(), IoError> {
         self.symlinks
-            .insert(link.to_string_lossy().to_string());
+            .insert(link.to_string_lossy().to_string(), original.to_string_lossy().to_string());
         Ok(())
     }
 
@@ -311,7 +315,7 @@ impl SystemIo for MockSystemIo {
 
     fn is_symlink(&self, path: &Path) -> bool {
         self.symlinks
-            .contains(&path.to_string_lossy().to_string())
+            .contains_key(&path.to_string_lossy().to_string())
     }
 
     fn rename_path(&mut self, from: &Path, to: &Path) -> Result<(), IoError> {
@@ -320,12 +324,20 @@ impl SystemIo for MockSystemIo {
         if let Some(data) = self.files.remove(&from_key) {
             self.files.insert(to_key, data);
             Ok(())
-        } else if self.symlinks.remove(&from_key) {
-            self.symlinks.insert(to_key);
+        } else if let Some(target) = self.symlinks.remove(&from_key) {
+            self.symlinks.insert(to_key, target);
             Ok(())
         } else {
             Err(IoError(format!("rename: source not found: {from_key}")))
         }
+    }
+
+    fn read_link(&self, path: &Path) -> Result<PathBuf, IoError> {
+        let key = path.to_string_lossy().to_string();
+        self.symlinks
+            .get(&key)
+            .map(|t| PathBuf::from(t))
+            .ok_or_else(|| IoError(format!("not a symlink: {key}")))
     }
 }
 
