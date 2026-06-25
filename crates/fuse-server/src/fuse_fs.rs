@@ -185,10 +185,6 @@ impl<S: SystemIo> Filesystem for GatekeeperFs<S> {
                 debug!("Granted read of '{name}' to pid {pid}");
                 reply.data(&content[start..end]);
             }
-            ReadOutcome::AlreadyAccessed => {
-                warn!("Denied second read of '{name}' by pid {pid}");
-                reply.error(libc::EACCES);
-            }
             ReadOutcome::HashMismatch { got, expected } => {
                 warn!("Hash mismatch for '{name}' pid {pid}: got {got}, want {expected}");
                 reply.error(libc::EACCES);

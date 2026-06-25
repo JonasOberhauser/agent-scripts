@@ -13,8 +13,6 @@ pub struct SecretRecord {
 pub enum ReadOutcome {
     /// Content served successfully; counter was incremented.
     Granted(Vec<u8>),
-    /// Counter already > 0 — second access denied.
-    AlreadyAccessed,
     /// Process hash did not match.
     HashMismatch { got: String, expected: String },
     /// No such secret.
@@ -56,10 +54,6 @@ impl ServerState {
         let Some(rec) = self.secrets.get_mut(name) else {
             return ReadOutcome::NotFound;
         };
-
-        if rec.access_count > 0 {
-            return ReadOutcome::AlreadyAccessed;
-        }
 
         match pid_hash {
             Some(h) if h == rec.allowed_hash => {
@@ -128,11 +122,12 @@ mod tests {
     }
 
     #[test]
-    fn second_read_denied() {
+    fn second_read_also_grants() {
         let mut s = sample_state();
         s.attempt_read("secrets.yaml", Some("abc123"));
         let out = s.attempt_read("secrets.yaml", Some("abc123"));
-        assert_eq!(out, ReadOutcome::AlreadyAccessed);
+        assert_eq!(out, ReadOutcome::Granted(b"TOPSECRET".to_vec()));
+        assert_eq!(s.secrets.get("secrets.yaml").unwrap().access_count, 2);
     }
 
     #[test]
@@ -149,12 +144,13 @@ mod tests {
     }
 
     #[test]
-    fn reset_allows_second_read() {
+    fn reset_zeroes_counter() {
         let mut s = sample_state();
         s.attempt_read("secrets.yaml", Some("abc123"));
+        s.attempt_read("secrets.yaml", Some("abc123"));
+        assert_eq!(s.secrets.get("secrets.yaml").unwrap().access_count, 2);
         s.reset(Some("secrets.yaml"));
-        let out = s.attempt_read("secrets.yaml", Some("abc123"));
-        assert_eq!(out, ReadOutcome::Granted(b"TOPSECRET".to_vec()));
+        assert_eq!(s.secrets.get("secrets.yaml").unwrap().access_count, 0);
     }
 
     #[test]
