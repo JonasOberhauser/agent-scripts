@@ -25,12 +25,12 @@ pub struct RunResult {
 /// 1. Validate workspace directories.
 /// 2. Probe for an existing fuse-server (discovery).
 /// 3. If none: spawn independent server, wait for socket.
-/// 4. Add the secret via `fuse-client add-secret`.
+/// 4. Add each secret via `AddSecret` socket command.
 /// 5. Detect container runtime.
-/// 6. Create the config symlink (with wrong-target / collision handling).
+/// 6. Create config symlinks (with wrong-target / running-agent handling).
 /// 7. Run the container (foreground).
-/// 8. **Auto-reset** this secret's counter.
-/// 9. Done (server stays running, symlink persists — no cleanup).
+/// 8. **Auto-reset** all secret counters.
+/// 9. Done (server stays running, symlinks persist — no cleanup).
 pub fn run_agent<S: SystemIo>(io: &mut S, config: &AgentConfig) -> Result<RunResult, String> {
     // ── 1. Validate ──────────────────────────────────────────────
     let host_config = config.host_config_dir();
@@ -133,28 +133,26 @@ pub fn run_agent<S: SystemIo>(io: &mut S, config: &AgentConfig) -> Result<RunRes
         info!("Socket ready at {}", socket.display());
     }
 
-    // ── 4. Add secret via socket ─────────────────────────────────
-    let secret_abs = config
-        .host_config_file
-        .canonicalize()
-        .unwrap_or_else(|_| config.host_config_file.clone());
-    let content = io
-        .read_file(&config.host_config_file)
-        .map_err(|e| format!("read secret file {}: {e}", secret_abs.display()))?;
+    // ── 4. Add secrets via socket ────────────────────────────────
+    for secret in &config.secrets {
+        let content = io
+            .read_file(&secret.host)
+            .map_err(|e| format!("read secret file {}: {e}", secret.host.display()))?;
 
-    match fuse_client::send_command(io, socket, Command::AddSecret {
-        name: config.filename(),
-        content: content.clone(),
-        hash: config.binary_hash.clone(),
-    }) {
-        Ok(fuse_protocol::Response::Ok) => {
-            info!("Secret '{}' added to server.", config.filename());
-        }
-        Ok(other) => {
-            return Err(format!("unexpected response adding secret: {other:?}"));
-        }
-        Err(e) => {
-            return Err(format!("failed to add secret: {e}"));
+        match fuse_client::send_command(io, socket, Command::AddSecret {
+            name: secret.guest.clone(),
+            content,
+            hash: config.binary_hash.clone(),
+        }) {
+            Ok(fuse_protocol::Response::Ok) => {
+                info!("Secret '{}' added to server.", secret.guest);
+            }
+            Ok(other) => {
+                return Err(format!("unexpected response adding secret '{}': {other:?}", secret.guest));
+            }
+            Err(e) => {
+                return Err(format!("failed to add secret '{}': {e}", secret.guest));
+            }
         }
     }
 
@@ -172,33 +170,36 @@ pub fn run_agent<S: SystemIo>(io: &mut S, config: &AgentConfig) -> Result<RunRes
         setup_rootless_docker();
     }
 
-    // ── 6. Symlink config → /fuse/<file> ─────────────────────────
-    let cont_fuse_file = config.container_fuse_file();
-    let host_link = config.host_config_link();
+    // ── 6. Create symlinks config/<guest> → /fuse/<guest> ────────
+    let config_dir = config.host_config_dir();
+    for secret in &config.secrets {
+        let host_link = secret.link_path(&config_dir);
+        let fuse_target = secret.fuse_target();
 
-    if io.is_symlink(&host_link) {
-        match io.read_link(&host_link) {
-            Ok(target) if target == PathBuf::from(&cont_fuse_file) => {
-                info!("Symlink already exists and points to correct target: {}", host_link.display());
-            }
-            _ => {
-                let agent_name = config.agent_name();
-                let running = probe_running_agents(io, container_bin, wrapper, &agent_name);
-                if running {
-                    return Err(format!(
-                        "Symlink at {} points to wrong target and agent '{}' appears to be running. \
-                         Cannot override symlink while agent is active.",
-                        host_link.display(), agent_name
-                    ));
+        if io.is_symlink(&host_link) {
+            match io.read_link(&host_link) {
+                Ok(target) if target == PathBuf::from(&fuse_target) => {
+                    info!("Symlink already exists: {} → {}", host_link.display(), fuse_target);
                 }
-                warn!("Symlink target mismatch — no running agents, overriding symlink.");
-                io.remove_path(&host_link)
-                    .map_err(|e| format!("remove stale symlink: {e}"))?;
-                create_symlink_with_collision(io, &host_link, &cont_fuse_file)?;
+                _ => {
+                    let agent_name = config.agent_name();
+                    let running = probe_running_agents(io, container_bin, wrapper, &agent_name);
+                    if running {
+                        return Err(format!(
+                            "Symlink at {} points to wrong target and agent '{}' appears to be running. \
+                             Cannot override symlink while agent is active.",
+                            host_link.display(), agent_name
+                        ));
+                    }
+                    warn!("Symlink target mismatch — no running agents, overriding symlink.");
+                    io.remove_path(&host_link)
+                        .map_err(|e| format!("remove stale symlink: {e}"))?;
+                    create_secret_symlink(io, &host_link, &fuse_target)?;
+                }
             }
+        } else {
+            create_secret_symlink(io, &host_link, &fuse_target)?;
         }
-    } else {
-        create_symlink_with_collision(io, &host_link, &cont_fuse_file)?;
     }
 
     // ── 7. Run container ─────────────────────────────────────────
@@ -219,25 +220,27 @@ pub fn run_agent<S: SystemIo>(io: &mut S, config: &AgentConfig) -> Result<RunRes
         warn!("Container exited with code {exit_code}.");
     }
 
-    // ── 8. Auto-reset this secret ────────────────────────────────
-    let reset_ok = match fuse_client::send_command(io, socket, Command::Reset {
-        name: Some(config.filename()),
-    }) {
-        Ok(fuse_protocol::Response::Ok) => {
-            info!("Auto-reset successful for '{}'.", config.filename());
-            true
+    // ── 8. Auto-reset all secrets ────────────────────────────────
+    let mut reset_ok = true;
+    for secret in &config.secrets {
+        match fuse_client::send_command(io, socket, Command::Reset {
+            name: Some(secret.guest.clone()),
+        }) {
+            Ok(fuse_protocol::Response::Ok) => {
+                info!("Auto-reset successful for '{}'.", secret.guest);
+            }
+            Ok(other) => {
+                warn!("Auto-reset returned unexpected response for '{}': {other:?}", secret.guest);
+                reset_ok = false;
+            }
+            Err(e) => {
+                warn!("Auto-reset failed for '{}': {e}", secret.guest);
+                reset_ok = false;
+            }
         }
-        Ok(other) => {
-            warn!("Auto-reset returned unexpected response: {other:?}");
-            false
-        }
-        Err(e) => {
-            warn!("Auto-reset failed: {e}");
-            false
-        }
-    };
+    }
 
-    // ── 9. Done (server stays running, symlink persists) ──────
+    // ── 9. Done (server stays running, symlinks persist) ──────
     Ok(RunResult {
         container_exit_code: exit_code,
         reset_ok,
@@ -245,27 +248,17 @@ pub fn run_agent<S: SystemIo>(io: &mut S, config: &AgentConfig) -> Result<RunRes
     })
 }
 
-/// Create symlink at `link` pointing to `target`, handling collision
-/// with an existing regular file by moving it aside to `<link>.orig`.
-fn create_symlink_with_collision<S: SystemIo>(
+/// Create a symlink at `link` pointing to `target`.
+/// Errors are logged as warnings but do not abort — the FUSE mount
+/// is still accessible directly at `/fuse/`.
+fn create_secret_symlink<S: SystemIo>(
     io: &mut S,
     link: &Path,
     target: &str,
 ) -> Result<(), String> {
-    if io.file_exists(link) {
-        let backup = PathBuf::from(format!("{}.orig", link.display()));
-        info!(
-            "Collision at {} — moving original to {}",
-            link.display(),
-            backup.display()
-        );
-        io.rename_path(link, &backup)
-            .map_err(|e| format!("rename original aside: {e}"))?;
-    }
-
     match io.create_symlink(Path::new(target), link) {
         Ok(()) => {
-            info!("Symlink: {} -> {target}", link.display());
+            info!("Symlink: {} → {target}", link.display());
             Ok(())
         }
         Err(e) => {
@@ -343,14 +336,17 @@ fn probe_running_agents<S: SystemIo>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{AgentConfig, Runtime};
+    use crate::config::{AgentConfig, Runtime, SecretMapping};
     use fuse_protocol::MockSystemIo;
     use std::path::PathBuf;
 
     fn test_config() -> AgentConfig {
         AgentConfig {
             binary_hash: "abc123".into(),
-            host_config_file: "secrets.yaml".into(),
+            secrets: vec![SecretMapping {
+                host: PathBuf::from("/home/user/secrets.yaml"),
+                guest: "secrets.yaml".to_string(),
+            }],
             agent_subfolder: "goose".into(),
             container_args: vec![],
             agent_path: PathBuf::from("/work/agent1"),
@@ -368,6 +364,14 @@ mod tests {
         }
     }
 
+    fn secret_link(cfg: &AgentConfig) -> PathBuf {
+        cfg.secrets[0].link_path(&cfg.host_config_dir())
+    }
+
+    fn secret_target(cfg: &AgentConfig) -> String {
+        cfg.secrets[0].fuse_target()
+    }
+
     #[test]
     fn missing_workspace_dirs_errors() {
         let mut mock = MockSystemIo::new();
@@ -382,10 +386,9 @@ mod tests {
         let mut mock = MockSystemIo::new()
             .with_file("/work/agent1/config", b"")
             .with_file("/work/agent1/workspace", b"")
-            .with_file("secrets.yaml", b"DATA")
-            // unix_connected defaults to false → server doesn't exist → spawn
-            .with_unix_response(br#"{"type":"ok"}"#)  // AddSecret response
-            .with_unix_response(br#"{"type":"ok"}"#); // Reset response
+            .with_file("/home/user/secrets.yaml", b"DATA")
+            .with_unix_response(br#"{"type":"ok"}"#)
+            .with_unix_response(br#"{"type":"ok"}"#);
 
         let cfg = test_config();
         let result = run_agent(&mut mock, &cfg);
@@ -396,7 +399,6 @@ mod tests {
         assert!(run.reset_ok);
         assert_eq!(run.container_exit_code, 0);
 
-        // fuse-server was spawned independently
         assert_eq!(mock.spawned.len(), 1);
         assert_eq!(mock.spawned[0].0, "fuse-server");
     }
@@ -406,19 +408,19 @@ mod tests {
         let mut mock = MockSystemIo::new()
             .with_file("/work/agent1/config", b"")
             .with_file("/work/agent1/workspace", b"")
-            .with_file("secrets.yaml", b"DATA");
-        mock.unix_connected = true; // server already running
+            .with_file("/home/user/secrets.yaml", b"DATA");
+        mock.unix_connected = true;
         mock = mock
-            .with_unix_response(br#"{"type":"ok"}"#)  // AddSecret
-            .with_unix_response(br#"{"type":"ok"}"#); // Reset
+            .with_unix_response(br#"{"type":"ok"}"#)
+            .with_unix_response(br#"{"type":"ok"}"#);
 
         let cfg = test_config();
         let result = run_agent(&mut mock, &cfg);
 
         assert!(result.is_ok(), "got: {:?}", result.err());
         let run = result.unwrap();
-        assert!(!run.server_was_spawned); // didn't spawn
-        assert_eq!(mock.spawned.len(), 0); // no spawn calls
+        assert!(!run.server_was_spawned);
+        assert_eq!(mock.spawned.len(), 0);
     }
 
     #[test]
@@ -426,71 +428,35 @@ mod tests {
         let mut mock = MockSystemIo::new()
             .with_file("/work/agent1/config", b"")
             .with_file("/work/agent1/workspace", b"")
-            .with_file("secrets.yaml", b"DATA")
+            .with_file("/home/user/secrets.yaml", b"DATA")
             .with_unix_response(br#"{"type":"ok"}"#)
             .with_unix_response(br#"{"type":"ok"}"#);
 
         let cfg = test_config();
         let _ = run_agent(&mut mock, &cfg);
 
-        let link = cfg.host_config_link();
+        let link = secret_link(&cfg);
         assert!(mock.is_symlink(&link), "symlink should persist after run");
-    }
-
-    #[test]
-    fn symlink_collision_persists_symlink() {
-        let mut mock = MockSystemIo::new()
-            .with_file("/work/agent1/config", b"")
-            .with_file("/work/agent1/workspace", b"")
-            .with_file("config/secrets.yaml", b"SECRET_DATA")
-            .with_file("/work/agent1/config/secrets.yaml", b"SECRET_DATA")
-            .with_unix_response(br#"{"type":"ok"}"#)
-            .with_unix_response(br#"{"type":"ok"}"#);
-
-        let mut cfg = test_config();
-        cfg.host_config_file = PathBuf::from("config/secrets.yaml");
-        let result = run_agent(&mut mock, &cfg);
-        assert!(result.is_ok(), "got: {:?}", result.err());
-
-        let link = cfg.host_config_link();
-        assert!(
-            mock.is_symlink(&link),
-            "symlink should persist after collision (not restored)"
-        );
-
-        let backup = PathBuf::from(format!("{}.orig", link.display()));
-        assert!(
-            mock.file_exists(&backup),
-            "original file should remain at .orig"
-        );
-        assert_eq!(
-            mock.read_file(&backup).unwrap(),
-            b"SECRET_DATA",
-            ".orig content must match original"
-        );
     }
 
     #[test]
     fn symlink_correct_target_skips_creation() {
         let cfg = test_config();
-        let link = cfg.host_config_link();
-        let correct_target = cfg.container_fuse_file();
+        let link = secret_link(&cfg);
+        let correct_target = secret_target(&cfg);
 
         let mut mock = MockSystemIo::new()
             .with_file("/work/agent1/config", b"")
             .with_file("/work/agent1/workspace", b"")
-            .with_file("secrets.yaml", b"DATA")
+            .with_file("/home/user/secrets.yaml", b"DATA")
             .with_unix_response(br#"{"type":"ok"}"#)
             .with_unix_response(br#"{"type":"ok"}"#);
-        // Pre-populate symlink with the correct target.
         mock.symlinks
             .insert(link.to_string_lossy().to_string(), correct_target.clone());
 
         let result = run_agent(&mut mock, &cfg);
         assert!(result.is_ok(), "got: {:?}", result.err());
 
-        // Symlink should still exist and point to the correct target.
-        assert!(mock.is_symlink(&link));
         assert_eq!(
             mock.read_link(&link).unwrap(),
             PathBuf::from(&correct_target),
@@ -501,24 +467,21 @@ mod tests {
     #[test]
     fn symlink_wrong_target_overrides_when_no_agents_running() {
         let cfg = test_config();
-        let link = cfg.host_config_link();
-        let correct_target = cfg.container_fuse_file();
+        let link = secret_link(&cfg);
+        let correct_target = secret_target(&cfg);
 
         let mut mock = MockSystemIo::new()
             .with_file("/work/agent1/config", b"")
             .with_file("/work/agent1/workspace", b"")
-            .with_file("secrets.yaml", b"DATA")
+            .with_file("/home/user/secrets.yaml", b"DATA")
             .with_unix_response(br#"{"type":"ok"}"#)
             .with_unix_response(br#"{"type":"ok"}"#);
-        // Pre-populate symlink with a WRONG target.
         mock.symlinks
             .insert(link.to_string_lossy().to_string(), "/wrong/target".to_string());
-        // command_stdout defaults to "" → no containers running.
 
         let result = run_agent(&mut mock, &cfg);
         assert!(result.is_ok(), "got: {:?}", result.err());
 
-        // Symlink should now point to the correct target.
         assert_eq!(
             mock.read_link(&link).unwrap(),
             PathBuf::from(&correct_target),
@@ -529,18 +492,16 @@ mod tests {
     #[test]
     fn symlink_wrong_target_errors_when_agents_running() {
         let cfg = test_config();
-        let link = cfg.host_config_link();
+        let link = secret_link(&cfg);
 
         let mut mock = MockSystemIo::new()
             .with_file("/work/agent1/config", b"")
             .with_file("/work/agent1/workspace", b"")
-            .with_file("secrets.yaml", b"DATA")
+            .with_file("/home/user/secrets.yaml", b"DATA")
             .with_unix_response(br#"{"type":"ok"}"#)
             .with_unix_response(br#"{"type":"ok"}"#);
-        // Pre-populate symlink with a WRONG target.
         mock.symlinks
             .insert(link.to_string_lossy().to_string(), "/wrong/target".to_string());
-        // Simulate a running container in the ps output.
         mock.command_stdout = "agent1_12345\n".to_string();
 
         let result = run_agent(&mut mock, &cfg);
@@ -551,11 +512,55 @@ mod tests {
             "error should mention running agent: {err}"
         );
 
-        // Symlink should NOT have been changed.
         assert_eq!(
             mock.read_link(&link).unwrap(),
             PathBuf::from("/wrong/target"),
             "symlink should not be overridden when agents are running"
         );
+    }
+
+    #[test]
+    fn multiple_secrets_all_get_symlinks() {
+        let mut cfg = test_config();
+        cfg.secrets = vec![
+            SecretMapping {
+                host: PathBuf::from("/home/user/key1.json"),
+                guest: "auth1.json".to_string(),
+            },
+            SecretMapping {
+                host: PathBuf::from("/home/user/key2.json"),
+                guest: "auth2.json".to_string(),
+            },
+        ];
+
+        let mut mock = MockSystemIo::new()
+            .with_file("/work/agent1/config", b"")
+            .with_file("/work/agent1/workspace", b"")
+            .with_file("/home/user/key1.json", b"KEY1")
+            .with_file("/home/user/key2.json", b"KEY2")
+            // 2 AddSecret + 2 Reset responses
+            .with_unix_response(br#"{"type":"ok"}"#)
+            .with_unix_response(br#"{"type":"ok"}"#)
+            .with_unix_response(br#"{"type":"ok"}"#)
+            .with_unix_response(br#"{"type":"ok"}"#);
+
+        let result = run_agent(&mut mock, &cfg);
+        assert!(result.is_ok(), "got: {:?}", result.err());
+
+        let config_dir = cfg.host_config_dir();
+        for secret in &cfg.secrets {
+            let link = secret.link_path(&config_dir);
+            assert!(
+                mock.is_symlink(&link),
+                "symlink should exist for {}",
+                secret.guest
+            );
+            assert_eq!(
+                mock.read_link(&link).unwrap(),
+                PathBuf::from(secret.fuse_target()),
+                "wrong target for {}",
+                secret.guest
+            );
+        }
     }
 }

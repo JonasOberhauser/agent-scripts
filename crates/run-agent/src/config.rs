@@ -104,13 +104,54 @@ pub fn split_wrapper(wrapper: &str) -> (String, Vec<String>) {
     (parts[0].clone(), parts[1..].to_vec())
 }
 
+/// A single secret mapping: read the real file at `host`, serve it through
+/// the FUSE gatekeeper, and place a symlink at `config/<guest>` so the
+/// container sees it at `/root/.config/<subfolder>/<guest>`.
+#[derive(Debug, Clone)]
+pub struct SecretMapping {
+    /// Host-side path to the real secret file.
+    pub host: PathBuf,
+    /// Filename inside the bind-mounted config directory (also the FUSE name).
+    pub guest: String,
+}
+
+impl SecretMapping {
+    /// Parse a `host:guest` string.
+    pub fn parse(s: &str) -> Result<Self, String> {
+        let (host, guest) = s
+            .split_once(':')
+            .ok_or_else(|| format!("--secret expects HOST:GUEST, got '{s}'"))?;
+        let host = host.trim();
+        let guest = guest.trim();
+        if host.is_empty() || guest.is_empty() {
+            return Err(format!(
+                "--secret host and guest must be non-empty: '{s}'"
+            ));
+        }
+        Ok(Self {
+            host: PathBuf::from(host),
+            guest: guest.to_string(),
+        })
+    }
+
+    /// The FUSE path for this secret (as seen inside the container).
+    pub fn fuse_target(&self) -> String {
+        format!("/fuse/{}", self.guest)
+    }
+
+    /// The host-side symlink path inside the config directory.
+    pub fn link_path(&self, config_dir: &Path) -> PathBuf {
+        config_dir.join(&self.guest)
+    }
+}
+
 /// All parameters needed to launch an agent session.
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
     /// SHA-256 of the binary allowed to read the secret.
     pub binary_hash: String,
-    /// Host path to the secret config file (e.g. `production.yaml`).
-    pub host_config_file: PathBuf,
+    /// Secret files to serve through the FUSE gatekeeper.
+    pub secrets: Vec<SecretMapping>,
     /// Subfolder under `~/.config/` inside the container (e.g. `goose`).
     pub agent_subfolder: String,
     /// Extra arguments forwarded to the container command.
@@ -146,17 +187,16 @@ pub struct AgentConfig {
 }
 
 impl AgentConfig {
-    /// Derive a config from the three positional args the original shell
-    /// script expected, using sensible defaults for the rest.
+    /// Derive a config from positional args, using sensible defaults.
     pub fn from_args(
         binary_hash: &str,
-        host_config_file: &str,
+        secrets: Vec<SecretMapping>,
         agent_subfolder: &str,
         container_args: &[String],
     ) -> Self {
         Self {
             binary_hash: binary_hash.to_string(),
-            host_config_file: PathBuf::from(host_config_file),
+            secrets,
             agent_subfolder: agent_subfolder.to_string(),
             container_args: container_args.to_vec(),
             agent_path: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
@@ -175,13 +215,6 @@ impl AgentConfig {
     }
 
     // ── computed paths ──────────────────────────────────────────
-
-    pub fn filename(&self) -> String {
-        self.host_config_file
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_default()
-    }
 
     pub fn host_config_dir(&self) -> PathBuf {
         self.agent_path.join("config")
@@ -204,16 +237,6 @@ impl AgentConfig {
 
     pub fn container_config_dir(&self) -> String {
         format!("/root/.config/{}", self.agent_subfolder)
-    }
-
-    /// The symlink target *as seen inside the container*.
-    pub fn container_fuse_file(&self) -> String {
-        format!("/fuse/{}", self.filename())
-    }
-
-    /// Where the symlink lives on the host (inside the bind-mounted config dir).
-    pub fn host_config_link(&self) -> PathBuf {
-        self.host_config_dir().join(self.filename())
     }
 
     pub fn container_name(&self) -> String {
@@ -286,16 +309,29 @@ mod tests {
     use fuse_protocol::MockSystemIo;
 
     #[test]
-    fn filename_extraction() {
-        let cfg = AgentConfig::from_args("abc", "/path/to/secrets.yaml", "goose", &[]);
-        assert_eq!(cfg.filename(), "secrets.yaml");
+    fn secret_mapping_parse() {
+        let m = SecretMapping::parse("/home/jonas/key.json:auth.json").unwrap();
+        assert_eq!(m.host, PathBuf::from("/home/jonas/key.json"));
+        assert_eq!(m.guest, "auth.json");
+        assert_eq!(m.fuse_target(), "/fuse/auth.json");
+    }
+
+    #[test]
+    fn secret_mapping_parse_rejects_missing_colon() {
+        assert!(SecretMapping::parse("no_colon").is_err());
+    }
+
+    #[test]
+    fn secret_mapping_parse_rejects_empty_parts() {
+        assert!(SecretMapping::parse(":auth.json").is_err());
+        assert!(SecretMapping::parse("/key:").is_err());
     }
 
     #[test]
     fn container_args_basics() {
         let cfg = AgentConfig {
             binary_hash: "h".into(),
-            host_config_file: "s.yaml".into(),
+            secrets: vec![],
             agent_subfolder: "goose".into(),
             container_args: vec!["--flag".into()],
             agent_path: PathBuf::from("/work/myagent"),
@@ -386,7 +422,7 @@ mod tests {
 
     #[test]
     fn container_name_contains_agent_name() {
-        let cfg = AgentConfig::from_args("h", "f.yaml", "goose", &[]);
+        let cfg = AgentConfig::from_args("h", vec![], "goose", &[]);
         let name = cfg.container_name();
         assert!(name.starts_with(&cfg.agent_name()));
     }

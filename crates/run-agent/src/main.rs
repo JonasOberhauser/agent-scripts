@@ -2,7 +2,9 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::Parser;
-use run_agent::{run_agent, AgentConfig, Runtime, DEFAULT_MOUNT_POINT, DEFAULT_SOCKET};
+use run_agent::{
+    run_agent, AgentConfig, Runtime, SecretMapping, DEFAULT_MOUNT_POINT, DEFAULT_SOCKET,
+};
 use tracing::error;
 use tracing_subscriber::EnvFilter;
 
@@ -15,11 +17,15 @@ struct Cli {
     /// SHA-256 of the allowed agent binary.
     binary_checksum: String,
 
-    /// Host path to the secret config file.
-    host_config_file: String,
-
     /// Guest subfolder under ~/.config/ (e.g. `goose`).
     agent_subfolder: String,
+
+    /// Secret file to serve through FUSE: HOST:GUEST.
+    /// HOST is the real file on the host; GUEST is the filename inside the
+    /// config directory where the symlink will appear.
+    /// Can be specified multiple times.
+    #[arg(long, value_name = "HOST:GUEST")]
+    secret: Vec<String>,
 
     /// Path to the fuse-server binary.
     #[arg(long, default_value = "fuse-server")]
@@ -74,9 +80,19 @@ fn main() -> ExitCode {
 
     let cli = Cli::parse();
 
+    let secrets: Vec<SecretMapping> = cli
+        .secret
+        .iter()
+        .map(|s| SecretMapping::parse(s))
+        .collect::<Result<_, _>>()
+        .unwrap_or_else(|e| {
+            error!("{e}");
+            std::process::exit(2);
+        });
+
     let mut config = AgentConfig::from_args(
         &cli.binary_checksum,
-        &cli.host_config_file,
+        secrets,
         &cli.agent_subfolder,
         &cli.container_args,
     );
