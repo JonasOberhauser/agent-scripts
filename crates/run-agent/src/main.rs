@@ -20,11 +20,13 @@ struct Cli {
     /// Guest subfolder under ~/.config/ (e.g. `goose`).
     agent_subfolder: String,
 
-    /// Secret file to serve through FUSE: HOST:GUEST.
-    /// HOST is the real file on the host; GUEST is the filename inside the
-    /// config directory where the symlink will appear.
+    /// Secret to serve through FUSE: HOST:CONTAINER.
+    /// HOST is the real file/dir on the host; CONTAINER is an absolute path
+    /// inside the container where the secret should appear (e.g.
+    /// `/root/.config/opencode/auth.json`).
+    /// Directories are mapped recursively (like `cp -r`).
     /// Can be specified multiple times.
-    #[arg(long, value_name = "HOST:GUEST")]
+    #[arg(long, value_name = "HOST:CONTAINER")]
     secret: Vec<String>,
 
     /// Path to the fuse-server binary.

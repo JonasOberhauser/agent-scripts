@@ -143,6 +143,18 @@ impl SystemIo for RealSystemIo {
             .unwrap_or(false)
     }
 
+    fn is_dir(&self, path: &Path) -> bool {
+        std::fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false)
+    }
+
+    fn list_dir(&self, path: &Path) -> Result<Vec<PathBuf>, IoError> {
+        let mut entries = Vec::new();
+        for entry in std::fs::read_dir(path)? {
+            entries.push(entry?.path());
+        }
+        Ok(entries)
+    }
+
     fn read_link(&self, path: &Path) -> Result<PathBuf, IoError> {
         Ok(std::fs::read_link(path)?)
     }
@@ -316,6 +328,30 @@ impl SystemIo for MockSystemIo {
     fn is_symlink(&self, path: &Path) -> bool {
         self.symlinks
             .contains_key(&path.to_string_lossy().to_string())
+    }
+
+    fn is_dir(&self, path: &Path) -> bool {
+        let prefix = format!("{}/", path.to_string_lossy());
+        self.files.keys().any(|k| k.starts_with(&prefix))
+    }
+
+    fn list_dir(&self, path: &Path) -> Result<Vec<PathBuf>, IoError> {
+        let prefix = format!("{}/", path.to_string_lossy());
+        let mut entries = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for key in self.files.keys() {
+            if let Some(rest) = key.strip_prefix(&prefix) {
+                let component = match rest.find('/') {
+                    Some(i) => &rest[..i],
+                    None => rest,
+                };
+                let full = format!("{}{}", prefix, component);
+                if seen.insert(full.clone()) {
+                    entries.push(PathBuf::from(full));
+                }
+            }
+        }
+        Ok(entries)
     }
 
     fn rename_path(&mut self, from: &Path, to: &Path) -> Result<(), IoError> {

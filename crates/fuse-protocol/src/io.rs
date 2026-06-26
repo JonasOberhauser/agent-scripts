@@ -45,6 +45,12 @@ pub trait SystemIo {
     fn sha256_process_exe(&self, pid: u32) -> Result<String, IoError>;
     fn is_symlink(&self, path: &Path) -> bool;
 
+    /// Whether the path is a directory.
+    fn is_dir(&self, path: &Path) -> bool;
+
+    /// List immediate children of a directory (full paths).
+    fn list_dir(&self, path: &Path) -> Result<Vec<PathBuf>, IoError>;
+
     /// Read the target of a symlink.
     fn read_link(&self, path: &Path) -> Result<PathBuf, IoError>;
 

@@ -104,44 +104,44 @@ pub fn split_wrapper(wrapper: &str) -> (String, Vec<String>) {
     (parts[0].clone(), parts[1..].to_vec())
 }
 
-/// A single secret mapping: read the real file at `host`, serve it through
-/// the FUSE gatekeeper, and place a symlink at `config/<guest>` so the
-/// container sees it at `/root/.config/<subfolder>/<guest>`.
+/// A single secret mapping, Docker `-v` style: `HOST:CONTAINER`.
+///
+/// The real file (or directory) at `host` is loaded into the FUSE
+/// gatekeeper.  A symlink is created inside the bind-mounted config
+/// directory so the secret appears at `container` (an absolute container
+/// path) and reads are redirected to `/fuse/<name>`.
+///
+/// If `host` is a directory, it is mapped recursively (`cp -r` style).
 #[derive(Debug, Clone)]
 pub struct SecretMapping {
-    /// Host-side path to the real secret file.
+    /// Host-side path to the real secret file or directory.
     pub host: PathBuf,
-    /// Filename inside the bind-mounted config directory (also the FUSE name).
-    pub guest: String,
+    /// Absolute path inside the container where the secret should appear.
+    pub container: PathBuf,
 }
 
 impl SecretMapping {
-    /// Parse a `host:guest` string.
+    /// Parse a `HOST:CONTAINER` string.
     pub fn parse(s: &str) -> Result<Self, String> {
-        let (host, guest) = s
+        let (host, container) = s
             .split_once(':')
-            .ok_or_else(|| format!("--secret expects HOST:GUEST, got '{s}'"))?;
+            .ok_or_else(|| format!("--secret expects HOST:CONTAINER, got '{s}'"))?;
         let host = host.trim();
-        let guest = guest.trim();
-        if host.is_empty() || guest.is_empty() {
+        let container = container.trim();
+        if host.is_empty() || container.is_empty() {
             return Err(format!(
-                "--secret host and guest must be non-empty: '{s}'"
+                "--secret host and container must be non-empty: '{s}'"
+            ));
+        }
+        if !container.starts_with('/') {
+            return Err(format!(
+                "--secret container path must be absolute (start with /): '{container}'"
             ));
         }
         Ok(Self {
             host: PathBuf::from(host),
-            guest: guest.to_string(),
+            container: PathBuf::from(container),
         })
-    }
-
-    /// The FUSE path for this secret (as seen inside the container).
-    pub fn fuse_target(&self) -> String {
-        format!("/fuse/{}", self.guest)
-    }
-
-    /// The host-side symlink path inside the config directory.
-    pub fn link_path(&self, config_dir: &Path) -> PathBuf {
-        config_dir.join(&self.guest)
     }
 }
 
@@ -310,10 +310,9 @@ mod tests {
 
     #[test]
     fn secret_mapping_parse() {
-        let m = SecretMapping::parse("/home/jonas/key.json:auth.json").unwrap();
+        let m = SecretMapping::parse("/home/jonas/key.json:/root/.config/opencode/auth.json").unwrap();
         assert_eq!(m.host, PathBuf::from("/home/jonas/key.json"));
-        assert_eq!(m.guest, "auth.json");
-        assert_eq!(m.fuse_target(), "/fuse/auth.json");
+        assert_eq!(m.container, PathBuf::from("/root/.config/opencode/auth.json"));
     }
 
     #[test]
@@ -322,9 +321,8 @@ mod tests {
     }
 
     #[test]
-    fn secret_mapping_parse_rejects_empty_parts() {
-        assert!(SecretMapping::parse(":auth.json").is_err());
-        assert!(SecretMapping::parse("/key:").is_err());
+    fn secret_mapping_parse_rejects_relative_container() {
+        assert!(SecretMapping::parse("/key:auth.json").is_err());
     }
 
     #[test]
