@@ -497,4 +497,103 @@ mod tests {
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("not under any bind-mounted"));
     }
+
+    #[test]
+    fn no_secrets_works() {
+        let mut cfg = test_config();
+        cfg.secrets = vec![];
+
+        let mut mock = MockSystemIo::new()
+            .with_file("/work/agent1/config", b"")
+            .with_file("/work/agent1/workspace", b"");
+
+        let result = run_agent(&mut mock, &cfg);
+        assert!(result.is_ok(), "got: {:?}", result.err());
+    }
+
+    #[test]
+    fn workspace_container_path_works() {
+        let mut cfg = test_config();
+        cfg.secrets = vec![SecretMapping {
+            host: PathBuf::from("/home/user/.env"),
+            container: PathBuf::from("/workspace/.env"),
+        }];
+
+        let mut mock = MockSystemIo::new()
+            .with_file("/work/agent1/config", b"")
+            .with_file("/work/agent1/workspace", b"")
+            .with_file("/home/user/.env", b"SECRET=1")
+            .with_unix_response(br#"{"type":"ok"}"#)
+            .with_unix_response(br#"{"type":"ok"}"#);
+
+        let result = run_agent(&mut mock, &cfg);
+        assert!(result.is_ok(), "got: {:?}", result.err());
+        assert!(
+            mock.is_symlink(Path::new("/work/agent1/workspace/.env")),
+            "symlink should be in workspace dir"
+        );
+    }
+
+    #[test]
+    fn rerun_overwrites_existing_symlink() {
+        let mut mock = MockSystemIo::new()
+            .with_file("/work/agent1/config", b"")
+            .with_file("/work/agent1/workspace", b"")
+            .with_file("/home/user/secrets.yaml", b"DATA")
+            .with_unix_response(br#"{"type":"ok"}"#)
+            .with_unix_response(br#"{"type":"ok"}"#);
+        // Simulate a leftover symlink from a previous run.
+        mock.symlinks.insert(
+            "/work/agent1/config/secrets.yaml".to_string(),
+            "/fuse/old_name".to_string(),
+        );
+
+        let cfg = test_config();
+        let result = run_agent(&mut mock, &cfg);
+        assert!(result.is_ok(), "got: {:?}", result.err());
+
+        let target = mock
+            .read_link(Path::new("/work/agent1/config/secrets.yaml"))
+            .unwrap();
+        assert_ne!(
+            target,
+            PathBuf::from("/fuse/old_name"),
+            "old symlink should have been replaced"
+        );
+        assert!(
+            target.starts_with("/fuse/"),
+            "new symlink should point to /fuse/"
+        );
+    }
+
+    #[test]
+    fn mixed_file_and_directory_in_same_run() {
+        let mut cfg = test_config();
+        cfg.secrets = vec![
+            SecretMapping {
+                host: PathBuf::from("/home/user/key.json"),
+                container: PathBuf::from("/root/.config/goose/key.json"),
+            },
+            SecretMapping {
+                host: PathBuf::from("/home/user/secrets"),
+                container: PathBuf::from("/root/.config/goose/secrets"),
+            },
+        ];
+
+        let mut mock = MockSystemIo::new()
+            .with_file("/work/agent1/config", b"")
+            .with_file("/work/agent1/workspace", b"")
+            .with_file("/home/user/key.json", b"KEY")
+            .with_file("/home/user/secrets/token.json", b"TOK")
+            .with_unix_response(br#"{"type":"ok"}"#)
+            .with_unix_response(br#"{"type":"ok"}"#)
+            .with_unix_response(br#"{"type":"ok"}"#)
+            .with_unix_response(br#"{"type":"ok"}"#);
+
+        let result = run_agent(&mut mock, &cfg);
+        assert!(result.is_ok(), "got: {:?}", result.err());
+
+        assert!(mock.is_symlink(Path::new("/work/agent1/config/key.json")));
+        assert!(mock.is_symlink(Path::new("/work/agent1/config/secrets/token.json")));
+    }
 }

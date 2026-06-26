@@ -122,6 +122,10 @@ pub struct SecretMapping {
 
 impl SecretMapping {
     /// Parse a `HOST:CONTAINER` string.
+    ///
+    /// `~` in the host path is expanded to `$HOME` (in case the shell
+    /// didn't do it, e.g. inside quotes).  The container path must be
+    /// absolute (starts with `/`).
     pub fn parse(s: &str) -> Result<Self, String> {
         let (host, container) = s
             .split_once(':')
@@ -139,10 +143,25 @@ impl SecretMapping {
             ));
         }
         Ok(Self {
-            host: PathBuf::from(host),
+            host: expand_tilde(host),
             container: PathBuf::from(container),
         })
     }
+}
+
+/// Expand a leading `~` or `~/` to `$HOME`.
+fn expand_tilde(s: &str) -> PathBuf {
+    if s == "~" {
+        return std::env::var("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from(s));
+    }
+    if let Some(rest) = s.strip_prefix("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            return PathBuf::from(home).join(rest);
+        }
+    }
+    PathBuf::from(s)
 }
 
 /// All parameters needed to launch an agent session.
@@ -323,6 +342,37 @@ mod tests {
     #[test]
     fn secret_mapping_parse_rejects_relative_container() {
         assert!(SecretMapping::parse("/key:auth.json").is_err());
+    }
+
+    #[test]
+    fn secret_mapping_parse_rejects_empty_host() {
+        assert!(SecretMapping::parse(":/container/path").is_err());
+    }
+
+    #[test]
+    fn secret_mapping_parse_rejects_empty_container() {
+        assert!(SecretMapping::parse("/host:").is_err());
+    }
+
+    #[test]
+    fn secret_mapping_parse_directory_paths() {
+        let m = SecretMapping::parse("/host/secrets/:/root/.config/app/secrets/").unwrap();
+        assert_eq!(m.host, PathBuf::from("/host/secrets/"));
+        assert_eq!(m.container, PathBuf::from("/root/.config/app/secrets/"));
+    }
+
+    #[test]
+    fn secret_mapping_parse_expands_tilde() {
+        std::env::set_var("HOME", "/home/testuser");
+        let m = SecretMapping::parse("~/secrets/key.json:/root/.config/app/key.json").unwrap();
+        assert_eq!(m.host, PathBuf::from("/home/testuser/secrets/key.json"));
+    }
+
+    #[test]
+    fn secret_mapping_parse_expands_bare_tilde() {
+        std::env::set_var("HOME", "/home/testuser");
+        let m = SecretMapping::parse("~:/root/.config/app/home").unwrap();
+        assert_eq!(m.host, PathBuf::from("/home/testuser"));
     }
 
     #[test]
