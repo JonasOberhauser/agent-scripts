@@ -123,9 +123,9 @@ pub struct SecretMapping {
 impl SecretMapping {
     /// Parse a `HOST:CONTAINER` string.
     ///
-    /// `~` in the host path is expanded to `$HOME` (in case the shell
-    /// didn't do it, e.g. inside quotes).  The container path must be
-    /// absolute (starts with `/`).
+    /// `~` is **not** expanded by us — the caller's shell expands it for
+    /// host paths, and the container's `sh -c` expands it for container
+    /// paths (where `~` = `/root`).
     pub fn parse(s: &str) -> Result<Self, String> {
         let (host, container) = s
             .split_once(':')
@@ -137,31 +137,11 @@ impl SecretMapping {
                 "--secret host and container must be non-empty: '{s}'"
             ));
         }
-        if !container.starts_with('/') {
-            return Err(format!(
-                "--secret container path must be absolute (start with /): '{container}'"
-            ));
-        }
         Ok(Self {
-            host: expand_tilde(host),
+            host: PathBuf::from(host),
             container: PathBuf::from(container),
         })
     }
-}
-
-/// Expand a leading `~` or `~/` to `$HOME`.
-fn expand_tilde(s: &str) -> PathBuf {
-    if s == "~" {
-        return std::env::var("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from(s));
-    }
-    if let Some(rest) = s.strip_prefix("~/") {
-        if let Ok(home) = std::env::var("HOME") {
-            return PathBuf::from(home).join(rest);
-        }
-    }
-    PathBuf::from(s)
 }
 
 /// All parameters needed to launch an agent session.
@@ -277,8 +257,13 @@ fn chrono_like_timestamp() -> String {
 
 /// Build the full `docker run` / `podman run` argument vector.
 ///
+/// `setup_script` is a shell snippet (e.g. `mkdir -p ... && ln -sf ...`)
+/// that runs inside the container before the main command.  When non-empty,
+/// the container command is wrapped as `sh -c '<setup> && exec "$@"' sh <args>`
+/// so the symlinks are created inside the container using native paths.
+///
 /// Pure function — trivially unit-testable without any I/O.
-pub fn build_container_args(config: &AgentConfig) -> Vec<String> {
+pub fn build_container_args(config: &AgentConfig, setup_script: &str) -> Vec<String> {
     let mut args = vec![
         "run".into(),
         "-it".into(),
@@ -318,7 +303,21 @@ pub fn build_container_args(config: &AgentConfig) -> Vec<String> {
         "/workspace".into(),
     ]);
     args.push(config.image_name.clone());
-    args.extend(config.container_args.iter().cloned());
+
+    if setup_script.is_empty() {
+        args.extend(config.container_args.iter().cloned());
+    } else {
+        // Wrap: sh -c '<setup> && exec "$@"' sh <original args>
+        args.push("sh".into());
+        args.push("-c".into());
+        if config.container_args.is_empty() {
+            args.push(format!("{setup_script} && exec sh"));
+        } else {
+            args.push(format!("{setup_script} && exec \"$@\""));
+            args.push("sh".into());
+            args.extend(config.container_args.iter().cloned());
+        }
+    }
     args
 }
 
@@ -340,11 +339,6 @@ mod tests {
     }
 
     #[test]
-    fn secret_mapping_parse_rejects_relative_container() {
-        assert!(SecretMapping::parse("/key:auth.json").is_err());
-    }
-
-    #[test]
     fn secret_mapping_parse_rejects_empty_host() {
         assert!(SecretMapping::parse(":/container/path").is_err());
     }
@@ -355,24 +349,16 @@ mod tests {
     }
 
     #[test]
+    fn secret_mapping_parse_allows_tilde_container() {
+        let m = SecretMapping::parse("/host/key:~/.config/app/key.json").unwrap();
+        assert_eq!(m.container, PathBuf::from("~/.config/app/key.json"));
+    }
+
+    #[test]
     fn secret_mapping_parse_directory_paths() {
         let m = SecretMapping::parse("/host/secrets/:/root/.config/app/secrets/").unwrap();
         assert_eq!(m.host, PathBuf::from("/host/secrets/"));
         assert_eq!(m.container, PathBuf::from("/root/.config/app/secrets/"));
-    }
-
-    #[test]
-    fn secret_mapping_parse_expands_tilde() {
-        std::env::set_var("HOME", "/home/testuser");
-        let m = SecretMapping::parse("~/secrets/key.json:/root/.config/app/key.json").unwrap();
-        assert_eq!(m.host, PathBuf::from("/home/testuser/secrets/key.json"));
-    }
-
-    #[test]
-    fn secret_mapping_parse_expands_bare_tilde() {
-        std::env::set_var("HOME", "/home/testuser");
-        let m = SecretMapping::parse("~:/root/.config/app/home").unwrap();
-        assert_eq!(m.host, PathBuf::from("/home/testuser"));
     }
 
     #[test]
@@ -395,7 +381,7 @@ mod tests {
             log_level: "info".to_string(),
             plans_path: None,
         };
-        let args = build_container_args(&cfg);
+        let args = build_container_args(&cfg, "");
         assert!(args.contains(&"run".to_string()));
         assert!(args.contains(&"-it".to_string()));
         assert!(args.contains(&"--rm".to_string()));

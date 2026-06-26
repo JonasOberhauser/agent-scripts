@@ -331,12 +331,14 @@ impl SystemIo for MockSystemIo {
     }
 
     fn is_dir(&self, path: &Path) -> bool {
-        let prefix = format!("{}/", path.to_string_lossy());
+        let path_str = path.to_string_lossy();
+        let prefix = format!("{}/", path_str.trim_end_matches('/'));
         self.files.keys().any(|k| k.starts_with(&prefix))
     }
 
     fn list_dir(&self, path: &Path) -> Result<Vec<PathBuf>, IoError> {
-        let prefix = format!("{}/", path.to_string_lossy());
+        let path_str = path.to_string_lossy();
+        let prefix = format!("{}/", path_str.trim_end_matches('/'));
         let mut entries = Vec::new();
         let mut seen = std::collections::HashSet::new();
         for key in self.files.keys() {

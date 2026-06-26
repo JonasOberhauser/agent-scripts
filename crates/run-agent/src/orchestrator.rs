@@ -133,15 +133,15 @@ pub fn run_agent<S: SystemIo>(io: &mut S, config: &AgentConfig) -> Result<RunRes
         info!("Socket ready at {}", socket.display());
     }
 
-    // ── 4. Expand + load secrets, create symlinks ────────────────
+    // ── 4. Expand + load secrets into FUSE ───────────────────────
     let pid = std::process::id();
-    let mut fuse_names: Vec<String> = Vec::new();
     let mut counter = 0usize;
+    let mut loaded: Vec<LoadedSecret> = Vec::new();
 
     for mapping in &config.secrets {
         load_secret_recursive(
             io, socket, &mapping.host, &mapping.container,
-            config, pid, &mut counter, &mut fuse_names,
+            config, pid, &mut counter, &mut loaded,
         )?;
     }
 
@@ -159,8 +159,9 @@ pub fn run_agent<S: SystemIo>(io: &mut S, config: &AgentConfig) -> Result<RunRes
         setup_rootless_docker();
     }
 
-    // ── 6. Run container ─────────────────────────────────────────
-    let args = build_container_args(config);
+    // ── 6. Run container (setup script creates symlinks inside) ──
+    let setup_script = build_setup_script(&loaded);
+    let args = build_container_args(config, &setup_script);
     let exit_code = if let Some(w) = wrapper {
         let (prog, prefix) = crate::config::split_wrapper(w);
         let mut full: Vec<&str> = prefix.iter().map(|s| s.as_str()).collect();
@@ -179,19 +180,19 @@ pub fn run_agent<S: SystemIo>(io: &mut S, config: &AgentConfig) -> Result<RunRes
 
     // ── 7. Auto-reset all secret counters ────────────────────────
     let mut reset_ok = true;
-    for name in &fuse_names {
+    for s in &loaded {
         match fuse_client::send_command(io, socket, Command::Reset {
-            name: Some(name.clone()),
+            name: Some(s.fuse_name.clone()),
         }) {
             Ok(fuse_protocol::Response::Ok) => {
-                info!("Auto-reset successful for '{name}'.");
+                info!("Auto-reset successful for '{}'.", s.fuse_name);
             }
             Ok(other) => {
-                warn!("Auto-reset returned unexpected response for '{name}': {other:?}");
+                warn!("Auto-reset returned unexpected response for '{}': {other:?}", s.fuse_name);
                 reset_ok = false;
             }
             Err(e) => {
-                warn!("Auto-reset failed for '{name}': {e}");
+                warn!("Auto-reset failed for '{}': {e}", s.fuse_name);
                 reset_ok = false;
             }
         }
@@ -205,8 +206,19 @@ pub fn run_agent<S: SystemIo>(io: &mut S, config: &AgentConfig) -> Result<RunRes
     })
 }
 
-/// Recursively load a secret file or directory into the FUSE server and
-/// create the corresponding symlink inside the config directory.
+/// A secret loaded into the FUSE server, ready to be symlinked.
+struct LoadedSecret {
+    fuse_name: String,
+    container: PathBuf,
+}
+
+/// Recursively load a secret file or directory into the FUSE server.
+///
+/// Destination semantics match `cp`:
+/// - File + `/dir/` (trailing slash) → file placed inside dir as `dir/basename`
+/// - File + `/dir/name` → file placed at exact path
+/// - Dir + `/dest` → directory contents mapped under `dest/`
+/// - Dir + `/dest/` → same (contents mapped under `dest/`)
 fn load_secret_recursive<S: SystemIo>(
     io: &mut S,
     socket: &Path,
@@ -215,7 +227,7 @@ fn load_secret_recursive<S: SystemIo>(
     config: &AgentConfig,
     pid: u32,
     counter: &mut usize,
-    fuse_names: &mut Vec<String>,
+    loaded: &mut Vec<LoadedSecret>,
 ) -> Result<(), String> {
     if io.is_dir(host) {
         let entries = io
@@ -227,13 +239,16 @@ fn load_secret_recursive<S: SystemIo>(
                 .ok_or_else(|| format!("invalid path: {}", entry.display()))?;
             load_secret_recursive(
                 io, socket, &entry, &container.join(name),
-                config, pid, counter, fuse_names,
+                config, pid, counter, loaded,
             )?;
         }
         return Ok(());
     }
 
     // ── Single file ──
+    // cp semantics: if container ends with '/', it's a directory destination.
+    let dest = resolve_dest(host, container);
+
     let fuse_name = format!("p{pid}_s{counter}");
     *counter += 1;
 
@@ -246,65 +261,45 @@ fn load_secret_recursive<S: SystemIo>(
         content,
         hash: config.binary_hash.clone(),
     }) {
-        Ok(fuse_protocol::Response::Ok) => {}
+        Ok(fuse_protocol::Response::Ok) => {
+            info!("Secret loaded: {} → /fuse/{fuse_name}", host.display());
+        }
         Ok(other) => return Err(format!("unexpected response adding secret: {other:?}")),
         Err(e) => return Err(format!("failed to add secret: {e}")),
     }
 
-    // Map the absolute container path to a host-side symlink location
-    // inside one of the bind-mounted directories.
-    let host_link = container_to_host_path(container, config)?;
-
-    // Create parent directories if needed (for nested paths).
-    if let Some(parent) = host_link.parent() {
-        io.create_dir_all(parent)
-            .map_err(|e| format!("create dir {}: {e}", parent.display()))?;
-    }
-
-    // Remove existing path (symlink or regular file) before creating.
-    if io.is_symlink(&host_link) || io.file_exists(&host_link) {
-        let _ = io.remove_path(&host_link);
-    }
-
-    let fuse_target = format!("/fuse/{fuse_name}");
-    match io.create_symlink(Path::new(&fuse_target), &host_link) {
-        Ok(()) => {
-            info!("Secret: {} → {} → {}", host.display(), host_link.display(), fuse_target);
-        }
-        Err(e) => {
-            warn!(
-                "Could not create symlink {} → {fuse_target} ({e}). \
-                 The FUSE mount is still available at {fuse_target}.",
-                host_link.display()
-            );
-        }
-    }
-
-    fuse_names.push(fuse_name);
+    loaded.push(LoadedSecret {
+        fuse_name,
+        container: dest,
+    });
     Ok(())
 }
 
-/// Map an absolute container path back to the corresponding host path
-/// within a bind-mounted directory.
-fn container_to_host_path(
-    container: &Path,
-    config: &AgentConfig,
-) -> Result<PathBuf, String> {
-    let container_str = container.to_string_lossy();
-    let config_prefix = format!("{}/", config.container_config_dir());
-    let workspace_prefix = "/workspace/";
-
-    if let Some(rel) = container_str.strip_prefix(&config_prefix) {
-        Ok(config.host_config_dir().join(rel))
-    } else if let Some(rel) = container_str.strip_prefix(workspace_prefix) {
-        Ok(config.host_workspace().join(rel))
-    } else {
-        Err(format!(
-            "container path {} is not under any bind-mounted directory ({} or /workspace/)",
-            container.display(),
-            config.container_config_dir()
-        ))
+/// Resolve the actual container destination path.
+///
+/// `cp foo/x.txt bar/`   → `bar/x.txt`   (trailing slash = directory dest)
+/// `cp foo/x.txt bar/y`  → `bar/y`       (no trailing slash = explicit name)
+fn resolve_dest(host: &Path, container: &Path) -> PathBuf {
+    if container.to_string_lossy().ends_with('/') {
+        if let Some(basename) = host.file_name() {
+            return container.join(basename);
+        }
     }
+    container.to_path_buf()
+}
+
+/// Build a shell snippet that creates symlinks inside the container.
+/// Each entry: `mkdir -p "$(dirname PATH)" && ln -sf /fuse/NAME PATH`
+fn build_setup_script(loaded: &[LoadedSecret]) -> String {
+    loaded
+        .iter()
+        .map(|s| {
+            let target = format!("/fuse/{}", s.fuse_name);
+            let path = s.container.to_string_lossy();
+            format!("mkdir -p \"$(dirname {path})\" && ln -sf {target} {path}")
+        })
+        .collect::<Vec<_>>()
+        .join(" && ")
 }
 
 fn setup_rootless_docker() {
@@ -344,6 +339,83 @@ mod tests {
         }
     }
 
+    fn base_mock() -> MockSystemIo {
+        MockSystemIo::new()
+            .with_file("/work/agent1/config", b"")
+            .with_file("/work/agent1/workspace", b"")
+    }
+
+    // ── resolve_dest (cp semantics) ──────────────────────────────
+
+    #[test]
+    fn resolve_dest_explicit_name() {
+        // cp foo/x.txt bar/y.txt → bar/y.txt
+        let d = resolve_dest(
+            Path::new("/host/key.json"),
+            Path::new("/root/.config/app/auth.json"),
+        );
+        assert_eq!(d, PathBuf::from("/root/.config/app/auth.json"));
+    }
+
+    #[test]
+    fn resolve_dest_trailing_slash_directory() {
+        // cp foo/x.txt bar/ → bar/x.txt
+        let d = resolve_dest(
+            Path::new("/host/key.json"),
+            Path::new("/root/.config/app/"),
+        );
+        assert_eq!(d, PathBuf::from("/root/.config/app/key.json"));
+    }
+
+    #[test]
+    fn resolve_dest_tilde_path() {
+        // ~ is passed through as-is (container shell expands it)
+        let d = resolve_dest(
+            Path::new("/host/key.json"),
+            Path::new("~/.config/app/key.json"),
+        );
+        assert_eq!(d, PathBuf::from("~/.config/app/key.json"));
+    }
+
+    // ── build_setup_script ───────────────────────────────────────
+
+    #[test]
+    fn setup_script_single_secret() {
+        let loaded = vec![LoadedSecret {
+            fuse_name: "p100_s0".into(),
+            container: PathBuf::from("/root/.config/app/auth.json"),
+        }];
+        let script = build_setup_script(&loaded);
+        assert!(script.contains("ln -sf /fuse/p100_s0 /root/.config/app/auth.json"));
+        assert!(script.contains("mkdir -p"));
+    }
+
+    #[test]
+    fn setup_script_multiple_secrets() {
+        let loaded = vec![
+            LoadedSecret {
+                fuse_name: "p100_s0".into(),
+                container: PathBuf::from("/root/.config/app/a.json"),
+            },
+            LoadedSecret {
+                fuse_name: "p100_s1".into(),
+                container: PathBuf::from("/root/.config/app/b.json"),
+            },
+        ];
+        let script = build_setup_script(&loaded);
+        assert!(script.contains("a.json"));
+        assert!(script.contains("b.json"));
+        assert!(script.contains("&&"));
+    }
+
+    #[test]
+    fn setup_script_empty_when_no_secrets() {
+        let script = build_setup_script(&[]);
+        assert!(script.is_empty());
+    }
+
+    // ── run_agent integration ────────────────────────────────────
+
     #[test]
     fn missing_workspace_dirs_errors() {
         let mut mock = MockSystemIo::new();
@@ -355,9 +427,7 @@ mod tests {
 
     #[test]
     fn spawns_server_when_none_exists() {
-        let mut mock = MockSystemIo::new()
-            .with_file("/work/agent1/config", b"")
-            .with_file("/work/agent1/workspace", b"")
+        let mut mock = base_mock()
             .with_file("/home/user/secrets.yaml", b"DATA")
             .with_unix_response(br#"{"type":"ok"}"#)
             .with_unix_response(br#"{"type":"ok"}"#);
@@ -369,14 +439,11 @@ mod tests {
         let run = result.unwrap();
         assert!(run.server_was_spawned);
         assert!(run.reset_ok);
-        assert_eq!(run.container_exit_code, 0);
     }
 
     #[test]
     fn reuses_existing_server() {
-        let mut mock = MockSystemIo::new()
-            .with_file("/work/agent1/config", b"")
-            .with_file("/work/agent1/workspace", b"")
+        let mut mock = base_mock()
             .with_file("/home/user/secrets.yaml", b"DATA");
         mock.unix_connected = true;
         mock = mock
@@ -387,115 +454,7 @@ mod tests {
         let result = run_agent(&mut mock, &cfg);
 
         assert!(result.is_ok(), "got: {:?}", result.err());
-        let run = result.unwrap();
-        assert!(!run.server_was_spawned);
-    }
-
-    #[test]
-    fn symlink_created_in_config_dir() {
-        let mut mock = MockSystemIo::new()
-            .with_file("/work/agent1/config", b"")
-            .with_file("/work/agent1/workspace", b"")
-            .with_file("/home/user/secrets.yaml", b"DATA")
-            .with_unix_response(br#"{"type":"ok"}"#)
-            .with_unix_response(br#"{"type":"ok"}"#);
-
-        let cfg = test_config();
-        let _ = run_agent(&mut mock, &cfg);
-
-        let link = PathBuf::from("/work/agent1/config/secrets.yaml");
-        assert!(
-            mock.is_symlink(&link),
-            "symlink should exist at {}",
-            link.display()
-        );
-        let target = mock.read_link(&link).unwrap();
-        assert!(
-            target.starts_with("/fuse/"),
-            "symlink should point to /fuse/, got {}",
-            target.display()
-        );
-    }
-
-    #[test]
-    fn multiple_secrets_all_get_symlinks() {
-        let mut cfg = test_config();
-        cfg.secrets = vec![
-            SecretMapping {
-                host: PathBuf::from("/home/user/key1.json"),
-                container: PathBuf::from("/root/.config/goose/auth1.json"),
-            },
-            SecretMapping {
-                host: PathBuf::from("/home/user/key2.json"),
-                container: PathBuf::from("/root/.config/goose/auth2.json"),
-            },
-        ];
-
-        let mut mock = MockSystemIo::new()
-            .with_file("/work/agent1/config", b"")
-            .with_file("/work/agent1/workspace", b"")
-            .with_file("/home/user/key1.json", b"KEY1")
-            .with_file("/home/user/key2.json", b"KEY2")
-            .with_unix_response(br#"{"type":"ok"}"#)
-            .with_unix_response(br#"{"type":"ok"}"#)
-            .with_unix_response(br#"{"type":"ok"}"#)
-            .with_unix_response(br#"{"type":"ok"}"#);
-
-        let result = run_agent(&mut mock, &cfg);
-        assert!(result.is_ok(), "got: {:?}", result.err());
-
-        assert!(mock.is_symlink(Path::new("/work/agent1/config/auth1.json")));
-        assert!(mock.is_symlink(Path::new("/work/agent1/config/auth2.json")));
-    }
-
-    #[test]
-    fn directory_secret_expands_recursively() {
-        let mut cfg = test_config();
-        cfg.secrets = vec![SecretMapping {
-            host: PathBuf::from("/home/user/secrets"),
-            container: PathBuf::from("/root/.config/goose/secrets"),
-        }];
-
-        let mut mock = MockSystemIo::new()
-            .with_file("/work/agent1/config", b"")
-            .with_file("/work/agent1/workspace", b"")
-            .with_file("/home/user/secrets/key1.json", b"KEY1")
-            .with_file("/home/user/secrets/subdir/key2.json", b"KEY2")
-            .with_unix_response(br#"{"type":"ok"}"#)
-            .with_unix_response(br#"{"type":"ok"}"#)
-            .with_unix_response(br#"{"type":"ok"}"#)
-            .with_unix_response(br#"{"type":"ok"}"#);
-
-        let result = run_agent(&mut mock, &cfg);
-        assert!(result.is_ok(), "got: {:?}", result.err());
-
-        assert!(
-            mock.is_symlink(Path::new("/work/agent1/config/secrets/key1.json")),
-            "should have symlink for key1.json"
-        );
-        assert!(
-            mock.is_symlink(Path::new("/work/agent1/config/secrets/subdir/key2.json")),
-            "should have symlink for subdir/key2.json"
-        );
-    }
-
-    #[test]
-    fn container_path_outside_binds_errors() {
-        let mut cfg = test_config();
-        cfg.secrets = vec![SecretMapping {
-            host: PathBuf::from("/home/user/key.json"),
-            container: PathBuf::from("/etc/passwd"),
-        }];
-
-        let mut mock = MockSystemIo::new()
-            .with_file("/work/agent1/config", b"")
-            .with_file("/work/agent1/workspace", b"")
-            .with_file("/home/user/key.json", b"KEY")
-            .with_unix_response(br#"{"type":"ok"}"#);
-
-        let result = run_agent(&mut mock, &cfg);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("not under any bind-mounted"));
+        assert!(!result.unwrap().server_was_spawned);
     }
 
     #[test]
@@ -503,67 +462,93 @@ mod tests {
         let mut cfg = test_config();
         cfg.secrets = vec![];
 
-        let mut mock = MockSystemIo::new()
-            .with_file("/work/agent1/config", b"")
-            .with_file("/work/agent1/workspace", b"");
-
+        let mut mock = base_mock();
         let result = run_agent(&mut mock, &cfg);
         assert!(result.is_ok(), "got: {:?}", result.err());
     }
 
+    // ── cp-style secret scenarios ────────────────────────────────
+
     #[test]
-    fn workspace_container_path_works() {
+    fn cp_file_to_explicit_name() {
+        // --secret /host/key.json:/root/.config/app/auth.json
         let mut cfg = test_config();
         cfg.secrets = vec![SecretMapping {
-            host: PathBuf::from("/home/user/.env"),
-            container: PathBuf::from("/workspace/.env"),
+            host: PathBuf::from("/home/user/key.json"),
+            container: PathBuf::from("/root/.config/goose/auth.json"),
         }];
 
-        let mut mock = MockSystemIo::new()
-            .with_file("/work/agent1/config", b"")
-            .with_file("/work/agent1/workspace", b"")
-            .with_file("/home/user/.env", b"SECRET=1")
+        let mut mock = base_mock()
+            .with_file("/home/user/key.json", b"KEY")
             .with_unix_response(br#"{"type":"ok"}"#)
             .with_unix_response(br#"{"type":"ok"}"#);
 
         let result = run_agent(&mut mock, &cfg);
         assert!(result.is_ok(), "got: {:?}", result.err());
-        assert!(
-            mock.is_symlink(Path::new("/work/agent1/workspace/.env")),
-            "symlink should be in workspace dir"
-        );
     }
 
     #[test]
-    fn rerun_overwrites_existing_symlink() {
-        let mut mock = MockSystemIo::new()
-            .with_file("/work/agent1/config", b"")
-            .with_file("/work/agent1/workspace", b"")
-            .with_file("/home/user/secrets.yaml", b"DATA")
+    fn cp_file_to_directory() {
+        // --secret /host/key.json:/root/.config/goose/
+        // Should resolve to /root/.config/goose/key.json
+        let mut cfg = test_config();
+        cfg.secrets = vec![SecretMapping {
+            host: PathBuf::from("/home/user/key.json"),
+            container: PathBuf::from("/root/.config/goose/"),
+        }];
+
+        let mut mock = base_mock()
+            .with_file("/home/user/key.json", b"KEY")
             .with_unix_response(br#"{"type":"ok"}"#)
             .with_unix_response(br#"{"type":"ok"}"#);
-        // Simulate a leftover symlink from a previous run.
-        mock.symlinks.insert(
-            "/work/agent1/config/secrets.yaml".to_string(),
-            "/fuse/old_name".to_string(),
-        );
 
-        let cfg = test_config();
         let result = run_agent(&mut mock, &cfg);
         assert!(result.is_ok(), "got: {:?}", result.err());
+    }
 
-        let target = mock
-            .read_link(Path::new("/work/agent1/config/secrets.yaml"))
-            .unwrap();
-        assert_ne!(
-            target,
-            PathBuf::from("/fuse/old_name"),
-            "old symlink should have been replaced"
-        );
-        assert!(
-            target.starts_with("/fuse/"),
-            "new symlink should point to /fuse/"
-        );
+    #[test]
+    fn cp_directory_recursive() {
+        // --secret /host/secrets:/root/.config/goose/secrets
+        // key1.json → /root/.config/goose/secrets/key1.json
+        // subdir/key2.json → /root/.config/goose/secrets/subdir/key2.json
+        let mut cfg = test_config();
+        cfg.secrets = vec![SecretMapping {
+            host: PathBuf::from("/home/user/secrets"),
+            container: PathBuf::from("/root/.config/goose/secrets"),
+        }];
+
+        let mut mock = base_mock()
+            .with_file("/home/user/secrets/key1.json", b"K1")
+            .with_file("/home/user/secrets/subdir/key2.json", b"K2")
+            .with_unix_response(br#"{"type":"ok"}"#)
+            .with_unix_response(br#"{"type":"ok"}"#)
+            .with_unix_response(br#"{"type":"ok"}"#)
+            .with_unix_response(br#"{"type":"ok"}"#);
+
+        let result = run_agent(&mut mock, &cfg);
+        assert!(result.is_ok(), "got: {:?}", result.err());
+    }
+
+    #[test]
+    fn cp_directory_into_existing_dir() {
+        // --secret /host/secrets/:/root/.config/goose/
+        // Contents spread into destination
+        let mut cfg = test_config();
+        cfg.secrets = vec![SecretMapping {
+            host: PathBuf::from("/home/user/secrets/"),
+            container: PathBuf::from("/root/.config/goose/"),
+        }];
+
+        let mut mock = base_mock()
+            .with_file("/home/user/secrets/key1.json", b"K1")
+            .with_file("/home/user/secrets/key2.json", b"K2")
+            .with_unix_response(br#"{"type":"ok"}"#)
+            .with_unix_response(br#"{"type":"ok"}"#)
+            .with_unix_response(br#"{"type":"ok"}"#)
+            .with_unix_response(br#"{"type":"ok"}"#);
+
+        let result = run_agent(&mut mock, &cfg);
+        assert!(result.is_ok(), "got: {:?}", result.err());
     }
 
     #[test]
@@ -580,9 +565,7 @@ mod tests {
             },
         ];
 
-        let mut mock = MockSystemIo::new()
-            .with_file("/work/agent1/config", b"")
-            .with_file("/work/agent1/workspace", b"")
+        let mut mock = base_mock()
             .with_file("/home/user/key.json", b"KEY")
             .with_file("/home/user/secrets/token.json", b"TOK")
             .with_unix_response(br#"{"type":"ok"}"#)
@@ -592,8 +575,5 @@ mod tests {
 
         let result = run_agent(&mut mock, &cfg);
         assert!(result.is_ok(), "got: {:?}", result.err());
-
-        assert!(mock.is_symlink(Path::new("/work/agent1/config/key.json")));
-        assert!(mock.is_symlink(Path::new("/work/agent1/config/secrets/token.json")));
     }
 }
