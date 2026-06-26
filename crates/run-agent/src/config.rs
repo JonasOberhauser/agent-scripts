@@ -311,7 +311,7 @@ pub fn build_container_args(config: &AgentConfig, setup_script: &str) -> Vec<Str
         args.push("sh".into());
         args.push("-c".into());
         if config.container_args.is_empty() {
-            args.push(format!("{setup_script} && exec sh"));
+            args.push(format!("{setup_script} && exec bash"));
         } else {
             args.push(format!("{setup_script} && exec \"$@\""));
             args.push("sh".into());
