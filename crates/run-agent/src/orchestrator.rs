@@ -80,12 +80,17 @@ pub fn run_agent<S: SystemIo>(io: &mut S, config: &AgentConfig) -> Result<RunRes
         let sock = socket
             .to_str()
             .ok_or_else(|| format!("socket path is not valid UTF-8: {}", socket.display()))?;
-        let args: Vec<&str> = vec![
+        let mut fuse_args: Vec<&str> = vec![
             "--mount-point", mount,
             "--socket", sock,
-            "--allow-other",
-            "--log-level", &config.log_level,
         ];
+        if config.allow_other {
+            fuse_args.push("--allow-other");
+        }
+        fuse_args.push("--log-level");
+        let log_level_str = config.log_level.clone();
+        fuse_args.push(&log_level_str);
+        let args = fuse_args;
 
         let server_bin = config
             .fuse_server_path
@@ -95,6 +100,30 @@ pub fn run_agent<S: SystemIo>(io: &mut S, config: &AgentConfig) -> Result<RunRes
         let log_path = config.agent_path.join("fuse-server.log");
         let log_str = log_path.to_str()
             .ok_or_else(|| format!("log path is not valid UTF-8: {}", log_path.display()))?;
+
+        // If using sudo, pre-authenticate interactively (with terminal
+        // access) so the detached daemon can use `sudo -n` without one.
+        if config.use_sudo {
+            let mut auth_parts: Vec<String> = Vec::new();
+            if let Some(w) = &config.runtime_wrapper {
+                let (prog, prefix) = crate::config::split_wrapper(w);
+                auth_parts.push(prog);
+                auth_parts.extend(prefix);
+            }
+            auth_parts.push("sudo".into());
+            auth_parts.push("-v".into());
+
+            let auth_prog = auth_parts[0].clone();
+            let auth_args: Vec<&str> = auth_parts[1..].iter().map(|s| s.as_str()).collect();
+
+            info!("Pre-authenticating sudo (enter your password if prompted)...");
+            let exit = io
+                .run_interactive(&auth_prog, &auth_args)
+                .map_err(|e| format!("sudo pre-authentication failed: {e}"))?;
+            if exit != 0 {
+                return Err(format!("sudo pre-authentication returned exit code {exit}"));
+            }
+        }
 
         // Build the full argv.  The fuse-server must run in the same
         // mount namespace as the container, so when a runtime wrapper
@@ -107,6 +136,7 @@ pub fn run_agent<S: SystemIo>(io: &mut S, config: &AgentConfig) -> Result<RunRes
         }
         if config.use_sudo {
             cmd_parts.push("sudo".into());
+            cmd_parts.push("-n".into());
         }
         cmd_parts.push(server_bin.to_string());
         cmd_parts.extend(args.iter().map(|s| s.to_string()));
@@ -346,6 +376,7 @@ mod tests {
             socket_path: PathBuf::from("/tmp/fgk.sock"),
             mount_point: PathBuf::from("/tmp/fgk-mnt"),
             use_sudo: false,
+            allow_other: false,
             runtime: Runtime::Auto,
             runtime_wrapper: None,
             log_level: "info".to_string(),

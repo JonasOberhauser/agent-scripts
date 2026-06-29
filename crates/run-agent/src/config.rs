@@ -172,6 +172,11 @@ pub struct AgentConfig {
     /// Run fuse-server under `sudo` (needed for `allow_other` without
     /// editing `/etc/fuse.conf`).
     pub use_sudo: bool,
+    /// Pass `--allow-other` to the fuse-server so users other than the
+    /// mount owner can access the FUSE filesystem.  **Not needed** with
+    /// rootless podman, where the container's root maps to the host user
+    /// that created the mount.
+    pub allow_other: bool,
     /// Container runtime preference.
     pub runtime: Runtime,
     /// Optional prefix command for the container runtime (e.g.
@@ -206,6 +211,7 @@ impl AgentConfig {
             socket_path: PathBuf::from(DEFAULT_SOCKET),
             mount_point: PathBuf::from(DEFAULT_MOUNT_POINT),
             use_sudo: false,
+            allow_other: false,
             runtime: Runtime::Auto,
             runtime_wrapper: None,
             log_level: "info".to_string(),
@@ -213,7 +219,7 @@ impl AgentConfig {
         }
     }
 
-    // ── computed paths ──────────────────────────────────────────
+    // ── computed paths ────────────────────────── ──────────────────────────────────────────
 
     pub fn host_config_dir(&self) -> PathBuf {
         self.agent_path.join("config")
@@ -376,6 +382,7 @@ mod tests {
             socket_path: PathBuf::from("/tmp/fuse-gatekeeper.sock"),
             mount_point: PathBuf::from("/tmp/fuse-gatekeeper-mnt"),
             use_sudo: false,
+            allow_other: false,
             runtime: Runtime::Auto,
             runtime_wrapper: None,
             log_level: "info".to_string(),

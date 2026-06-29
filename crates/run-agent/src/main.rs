@@ -41,9 +41,16 @@ struct Cli {
     #[arg(long, default_value = DEFAULT_MOUNT_POINT)]
     mount_point: PathBuf,
 
-    /// Run fuse-server under sudo (needed for allow_other without fuse.conf edit).
+    /// Run fuse-server under sudo (implies --allow-other).
     #[arg(long)]
     sudo: bool,
+
+    /// Pass --allow-other to the fuse-server so other users can access the
+    /// FUSE mount.  NOT needed with rootless podman (the default), where
+    /// container root maps to your host UID.  Only needed for rootful
+    /// Docker/Podman where container UID 0 != your host UID.
+    #[arg(long)]
+    allow_other: bool,
 
     /// Container runtime to use.
     #[arg(long, default_value = "auto")]
@@ -102,6 +109,7 @@ fn main() -> ExitCode {
     config.socket_path = cli.socket;
     config.mount_point = cli.mount_point;
     config.use_sudo = cli.sudo;
+    config.allow_other = cli.allow_other || cli.sudo;
     config.runtime = cli.runtime;
     config.runtime_wrapper = cli.runtime_wrapper;
     config.image_name = cli.image;
