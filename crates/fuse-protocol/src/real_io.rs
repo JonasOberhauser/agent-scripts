@@ -374,7 +374,7 @@ impl SystemIo for MockSystemIo {
         let key = path.to_string_lossy().to_string();
         self.symlinks
             .get(&key)
-            .map(|t| PathBuf::from(t))
+            .map(PathBuf::from)
             .ok_or_else(|| IoError(format!("not a symlink: {key}")))
     }
 }

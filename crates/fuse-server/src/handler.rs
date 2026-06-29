@@ -93,11 +93,11 @@ mod tests {
     fn reset_specific() {
         let mut s = seeded();
         // simulate one read
-        s.attempt_read("a.yaml", Some("hash_a"));
+        s.attempt_read("a.yaml", 1, Some("hash_a"), 0, 1024);
         let resp = handle_command(Command::Reset { name: Some("a.yaml".into()) }, &mut s);
         assert_eq!(resp, Response::Ok);
         // should be readable again
-        let out = s.attempt_read("a.yaml", Some("hash_a"));
+        let out = s.attempt_read("a.yaml", 1, Some("hash_a"), 0, 1024);
         assert!(matches!(out, crate::state::ReadOutcome::Granted(_)));
     }
 
@@ -116,7 +116,7 @@ mod tests {
     #[test]
     fn reset_all_ok() {
         let mut s = seeded();
-        s.attempt_read("a.yaml", Some("hash_a"));
+        s.attempt_read("a.yaml", 1, Some("hash_a"), 0, 1024);
         let resp = handle_command(Command::Reset { name: None }, &mut s);
         assert_eq!(resp, Response::Ok);
     }
@@ -124,7 +124,7 @@ mod tests {
     #[test]
     fn status_reports_counts() {
         let mut s = seeded();
-        s.attempt_read("a.yaml", Some("hash_a"));
+        s.attempt_read("a.yaml", 1, Some("hash_a"), 0, 1024);
         let resp = handle_command(Command::Status, &mut s);
         match resp {
             Response::Status { secrets } => {
@@ -170,7 +170,7 @@ mod tests {
             &mut s,
         );
         assert_eq!(resp, Response::Ok);
-        let out = s.attempt_read("a.yaml", Some("xyz"));
+        let out = s.attempt_read("a.yaml", 1, Some("xyz"), 0, 1024);
         assert!(matches!(out, crate::state::ReadOutcome::Granted(_)));
     }
 

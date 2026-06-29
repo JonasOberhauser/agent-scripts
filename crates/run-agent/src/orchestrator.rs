@@ -57,8 +57,21 @@ pub fn run_agent<S: SystemIo>(io: &mut S, config: &AgentConfig) -> Result<RunRes
         server_was_spawned = true;
         info!("No fuse-server found — spawning a new one.");
 
-        io.create_dir_all(&config.mount_point)
-            .map_err(|e| format!("create mount point: {e}"))?;
+        // Ensure the mount point exists.  If a stale file or broken FUSE
+        // mount lingers at the path, remove it first.
+        if let Err(e) = io.create_dir_all(&config.mount_point) {
+            warn!("create_dir_all failed ({e}); attempting cleanup of stale path");
+            let _ = io.remove_path(&config.mount_point);
+            io.create_dir_all(&config.mount_point)
+                .map_err(|e| format!(
+                    "create mount point {}: {e}.\n\
+                     If a stale FUSE mount persists, run:\n  \
+                     fusermount -uz {} && rm -rf {}",
+                    config.mount_point.display(),
+                    config.mount_point.display(),
+                    config.mount_point.display(),
+                ))?;
+        }
 
         let mount = config
             .mount_point
@@ -219,6 +232,7 @@ struct LoadedSecret {
 /// - File + `/dir/name` → file placed at exact path
 /// - Dir + `/dest` → directory contents mapped under `dest/`
 /// - Dir + `/dest/` → same (contents mapped under `dest/`)
+#[allow(clippy::too_many_arguments)]
 fn load_secret_recursive<S: SystemIo>(
     io: &mut S,
     socket: &Path,

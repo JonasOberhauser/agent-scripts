@@ -87,7 +87,7 @@ fn handle_connection(
         };
 
         let json = serde_json::to_string(&resp)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            .map_err(std::io::Error::other)?;
         writeln!(stream, "{json}")?;
     }
 

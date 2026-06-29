@@ -4,7 +4,7 @@ use std::time::{Duration, SystemTime};
 
 use fuser::{
     FileAttr, FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, ReplyOpen,
-    Request,
+    ReplyStatfs, Request,
 };
 use fuse_protocol::SystemIo;
 use tracing::{debug, warn};
@@ -12,7 +12,13 @@ use tracing::{debug, warn};
 use crate::state::{ReadOutcome, ServerState};
 
 const ROOT_INO: u64 = 1;
-const TTL: Duration = Duration::from_secs(1);
+
+/// TTL for kernel cache entries.  Set to zero so the kernel always
+/// re-validates with the FUSE daemon.  This is essential because secrets
+/// are added dynamically via the socket protocol — a positive TTL would
+/// cause stale entries (file appears to not exist, or removed file still
+/// resolves) for up to TTL seconds after a state change.
+const TTL: Duration = Duration::ZERO;
 
 /// The FUSE gatekeeper filesystem.  Shares `Arc<Mutex<ServerState>>` with the
 /// socket server so CRUD commands take effect immediately.
@@ -22,6 +28,19 @@ pub struct GatekeeperFs<S: SystemIo> {
     next_inode: AtomicU64,
     /// inode → secret-name  (root inode 1 is absent from this map)
     inodes: Mutex<std::collections::HashMap<u64, String>>,
+}
+
+/// Result of a `statfs` query — exposed for unit testing.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StatfsData {
+    pub blocks: u64,
+    pub bfree: u64,
+    pub bavail: u64,
+    pub files: u64,
+    pub ffree: u64,
+    pub bsize: u32,
+    pub namelen: u32,
+    pub frsize: u32,
 }
 
 impl<S: SystemIo> GatekeeperFs<S> {
@@ -55,7 +74,7 @@ impl<S: SystemIo> GatekeeperFs<S> {
         FileAttr {
             ino,
             size,
-            blocks: (size + 511) / 512,
+            blocks: size.div_ceil(512),
             atime: SystemTime::now(),
             mtime: SystemTime::now(),
             ctime: SystemTime::now(),
@@ -90,6 +109,121 @@ impl<S: SystemIo> GatekeeperFs<S> {
             flags: 0,
         }
     }
+
+    // ── Core logic (testable without a live FUSE mount) ───────────
+
+    /// Resolve a name in a directory to an inode + attributes.
+    ///
+    /// Returns `Err(ENOENT)` when the parent is not the root directory or
+    /// the name does not correspond to a known secret.
+    pub fn do_lookup(
+        &self,
+        uid: u32,
+        gid: u32,
+        parent: u64,
+        name: &str,
+    ) -> Result<(u64, FileAttr), i32> {
+        if parent != ROOT_INO {
+            return Err(libc::ENOENT);
+        }
+        let state = self.state.lock().expect("ServerState mutex poisoned");
+        if let Some(rec) = state.secrets.get(name) {
+            let ino = self.assign_inode(name);
+            let attr = self.file_attr(ino, rec.content.len() as u64, uid, gid);
+            Ok((ino, attr))
+        } else {
+            Err(libc::ENOENT)
+        }
+    }
+
+    /// Get attributes for an inode.
+    pub fn do_getattr(&self, uid: u32, gid: u32, ino: u64) -> Result<FileAttr, i32> {
+        if ino == ROOT_INO {
+            return Ok(self.dir_attr(ROOT_INO, uid, gid));
+        }
+        let name = match self.inode_name(ino) {
+            Some(n) => n,
+            None => return Err(libc::ENOENT),
+        };
+        let state = self.state.lock().expect("ServerState mutex poisoned");
+        if let Some(rec) = state.secrets.get(&name) {
+            Ok(self.file_attr(ino, rec.content.len() as u64, uid, gid))
+        } else {
+            Err(libc::ENOENT)
+        }
+    }
+
+    /// Read data from a secret file, enforcing the one-read / hash-check
+    /// gatekeeper policy.
+    ///
+    /// `pid` is the PID of the reading process (used for multi-chunk
+    /// detection).  `pid_hash` is the SHA-256 of the calling process's
+    /// executable, or `None` if it could not be determined.  Forward-only
+    /// reads are enforced: re-reading already-served bytes is denied.
+    pub fn do_read(
+        &self,
+        ino: u64,
+        pid: u32,
+        pid_hash: Option<&str>,
+        offset: i64,
+        size: u32,
+    ) -> Result<Vec<u8>, i32> {
+        let name = match self.inode_name(ino) {
+            Some(n) => n,
+            None => return Err(libc::ENOENT),
+        };
+
+        let off = offset.max(0) as usize;
+
+        let outcome = {
+            let mut state = self.state.lock().expect("ServerState mutex poisoned");
+            state.attempt_read(&name, pid, pid_hash, off, size as usize)
+        };
+
+        match outcome {
+            ReadOutcome::Granted(content) => {
+                let start = off.min(content.len());
+                let end = (start + size as usize).min(content.len());
+                Ok(content[start..end].to_vec())
+            }
+            ReadOutcome::AlreadyAccessed => Err(libc::EACCES),
+            ReadOutcome::HashMismatch { .. } => Err(libc::EACCES),
+            ReadOutcome::NotFound => Err(libc::ENOENT),
+        }
+    }
+
+    /// List all entries in the root directory.
+    pub fn do_readdir(&self) -> Vec<(u64, FileType, String)> {
+        let state = self.state.lock().expect("ServerState mutex poisoned");
+        let mut entries: Vec<(u64, FileType, String)> = vec![
+            (ROOT_INO, FileType::Directory, ".".to_string()),
+            (ROOT_INO, FileType::Directory, "..".to_string()),
+        ];
+        for name in state.secrets.keys() {
+            let ino = self.assign_inode(name);
+            entries.push((ino, FileType::RegularFile, name.clone()));
+        }
+        entries
+    }
+
+    /// Filesystem statistics for `statfs`.
+    pub fn do_statfs(&self) -> Result<StatfsData, i32> {
+        let state = self.state.lock().expect("ServerState mutex poisoned");
+        let total_size: usize = state.secrets.values().map(|r| r.content.len()).max().unwrap_or(0);
+        let num_files = state.secrets.len() as u64;
+        drop(state);
+
+        Ok(StatfsData {
+            blocks: (total_size as u64).div_ceil(512),
+            bfree: 1_000_000,
+            bavail: 1_000_000,
+            files: num_files + 1,
+            ffree: 1_000_000,
+            bsize: 512,
+            namelen: 255,
+            frsize: 512,
+        })
+    }
 }
 
 impl<S: SystemIo> Filesystem for GatekeeperFs<S> {
@@ -100,10 +234,6 @@ impl<S: SystemIo> Filesystem for GatekeeperFs<S> {
         name: &std::ffi::OsStr,
         reply: ReplyEntry,
     ) {
-        if parent != ROOT_INO {
-            reply.error(libc::ENONET);
-            return;
-        }
         let name_str = match name.to_str() {
             Some(s) => s,
             None => {
@@ -111,33 +241,16 @@ impl<S: SystemIo> Filesystem for GatekeeperFs<S> {
                 return;
             }
         };
-        let state = self.state.lock().expect("ServerState mutex poisoned");
-        if let Some(rec) = state.secrets.get(name_str) {
-            let ino = self.assign_inode(name_str);
-            let attr = self.file_attr(ino, rec.content.len() as u64, req.uid(), req.gid());
-            reply.entry(&TTL, &attr, 0);
-        } else {
-            reply.error(libc::ENOENT);
+        match self.do_lookup(req.uid(), req.gid(), parent, name_str) {
+            Ok((_, attr)) => reply.entry(&TTL, &attr, 0),
+            Err(e) => reply.error(e),
         }
     }
 
     fn getattr(&mut self, req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
-        if ino == ROOT_INO {
-            reply.attr(&TTL, &self.dir_attr(ROOT_INO, req.uid(), req.gid()));
-            return;
-        }
-        let name = match self.inode_name(ino) {
-            Some(n) => n,
-            None => {
-                reply.error(libc::ENOENT);
-                return;
-            }
-        };
-        let state = self.state.lock().expect("ServerState mutex poisoned");
-        if let Some(rec) = state.secrets.get(&name) {
-            reply.attr(&TTL, &self.file_attr(ino, rec.content.len() as u64, req.uid(), req.gid()));
-        } else {
-            reply.error(libc::ENOENT);
+        match self.do_getattr(req.uid(), req.gid(), ino) {
+            Ok(attr) => reply.attr(&TTL, &attr),
+            Err(e) => reply.error(e),
         }
     }
 
@@ -156,14 +269,6 @@ impl<S: SystemIo> Filesystem for GatekeeperFs<S> {
         _lock_owner: Option<u64>,
         reply: ReplyData,
     ) {
-        let name = match self.inode_name(ino) {
-            Some(n) => n,
-            None => {
-                reply.error(libc::ENOENT);
-                return;
-            }
-        };
-
         let pid = req.pid();
         let pid_hash = match self.io.sha256_process_exe(pid) {
             Ok(h) => Some(h),
@@ -173,28 +278,14 @@ impl<S: SystemIo> Filesystem for GatekeeperFs<S> {
             }
         };
 
-        let outcome = {
-            let mut state = self.state.lock().expect("ServerState mutex poisoned");
-            state.attempt_read(&name, pid_hash.as_deref())
-        };
-
-        match outcome {
-            ReadOutcome::Granted(content) => {
-                let start = offset.max(0) as usize;
-                let end = (start + size as usize).min(content.len());
-                debug!("Granted read of '{name}' to pid {pid}");
-                reply.data(&content[start..end]);
+        match self.do_read(ino, pid, pid_hash.as_deref(), offset, size) {
+            Ok(data) => {
+                debug!("Granted read of ino {ino} to pid {pid}");
+                reply.data(&data);
             }
-            ReadOutcome::AlreadyAccessed => {
-                warn!("Denied second read of '{name}' by pid {pid}");
-                reply.error(libc::EACCES);
-            }
-            ReadOutcome::HashMismatch { got, expected } => {
-                warn!("Hash mismatch for '{name}' pid {pid}: got {got}, want {expected}");
-                reply.error(libc::EACCES);
-            }
-            ReadOutcome::NotFound => {
-                reply.error(libc::ENOENT);
+            Err(e) => {
+                warn!("Denied read of ino {ino} by pid {pid}: errno {e}");
+                reply.error(e);
             }
         }
     }
@@ -211,30 +302,283 @@ impl<S: SystemIo> Filesystem for GatekeeperFs<S> {
             reply.error(libc::ENOTDIR);
             return;
         }
-        let state = self.state.lock().expect("ServerState mutex poisoned");
-        let names: Vec<(u64, String, usize)> = state
-            .secrets
-            .iter()
-            .map(|(name, rec)| (self.assign_inode(name), name.clone(), rec.content.len()))
-            .collect();
-        drop(state);
-
-        let mut entries = vec![
-            (ROOT_INO, FileType::Directory, ".".to_string()),
-            (ROOT_INO, FileType::Directory, "..".to_string()),
-        ];
-        for (ino, name, _len) in &names {
-            entries.push((*ino, FileType::RegularFile, name.clone()));
-        }
-
+        let entries = self.do_readdir();
         let start = offset.max(0) as usize;
         for (i, (eino, kind, ename)) in entries.iter().enumerate().skip(start) {
-            let buf_full = !reply.add(*eino, (i + 1) as i64, *kind, &ename);
+            let buf_full = !reply.add(*eino, (i + 1) as i64, *kind, ename);
             if buf_full {
                 break;
             }
         }
         reply.ok();
     }
+
+    fn statfs(&mut self, _req: &Request<'_>, _ino: u64, reply: ReplyStatfs) {
+        match self.do_statfs() {
+            Ok(s) => reply.statfs(
+                s.blocks, s.bfree, s.bavail, s.files, s.ffree, s.bsize, s.namelen, s.frsize,
+            ),
+            Err(e) => reply.error(e),
+        }
+    }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fuse_protocol::MockSystemIo;
+
+    fn make_fs(secrets: &[(&str, &[u8], &str)]) -> GatekeeperFs<MockSystemIo> {
+        let mut state = ServerState::new();
+        for (name, content, hash) in secrets {
+            state.add(*name, content.to_vec(), *hash);
+        }
+        let state = std::sync::Arc::new(std::sync::Mutex::new(state));
+        GatekeeperFs::new(state, MockSystemIo::new())
+    }
+
+    // ── do_lookup tests ──────────────────────────────────────────
+
+    #[test]
+    fn lookup_non_root_parent_returns_enoent() {
+        let fs = make_fs(&[("secret", b"data", "hash_a")]);
+        let result = fs.do_lookup(0, 0, 999, "secret");
+        assert_eq!(result, Err(libc::ENOENT));
+    }
+
+    #[test]
+    fn lookup_existing_secret_returns_attr() {
+        let fs = make_fs(&[("secret", b"hello world", "hash_a")]);
+        let (ino, attr) = fs.do_lookup(0, 0, ROOT_INO, "secret").unwrap();
+        assert!(ino >= 2);
+        assert_eq!(attr.size, 11);
+        assert_eq!(attr.kind, FileType::RegularFile);
+        assert_eq!(attr.perm, 0o444);
+    }
+
+    #[test]
+    fn lookup_nonexistent_secret_returns_enoent() {
+        let fs = make_fs(&[("secret", b"data", "hash_a")]);
+        let result = fs.do_lookup(0, 0, ROOT_INO, "nope");
+        assert_eq!(result, Err(libc::ENOENT));
+    }
+
+    #[test]
+    fn lookup_assigns_stable_inode() {
+        let fs = make_fs(&[("a", b"x", "h"), ("b", b"y", "h")]);
+        let (ino1, _) = fs.do_lookup(0, 0, ROOT_INO, "a").unwrap();
+        let (ino2, _) = fs.do_lookup(0, 0, ROOT_INO, "a").unwrap();
+        assert_eq!(ino1, ino2, "same name should get same inode");
+        let (ino3, _) = fs.do_lookup(0, 0, ROOT_INO, "b").unwrap();
+        assert_ne!(ino2, ino3, "different names get different inodes");
+    }
+
+    #[test]
+    fn lookup_non_root_parent_does_not_return_enonet() {
+        // Regression: the original code returned libc::ENONET (error 64,
+        // "Machine is not on the network") instead of libc::ENOENT
+        // (error 2, "No such file or directory").
+        let fs = make_fs(&[]);
+        let err = fs.do_lookup(0, 0, 42, "anything").unwrap_err();
+        assert_ne!(err, libc::ENONET, "must not return ENONET");
+        assert_eq!(err, libc::ENOENT);
+    }
+
+    // ── do_getattr tests ─────────────────────────────────────────
+
+    #[test]
+    fn getattr_root_returns_directory() {
+        let fs = make_fs(&[]);
+        let attr = fs.do_getattr(0, 0, ROOT_INO).unwrap();
+        assert_eq!(attr.kind, FileType::Directory);
+        assert_eq!(attr.perm, 0o755);
+    }
+
+    #[test]
+    fn getattr_secret_returns_file() {
+        let fs = make_fs(&[("s", b"ABCDEF", "h")]);
+        let (ino, _) = fs.do_lookup(0, 0, ROOT_INO, "s").unwrap();
+        let attr = fs.do_getattr(0, 0, ino).unwrap();
+        assert_eq!(attr.size, 6);
+        assert_eq!(attr.kind, FileType::RegularFile);
+    }
+
+    #[test]
+    fn getattr_unknown_inode_returns_enoent() {
+        let fs = make_fs(&[]);
+        let result = fs.do_getattr(0, 0, 9999);
+        assert_eq!(result, Err(libc::ENOENT));
+    }
+
+    // ── do_read tests ────────────────────────────────────────────
+
+    #[test]
+    fn read_with_correct_hash_grants_content() {
+        let fs = make_fs(&[("s", b"TOPSECRET", "good_hash")]);
+        let (ino, _) = fs.do_lookup(0, 0, ROOT_INO, "s").unwrap();
+        let data = fs.do_read(ino, 100, Some("good_hash"), 0, 1024).unwrap();
+        assert_eq!(data, b"TOPSECRET");
+    }
+
+    #[test]
+    fn read_with_wrong_hash_denied() {
+        let fs = make_fs(&[("s", b"TOPSECRET", "good_hash")]);
+        let (ino, _) = fs.do_lookup(0, 0, ROOT_INO, "s").unwrap();
+        let result = fs.do_read(ino, 100, Some("bad_hash"), 0, 1024);
+        assert_eq!(result, Err(libc::EACCES));
+    }
+
+    #[test]
+    fn read_with_unknown_hash_denied() {
+        let fs = make_fs(&[("s", b"TOPSECRET", "good_hash")]);
+        let (ino, _) = fs.do_lookup(0, 0, ROOT_INO, "s").unwrap();
+        let result = fs.do_read(ino, 100, None, 0, 1024);
+        assert_eq!(result, Err(libc::EACCES));
+    }
+
+    #[test]
+    fn read_cross_pid_second_access_denied() {
+        let fs = make_fs(&[("s", b"TOPSECRET", "good_hash")]);
+        let (ino, _) = fs.do_lookup(0, 0, ROOT_INO, "s").unwrap();
+        // PID 100 reads first
+        let _ = fs.do_read(ino, 100, Some("good_hash"), 0, 1024).unwrap();
+        // PID 200 denied
+        let result = fs.do_read(ino, 200, Some("good_hash"), 0, 1024);
+        assert_eq!(result, Err(libc::EACCES));
+    }
+
+    #[test]
+    fn read_multi_chunk_same_pid_allowed() {
+        let fs = make_fs(&[("s", b"0123456789ABCDEF", "good_hash")]);
+        let (ino, _) = fs.do_lookup(0, 0, ROOT_INO, "s").unwrap();
+        // Chunk 1: forward
+        let d1 = fs.do_read(ino, 42, Some("good_hash"), 0, 4).unwrap();
+        assert_eq!(d1, b"0123");
+        // Chunk 2: forward
+        let d2 = fs.do_read(ino, 42, Some("good_hash"), 4, 4).unwrap();
+        assert_eq!(d2, b"4567");
+        // Chunk 3: forward
+        let d3 = fs.do_read(ino, 42, Some("good_hash"), 8, 4).unwrap();
+        assert_eq!(d3, b"89AB");
+    }
+
+    #[test]
+    fn read_backward_chunk_denied() {
+        let fs = make_fs(&[("s", b"0123456789", "good_hash")]);
+        let (ino, _) = fs.do_lookup(0, 0, ROOT_INO, "s").unwrap();
+        // Read 0..4
+        fs.do_read(ino, 42, Some("good_hash"), 0, 4).unwrap();
+        // Re-read 0..4 — denied
+        let result = fs.do_read(ino, 42, Some("good_hash"), 0, 4);
+        assert_eq!(result, Err(libc::EACCES));
+        // Read 2..6 — overlaps — denied
+        let result = fs.do_read(ino, 42, Some("good_hash"), 2, 4);
+        assert_eq!(result, Err(libc::EACCES));
+        // Read 4..8 — forward — allowed
+        let d = fs.do_read(ino, 42, Some("good_hash"), 4, 4).unwrap();
+        assert_eq!(d, b"4567");
+    }
+
+    #[test]
+    fn read_partial_with_offset() {
+        let fs = make_fs(&[("s", b"0123456789", "good_hash")]);
+        let (ino, _) = fs.do_lookup(0, 0, ROOT_INO, "s").unwrap();
+        let data = fs.do_read(ino, 100, Some("good_hash"), 3, 4).unwrap();
+        assert_eq!(data, b"3456");
+    }
+
+    #[test]
+    fn read_unknown_inode_returns_enoent() {
+        let fs = make_fs(&[]);
+        let result = fs.do_read(9999, 100, Some("hash"), 0, 1024);
+        assert_eq!(result, Err(libc::ENOENT));
+    }
+
+    #[test]
+    fn read_resets_allow_reread() {
+        let fs = make_fs(&[("s", b"DATA", "h")]);
+        let (ino, _) = fs.do_lookup(0, 0, ROOT_INO, "s").unwrap();
+        // First read succeeds
+        let _ = fs.do_read(ino, 100, Some("h"), 0, 1024).unwrap();
+        // Different PID denied
+        assert_eq!(fs.do_read(ino, 200, Some("h"), 0, 1024), Err(libc::EACCES));
+        // Reset via shared state
+        {
+            let mut state = fs.state.lock().unwrap();
+            state.reset(Some("s"));
+        }
+        // After reset, same PID can read again
+        let data = fs.do_read(ino, 100, Some("h"), 0, 1024).unwrap();
+        assert_eq!(data, b"DATA");
+    }
+
+    // ── do_readdir tests ─────────────────────────────────────────
+
+    #[test]
+    fn readdir_lists_all_secrets() {
+        let fs = make_fs(&[("a", b"x", "h"), ("b", b"y", "h")]);
+        let entries = fs.do_readdir();
+        let names: Vec<&str> = entries.iter().map(|(_, _, n)| n.as_str()).collect();
+        assert!(names.contains(&"."));
+        assert!(names.contains(&".."));
+        assert!(names.contains(&"a"));
+        assert!(names.contains(&"b"));
+        assert_eq!(entries.len(), 4);
+    }
+
+    #[test]
+    fn readdir_empty_has_dot_dotdot() {
+        let fs = make_fs(&[]);
+        let entries = fs.do_readdir();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].2, ".");
+        assert_eq!(entries[1].2, "..");
+    }
+
+    #[test]
+    fn readdir_entries_are_regular_files() {
+        let fs = make_fs(&[("s", b"data", "h")]);
+        let entries = fs.do_readdir();
+        let secret_entry = entries.iter().find(|(_, _, n)| n == "s").unwrap();
+        assert_eq!(secret_entry.1, FileType::RegularFile);
+    }
+
+    // ── do_statfs tests ──────────────────────────────────────────
+
+    #[test]
+    fn statfs_returns_valid_data() {
+        let fs = make_fs(&[("s", b"data", "h")]);
+        let s = fs.do_statfs().unwrap();
+        assert!(s.bsize > 0);
+        assert!(s.namelen > 0);
+        assert!(s.files >= 1, "files should include at least root");
+    }
+
+    #[test]
+    fn statfs_empty_filesystem() {
+        let fs = make_fs(&[]);
+        let s = fs.do_statfs().unwrap();
+        assert_eq!(s.files, 1, "just root inode");
+        assert!(s.bfree > 0);
+    }
+
+    // ── dynamic add via shared state ─────────────────────────────
+
+    #[test]
+    fn dynamic_add_visible_after_lookup() {
+        let state = std::sync::Arc::new(std::sync::Mutex::new(ServerState::new()));
+        let fs = GatekeeperFs::new(state.clone(), MockSystemIo::new());
+
+        // Initially no secrets
+        assert_eq!(fs.do_lookup(0, 0, ROOT_INO, "new"), Err(libc::ENOENT));
+
+        // Add via shared state (simulates socket AddSecret)
+        state.lock().unwrap().add("new", b"DATA".to_vec(), "hash");
+
+        // Now visible
+        let (ino, attr) = fs.do_lookup(0, 0, ROOT_INO, "new").unwrap();
+        assert_eq!(attr.size, 4);
+        let data = fs.do_read(ino, 100, Some("hash"), 0, 1024).unwrap();
+        assert_eq!(data, b"DATA");
+    }
+}
