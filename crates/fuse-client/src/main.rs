@@ -738,13 +738,18 @@ fn interactive(
                     chunks[0],
                 );
 
-                // Scrollbar on the right edge of the log pane
+                // Scrollbar: ratatui's formula divides by (content + viewport),
+                // so raw line counts prevent the thumb from reaching the end.
+                // Fix: use a percentage scale (0-99) with minimal viewport.
                 let max_scroll = total.saturating_sub(log_height);
-                let clamped_scroll_up = (log_scroll_up as usize).min(max_scroll);
-                let sb_pos = max_scroll.saturating_sub(clamped_scroll_up);
-                let mut sb_state = ScrollbarState::new(total)
-                    .position(sb_pos)
-                    .viewport_content_length(log_height);
+                let clamped = (log_scroll_up as usize).min(max_scroll);
+                let scroll_pct = match max_scroll {
+                    0 => 0,
+                    ms => (ms - clamped) * 99 / ms,
+                };
+                let mut sb_state = ScrollbarState::new(100)
+                    .position(scroll_pct)
+                    .viewport_content_length(1);
                 f.render_stateful_widget(
                     Scrollbar::new(ScrollbarOrientation::VerticalRight)
                         .begin_symbol(None)
