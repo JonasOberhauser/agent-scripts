@@ -79,14 +79,34 @@ fn main() {
         }
     });
 
-    // Wait for socket to appear.
+    // Wait for socket to appear AND be connectable.  Checking only
+    // `.exists()` is not enough — a stale socket file from a previous
+    // run may linger even though the bind failed.
+    let mut socket_ready = false;
     for _ in 0..200 {
         if cli.socket.exists() {
-            break;
+            match std::os::unix::net::UnixStream::connect(&cli.socket) {
+                Ok(_) => {
+                    socket_ready = true;
+                    break;
+                }
+                Err(_) => {
+                    // File exists but nobody is listening — stale.
+                    error!(
+                        "Socket file exists at {} but is not connectable.\n\
+                         This is likely a stale socket from a previous run.\n\
+                         Remove it and retry:\n  rm -f {}  (or: sudo rm -f {})",
+                        cli.socket.display(),
+                        cli.socket.display(),
+                        cli.socket.display(),
+                    );
+                    std::process::exit(1);
+                }
+            }
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
-    if !cli.socket.exists() {
+    if !socket_ready {
         error!("Socket server did not start in time");
         std::process::exit(1);
     }

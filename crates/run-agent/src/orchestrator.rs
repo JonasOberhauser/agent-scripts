@@ -57,21 +57,75 @@ pub fn run_agent<S: SystemIo>(io: &mut S, config: &AgentConfig) -> Result<RunRes
         server_was_spawned = true;
         info!("No fuse-server found — spawning a new one.");
 
-        // Ensure the mount point exists.  If a stale file or broken FUSE
-        // mount lingers at the path, remove it first.
-        if let Err(e) = io.create_dir_all(&config.mount_point) {
-            warn!("create_dir_all failed ({e}); attempting cleanup of stale path");
-            let _ = io.remove_path(&config.mount_point);
-            io.create_dir_all(&config.mount_point)
-                .map_err(|e| format!(
-                    "create mount point {}: {e}.\n\
-                     If a stale FUSE mount persists, run:\n  \
-                     fusermount -uz {} && rm -rf {}",
-                    config.mount_point.display(),
-                    config.mount_point.display(),
-                    config.mount_point.display(),
-                ))?;
+        // Clean up stale socket file (e.g., root-owned from a previous
+        // --sudo run, or leftover from a crashed server).
+        if socket.exists() {
+            info!("Removing stale socket at {}", socket.display());
+            io.remove_path(socket).map_err(|e| format!(
+                "Cannot remove stale socket {}: {e}.\n\
+                 If it is root-owned from a previous --sudo run:\n  \
+                 flatpak-spawn --host sudo rm -f {}",
+                socket.display(),
+                socket.display(),
+            ))?;
         }
+
+        // Ensure the mount point is fresh and owned by the current user.
+        // A previous run may have left a stale FUSE mount or root-owned
+        // directory at this path.
+        if io.file_exists(&config.mount_point) {
+            if let Err(e) = io.remove_path(&config.mount_point) {
+                // EBUSY = stale FUSE mount. Try lazy unmount.
+                info!("Mount point busy ({e}); attempting lazy unmount");
+                let mount_str = config.mount_point.to_string_lossy().to_string();
+                let wrapper = config.runtime_wrapper.as_deref();
+
+                let mut unmounted = false;
+                for (cmd, flag) in [("fusermount", "-uz"), ("fusermount3", "-uz"), ("umount", "-l")] {
+                    let mut parts: Vec<String> = Vec::new();
+                    if let Some(w) = wrapper {
+                        let (prog, prefix) = crate::config::split_wrapper(w);
+                        parts.push(prog);
+                        parts.extend(prefix);
+                    }
+                    parts.push(cmd.to_string());
+                    parts.push(flag.to_string());
+                    parts.push(mount_str.clone());
+
+                    let prog = parts[0].clone();
+                    let args: Vec<&str> = parts[1..].iter().map(|s| s.as_str()).collect();
+                    if io.run_command(&prog, &args).map(|o| o.success()).unwrap_or(false) {
+                        info!("Lazy unmount succeeded via {cmd} {flag}");
+                        unmounted = true;
+                        break;
+                    }
+                }
+
+                if !unmounted {
+                    return Err(format!(
+                        "Cannot remove mount point {}: {e}.\n\
+                         Lazy unmount also failed.\n\
+                         Run manually:\n  \
+                         fusermount -uz {} && rm -rf {}\n\
+                         (or with sudo if root-owned)",
+                        config.mount_point.display(),
+                        config.mount_point.display(),
+                        config.mount_point.display(),
+                    ));
+                }
+
+                // Wait for lazy unmount to take effect, then remove.
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                if let Err(e) = io.remove_path(&config.mount_point) {
+                    return Err(format!(
+                        "Mount point unmounted but cannot remove {}: {e}",
+                        config.mount_point.display()
+                    ));
+                }
+            }
+        }
+        io.create_dir_all(&config.mount_point)
+            .map_err(|e| format!("create mount point {}: {e}", config.mount_point.display()))?;
 
         let mount = config
             .mount_point
