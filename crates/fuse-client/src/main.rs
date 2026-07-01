@@ -1,18 +1,16 @@
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::path::{Path, PathBuf};
 
-use clap::{Parser, Subcommand};
+use clap::Parser;
 use fuse_client::send_command;
 use fuse_protocol::{Command, Response, SystemIo};
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 
+// ── CLI (non-interactive) ──────────────────────────────────────
+
 #[derive(Parser)]
 #[command(name = "fuse-client", about = "Send CRUD commands to the fuse-server")]
 struct Cli {
-    /// Path to the Unix domain socket.
     #[arg(short, long, env = "FUSE_GATEKEEPER_SOCKET", default_value = "/tmp/fuse-gatekeeper.sock")]
     socket: PathBuf,
 
@@ -20,75 +18,51 @@ struct Cli {
     command: Option<Commands>,
 }
 
-#[derive(Subcommand)]
+#[derive(clap::Subcommand)]
 enum Commands {
-    /// Reset the access counter for one secret (or all).
-    Reset {
-        #[arg(short, long)]
-        name: Option<String>,
-    },
-    /// Reset all secrets.
+    Reset { #[arg(short, long)] name: Option<String> },
     ResetAll,
-    /// Show status of every secret.
     Status,
-    /// Add a new secret to the mount.
-    AddSecret {
-        name: String,
-        #[arg(short, long)]
-        file: PathBuf,
-        #[arg(long)]
-        hash: String,
-    },
-    /// Remove a secret from the mount.
+    AddSecret { name: String, #[arg(short, long)] file: PathBuf, #[arg(long)] hash: String },
     RemoveSecret { name: String },
-    /// Replace the allowed binary hash for a secret.
-    RotateHash {
-        name: String,
-        #[arg(long)]
-        hash: String,
-    },
-    /// List all mounted secrets.
+    RotateHash { name: String, #[arg(long)] hash: String },
     ListMounts,
-    /// List pending access requests waiting for approval.
     Pending,
-    /// Grant a pending access request.
     Grant { id: u64 },
-    /// Deny a pending access request.
     Deny { id: u64 },
 }
 
 fn main() {
-    tracing_subscriber::fmt().with_env_filter(
-        tracing_subscriber::EnvFilter::from_default_env()
-    ).init();
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
 
     let cli = Cli::parse();
     let io = fuse_protocol::RealSystemIo::new();
 
     match &cli.command {
         Some(cmd) => {
-            let cmd = match build_command(cmd, &io) {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("Error: {e}");
-                    std::process::exit(1);
-                }
-            };
-            match send_command(&io, &cli.socket, cmd) {
-                Ok(resp) => {
-                    print_response(&resp);
-                    if matches!(resp, Response::Error { .. }) {
+            let cmd = build_clap_command(cmd, &io);
+            match cmd {
+                Ok(command) => match send_command(&io, &cli.socket, command) {
+                    Ok(resp) => {
+                        print_response(&resp);
+                        if matches!(resp, Response::Error { .. }) {
+                            std::process::exit(1);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Connection error: {e}");
                         std::process::exit(1);
                     }
-                }
+                },
                 Err(e) => {
-                    eprintln!("Connection error: {e}");
+                    eprintln!("Error: {e}");
                     std::process::exit(1);
                 }
             }
         }
         None => {
-            // Interactive mode
             if let Err(e) = interactive(&io, &cli.socket) {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
@@ -97,18 +71,14 @@ fn main() {
     }
 }
 
-fn build_command<S: SystemIo>(cmd: &Commands, io: &S) -> Result<Command, String> {
+fn build_clap_command<S: SystemIo>(cmd: &Commands, io: &S) -> Result<Command, String> {
     Ok(match cmd {
         Commands::Reset { name } => Command::Reset { name: name.clone() },
         Commands::ResetAll => Command::Reset { name: None },
         Commands::Status => Command::Status,
         Commands::AddSecret { name, file, hash } => {
             let content = io.read_file(file).map_err(|e| e.0)?;
-            Command::AddSecret {
-                name: name.clone(),
-                content,
-                hash: hash.clone(),
-            }
+            Command::AddSecret { name: name.clone(), content, hash: hash.clone() }
         }
         Commands::RemoveSecret { name } => Command::RemoveSecret { name: name.clone() },
         Commands::RotateHash { name, hash } => Command::RotateHash {
@@ -121,6 +91,192 @@ fn build_command<S: SystemIo>(cmd: &Commands, io: &S) -> Result<Command, String>
         Commands::Deny { id } => Command::Deny { id: *id },
     })
 }
+
+// ── Plugin system ──────────────────────────────────────────────
+
+/// What a command plugin returns after execution.
+enum ShellAction {
+    Continue,
+    Exit,
+}
+
+/// A single command plugin.  Each plugin owns its argument parsing
+/// (the raw remaining text after the command name) and execution logic.
+/// This eliminates duplication between CLI and interactive modes.
+struct Plugin {
+    name: &'static str,
+    help: &'static str,
+    execute: fn(args: &str, io: &fuse_protocol::RealSystemIo, socket: &Path) -> ShellAction,
+}
+
+fn all_plugins() -> Vec<Plugin> {
+    vec![
+        Plugin {
+            name: "status",
+            help: "Show all secrets and access counts",
+            
+            execute: |_, io, sock| {
+                run_simple(io, sock, Command::Status)
+            },
+        },
+        Plugin {
+            name: "mounts",
+            help: "List mounted secret files",
+            
+            execute: |_, io, sock| run_simple(io, sock, Command::ListMounts),
+        },
+        Plugin {
+            name: "reset",
+            help: "Reset access counter for one or all secrets",
+            
+            execute: |args, io, sock| {
+                let name = args.split_whitespace().next().map(|s| s.to_string());
+                run_simple(io, sock, Command::Reset { name })
+            },
+        },
+        Plugin {
+            name: "reset-all",
+            help: "Reset all access counters",
+            
+            execute: |_, io, sock| run_simple(io, sock, Command::Reset { name: None }),
+        },
+        Plugin {
+            name: "add",
+            help: "Add a new secret from a file",
+            
+            execute: |args, io, sock| {
+                let parts: Vec<&str> = args.trim().splitn(3, char::is_whitespace).collect();
+                if parts.len() < 3 {
+                    eprintln!("Usage: add NAME FILE HASH");
+                    return ShellAction::Continue;
+                }
+                let file = PathBuf::from(parts[1]);
+                match io.read_file(&file) {
+                    Ok(content) => run_simple(io, sock, Command::AddSecret {
+                        name: parts[0].to_string(),
+                        content,
+                        hash: parts[2].to_string(),
+                    }),
+                    Err(e) => {
+                        eprintln!("Error reading file: {e}");
+                        ShellAction::Continue
+                    }
+                }
+            },
+        },
+        Plugin {
+            name: "remove",
+            help: "Remove a secret",
+            
+            execute: |args, io, sock| {
+                let name = args.trim();
+                if name.is_empty() {
+                    eprintln!("Usage: remove NAME");
+                    return ShellAction::Continue;
+                }
+                run_simple(io, sock, Command::RemoveSecret { name: name.to_string() })
+            },
+        },
+        Plugin {
+            name: "rotate",
+            help: "Change the allowed binary hash",
+            
+            execute: |args, io, sock| {
+                let parts: Vec<&str> = args.trim().splitn(2, char::is_whitespace).collect();
+                if parts.len() < 2 {
+                    eprintln!("Usage: rotate NAME HASH");
+                    return ShellAction::Continue;
+                }
+                run_simple(io, sock, Command::RotateHash {
+                    name: parts[0].to_string(),
+                    new_hash: parts[1].to_string(),
+                })
+            },
+        },
+        Plugin {
+            name: "pending",
+            help: "Show pending access requests waiting for approval",
+            
+            execute: |_, io, sock| run_simple(io, sock, Command::ListPending),
+        },
+        Plugin {
+            name: "grant",
+            help: "Grant a pending access request",
+            
+            execute: |args, io, sock| {
+                match args.trim().parse::<u64>() {
+                    Ok(id) => run_simple(io, sock, Command::Grant { id }),
+                    Err(_) => {
+                        eprintln!("Usage: grant ID (ID must be a number)");
+                        ShellAction::Continue
+                    }
+                }
+            },
+        },
+        Plugin {
+            name: "deny",
+            help: "Deny a pending access request",
+            
+            execute: |args, io, sock| {
+                match args.trim().parse::<u64>() {
+                    Ok(id) => run_simple(io, sock, Command::Deny { id }),
+                    Err(_) => {
+                        eprintln!("Usage: deny ID (ID must be a number)");
+                        ShellAction::Continue
+                    }
+                }
+            },
+        },
+        Plugin {
+            name: "help",
+            help: "Show available commands",
+            
+            execute: |_, _, _| {
+                print_help();
+                ShellAction::Continue
+            },
+        },
+        Plugin {
+            name: "exit",
+            help: "Exit the shell",
+            
+            execute: |_, _, _| ShellAction::Exit,
+        },
+        Plugin {
+            name: "quit",
+            help: "Exit the shell",
+            
+            execute: |_, _, _| ShellAction::Exit,
+        },
+    ]
+}
+
+/// Send a command and print the response. Returns Continue.
+fn run_simple(
+    io: &fuse_protocol::RealSystemIo,
+    socket: &Path,
+    cmd: Command,
+) -> ShellAction {
+    match send_command(io, socket, cmd) {
+        Ok(resp) => print_response(&resp),
+        Err(e) => eprintln!("Connection error: {e}"),
+    }
+    ShellAction::Continue
+}
+
+fn print_help() {
+    println!("COMMANDS:");
+    let max_name = all_plugins().iter().map(|p| p.name.len()).max().unwrap_or(0);
+    for p in all_plugins() {
+        if p.name == "exit" || p.name == "quit" {
+            continue;
+        }
+        println!("  {:<width$}  {}", p.name, p.help, width = max_name);
+    }
+    println!("  {:<width$}  Exit the shell", "exit", width = max_name);
+}
+
+// ── Response printing ──────────────────────────────────────────
 
 fn print_response(resp: &Response) {
     match resp {
@@ -156,9 +312,12 @@ fn print_response(resp: &Response) {
                 for p in pending {
                     println!(
                         "  [{}] {} pid={} hash={} reason=\"{}\" expires_at={}",
-                        p.id, p.secret_name, p.pid,
+                        p.id,
+                        p.secret_name,
+                        p.pid,
                         p.pid_hash.as_deref().unwrap_or("<unknown>"),
-                        p.reason, p.expires_at
+                        p.reason,
+                        p.expires_at
                     );
                 }
             }
@@ -166,40 +325,31 @@ fn print_response(resp: &Response) {
     }
 }
 
-const HELP_TEXT: &str = "\
-COMMANDS:
-  status              Show all secrets and access counts
-  mounts              List mounted secret files
-  reset [NAME]        Reset access counter (all if no name)
-  add NAME FILE HASH  Add a new secret
-  remove NAME         Remove a secret
-  rotate NAME HASH    Change the allowed binary hash
-  pending             Show pending access requests
-  grant ID            Grant a pending access request
-  deny ID             Deny a pending access request
-  help                Show this help
-  exit / quit         Exit";
+// ── Interactive shell ──────────────────────────────────────────
 
-fn interactive<S: SystemIo>(io: &S, socket: &std::path::Path) -> Result<(), String> {
+fn interactive(
+    io: &fuse_protocol::RealSystemIo,
+    socket: &Path,
+) -> Result<(), String> {
     println!("fuse-client interactive mode. Type 'help' for commands, 'exit' to quit.");
 
-    let mut rl: DefaultEditor = DefaultEditor::new().map_err(|e| e.to_string())?;
+    let mut rl = DefaultEditor::new().map_err(|e| e.to_string())?;
+    let plugins = all_plugins();
 
     // Background thread: poll for pending accesses every 3 seconds.
-    // Sets a flag so the main loop can check between readline calls.
-    let pending_flag = Arc::new(AtomicBool::new(false));
+    let pending_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let poll_flag = pending_flag.clone();
     let socket_owned = socket.to_path_buf();
 
     std::thread::spawn(move || {
         let io = fuse_protocol::RealSystemIo::new();
         loop {
-            std::thread::sleep(Duration::from_secs(3));
+            std::thread::sleep(std::time::Duration::from_secs(3));
             if let Ok(Response::PendingList { pending }) =
                 send_command(&io, &socket_owned, Command::ListPending)
             {
                 if !pending.is_empty() {
-                    poll_flag.store(true, Ordering::SeqCst);
+                    poll_flag.store(true, std::sync::atomic::Ordering::SeqCst);
                 }
             }
         }
@@ -207,7 +357,7 @@ fn interactive<S: SystemIo>(io: &S, socket: &std::path::Path) -> Result<(), Stri
 
     loop {
         // Check for pending accesses before each prompt
-        if pending_flag.swap(false, Ordering::SeqCst) {
+        if pending_flag.swap(false, std::sync::atomic::Ordering::SeqCst) {
             check_and_handle_pending(io, socket, &mut rl)?;
         }
 
@@ -224,99 +374,24 @@ fn interactive<S: SystemIo>(io: &S, socket: &std::path::Path) -> Result<(), Stri
         }
         let _ = rl.add_history_entry(trimmed);
 
-        if matches!(trimmed, "exit" | "quit") {
-            break;
-        }
-
-        if trimmed == "help" {
-            println!("{HELP_TEXT}");
-            continue;
-        }
-
-        // Parse the interactive command
-        let parts: Vec<&str> = trimmed.splitn(4, ' ').collect();
-        let cmd_str = parts[0];
-
-        let result = match cmd_str {
-            "status" => send_command(io, socket, Command::Status),
-            "mounts" | "list" => send_command(io, socket, Command::ListMounts),
-            "reset" => {
-                let name = parts.get(1).map(|s| s.to_string());
-                send_command(io, socket, Command::Reset { name })
-            }
-            "add" => {
-                if parts.len() < 4 {
-                    eprintln!("Usage: add NAME FILE HASH");
-                    continue;
-                }
-                let name = parts[1].to_string();
-                let file = std::path::PathBuf::from(parts[2]);
-                let hash = parts[3].to_string();
-                match io.read_file(&file) {
-                    Ok(content) => send_command(io, socket, Command::AddSecret {
-                        name,
-                        content,
-                        hash,
-                    }),
-                    Err(e) => {
-                        eprintln!("Error reading file: {e}");
-                        continue;
-                    }
-                }
-            }
-            "remove" => {
-                if parts.len() < 2 {
-                    eprintln!("Usage: remove NAME");
-                    continue;
-                }
-                send_command(io, socket, Command::RemoveSecret { name: parts[1].to_string() })
-            }
-            "rotate" => {
-                if parts.len() < 3 {
-                    eprintln!("Usage: rotate NAME HASH");
-                    continue;
-                }
-                send_command(io, socket, Command::RotateHash {
-                    name: parts[1].to_string(),
-                    new_hash: parts[2].to_string(),
-                })
-            }
-            "pending" => send_command(io, socket, Command::ListPending),
-            "grant" => {
-                if parts.len() < 2 {
-                    eprintln!("Usage: grant ID");
-                    continue;
-                }
-                match parts[1].parse::<u64>() {
-                    Ok(id) => send_command(io, socket, Command::Grant { id }),
-                    Err(_) => {
-                        eprintln!("Invalid ID: {}", parts[1]);
-                        continue;
-                    }
-                }
-            }
-            "deny" => {
-                if parts.len() < 2 {
-                    eprintln!("Usage: deny ID");
-                    continue;
-                }
-                match parts[1].parse::<u64>() {
-                    Ok(id) => send_command(io, socket, Command::Deny { id }),
-                    Err(_) => {
-                        eprintln!("Invalid ID: {}", parts[1]);
-                        continue;
-                    }
-                }
-            }
-            _ => {
-                eprintln!("Unknown command: '{cmd_str}'. Type 'help' for commands.");
-                continue;
-            }
+        // Split into command name + remaining args
+        let (cmd_name, args) = match trimmed.split_once(' ') {
+            Some((name, rest)) => (name, rest),
+            None => (trimmed, ""),
         };
 
-        match result {
-            Ok(resp) => print_response(&resp),
-            Err(e) => eprintln!("Connection error: {e}"),
+        // Dispatch to plugin
+        match plugins.iter().find(|p| p.name == cmd_name) {
+            Some(plugin) => {
+                if let ShellAction::Exit = (plugin.execute)(args, io, socket) {
+                    break;
+                }
+            }
+            None => {
+                eprintln!(
+                    "Unknown command: '{cmd_name}'. Type 'help' for commands."
+                );
+            }
         }
     }
 
@@ -324,10 +399,10 @@ fn interactive<S: SystemIo>(io: &S, socket: &std::path::Path) -> Result<(), Stri
     Ok(())
 }
 
-/// Check for pending accesses and prompt the user to grant/deny.
-fn check_and_handle_pending<S: SystemIo>(
-    io: &S,
-    socket: &std::path::Path,
+/// Check for pending accesses and prompt the user to grant/deny each.
+fn check_and_handle_pending(
+    io: &fuse_protocol::RealSystemIo,
+    socket: &Path,
     rl: &mut DefaultEditor,
 ) -> Result<(), String> {
     let pending = match send_command(io, socket, Command::ListPending) {
@@ -360,18 +435,17 @@ fn check_and_handle_pending<S: SystemIo>(
             Ok(line) => line.trim().to_lowercase(),
             Err(_) => continue,
         };
-        if answer == "y" || answer == "yes" {
-            match send_command(io, socket, Command::Grant { id: p.id }) {
-                Ok(Response::Ok) => println!("  Granted."),
-                Ok(other) => println!("  Server response: {other:?}"),
-                Err(e) => eprintln!("  Error: {e}"),
-            }
+        let cmd = if answer == "y" || answer == "yes" {
+            Command::Grant { id: p.id }
         } else {
-            match send_command(io, socket, Command::Deny { id: p.id }) {
-                Ok(Response::Ok) => println!("  Denied."),
-                Ok(other) => println!("  Server response: {other:?}"),
-                Err(e) => eprintln!("  Error: {e}"),
+            Command::Deny { id: p.id }
+        };
+        match send_command(io, socket, cmd) {
+            Ok(Response::Ok) => {
+                println!("  {}", if answer == "y" || answer == "yes" { "Granted." } else { "Denied." });
             }
+            Ok(other) => println!("  Server response: {other:?}"),
+            Err(e) => eprintln!("  Error: {e}"),
         }
     }
     println!();
