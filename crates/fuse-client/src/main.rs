@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 use clap::Parser;
 use fuse_client::send_command;
 use fuse_protocol::{Command, Response, ServerStateFile, SystemIo, VERSION as CLIENT_VERSION};
+#[allow(unused_imports)]
+use rustyline::DefaultEditor;
 
 // ── CLI (non-interactive) ──────────────────────────────────────
 
@@ -619,277 +621,174 @@ fn print_response(resp: &Response) {
     }
 }
 
-// ── Interactive shell (crossterm-based, real-time pending) ─────
+// ── Interactive shell (ratatui + tui-input) ────────────────────
 
 fn interactive(
     io: &fuse_protocol::RealSystemIo,
     socket: &Path,
 ) -> Result<(), String> {
-    use crossterm::terminal;
-
-    println!("fuse-client interactive mode. Type 'help' for commands, 'exit' to quit.");
-    println!("Pending access requests appear automatically — no need to type 'pending'.");
-
-    terminal::enable_raw_mode().map_err(|e| e.to_string())?;
-    let result = interactive_loop(io, socket);
-    let _ = terminal::disable_raw_mode();
-    println!();
-    println!("Goodbye.");
-    result
-}
-
-fn interactive_loop(
-    io: &fuse_protocol::RealSystemIo,
-    socket: &Path,
-) -> Result<(), String> {
     use crossterm::{
         event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
-        terminal::{self},
+        execute,
+        terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     };
+    use ratatui::{
+        backend::CrosstermBackend,
+        layout::{Constraint, Direction, Layout, Rect},
+        style::{Color, Style},
+        text::Line,
+        widgets::{Block, Borders, Clear, Paragraph, Wrap},
+        Terminal,
+    };
+    use std::io as std_io;
+    use tui_input::Input;
+    use tui_input::backend::crossterm::EventHandler;
+
+    enable_raw_mode().map_err(|e| e.to_string())?;
+    execute!(std_io::stdout(), EnterAlternateScreen).map_err(|e| e.to_string())?;
+    let backend = CrosstermBackend::new(std_io::stdout());
+    let mut terminal = Terminal::new(backend).map_err(|e| e.to_string())?;
 
     let plugins = all_plugins();
-    let mut input = String::new();
-    let mut cursor_pos: usize = 0;
+    let mut input = Input::default();
     let mut history: Vec<String> = Vec::new();
     let mut history_idx: Option<usize> = None;
-    let mut pending: Vec<fuse_protocol::PendingAccessInfo> = Vec::new();
-    let mut pending_grant_mode: Option<usize> = None; // index into pending for yes/no prompt
+    let mut log_lines: Vec<String> = vec!["fuse-client TUI. Type 'help' for commands.".into()];
+    let mut pending: Vec<fuse_protocol::PendingAccessInfo>;
+    let mut grant_idx: Option<usize> = None;
 
-    fn redraw(
-        input: &str,
-        cursor_pos: usize,
-        pending: &[fuse_protocol::PendingAccessInfo],
-        pending_grant_mode: Option<usize>,
-    ) {
-        use crossterm::{cursor, execute, style::{Color, SetForegroundColor}, terminal::{self, ClearType}};
+    let poll = || match send_command(io, socket, Command::ListPending) {
+        Ok(Response::PendingList { pending: p }) => p,
+        _ => Vec::new(),
+    };
+    pending = poll();
+    if !pending.is_empty() { grant_idx = Some(0); }
 
-        // Move cursor to the start and clear everything below
-        let _ = execute!(
-            std::io::stdout(),
-            cursor::MoveToColumn(0),
-            terminal::Clear(ClearType::FromCursorDown),
-        );
+    let result = (|| {
+        loop {
+            terminal.draw(|f| {
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Min(3), Constraint::Min(1)])
+                    .split(f.area());
 
-        // Draw pending access pop-up
-        if !pending.is_empty() {
-            let _ = execute!(std::io::stdout(), SetForegroundColor(Color::Yellow));
-            println!();
-            for (i, p) in pending.iter().enumerate() {
-                let active = pending_grant_mode == Some(i);
-                let prefix = if active { "  ▸ " } else { "  ⚡ " };
-                println!(
-                    "{prefix}[{}] secret='{}' pid={} hash={} reason='{}'",
-                    p.id,
-                    p.secret_name,
-                    p.pid,
-                    p.pid_hash.as_deref().unwrap_or("<unknown>"),
-                    p.reason
+                // Log area
+                let lines: Vec<Line> = log_lines.iter().map(|s| Line::from(s.as_str())).collect();
+                f.render_widget(
+                    Paragraph::new(lines).block(Block::default().borders(Borders::TOP)).wrap(Wrap{trim:false}),
+                    chunks[0],
                 );
-                if active {
-                    let _ = execute!(std::io::stdout(), SetForegroundColor(Color::Cyan));
-                    println!("    Grant access [{}]? [y/N] ", p.id);
-                    let _ = execute!(std::io::stdout(), SetForegroundColor(Color::Yellow));
-                }
-            }
-            let _ = execute!(std::io::stdout(), SetForegroundColor(Color::Reset));
-        }
 
-        // Draw prompt + input
-        let pending_count = if pending.is_empty() { String::new() } else { format!("({} pending) ", pending.len()) };
-        print!("{pending_count}fuse-client> {input}");
-        // Position cursor
-        let _ = execute!(
-            std::io::stdout(),
-            cursor::MoveToColumn((format!("{pending_count}fuse-client> ").len() + cursor_pos) as u16),
-        );
-        let _ = std::io::stdout().flush();
-    }
-
-    redraw(&input, cursor_pos, &pending, pending_grant_mode);
-
-    loop {
-        // Poll for input with 3-second timeout
-        if event::poll(std::time::Duration::from_secs(3)).map_err(|e| e.to_string())? {
-            // Terminal event
-            match event::read().map_err(|e| e.to_string())? {
-                Event::Key(key) if key.kind == KeyEventKind::Press => {
-                    // If in grant mode, handle y/n
-                    if let Some(idx) = pending_grant_mode {
-                        match key.code {
-                            KeyCode::Char('y') | KeyCode::Char('Y') => {
-                                let p = &pending[idx];
-                                let _ = send_command(io, socket, Command::Grant { id: p.id });
-                                pending.remove(idx);
-                                pending_grant_mode = None;
-                            }
-                            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Enter => {
-                                let p = &pending[idx];
-                                let _ = send_command(io, socket, Command::Deny { id: p.id });
-                                pending.remove(idx);
-                                pending_grant_mode = None;
-                            }
-                            _ => {}
-                        }
-                        redraw(&input, cursor_pos, &pending, pending_grant_mode);
-                        continue;
+                // Pending pop-up
+                if !pending.is_empty() {
+                    let h = (pending.len() + 4) as u16;
+                    let pop = Rect { x: 1, y: chunks[0].y, width: chunks[0].width.saturating_sub(2), height: h.min(chunks[0].height) };
+                    f.render_widget(Clear, pop);
+                    let mut pl: Vec<Line> = vec![Line::from(format!(" {} pending request(s)", pending.len()))];
+                    for (i, p) in pending.iter().enumerate() {
+                        let m = if grant_idx == Some(i) { "▶" } else { "⚡" };
+                        pl.push(Line::from(format!(" {m} [{}] {} pid={} {}", p.id, p.secret_name, p.pid, p.reason)));
                     }
+                    if let Some(idx) = grant_idx {
+                        pl.push(Line::from(""));
+                        pl.push(Line::from(format!("  Grant [{}]? [y/N]", pending[idx].id)));
+                    }
+                    f.render_widget(
+                        Paragraph::new(pl)
+                            .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Yellow)).title("Pending"))
+                            .style(Style::default().bg(Color::Black)),
+                        pop,
+                    );
+                }
 
+                // Input
+                let prompt = if pending.is_empty() { "fuse-client> ".into() } else { format!("({}p) fuse-client> ", pending.len()) };
+                f.render_widget(Paragraph::new(format!("{prompt}{}", input.value())), chunks[1]);
+                f.set_cursor_position((chunks[1].x + prompt.len() as u16 + input.visual_cursor() as u16, chunks[1].y));
+            }).map_err(|e| e.to_string())?;
+
+            if event::poll(std::time::Duration::from_secs(3)).map_err(|e| e.to_string())? {
+                let ev = event::read().map_err(|e| e.to_string())?;
+                let Event::Key(key) = ev else { continue };
+                if key.kind != KeyEventKind::Press { continue }
+
+                // Grant mode
+                if let Some(idx) = grant_idx {
                     match key.code {
-                        KeyCode::Enter => {
-                            let line = std::mem::take(&mut input);
-                            cursor_pos = 0;
-                            // Move to next line for output
-                            println!();
-                            let _ = std::io::stdout().flush();
-
-                            // Temporarily exit raw mode for command output
-                            let _ = terminal::disable_raw_mode();
-
-                            let trimmed = line.trim();
-                            if trimmed.is_empty() {
-                                let _ = terminal::enable_raw_mode();
-                                redraw(&input, cursor_pos, &pending, pending_grant_mode);
-                                continue;
-                            }
-                            history.push(line.clone());
-                            history_idx = None;
-
-                            if trimmed == "exit" || trimmed == "quit" {
-                                return Ok(());
-                            }
-
-                            let (cmd_name, args) = match trimmed.split_once(' ') {
-                                Some((n, r)) => (n, r),
-                                None => (trimmed, ""),
-                            };
-
-                            match plugins.iter().find(|p| p.name == cmd_name) {
-                                Some(plugin) => {
-                                    if let ShellAction::Exit = (plugin.execute)(args, io, socket) {
-                                        return Ok(());
-                                    }
-                                }
-                                None => {
-                                    eprintln!("Unknown command: '{cmd_name}'. Type 'help' for commands.");
-                                }
-                            }
-
-                            let _ = terminal::enable_raw_mode();
-                            redraw(&input, cursor_pos, &pending, pending_grant_mode);
+                        KeyCode::Char('y') | KeyCode::Char('Y') => {
+                            let p = pending[idx].clone();
+                            let _ = send_command(io, socket, Command::Grant{ id: p.id });
+                            log_lines.push(format!("Granted [{}]", p.id));
+                            pending.remove(idx);
+                            grant_idx = if pending.is_empty() { None } else { Some(idx.min(pending.len()-1)) };
+                            continue;
                         }
-                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            input.clear();
-                            cursor_pos = 0;
-                            history_idx = None;
-                            redraw(&input, cursor_pos, &pending, pending_grant_mode);
+                        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Enter => {
+                            let p = pending[idx].clone();
+                            let _ = send_command(io, socket, Command::Deny{ id: p.id });
+                            log_lines.push(format!("Denied [{}]", p.id));
+                            pending.remove(idx);
+                            grant_idx = if pending.is_empty() { None } else { Some(idx.min(pending.len()-1)) };
+                            continue;
                         }
-                        KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL)
-                            && input.is_empty() => {
-                                return Ok(());
-                            }
-                        KeyCode::Char(c) => {
-                            input.insert(cursor_pos, c);
-                            cursor_pos += 1;
-                            redraw(&input, cursor_pos, &pending, pending_grant_mode);
-                        }
-                        KeyCode::Backspace
-                            if cursor_pos > 0 => {
-                                cursor_pos -= 1;
-                                input.remove(cursor_pos);
-                                redraw(&input, cursor_pos, &pending, pending_grant_mode);
-                            }
-                        KeyCode::Delete
-                            if cursor_pos < input.len() => {
-                                input.remove(cursor_pos);
-                                redraw(&input, cursor_pos, &pending, pending_grant_mode);
-                            }
-                        KeyCode::Left
-                            if cursor_pos > 0 => {
-                                cursor_pos -= 1;
-                                redraw(&input, cursor_pos, &pending, pending_grant_mode);
-                            }
-                        KeyCode::Right
-                            if cursor_pos < input.len() => {
-                                cursor_pos += 1;
-                                redraw(&input, cursor_pos, &pending, pending_grant_mode);
-                            }
-                        KeyCode::Home => {
-                            cursor_pos = 0;
-                            redraw(&input, cursor_pos, &pending, pending_grant_mode);
-                        }
-                        KeyCode::End => {
-                            cursor_pos = input.len();
-                            redraw(&input, cursor_pos, &pending, pending_grant_mode);
-                        }
-                        KeyCode::Up
-                            if !history.is_empty() => {
-                                history_idx = Some(match history_idx {
-                                    Some(0) => 0,
-                                    Some(i) => i - 1,
-                                    None => history.len() - 1,
-                                });
-                                input = history[history_idx.unwrap()].clone();
-                                cursor_pos = input.len();
-                                redraw(&input, cursor_pos, &pending, pending_grant_mode);
-                            }
-                        KeyCode::Down => {
-                            match history_idx {
-                                Some(i) if i + 1 < history.len() => {
-                                    history_idx = Some(i + 1);
-                                    input = history[i + 1].clone();
-                                }
-                                _ => {
-                                    history_idx = None;
-                                    input.clear();
-                                }
-                            }
-                            cursor_pos = input.len();
-                            redraw(&input, cursor_pos, &pending, pending_grant_mode);
-                        }
-                        KeyCode::Tab => {
-                            // Simple tab completion: complete command name
-                            let word = input.split_whitespace().next().unwrap_or("");
-                            if !word.is_empty() && !input.contains(' ') {
-                                if let Some(p) = plugins.iter().find(|pl| pl.name.starts_with(word)) {
-                                    input = p.name.to_string();
-                                    cursor_pos = input.len();
-                                    redraw(&input, cursor_pos, &pending, pending_grant_mode);
-                                }
-                            }
-                        }
+                        KeyCode::Up if idx > 0 => { grant_idx = Some(idx-1); continue }
+                        KeyCode::Down if idx+1 < pending.len() => { grant_idx = Some(idx+1); continue }
                         _ => {}
                     }
                 }
-                _ => {}
-            }
-        } else {
-            // Timeout — poll for pending accesses
-            let new_pending = match send_command(io, socket, Command::ListPending) {
-                Ok(Response::PendingList { pending: p }) => p,
-                _ => Vec::new(),
-            };
 
-            // Clean up expired entries
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            let live: Vec<_> = new_pending.into_iter().filter(|p| p.expires_at > now).collect();
-
-            if live != pending {
-                pending = live;
-                // Auto-enter grant mode for the first pending if not already handling one
-                if pending_grant_mode.is_none() && !pending.is_empty() {
-                    pending_grant_mode = Some(0);
-                }
-                // Adjust grant mode if current index is out of bounds
-                if let Some(idx) = pending_grant_mode {
-                    if idx >= pending.len() {
-                        pending_grant_mode = if pending.is_empty() { None } else { Some(0) };
+                match key.code {
+                    KeyCode::Enter => {
+                        let line = input.value().to_string();
+                        input.reset(); history_idx = None;
+                        if line.trim().is_empty() { continue }
+                        history.push(line.clone());
+                        if line.trim()=="exit" || line.trim()=="quit" { return Ok(()); }
+                        log_lines.push(format!("> {line}"));
+                        let (cn, args) = line.trim().split_once(' ').unwrap_or((line.trim(),""));
+                        match plugins.iter().find(|p| p.name==cn) {
+                            Some(pl) => { if let ShellAction::Exit = (pl.execute)(args, io, socket) { return Ok(()); } }
+                            None => log_lines.push(format!("Unknown: '{cn}'")),
+                        }
                     }
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => { input.reset(); history_idx=None; }
+                    KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) && input.value().is_empty() => return Ok(()),
+                    KeyCode::Tab => {
+                        let w = input.value().split_whitespace().next().unwrap_or("");
+                        if !w.is_empty() && !input.value().contains(' ') {
+                            if let Some(p) = plugins.iter().find(|pl| pl.name.starts_with(w)) { input = Input::new(p.name.into()); }
+                        }
+                    }
+                    KeyCode::Up if grant_idx.is_none() => {
+                        if !history.is_empty() {
+                            history_idx = Some(match history_idx { Some(0)=>0, Some(i)=>i-1, None=>history.len()-1 });
+                            input = Input::new(history[history_idx.unwrap()].clone());
+                        }
+                    }
+                    KeyCode::Down if grant_idx.is_none() => {
+                        match history_idx {
+                            Some(i) if i+1<history.len() => { history_idx=Some(i+1); input=Input::new(history[i+1].clone()); }
+                            _ => { history_idx=None; input.reset(); }
+                        }
+                    }
+                    _ => { let _ = input.handle_event(&Event::Key(key)); }
                 }
-                redraw(&input, cursor_pos, &pending, pending_grant_mode);
+            } else {
+                // Timeout: poll pending
+                let np = poll();
+                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+                let live: Vec<_> = np.into_iter().filter(|p| p.expires_at > now).collect();
+                if live != pending {
+                    pending = live;
+                    if grant_idx.is_none() && !pending.is_empty() { grant_idx = Some(0); }
+                    if let Some(i) = grant_idx { if i >= pending.len() { grant_idx = if pending.is_empty() {None} else {Some(0)}; } }
+                }
             }
         }
-    }
+    })();
+
+    disable_raw_mode().ok();
+    execute!(std_io::stdout(), LeaveAlternateScreen).ok();
+    println!("Goodbye.");
+    result
 }
