@@ -59,7 +59,7 @@ pub fn run_agent<S: SystemIo>(io: &mut S, config: &AgentConfig) -> Result<RunRes
 
         // Clean up stale socket file (e.g., root-owned from a previous
         // --sudo run, or leftover from a crashed server).
-        if socket.exists() {
+        if io.file_exists(socket) {
             info!("Removing stale socket at {}", socket.display());
             io.remove_path(socket).map_err(|e| format!(
                 "Cannot remove stale socket {}: {e}.\n\
@@ -674,5 +674,214 @@ mod tests {
 
         let result = run_agent(&mut mock, &cfg);
         assert!(result.is_ok(), "got: {:?}", result.err());
+    }
+
+    // ── stale state recovery ─────────────────────────────────────
+
+    #[test]
+    fn stale_socket_removed_before_spawn() {
+        let mut mock = base_mock()
+            .with_file("/tmp/fgk.sock", b"stale")
+            .with_file("/home/user/secrets.yaml", b"DATA")
+            .with_unix_response(br#"{"type":"ok"}"#)
+            .with_unix_response(br#"{"type":"ok"}"#);
+
+        let cfg = test_config();
+        let result = run_agent(&mut mock, &cfg);
+        assert!(result.is_ok(), "got: {:?}", result.err());
+        assert!(
+            !mock.files.contains_key("/tmp/fgk.sock"),
+            "stale socket should have been removed"
+        );
+    }
+
+    #[test]
+    fn stale_socket_removal_fails_clear_error() {
+        let mut mock = base_mock()
+            .with_file("/tmp/fgk.sock", b"stale")
+            .with_busy_path("/tmp/fgk.sock")
+            .with_file("/home/user/secrets.yaml", b"DATA");
+
+        let cfg = test_config();
+        let result = run_agent(&mut mock, &cfg);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn stale_mount_point_lazy_unmounted() {
+        let mut mock = base_mock()
+            .with_dir("/tmp/fgk-mnt")
+            .with_busy_path("/tmp/fgk-mnt")
+            .with_command_result("fusermount", Some(0))
+            .with_file("/home/user/secrets.yaml", b"DATA")
+            .with_unix_response(br#"{"type":"ok"}"#)
+            .with_unix_response(br#"{"type":"ok"}"#);
+
+        let cfg = test_config();
+        let result = run_agent(&mut mock, &cfg);
+        assert!(result.is_ok(), "got: {:?}", result.err());
+    }
+
+    #[test]
+    fn stale_mount_point_all_unmounts_fail() {
+        let mut mock = base_mock()
+            .with_dir("/tmp/fgk-mnt")
+            .with_busy_path("/tmp/fgk-mnt")
+            .with_command_result("fusermount", Some(1))
+            .with_command_result("fusermount3", Some(1))
+            .with_command_result("umount", Some(1))
+            .with_file("/home/user/secrets.yaml", b"DATA");
+
+        let cfg = test_config();
+        let result = run_agent(&mut mock, &cfg);
+        assert!(result.is_err());
+    }
+
+    // ── spawn argv validation ────────────────────────────────────
+
+    #[test]
+    fn spawn_command_no_allow_other_by_default() {
+        let mut mock = base_mock()
+            .with_file("/home/user/secrets.yaml", b"DATA")
+            .with_unix_response(br#"{"type":"ok"}"#)
+            .with_unix_response(br#"{"type":"ok"}"#);
+
+        let cfg = test_config();
+        let result = run_agent(&mut mock, &cfg);
+        assert!(result.is_ok());
+        assert!(!mock.spawned.is_empty(), "should have spawned fuse-server");
+        assert!(
+            !mock.spawn_contains(0, &["--allow-other"]),
+            "should NOT pass --allow-other by default"
+        );
+    }
+
+    #[test]
+    fn spawn_command_includes_allow_other_when_sudo() {
+        let mut cfg = test_config();
+        cfg.use_sudo = true;
+        cfg.allow_other = true; // mirrors main.rs: allow_other = cli.allow_other || cli.sudo
+
+        let mut mock = base_mock()
+            .with_file("/home/user/secrets.yaml", b"DATA")
+            .with_unix_response(br#"{"type":"ok"}"#)
+            .with_unix_response(br#"{"type":"ok"}"#);
+
+        let result = run_agent(&mut mock, &cfg);
+        assert!(result.is_ok());
+        assert!(
+            mock.spawn_contains(0, &["--allow-other"]),
+            "--sudo should imply --allow-other"
+        );
+    }
+
+    #[test]
+    fn spawn_command_explicit_allow_other() {
+        let mut cfg = test_config();
+        cfg.allow_other = true;
+
+        let mut mock = base_mock()
+            .with_file("/home/user/secrets.yaml", b"DATA")
+            .with_unix_response(br#"{"type":"ok"}"#)
+            .with_unix_response(br#"{"type":"ok"}"#);
+
+        let result = run_agent(&mut mock, &cfg);
+        assert!(result.is_ok());
+        assert!(
+            mock.spawn_contains(0, &["--allow-other"]),
+            "--allow-other should be passed through"
+        );
+    }
+
+    #[test]
+    fn spawn_command_uses_sudo_n_when_sudo() {
+        let mut cfg = test_config();
+        cfg.use_sudo = true;
+        cfg.allow_other = true;
+
+        let mut mock = base_mock()
+            .with_file("/home/user/secrets.yaml", b"DATA")
+            .with_unix_response(br#"{"type":"ok"}"#)
+            .with_unix_response(br#"{"type":"ok"}"#);
+
+        let result = run_agent(&mut mock, &cfg);
+        assert!(result.is_ok());
+        assert!(!mock.spawned.is_empty());
+        // Without wrapper: prog="sudo", args=["-n", "fuse-server", ...]
+        // With wrapper:    prog="flatpak-spawn", args=["--host", "sudo", "-n", ...]
+        let (prog, args) = &mock.spawned[0];
+        let has_sudo = prog == "sudo" || args.contains(&"sudo".to_string());
+        let has_n = args.contains(&"-n".to_string());
+        assert!(has_sudo && has_n, "should use sudo -n: prog={prog}, args={args:?}");
+    }
+
+    #[test]
+    fn sudo_preauth_called_when_sudo() {
+        let mut cfg = test_config();
+        cfg.use_sudo = true;
+
+        let mut mock = base_mock()
+            .with_file("/home/user/secrets.yaml", b"DATA")
+            .with_unix_response(br#"{"type":"ok"}"#)
+            .with_unix_response(br#"{"type":"ok"}"#);
+
+        let result = run_agent(&mut mock, &cfg);
+        assert!(result.is_ok());
+
+        let calls = mock.interactive_calls.borrow();
+        let has_sudo_v = calls.iter().any(|(prog, args)| {
+            prog == "sudo" && args.iter().any(|a| a == "-v")
+        });
+        assert!(
+            has_sudo_v,
+            "should have called 'sudo -v' for pre-authentication, got: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn no_preauth_when_not_sudo() {
+        let cfg = test_config();
+
+        let mut mock = base_mock()
+            .with_file("/home/user/secrets.yaml", b"DATA")
+            .with_unix_response(br#"{"type":"ok"}"#)
+            .with_unix_response(br#"{"type":"ok"}"#);
+
+        let result = run_agent(&mut mock, &cfg);
+        assert!(result.is_ok());
+
+        let calls = mock.interactive_calls.borrow();
+        // Container launch uses run_interactive, but no sudo -v
+        let has_sudo_v = calls.iter().any(|(prog, _)| prog == "sudo");
+        assert!(!has_sudo_v, "should NOT call sudo when --sudo not set");
+    }
+
+    // ── spawn failure ────────────────────────────────────────────
+
+    #[test]
+    fn spawn_failure_clear_error() {
+        let mut mock = base_mock()
+            .with_file("/home/user/secrets.yaml", b"DATA")
+            .with_spawn_error("command not found");
+
+        let cfg = test_config();
+        let result = run_agent(&mut mock, &cfg);
+        assert!(result.is_err());
+    }
+
+    // ── fresh start (no stale state) ─────────────────────────────
+
+    #[test]
+    fn fresh_start_no_cleanup_needed() {
+        let mut mock = base_mock()
+            .with_file("/home/user/secrets.yaml", b"DATA")
+            .with_unix_response(br#"{"type":"ok"}"#)
+            .with_unix_response(br#"{"type":"ok"}"#);
+
+        let cfg = test_config();
+        let result = run_agent(&mut mock, &cfg);
+        assert!(result.is_ok());
+        // No stale socket or mount point, so no removals attempted
+        assert!(!mock.spawned.is_empty());
     }
 }
