@@ -674,7 +674,7 @@ fn interactive(
         layout::{Constraint, Direction, Layout},
         style::{Color, Style},
         text::Line,
-        widgets::{Block, Borders, Clear, Paragraph, Wrap},
+        widgets::{Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap},
         Terminal,
     };
     use std::io as std_io;
@@ -730,6 +730,18 @@ fn interactive(
                         .block(Block::default().borders(Borders::ALL).title(title))
                         .wrap(Wrap { trim: false }),
                     chunks[0],
+                );
+
+                // Scrollbar on the right edge of the log pane
+                let mut sb_state = ScrollbarState::new(total)
+                    .position((total.saturating_sub(log_height) - log_scroll_up as usize).min(total))
+                    .viewport_content_length(log_height);
+                f.render_stateful_widget(
+                    Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                        .begin_symbol(None)
+                        .end_symbol(None),
+                    chunks[0].inner(ratatui::layout::Margin { horizontal: 0, vertical: 1 }),
+                    &mut sb_state,
                 );
 
                 // ── Pending pop-up (overlays the log pane) ──
