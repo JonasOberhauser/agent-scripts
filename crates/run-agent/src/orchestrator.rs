@@ -71,16 +71,15 @@ pub fn run_agent<S: SystemIo>(io: &mut S, config: &AgentConfig) -> Result<RunRes
         }
 
         // Ensure the mount point is fresh and owned by the current user.
-        // A previous run may have left a stale FUSE mount (whose stat()
-        // fails, so file_exists() returns false) or a root-owned directory.
-        // Strategy: try create_dir_all first; on failure, unmount + remove
-        // + retry.
-        if io.create_dir_all(&config.mount_point).is_err() {
-            info!("Mount point unavailable; attempting cleanup");
-
-            // Try lazy unmount to clear any stale FUSE mount.
+        // Always try to clean up stale mounts/ownership, even if the
+        // directory already exists (create_dir_all succeeds on an
+        // existing dir, but fusermount may still fail if it's root-owned
+        // or has a stale FUSE mount).
+        {
             let mount_str = config.mount_point.to_string_lossy().to_string();
             let wrapper = config.runtime_wrapper.as_deref();
+
+            // Try lazy unmount to clear any stale FUSE mount.
             for (cmd, flag) in [("fusermount", "-uz"), ("fusermount3", "-uz"), ("umount", "-l")] {
                 let mut parts: Vec<String> = Vec::new();
                 if let Some(w) = wrapper {
@@ -100,11 +99,10 @@ pub fn run_agent<S: SystemIo>(io: &mut S, config: &AgentConfig) -> Result<RunRes
                 }
             }
 
-            // Wait for lazy unmount, then remove stale path.
+            // Wait for lazy unmount, then remove + recreate.
             std::thread::sleep(std::time::Duration::from_millis(200));
             let _ = io.remove_path(&config.mount_point);
 
-            // Retry creation.
             io.create_dir_all(&config.mount_point).map_err(|e| format!(
                 "create mount point {}: {e}.\n\
                  If the problem persists, run manually:\n  \

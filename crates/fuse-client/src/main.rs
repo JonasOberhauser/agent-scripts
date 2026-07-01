@@ -181,6 +181,40 @@ fn start_server_from_state(
         (state.server_binary.clone(), cmd_args)
     };
 
+    eprintln!(
+        "  Binary:   {}",
+        state.server_binary
+    );
+    eprintln!("  Wrapper:  {}", state.runtime_wrapper.as_deref().unwrap_or("(none)"));
+    eprintln!("  Program:  {spawn_prog}");
+    eprintln!("  Args:     {}", spawn_args.join(" "));
+    eprintln!("  Mount:    {}", state.mount_point);
+    eprintln!("  Socket:   {}", state.socket);
+
+    // Check binary exists
+    if !std::process::Command::new(&spawn_prog)
+        .arg("--help")
+        .output()
+        .is_ok()
+    {
+        eprintln!("  WARNING: cannot execute '{spawn_prog}' — check PATH");
+    }
+
+    // Clean up stale mount point and socket before spawning
+    eprintln!("  Cleaning up stale mount/socket...");
+    if let Some(w) = &state.runtime_wrapper {
+        let wparts: Vec<&str> = w.split_whitespace().collect();
+        let mut umount_args: Vec<&str> = wparts[1..].to_vec();
+        umount_args.extend(&["fusermount", "-uz", &state.mount_point]);
+        let _ = std::process::Command::new(wparts[0]).args(&umount_args).output();
+    } else {
+        let _ = std::process::Command::new("fusermount").arg("-uz").arg(&state.mount_point).output();
+    }
+    let _ = std::fs::remove_file(&state.socket);
+    let _ = std::fs::remove_dir_all(&state.mount_point);
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let _ = std::fs::create_dir_all(&state.mount_point);
+
     // Spawn new server as independent daemon
     eprintln!("Starting server (v{})...", CLIENT_VERSION);
     use std::os::unix::process::CommandExt;
@@ -195,10 +229,15 @@ fn start_server_from_state(
             Ok(())
         });
     }
-    if let Err(e) = cmd.spawn() {
-        eprintln!("Failed to start server: {e}");
-        eprintln!("Start it manually with: run-agent ...");
-        std::process::exit(1);
+    match cmd.spawn() {
+        Ok(child) => {
+            eprintln!("  Spawned pid {}", child.id());
+        }
+        Err(e) => {
+            eprintln!("Failed to start server: {e}");
+            eprintln!("Start it manually with: run-agent ...");
+            std::process::exit(1);
+        }
     }
 
     // Wait for socket
