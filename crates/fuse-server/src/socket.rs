@@ -77,7 +77,17 @@ fn handle_connection(
             }
         };
 
-        info!("Command received: {:?}", cmd);
+        match &cmd {
+            Command::AddSecret { name, content, hash } => {
+                info!(
+                    "Command received: AddSecret {{ name: {name}, size: {} bytes, hash: {hash} }}",
+                    content.len()
+                );
+            }
+            _ => {
+                info!("Command received: {:?}", cmd);
+            }
+        }
 
         let resp = {
             let mut s = state

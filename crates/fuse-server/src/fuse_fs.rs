@@ -186,8 +186,14 @@ impl<S: SystemIo> GatekeeperFs<S> {
                 let end = (start + size as usize).min(content.len());
                 Ok(content[start..end].to_vec())
             }
-            ReadOutcome::AlreadyAccessed => Err(libc::EACCES),
-            ReadOutcome::HashMismatch { .. } => Err(libc::EACCES),
+            ReadOutcome::AlreadyAccessed => {
+                warn!("Denied read of '{name}' by pid {pid}: already accessed (re-read or different process)");
+                Err(libc::EACCES)
+            }
+            ReadOutcome::HashMismatch { got, expected } => {
+                warn!("Denied read of '{name}' by pid {pid}: hash mismatch — got {got}, expected {expected}");
+                Err(libc::EACCES)
+            }
             ReadOutcome::NotFound => Err(libc::ENOENT),
         }
     }
@@ -283,10 +289,7 @@ impl<S: SystemIo> Filesystem for GatekeeperFs<S> {
                 debug!("Granted read of ino {ino} to pid {pid}");
                 reply.data(&data);
             }
-            Err(e) => {
-                warn!("Denied read of ino {ino} by pid {pid}: errno {e}");
-                reply.error(e);
-            }
+            Err(e) => reply.error(e),
         }
     }
 
