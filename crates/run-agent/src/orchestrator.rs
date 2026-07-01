@@ -419,6 +419,7 @@ mod tests {
             mount_point: PathBuf::from("/tmp/fgk-mnt"),
             use_sudo: false,
             allow_other: false,
+            pidns_host: false,
             runtime: Runtime::Auto,
             runtime_wrapper: None,
             log_level: "info".to_string(),

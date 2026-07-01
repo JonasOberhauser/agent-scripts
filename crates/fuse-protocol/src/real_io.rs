@@ -132,7 +132,11 @@ impl SystemIo for RealSystemIo {
 
     fn sha256_process_exe(&self, pid: u32) -> Result<String, IoError> {
         let exe_path = std::fs::read_link(format!("/proc/{pid}/exe"))
-            .map_err(|e| IoError(format!("read /proc/{pid}/exe: {e}")))?;
+            .map_err(|e| IoError(format!(
+                "read /proc/{pid}/exe: {e}. \
+                 The process may be in a different PID namespace — \
+                 use --pidns=host on the container, or '*' as the hash to skip verification"
+            )))?;
         let data = std::fs::read(&exe_path)?;
         Ok(hex_sha256(&data))
     }

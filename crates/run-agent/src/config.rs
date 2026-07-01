@@ -177,6 +177,10 @@ pub struct AgentConfig {
     /// rootless podman, where the container's root maps to the host user
     /// that created the mount.
     pub allow_other: bool,
+    /// Pass `--pidns=host` to the container so its processes share the
+    /// host's PID namespace.  This allows the FUSE server (on the host)
+    /// to read `/proc/{pid}/exe` and verify the binary hash.
+    pub pidns_host: bool,
     /// Container runtime preference.
     pub runtime: Runtime,
     /// Optional prefix command for the container runtime (e.g.
@@ -212,6 +216,7 @@ impl AgentConfig {
             mount_point: PathBuf::from(DEFAULT_MOUNT_POINT),
             use_sudo: false,
             allow_other: false,
+            pidns_host: false,
             runtime: Runtime::Auto,
             runtime_wrapper: None,
             log_level: "info".to_string(),
@@ -308,6 +313,11 @@ pub fn build_container_args(config: &AgentConfig, setup_script: &str) -> Vec<Str
         "--workdir".into(),
         "/workspace".into(),
     ]);
+
+    if config.pidns_host {
+        args.push("--pidns=host".into());
+    }
+
     args.push(config.image_name.clone());
 
     if setup_script.is_empty() {
@@ -383,6 +393,7 @@ mod tests {
             mount_point: PathBuf::from("/tmp/fuse-gatekeeper-mnt"),
             use_sudo: false,
             allow_other: false,
+            pidns_host: false,
             runtime: Runtime::Auto,
             runtime_wrapper: None,
             log_level: "info".to_string(),
@@ -409,6 +420,37 @@ mod tests {
 
         // fuse mount
         assert!(args.iter().any(|a| a.contains("/fuse:ro")));
+        // no pidns by default
+        assert!(!args.iter().any(|a| a.contains("--pidns")));
+    }
+
+    #[test]
+    fn container_args_pidns_host() {
+        let mut cfg = AgentConfig {
+            binary_hash: "h".into(),
+            secrets: vec![],
+            agent_subfolder: "goose".into(),
+            container_args: vec![],
+            agent_path: PathBuf::from("/work/myagent"),
+            fuse_server_path: "fuse-server".into(),
+            image_name: "myimg".into(),
+            memory: "16G".into(),
+            cpus: "4".into(),
+            socket_path: PathBuf::from("/tmp/fuse-gatekeeper.sock"),
+            mount_point: PathBuf::from("/tmp/fuse-gatekeeper-mnt"),
+            use_sudo: false,
+            allow_other: false,
+            pidns_host: true,
+            runtime: Runtime::Auto,
+            runtime_wrapper: None,
+            log_level: "info".to_string(),
+            plans_path: None,
+        };
+        let args = build_container_args(&cfg, "");
+        assert!(
+            args.iter().any(|a| a == "--pidns=host"),
+            "should include --pidns=host when pidns_host is true"
+        );
     }
 
     #[test]

@@ -52,6 +52,13 @@ struct Cli {
     #[arg(long)]
     allow_other: bool,
 
+    /// Pass --pidns=host to the container so its processes are visible in
+    /// the host's PID namespace.  This allows the FUSE server to read
+    /// /proc/{pid}/exe and verify the binary hash.  Without this flag,
+    /// use '*' as the hash to skip binary verification.
+    #[arg(long)]
+    pidns_host: bool,
+
     /// Container runtime to use.
     #[arg(long, default_value = "auto")]
     runtime: Runtime,
@@ -110,6 +117,7 @@ fn main() -> ExitCode {
     config.mount_point = cli.mount_point;
     config.use_sudo = cli.sudo;
     config.allow_other = cli.allow_other || cli.sudo;
+    config.pidns_host = cli.pidns_host;
     config.runtime = cli.runtime;
     config.runtime_wrapper = cli.runtime_wrapper;
     config.image_name = cli.image;
