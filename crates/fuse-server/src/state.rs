@@ -108,22 +108,26 @@ impl ServerState {
         }
 
         // First read: verify hash.
-        match pid_hash {
-            Some(h) if h == rec.allowed_hash => {
-                rec.access_count += 1;
-                rec.reading_pid = Some(pid);
-                let end = offset.saturating_add(size).min(rec.content.len());
-                rec.read_progress = end;
-                ReadOutcome::Granted(rec.content.clone())
+        // "*" as allowed_hash = wildcard: allow any process, even when the
+        // hash can't be determined (e.g., container processes whose
+        // /proc/{pid}/exe is invisible to the FUSE server).
+        let hash_ok = match pid_hash {
+            Some(_) if rec.allowed_hash == "*" => true,
+            Some(h) if h == rec.allowed_hash => true,
+            _ => rec.allowed_hash == "*",
+        };
+
+        if hash_ok {
+            rec.access_count += 1;
+            rec.reading_pid = Some(pid);
+            let end = offset.saturating_add(size).min(rec.content.len());
+            rec.read_progress = end;
+            ReadOutcome::Granted(rec.content.clone())
+        } else {
+            ReadOutcome::HashMismatch {
+                got: pid_hash.unwrap_or("<unknown>").to_string(),
+                expected: rec.allowed_hash.clone(),
             }
-            Some(h) => ReadOutcome::HashMismatch {
-                got: h.to_string(),
-                expected: rec.allowed_hash.clone(),
-            },
-            None => ReadOutcome::HashMismatch {
-                got: "<unknown>".to_string(),
-                expected: rec.allowed_hash.clone(),
-            },
         }
     }
 
@@ -342,5 +346,56 @@ mod tests {
             s.secrets.get("secrets.yaml").unwrap().access_count,
             1
         );
+    }
+
+    // ── wildcard hash tests ──────────────────────────────────────
+
+    #[test]
+    fn wildcard_allows_known_hash() {
+        let mut s = ServerState::new();
+        s.add("s", b"DATA".to_vec(), "*");
+        let out = s.attempt_read("s", 100, Some("any_hash_value"), 0, 1024);
+        assert!(matches!(out, ReadOutcome::Granted(_)));
+    }
+
+    #[test]
+    fn wildcard_allows_unknown_hash() {
+        let mut s = ServerState::new();
+        s.add("s", b"DATA".to_vec(), "*");
+        // Simulates container process where /proc/{pid}/exe can't be read
+        let out = s.attempt_read("s", 100, None, 0, 1024);
+        assert!(matches!(out, ReadOutcome::Granted(_)));
+    }
+
+    #[test]
+    fn wildcard_still_enforces_one_read() {
+        let mut s = ServerState::new();
+        s.add("s", b"DATA".to_vec(), "*");
+        // First process reads
+        let out = s.attempt_read("s", 100, None, 0, 1024);
+        assert!(matches!(out, ReadOutcome::Granted(_)));
+        // Different process denied
+        let out = s.attempt_read("s", 200, None, 0, 1024);
+        assert_eq!(out, ReadOutcome::AlreadyAccessed);
+    }
+
+    #[test]
+    fn wildcard_still_enforces_forward_only() {
+        let mut s = ServerState::new();
+        s.add("s", b"0123456789".to_vec(), "*");
+        s.attempt_read("s", 42, None, 0, 4);
+        // Backward read denied even with wildcard
+        let out = s.attempt_read("s", 42, None, 0, 4);
+        assert_eq!(out, ReadOutcome::AlreadyAccessed);
+        // Forward read allowed
+        let out = s.attempt_read("s", 42, None, 4, 4);
+        assert!(matches!(out, ReadOutcome::Granted(_)));
+    }
+
+    #[test]
+    fn non_wildcard_denies_unknown_hash() {
+        let mut s = sample_state(); // hash = "abc123"
+        let out = s.attempt_read("secrets.yaml", 100, None, 0, 1024);
+        assert!(matches!(out, ReadOutcome::HashMismatch { .. }));
     }
 }

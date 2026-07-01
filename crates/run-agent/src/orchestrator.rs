@@ -71,61 +71,49 @@ pub fn run_agent<S: SystemIo>(io: &mut S, config: &AgentConfig) -> Result<RunRes
         }
 
         // Ensure the mount point is fresh and owned by the current user.
-        // A previous run may have left a stale FUSE mount or root-owned
-        // directory at this path.
-        if io.file_exists(&config.mount_point) {
-            if let Err(e) = io.remove_path(&config.mount_point) {
-                // EBUSY = stale FUSE mount. Try lazy unmount.
-                info!("Mount point busy ({e}); attempting lazy unmount");
-                let mount_str = config.mount_point.to_string_lossy().to_string();
-                let wrapper = config.runtime_wrapper.as_deref();
+        // A previous run may have left a stale FUSE mount (whose stat()
+        // fails, so file_exists() returns false) or a root-owned directory.
+        // Strategy: try create_dir_all first; on failure, unmount + remove
+        // + retry.
+        if io.create_dir_all(&config.mount_point).is_err() {
+            info!("Mount point unavailable; attempting cleanup");
 
-                let mut unmounted = false;
-                for (cmd, flag) in [("fusermount", "-uz"), ("fusermount3", "-uz"), ("umount", "-l")] {
-                    let mut parts: Vec<String> = Vec::new();
-                    if let Some(w) = wrapper {
-                        let (prog, prefix) = crate::config::split_wrapper(w);
-                        parts.push(prog);
-                        parts.extend(prefix);
-                    }
-                    parts.push(cmd.to_string());
-                    parts.push(flag.to_string());
-                    parts.push(mount_str.clone());
-
-                    let prog = parts[0].clone();
-                    let args: Vec<&str> = parts[1..].iter().map(|s| s.as_str()).collect();
-                    if io.run_command(&prog, &args).map(|o| o.success()).unwrap_or(false) {
-                        info!("Lazy unmount succeeded via {cmd} {flag}");
-                        unmounted = true;
-                        break;
-                    }
+            // Try lazy unmount to clear any stale FUSE mount.
+            let mount_str = config.mount_point.to_string_lossy().to_string();
+            let wrapper = config.runtime_wrapper.as_deref();
+            for (cmd, flag) in [("fusermount", "-uz"), ("fusermount3", "-uz"), ("umount", "-l")] {
+                let mut parts: Vec<String> = Vec::new();
+                if let Some(w) = wrapper {
+                    let (prog, prefix) = crate::config::split_wrapper(w);
+                    parts.push(prog);
+                    parts.extend(prefix);
                 }
+                parts.push(cmd.to_string());
+                parts.push(flag.to_string());
+                parts.push(mount_str.clone());
 
-                if !unmounted {
-                    return Err(format!(
-                        "Cannot remove mount point {}: {e}.\n\
-                         Lazy unmount also failed.\n\
-                         Run manually:\n  \
-                         fusermount -uz {} && rm -rf {}\n\
-                         (or with sudo if root-owned)",
-                        config.mount_point.display(),
-                        config.mount_point.display(),
-                        config.mount_point.display(),
-                    ));
-                }
-
-                // Wait for lazy unmount to take effect, then remove.
-                std::thread::sleep(std::time::Duration::from_millis(200));
-                if let Err(e) = io.remove_path(&config.mount_point) {
-                    return Err(format!(
-                        "Mount point unmounted but cannot remove {}: {e}",
-                        config.mount_point.display()
-                    ));
+                let prog = parts[0].clone();
+                let args: Vec<&str> = parts[1..].iter().map(|s| s.as_str()).collect();
+                if io.run_command(&prog, &args).map(|o| o.success()).unwrap_or(false) {
+                    info!("Lazy unmount succeeded via {cmd} {flag}");
+                    break;
                 }
             }
+
+            // Wait for lazy unmount, then remove stale path.
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            let _ = io.remove_path(&config.mount_point);
+
+            // Retry creation.
+            io.create_dir_all(&config.mount_point).map_err(|e| format!(
+                "create mount point {}: {e}.\n\
+                 If the problem persists, run manually:\n  \
+                 fusermount -uz {} && rm -rf {}",
+                config.mount_point.display(),
+                config.mount_point.display(),
+                config.mount_point.display(),
+            ))?;
         }
-        io.create_dir_all(&config.mount_point)
-            .map_err(|e| format!("create mount point {}: {e}", config.mount_point.display()))?;
 
         let mount = config
             .mount_point
