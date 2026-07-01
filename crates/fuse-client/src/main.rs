@@ -738,18 +738,36 @@ fn interactive(
                     chunks[0],
                 );
 
-                // Scrollbar: ratatui's formula divides by (content + viewport),
-                // so raw line counts prevent the thumb from reaching the end.
-                // Fix: use a percentage scale (0-99) with minimal viewport.
+                // Scrollbar: thumb size proportional to viewport/total,
+                // thumb reaches 100% at the bottom.
+                // Scale = log_height, so content = max_scroll + log_height = total,
+                // viewport = log_height, position = (max_scroll - scroll_up).
+                // But ratatui divides by (content + viewport - 1), so to make
+                // thumb_end = track at bottom: we need (pos+vp) = content+vp-1,
+                // i.e. pos = content-1. With content = max_scroll+1, vp = 1:
+                // pos_bottom = max_scroll, thumb_end = (max_scroll+1)/(max_scroll+1+1-1)*track = track.
+                // But that gives thumb_size = 1/total → too small.
+                //
+                // Better: content = total, viewport = log_height, position = (max_scroll - scroll_up).
+                // thumb_size = log_height / (total + log_height - 1) * track → proportional ✓
+                // thumb_end at bottom = total / (total + log_height - 1) * track → < 100% but close
+                // when log_height << total.
+                //
+                // To force 100%: set content = max_scroll + 1 (= scrollable range + 1),
+                // viewport = 1. thumb_size = 1/(max_scroll+1) → small.
+                //
+                // Compromise: content = max_scroll + log_height, viewport = log_height.
+                // thumb_size = log_height / (max_scroll + 2*log_height - 1) → proportional-ish
+                // thumb_end at bottom = (max_scroll + log_height) / (max_scroll + 2*log_height - 1) * track
+                // → approaches track as max_scroll grows.
                 let max_scroll = total.saturating_sub(log_height);
                 let clamped = (log_scroll_up as usize).min(max_scroll);
-                let scroll_pct = match max_scroll {
-                    0 => 0,
-                    ms => (ms - clamped) * 99 / ms,
-                };
-                let mut sb_state = ScrollbarState::new(100)
-                    .position(scroll_pct)
-                    .viewport_content_length(1);
+                let content = max_scroll + log_height;
+                let viewport = log_height;
+                let pos = max_scroll - clamped;
+                let mut sb_state = ScrollbarState::new(content)
+                    .position(pos)
+                    .viewport_content_length(viewport);
                 f.render_stateful_widget(
                     Scrollbar::new(ScrollbarOrientation::VerticalRight)
                         .begin_symbol(None)
