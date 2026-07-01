@@ -105,7 +105,16 @@ fn build_clap_command<S: SystemIo>(cmd: &Commands, io: &S) -> Result<Command, St
 fn check_version_or_restart(io: &fuse_protocol::RealSystemIo, socket: &Path) {
     let server_version = match send_command(io, socket, Command::GetVersion) {
         Ok(Response::Version { version }) => version,
-        _ => return, // Server too old to know GetVersion — proceed
+        Ok(_) => {
+            // Server responded but doesn't understand GetVersion — it's
+            // an older version.  This IS a mismatch.
+            "<unknown (old server)>".to_string()
+        }
+        Err(e) => {
+            // Can't communicate at all — proceed without version check.
+            eprintln!("Warning: cannot query server version: {e}");
+            return;
+        }
     };
 
     if server_version == CLIENT_VERSION {
@@ -159,21 +168,49 @@ fn restart_server(io: &fuse_protocol::RealSystemIo, socket: &Path) {
 
     eprintln!("Current server state: {status_info}");
 
-    // Kill old server
-    eprintln!("Stopping old server (pid {})...", state.server_pid);
-    let _ = std::process::Command::new("kill")
-        .arg("-TERM")
-        .arg(state.server_pid.to_string())
-        .output();
-    std::thread::sleep(std::time::Duration::from_secs(1));
+    // Kill old server using pkill (not PID-based kill, since the state
+    // file's PID may be the orchestrator, not the actual fuse-server).
+    eprintln!("Stopping old server...");
+    if let Some(w) = &state.runtime_wrapper {
+        let wparts: Vec<&str> = w.split_whitespace().collect();
+        let mut kill_args: Vec<&str> = wparts[1..].to_vec();
+        kill_args.extend(&["pkill", "-f", "fuse-server"]);
+        let _ = std::process::Command::new(wparts[0])
+            .args(&kill_args)
+            .output();
+    } else {
+        let _ = std::process::Command::new("pkill")
+            .arg("-f")
+            .arg("fuse-server")
+            .output();
+    }
+    std::thread::sleep(std::time::Duration::from_secs(2));
 
     // Wait for socket to disappear
-    for _ in 0..20 {
+    for _ in 0..30 {
         if !io.try_unix_connect(socket) {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
+
+    // Clean up stale FUSE mount so the new server can mount cleanly
+    if let Some(w) = &state.runtime_wrapper {
+        let wparts: Vec<&str> = w.split_whitespace().collect();
+        let mut umount_args: Vec<&str> = wparts[1..].to_vec();
+        umount_args.extend(&["fusermount", "-uz", &state.mount_point]);
+        let _ = std::process::Command::new(wparts[0])
+            .args(&umount_args)
+            .output();
+    } else {
+        let _ = std::process::Command::new("fusermount")
+            .arg("-uz")
+            .arg(&state.mount_point)
+            .output();
+    }
+    let _ = std::fs::remove_file(&state.socket);
+    let _ = std::fs::remove_dir_all(&state.mount_point);
+    std::thread::sleep(std::time::Duration::from_millis(500));
 
     // Build server command
     let mut cmd_args: Vec<String> = vec![
