@@ -315,7 +315,8 @@ pub fn build_container_args(config: &AgentConfig, setup_script: &str) -> Vec<Str
     ]);
 
     if config.pidns_host {
-        args.push("--pidns=host".into());
+        args.push("--pid".into());
+        args.push("host".into());
     }
 
     args.push(config.image_name.clone());
@@ -448,8 +449,8 @@ mod tests {
         };
         let args = build_container_args(&cfg, "");
         assert!(
-            args.iter().any(|a| a == "--pidns=host"),
-            "should include --pidns=host when pidns_host is true"
+            args.iter().any(|a| a == "--pid") && args.iter().any(|a| a == "host"),
+            "should include --pid host when pidns_host is true"
         );
     }
 
