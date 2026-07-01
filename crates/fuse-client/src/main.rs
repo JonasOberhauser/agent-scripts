@@ -665,7 +665,7 @@ fn interactive(
     socket: &Path,
 ) -> Result<(), String> {
     use crossterm::{
-        event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+        event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind, EnableMouseCapture, DisableMouseCapture},
         execute,
         terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     };
@@ -682,7 +682,7 @@ fn interactive(
     use tui_input::backend::crossterm::EventHandler;
 
     enable_raw_mode().map_err(|e| e.to_string())?;
-    execute!(std_io::stdout(), EnterAlternateScreen).map_err(|e| e.to_string())?;
+    execute!(std_io::stdout(), EnterAlternateScreen, EnableMouseCapture).map_err(|e| e.to_string())?;
     let backend = CrosstermBackend::new(std_io::stdout());
     let mut terminal = Terminal::new(backend).map_err(|e| e.to_string())?;
 
@@ -704,6 +704,12 @@ fn interactive(
 
     let result = (|| {
         loop {
+            // Clamp scroll to valid range (can't exceed the log content)
+            let term_h = terminal.size().map(|s| s.height as usize).unwrap_or(24);
+            let log_h = term_h.saturating_sub(3).saturating_sub(2); // input pane + borders
+            let max_scroll = log_lines.len().saturating_sub(log_h);
+            log_scroll_up = ((log_scroll_up as usize).min(max_scroll)) as u16;
+
             terminal.draw(|f| {
                 // Two-pane layout: 80% log (top), 3 lines input (bottom)
                 let chunks = Layout::default()
@@ -733,8 +739,11 @@ fn interactive(
                 );
 
                 // Scrollbar on the right edge of the log pane
+                let max_scroll = total.saturating_sub(log_height);
+                let clamped_scroll_up = (log_scroll_up as usize).min(max_scroll);
+                let sb_pos = max_scroll.saturating_sub(clamped_scroll_up);
                 let mut sb_state = ScrollbarState::new(total)
-                    .position((total.saturating_sub(log_height) - log_scroll_up as usize).min(total))
+                    .position(sb_pos)
                     .viewport_content_length(log_height);
                 f.render_stateful_widget(
                     Scrollbar::new(ScrollbarOrientation::VerticalRight)
@@ -786,8 +795,23 @@ fn interactive(
 
             if event::poll(std::time::Duration::from_secs(3)).map_err(|e| e.to_string())? {
                 let ev = event::read().map_err(|e| e.to_string())?;
-                let Event::Key(key) = ev else { continue };
-                if key.kind != KeyEventKind::Press { continue }
+                let key = match ev {
+                    Event::Mouse(mouse) => {
+                        // Scroll wheel only affects the log pane
+                        let term_h = terminal.size().map(|s| s.height).unwrap_or(0);
+                        let log_h = term_h.saturating_sub(3);
+                        if mouse.row < log_h {
+                            match mouse.kind {
+                                MouseEventKind::ScrollUp => log_scroll_up = log_scroll_up.saturating_add(1),
+                                MouseEventKind::ScrollDown => log_scroll_up = log_scroll_up.saturating_sub(1),
+                                _ => {}
+                            }
+                        }
+                        continue;
+                    }
+                    Event::Key(k) if k.kind == KeyEventKind::Press => k,
+                    _ => continue,
+                };
 
                 // ── Log scrolling (always available) ──
                 match key.code {
@@ -886,7 +910,7 @@ fn interactive(
     })();
 
     disable_raw_mode().ok();
-    execute!(std_io::stdout(), LeaveAlternateScreen).ok();
+    execute!(std_io::stdout(), LeaveAlternateScreen, DisableMouseCapture).ok();
     println!("Goodbye.");
     result
 }
