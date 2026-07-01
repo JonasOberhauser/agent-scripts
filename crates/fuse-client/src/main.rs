@@ -42,9 +42,11 @@ fn main() {
     let cli = Cli::parse();
     let io = fuse_protocol::RealSystemIo::new();
 
-    // Version check: if server is running, compare versions.
+    // Check server: if running, verify version; if not, offer to start.
     if io.try_unix_connect(&cli.socket) {
         check_version_or_restart(&io, &cli.socket);
+    } else {
+        check_start_server(&io, &cli.socket);
     }
 
     match &cli.command {
@@ -141,77 +143,21 @@ fn check_version_or_restart(io: &fuse_protocol::RealSystemIo, socket: &Path) {
     restart_server(io, socket);
 }
 
-fn restart_server(io: &fuse_protocol::RealSystemIo, socket: &Path) {
+/// Read the state file written by the orchestrator.
+fn read_state_file() -> Option<ServerStateFile> {
     let state_path = Path::new("/tmp/fuse-gatekeeper-state.json");
-    let state: ServerStateFile = match io.read_file(state_path) {
-        Ok(data) => match serde_json::from_slice(&data) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("Failed to parse state file: {e}");
-                return ask_reset_anyway();
-            }
-        },
-        Err(e) => {
-            eprintln!("Failed to read state file: {e}");
-            return ask_reset_anyway();
-        }
-    };
+    let io = fuse_protocol::RealSystemIo::new();
+    let data = io.read_file(state_path).ok()?;
+    serde_json::from_slice(&data).ok()
+}
 
-    // Try to get current secret status (for display)
-    let status_info = match send_command(io, socket, Command::Status) {
-        Ok(Response::Status { secrets }) => {
-            let names: Vec<&str> = secrets.iter().map(|s| s.name.as_str()).collect();
-            format!("{} secret(s): {}", secrets.len(), names.join(", "))
-        }
-        _ => "could not query current secrets".to_string(),
-    };
-
-    eprintln!("Current server state: {status_info}");
-
-    // Kill old server using pkill (not PID-based kill, since the state
-    // file's PID may be the orchestrator, not the actual fuse-server).
-    eprintln!("Stopping old server...");
-    if let Some(w) = &state.runtime_wrapper {
-        let wparts: Vec<&str> = w.split_whitespace().collect();
-        let mut kill_args: Vec<&str> = wparts[1..].to_vec();
-        kill_args.extend(&["pkill", "-f", "fuse-server"]);
-        let _ = std::process::Command::new(wparts[0])
-            .args(&kill_args)
-            .output();
-    } else {
-        let _ = std::process::Command::new("pkill")
-            .arg("-f")
-            .arg("fuse-server")
-            .output();
-    }
-    std::thread::sleep(std::time::Duration::from_secs(2));
-
-    // Wait for socket to disappear
-    for _ in 0..30 {
-        if !io.try_unix_connect(socket) {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(200));
-    }
-
-    // Clean up stale FUSE mount so the new server can mount cleanly
-    if let Some(w) = &state.runtime_wrapper {
-        let wparts: Vec<&str> = w.split_whitespace().collect();
-        let mut umount_args: Vec<&str> = wparts[1..].to_vec();
-        umount_args.extend(&["fusermount", "-uz", &state.mount_point]);
-        let _ = std::process::Command::new(wparts[0])
-            .args(&umount_args)
-            .output();
-    } else {
-        let _ = std::process::Command::new("fusermount")
-            .arg("-uz")
-            .arg(&state.mount_point)
-            .output();
-    }
-    let _ = std::fs::remove_file(&state.socket);
-    let _ = std::fs::remove_dir_all(&state.mount_point);
-    std::thread::sleep(std::time::Duration::from_millis(500));
-
+/// Spawn a new fuse-server from a state file, wait for the socket,
+/// and restore all secrets.  Used by both restart and start-if-not-running.
+fn start_server_from_state(
+    io: &fuse_protocol::RealSystemIo,
+    socket: &Path,
+    state: &ServerStateFile,
+) {
     // Build server command
     let mut cmd_args: Vec<String> = vec![
         "--mount-point".into(), state.mount_point.clone(),
@@ -225,7 +171,6 @@ fn restart_server(io: &fuse_protocol::RealSystemIo, socket: &Path) {
     cmd_args.push("--pending-timeout".into());
     cmd_args.push(state.pending_timeout.to_string());
 
-    // Handle wrapper (e.g. flatpak-spawn --host)
     let (spawn_prog, spawn_args): (String, Vec<String>) = if let Some(w) = &state.runtime_wrapper {
         let parts: Vec<String> = w.split_whitespace().map(|s| s.to_string()).collect();
         let mut args = parts[1..].to_vec();
@@ -237,7 +182,7 @@ fn restart_server(io: &fuse_protocol::RealSystemIo, socket: &Path) {
     };
 
     // Spawn new server as independent daemon
-    eprintln!("Starting new server (v{})...", CLIENT_VERSION);
+    eprintln!("Starting server (v{})...", CLIENT_VERSION);
     use std::os::unix::process::CommandExt;
     let mut cmd = std::process::Command::new(&spawn_prog);
     cmd.args(&spawn_args)
@@ -256,7 +201,7 @@ fn restart_server(io: &fuse_protocol::RealSystemIo, socket: &Path) {
         std::process::exit(1);
     }
 
-    // Wait for new socket
+    // Wait for socket
     eprintln!("Waiting for server...");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
@@ -291,7 +236,86 @@ fn restart_server(io: &fuse_protocol::RealSystemIo, socket: &Path) {
         }
     }
 
-    eprintln!("Server restarted (v{}).", CLIENT_VERSION);
+    eprintln!("Server ready (v{}).", CLIENT_VERSION);
+}
+
+fn restart_server(io: &fuse_protocol::RealSystemIo, socket: &Path) {
+    let state = match read_state_file() {
+        Some(s) => s,
+        None => {
+            eprintln!("Failed to read state file.");
+            return ask_reset_anyway();
+        }
+    };
+
+    // Try to get current secret status (for display)
+    let status_info = match send_command(io, socket, Command::Status) {
+        Ok(Response::Status { secrets }) => {
+            let names: Vec<&str> = secrets.iter().map(|s| s.name.as_str()).collect();
+            format!("{} secret(s): {}", secrets.len(), names.join(", "))
+        }
+        _ => "could not query current secrets".to_string(),
+    };
+    eprintln!("Current server state: {status_info}");
+
+    // Kill old server using pkill (state file PID may be the orchestrator)
+    eprintln!("Stopping old server...");
+    if let Some(w) = &state.runtime_wrapper {
+        let wparts: Vec<&str> = w.split_whitespace().collect();
+        let mut kill_args: Vec<&str> = wparts[1..].to_vec();
+        kill_args.extend(&["pkill", "-f", "fuse-server"]);
+        let _ = std::process::Command::new(wparts[0]).args(&kill_args).output();
+    } else {
+        let _ = std::process::Command::new("pkill").arg("-f").arg("fuse-server").output();
+    }
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    // Wait for socket to disappear
+    for _ in 0..30 {
+        if !io.try_unix_connect(socket) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+
+    // Clean up stale FUSE mount so the new server can mount cleanly
+    if let Some(w) = &state.runtime_wrapper {
+        let wparts: Vec<&str> = w.split_whitespace().collect();
+        let mut umount_args: Vec<&str> = wparts[1..].to_vec();
+        umount_args.extend(&["fusermount", "-uz", &state.mount_point]);
+        let _ = std::process::Command::new(wparts[0]).args(&umount_args).output();
+    } else {
+        let _ = std::process::Command::new("fusermount").arg("-uz").arg(&state.mount_point).output();
+    }
+    let _ = std::fs::remove_file(&state.socket);
+    let _ = std::fs::remove_dir_all(&state.mount_point);
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
+    start_server_from_state(io, socket, &state);
+}
+
+/// Called when the server is not running at all.  Offers to start it
+/// from the state file.
+fn check_start_server(io: &fuse_protocol::RealSystemIo, socket: &Path) {
+    print!("Server is not running. Start it? [y/N] ");
+    stdio::stdout().flush().unwrap();
+    let mut input = String::new();
+    if stdio::stdin().read_line(&mut input).is_err() {
+        return;
+    }
+    if input.trim().to_lowercase() != "y" {
+        return;
+    }
+
+    match read_state_file() {
+        Some(state) => start_server_from_state(io, socket, &state),
+        None => {
+            eprintln!(
+                "No state file found at /tmp/fuse-gatekeeper-state.json.\n\
+                 Start the server manually with: run-agent ..."
+            );
+        }
+    }
 }
 
 fn ask_reset_anyway() {
