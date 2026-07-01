@@ -28,6 +28,30 @@ pub struct PendingAccessInfo {
     pub expires_at: u64,
 }
 
+/// On-disk state file written by the orchestrator so that `fuse-client`
+/// can restart the server with the same configuration when versions mismatch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerStateFile {
+    pub version: String,
+    pub server_pid: u32,
+    pub server_binary: String,
+    pub mount_point: String,
+    pub socket: String,
+    pub allow_other: bool,
+    pub log_level: String,
+    pub pending_timeout: u64,
+    pub runtime_wrapper: Option<String>,
+    pub secrets: Vec<StateSecretEntry>,
+}
+
+/// One secret entry in the state file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StateSecretEntry {
+    pub fuse_name: String,
+    pub host_path: String,
+    pub hash: String,
+}
+
 // ── Commands (client → server) ─────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -55,6 +79,8 @@ pub enum Command {
     Grant { id: u64 },
     /// Deny a pending access request by ID (immediate rejection).
     Deny { id: u64 },
+    /// Request the server's protocol version.
+    GetVersion,
 }
 
 // ── Responses (server → client) ────────────────────────────────
@@ -67,4 +93,6 @@ pub enum Response {
     Status { secrets: Vec<SecretStatus> },
     MountList { mounts: Vec<MountEntry> },
     PendingList { pending: Vec<PendingAccessInfo> },
+    /// Server protocol version.
+    Version { version: String },
 }

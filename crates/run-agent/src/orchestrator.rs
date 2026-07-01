@@ -230,6 +230,9 @@ pub fn run_agent<S: SystemIo>(io: &mut S, config: &AgentConfig) -> Result<RunRes
         )?;
     }
 
+    // Write state file so fuse-client can restart the server if needed.
+    write_state_file(config, &loaded, io);
+
     // ── 5. Detect container runtime ──────────────────────────────
     let wrapper = config.runtime_wrapper.as_deref();
     let container_bin = match config.runtime.resolve(io, wrapper) {
@@ -295,6 +298,7 @@ pub fn run_agent<S: SystemIo>(io: &mut S, config: &AgentConfig) -> Result<RunRes
 struct LoadedSecret {
     fuse_name: String,
     container: PathBuf,
+    host_path: PathBuf,
 }
 
 /// Recursively load a secret file or directory into the FUSE server.
@@ -357,6 +361,7 @@ fn load_secret_recursive<S: SystemIo>(
     loaded.push(LoadedSecret {
         fuse_name,
         container: dest,
+        host_path: host.to_path_buf(),
     });
     Ok(())
 }
@@ -392,6 +397,43 @@ fn setup_rootless_docker() {
     let sock = format!("unix://{}", crate::config::rootless_docker_socket());
     std::env::set_var("DOCKER_HOST", &sock);
     info!("Docker rootless socket: {sock}");
+}
+
+/// Write a state file so `fuse-client` can restart the server with the same
+/// secrets when a version mismatch is detected.
+fn write_state_file<S: SystemIo>(config: &AgentConfig, loaded: &[LoadedSecret], io: &mut S) {
+    let state = fuse_protocol::ServerStateFile {
+        version: fuse_protocol::VERSION.to_string(),
+        server_pid: std::process::id(),
+        server_binary: config.fuse_server_path.to_string_lossy().to_string(),
+        mount_point: config.mount_point.to_string_lossy().to_string(),
+        socket: config.socket_path.to_string_lossy().to_string(),
+        allow_other: config.allow_other,
+        log_level: config.log_level.clone(),
+        pending_timeout: 300,
+        runtime_wrapper: config.runtime_wrapper.clone(),
+        secrets: loaded
+            .iter()
+            .map(|s| fuse_protocol::StateSecretEntry {
+                fuse_name: s.fuse_name.clone(),
+                host_path: s.host_path.to_string_lossy().to_string(),
+                hash: config.binary_hash.clone(),
+            })
+            .collect(),
+    };
+
+    let json = match serde_json::to_string_pretty(&state) {
+        Ok(j) => j,
+        Err(e) => {
+            warn!("Failed to serialize state file: {e}");
+            return;
+        }
+    };
+
+    let state_path = std::path::Path::new("/tmp/fuse-gatekeeper-state.json");
+    if let Err(e) = io.write_file(state_path, json.as_bytes()) {
+        warn!("Failed to write state file: {e}");
+    }
 }
 
 #[cfg(test)]
@@ -472,6 +514,7 @@ mod tests {
         let loaded = vec![LoadedSecret {
             fuse_name: "p100_s0".into(),
             container: PathBuf::from("/root/.config/app/auth.json"),
+            host_path: PathBuf::from("/host/auth.json"),
         }];
         let script = build_setup_script(&loaded);
         assert!(script.contains("ln -sf /fuse/p100_s0 /root/.config/app/auth.json"));
@@ -484,10 +527,12 @@ mod tests {
             LoadedSecret {
                 fuse_name: "p100_s0".into(),
                 container: PathBuf::from("/root/.config/app/a.json"),
+                host_path: PathBuf::from("/host/a.json"),
             },
             LoadedSecret {
                 fuse_name: "p100_s1".into(),
                 container: PathBuf::from("/root/.config/app/b.json"),
+                host_path: PathBuf::from("/host/b.json"),
             },
         ];
         let script = build_setup_script(&loaded);

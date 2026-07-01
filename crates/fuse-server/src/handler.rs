@@ -100,6 +100,10 @@ pub fn handle_command(cmd: Command, state: &mut ServerState) -> Response {
                 }
             }
         }
+
+        Command::GetVersion => Response::Version {
+            version: fuse_protocol::VERSION.to_string(),
+        },
     }
 }
 

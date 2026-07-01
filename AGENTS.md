@@ -1,10 +1,33 @@
 # AGENTS.md
 
+## Versioning
+
+The workspace version in `Cargo.toml` (`[workspace.package] version`) is the
+**protocol version** shared between `fuse-client` and `fuse-server`. Both
+crates use `version.workspace = true` and access it at runtime via
+`fuse_protocol::VERSION`.
+
+**Increment the minor version for every build** that changes either the client
+or the server. This ensures the client detects version mismatches and can offer
+to restart the server.
+
+The version follows semantic versioning:
+- **Major**: incompatible protocol changes (commands removed/renamed)
+- **Minor**: new features, new commands, behavior changes
+- **Patch**: bug fixes with no protocol impact
+
+On startup, `fuse-client` sends `GetVersion` to the running server. If the
+versions differ, the client offers to restart the server:
+1. Reads `/tmp/fuse-gatekeeper-state.json` (written by the orchestrator)
+2. Kills the old server, starts the new one with the same configuration
+3. Re-adds all secrets from the state file's host paths
+4. If the state file is missing or unreadable: offers a clean reset
+
 ## Build & Test
 
 ```sh
 cargo build                              # build all crates
-cargo test                               # run all tests (100 total)
+cargo test                               # run all tests
 cargo test -p fuse-server                # fuse-server only (unit + e2e)
 cargo test -p fuse-server --test fuse_e2e -- --include-ignored  # e2e (needs /dev/fuse)
 cargo clippy --workspace                 # zero warnings required

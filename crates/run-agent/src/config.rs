@@ -427,7 +427,7 @@ mod tests {
 
     #[test]
     fn container_args_pidns_host() {
-        let mut cfg = AgentConfig {
+        let cfg = AgentConfig {
             binary_hash: "h".into(),
             secrets: vec![],
             agent_subfolder: "goose".into(),

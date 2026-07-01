@@ -1,8 +1,9 @@
+use std::io::{self as stdio, Write};
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
 use fuse_client::send_command;
-use fuse_protocol::{Command, Response, SystemIo};
+use fuse_protocol::{Command, Response, ServerStateFile, SystemIo, VERSION as CLIENT_VERSION};
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 
@@ -30,6 +31,7 @@ enum Commands {
     Pending,
     Grant { id: u64 },
     Deny { id: u64 },
+    GetVersion,
 }
 
 fn main() {
@@ -39,6 +41,11 @@ fn main() {
 
     let cli = Cli::parse();
     let io = fuse_protocol::RealSystemIo::new();
+
+    // Version check: if server is running, compare versions.
+    if io.try_unix_connect(&cli.socket) {
+        check_version_or_restart(&io, &cli.socket);
+    }
 
     match &cli.command {
         Some(cmd) => {
@@ -89,7 +96,181 @@ fn build_clap_command<S: SystemIo>(cmd: &Commands, io: &S) -> Result<Command, St
         Commands::Pending => Command::ListPending,
         Commands::Grant { id } => Command::Grant { id: *id },
         Commands::Deny { id } => Command::Deny { id: *id },
+        Commands::GetVersion => Command::GetVersion,
     })
+}
+
+// ── Version check & server restart ─────────────────────────────
+
+fn check_version_or_restart(io: &fuse_protocol::RealSystemIo, socket: &Path) {
+    let server_version = match send_command(io, socket, Command::GetVersion) {
+        Ok(Response::Version { version }) => version,
+        _ => return, // Server too old to know GetVersion — proceed
+    };
+
+    if server_version == CLIENT_VERSION {
+        return; // Match
+    }
+
+    eprintln!(
+        "Version mismatch: client={}, server={}",
+        CLIENT_VERSION, server_version
+    );
+
+    print!("Restart server to update? [y/N] ");
+    stdio::stdout().flush().unwrap();
+    let mut input = String::new();
+    if stdio::stdin().read_line(&mut input).is_err() {
+        return;
+    }
+
+    if input.trim().to_lowercase() != "y" {
+        eprintln!("Exiting. Restart the server manually, then re-run fuse-client.");
+        std::process::exit(1);
+    }
+
+    restart_server(io, socket);
+}
+
+fn restart_server(io: &fuse_protocol::RealSystemIo, socket: &Path) {
+    let state_path = Path::new("/tmp/fuse-gatekeeper-state.json");
+    let state: ServerStateFile = match io.read_file(state_path) {
+        Ok(data) => match serde_json::from_slice(&data) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("Failed to parse state file: {e}");
+                return ask_reset_anyway();
+            }
+        },
+        Err(e) => {
+            eprintln!("Failed to read state file: {e}");
+            return ask_reset_anyway();
+        }
+    };
+
+    // Try to get current secret status (for display)
+    let status_info = match send_command(io, socket, Command::Status) {
+        Ok(Response::Status { secrets }) => {
+            let names: Vec<&str> = secrets.iter().map(|s| s.name.as_str()).collect();
+            format!("{} secret(s): {}", secrets.len(), names.join(", "))
+        }
+        _ => "could not query current secrets".to_string(),
+    };
+
+    eprintln!("Current server state: {status_info}");
+
+    // Kill old server
+    eprintln!("Stopping old server (pid {})...", state.server_pid);
+    let _ = std::process::Command::new("kill")
+        .arg("-TERM")
+        .arg(state.server_pid.to_string())
+        .output();
+    std::thread::sleep(std::time::Duration::from_secs(1));
+
+    // Wait for socket to disappear
+    for _ in 0..20 {
+        if !io.try_unix_connect(socket) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+
+    // Build server command
+    let mut cmd_args: Vec<String> = vec![
+        "--mount-point".into(), state.mount_point.clone(),
+        "--socket".into(), state.socket.clone(),
+    ];
+    if state.allow_other {
+        cmd_args.push("--allow-other".into());
+    }
+    cmd_args.push("--log-level".into());
+    cmd_args.push(state.log_level.clone());
+    cmd_args.push("--pending-timeout".into());
+    cmd_args.push(state.pending_timeout.to_string());
+
+    // Handle wrapper (e.g. flatpak-spawn --host)
+    let (spawn_prog, spawn_args): (String, Vec<String>) = if let Some(w) = &state.runtime_wrapper {
+        let parts: Vec<String> = w.split_whitespace().map(|s| s.to_string()).collect();
+        let mut args = parts[1..].to_vec();
+        args.push(state.server_binary.clone());
+        args.extend(cmd_args);
+        (parts[0].clone(), args)
+    } else {
+        (state.server_binary.clone(), cmd_args)
+    };
+
+    // Spawn new server as independent daemon
+    eprintln!("Starting new server (v{})...", CLIENT_VERSION);
+    use std::os::unix::process::CommandExt;
+    let mut cmd = std::process::Command::new(&spawn_prog);
+    cmd.args(&spawn_args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    if let Err(e) = cmd.spawn() {
+        eprintln!("Failed to start server: {e}");
+        eprintln!("Start it manually with: run-agent ...");
+        std::process::exit(1);
+    }
+
+    // Wait for new socket
+    eprintln!("Waiting for server...");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if io.try_unix_connect(socket) {
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            eprintln!("Server did not start within 10s. Start it manually.");
+            std::process::exit(1);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+
+    // Re-add secrets
+    eprintln!("Restoring {} secret(s)...", state.secrets.len());
+    for entry in &state.secrets {
+        let content = match io.read_file(Path::new(&entry.host_path)) {
+            Ok(data) => data,
+            Err(e) => {
+                eprintln!("  Skip {}: cannot read {}: {e}", entry.fuse_name, entry.host_path);
+                continue;
+            }
+        };
+        match send_command(io, socket, Command::AddSecret {
+            name: entry.fuse_name.clone(),
+            content,
+            hash: entry.hash.clone(),
+        }) {
+            Ok(Response::Ok) => eprintln!("  Restored {}", entry.fuse_name),
+            Ok(other) => eprintln!("  Error restoring {}: {other:?}", entry.fuse_name),
+            Err(e) => eprintln!("  Error restoring {}: {e}", entry.fuse_name),
+        }
+    }
+
+    eprintln!("Server restarted (v{}).", CLIENT_VERSION);
+}
+
+fn ask_reset_anyway() {
+    eprintln!("Failed to get current secret list for restore.");
+    print!("Reset server anyways (all secrets will be lost)? [y/N] ");
+    stdio::stdout().flush().unwrap();
+    let mut input = String::new();
+    let _ = stdio::stdin().read_line(&mut input);
+    if input.trim().to_lowercase() == "y" {
+        let _ = std::process::Command::new("pkill").arg("-f").arg("fuse-server").output();
+        eprintln!("Server killed. Re-run run-agent to start a fresh server.");
+        std::process::exit(0);
+    } else {
+        eprintln!("Exiting without restarting.");
+        std::process::exit(1);
+    }
 }
 
 // ── Plugin system ──────────────────────────────────────────────
@@ -228,6 +409,19 @@ fn all_plugins() -> Vec<Plugin> {
             },
         },
         Plugin {
+            name: "version",
+            help: "Show client and server versions",
+            execute: |_, io, sock| {
+                println!("Client: {}", CLIENT_VERSION);
+                match send_command(io, sock, Command::GetVersion) {
+                    Ok(Response::Version { version }) => println!("Server: {version}"),
+                    Ok(_) => println!("Server: <unknown response>"),
+                    Err(e) => println!("Server: <unreachable: {e}>"),
+                }
+                ShellAction::Continue
+            },
+        },
+        Plugin {
             name: "help",
             help: "Show available commands",
             
@@ -321,6 +515,9 @@ fn print_response(resp: &Response) {
                     );
                 }
             }
+        }
+        Response::Version { version } => {
+            println!("Server version: {version}");
         }
     }
 }
