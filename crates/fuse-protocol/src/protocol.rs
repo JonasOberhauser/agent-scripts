@@ -60,6 +60,12 @@ pub enum Command {
     /// Reset the access counter for one secret (or all when `name` is `None`).
     Reset { name: Option<String> },
     /// Return status of every secret.
+    //
+    // IMPORTANT: Do NOT change this variant's name, serde tag, or the
+    // structure of SecretStatus in the response.  Older versions of
+    // fuse-client call this command during the server-restart flow to
+    // enumerate and restore secrets.  Changing it breaks cross-version
+    // compatibility.
     Status,
     /// Add a new secret to the mount.
     AddSecret {
@@ -80,6 +86,10 @@ pub enum Command {
     /// Deny a pending access request by ID (immediate rejection).
     Deny { id: u64 },
     /// Request the server's protocol version.
+    //
+    // IMPORTANT: Do NOT change this variant's name or serde tag.
+    // Older versions of fuse-client rely on this exact command to
+    // detect version mismatches before restarting the server.
     GetVersion,
 }
 
