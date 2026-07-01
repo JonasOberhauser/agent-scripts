@@ -671,7 +671,7 @@ fn interactive(
     };
     use ratatui::{
         backend::CrosstermBackend,
-        layout::{Constraint, Direction, Layout, Rect},
+        layout::{Constraint, Direction, Layout},
         style::{Color, Style},
         text::Line,
         widgets::{Block, Borders, Clear, Paragraph, Wrap},
@@ -693,6 +693,7 @@ fn interactive(
     let mut log_lines: Vec<String> = vec!["fuse-client TUI. Type 'help' for commands.".into()];
     let mut pending: Vec<fuse_protocol::PendingAccessInfo>;
     let mut grant_idx: Option<usize> = None;
+    let mut log_scroll_up: u16 = 0; // lines scrolled up from bottom (0 = auto-scroll to latest)
 
     let poll = || match send_command(io, socket, Command::ListPending) {
         Ok(Response::PendingList { pending: p }) => p,
@@ -704,22 +705,42 @@ fn interactive(
     let result = (|| {
         loop {
             terminal.draw(|f| {
+                // Two-pane layout: 80% log (top), 3 lines input (bottom)
                 let chunks = Layout::default()
                     .direction(Direction::Vertical)
-                    .constraints([Constraint::Min(3), Constraint::Min(1)])
+                    .constraints([Constraint::Min(3), Constraint::Length(3)])
                     .split(f.area());
 
-                // Log area
+                // ── Log pane (scrollable) ──
+                let log_height = chunks[0].height.saturating_sub(2) as usize; // -border
+                let total = log_lines.len();
+                let base_scroll = total.saturating_sub(log_height) as u16;
+                let scroll = base_scroll.saturating_sub(log_scroll_up);
+
+                let title = if log_scroll_up > 0 {
+                    format!("Log (↑{} lines scrolled)", log_scroll_up)
+                } else {
+                    "Log".to_string()
+                };
+
                 let lines: Vec<Line> = log_lines.iter().map(|s| Line::from(s.as_str())).collect();
                 f.render_widget(
-                    Paragraph::new(lines).block(Block::default().borders(Borders::TOP)).wrap(Wrap{trim:false}),
+                    Paragraph::new(lines)
+                        .scroll((scroll, 0))
+                        .block(Block::default().borders(Borders::ALL).title(title))
+                        .wrap(Wrap { trim: false }),
                     chunks[0],
                 );
 
-                // Pending pop-up
+                // ── Pending pop-up (overlays the log pane) ──
                 if !pending.is_empty() {
                     let h = (pending.len() + 4) as u16;
-                    let pop = Rect { x: 1, y: chunks[0].y, width: chunks[0].width.saturating_sub(2), height: h.min(chunks[0].height) };
+                    let pop = ratatui::layout::Rect {
+                        x: chunks[0].x + 1,
+                        y: chunks[0].y + 1,
+                        width: chunks[0].width.saturating_sub(2),
+                        height: h.min(chunks[0].height.saturating_sub(2)),
+                    };
                     f.render_widget(Clear, pop);
                     let mut pl: Vec<Line> = vec![Line::from(format!(" {} pending request(s)", pending.len()))];
                     for (i, p) in pending.iter().enumerate() {
@@ -732,16 +753,23 @@ fn interactive(
                     }
                     f.render_widget(
                         Paragraph::new(pl)
-                            .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Yellow)).title("Pending"))
+                            .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Yellow)).title("⚠ Pending"))
                             .style(Style::default().bg(Color::Black)),
                         pop,
                     );
                 }
 
-                // Input
+                // ── Input pane (fixed at bottom) ──
                 let prompt = if pending.is_empty() { "fuse-client> ".into() } else { format!("({}p) fuse-client> ", pending.len()) };
-                f.render_widget(Paragraph::new(format!("{prompt}{}", input.value())), chunks[1]);
-                f.set_cursor_position((chunks[1].x + prompt.len() as u16 + input.visual_cursor() as u16, chunks[1].y));
+                f.render_widget(
+                    Paragraph::new(format!("{prompt}{}", input.value()))
+                        .block(Block::default().borders(Borders::ALL).title("Input")),
+                    chunks[1],
+                );
+                f.set_cursor_position((
+                    chunks[1].x + 1 + prompt.len() as u16 + input.visual_cursor() as u16,
+                    chunks[1].y + 1,
+                ));
             }).map_err(|e| e.to_string())?;
 
             if event::poll(std::time::Duration::from_secs(3)).map_err(|e| e.to_string())? {
@@ -749,13 +777,27 @@ fn interactive(
                 let Event::Key(key) = ev else { continue };
                 if key.kind != KeyEventKind::Press { continue }
 
-                // Grant mode
+                // ── Log scrolling (always available) ──
+                match key.code {
+                    KeyCode::PageUp => {
+                        log_scroll_up = log_scroll_up.saturating_add(5);
+                        continue;
+                    }
+                    KeyCode::PageDown => {
+                        log_scroll_up = log_scroll_up.saturating_sub(5);
+                        continue;
+                    }
+                    _ => {}
+                }
+
+                // ── Grant mode (y/n for pending) ──
                 if let Some(idx) = grant_idx {
                     match key.code {
                         KeyCode::Char('y') | KeyCode::Char('Y') => {
                             let p = pending[idx].clone();
                             let _ = send_command(io, socket, Command::Grant{ id: p.id });
                             log_lines.push(format!("Granted [{}]", p.id));
+                            log_scroll_up = 0;
                             pending.remove(idx);
                             grant_idx = if pending.is_empty() { None } else { Some(idx.min(pending.len()-1)) };
                             continue;
@@ -764,6 +806,7 @@ fn interactive(
                             let p = pending[idx].clone();
                             let _ = send_command(io, socket, Command::Deny{ id: p.id });
                             log_lines.push(format!("Denied [{}]", p.id));
+                            log_scroll_up = 0;
                             pending.remove(idx);
                             grant_idx = if pending.is_empty() { None } else { Some(idx.min(pending.len()-1)) };
                             continue;
@@ -774,6 +817,7 @@ fn interactive(
                     }
                 }
 
+                // ── Normal input handling ──
                 match key.code {
                     KeyCode::Enter => {
                         let line = input.value().to_string();
@@ -791,6 +835,7 @@ fn interactive(
                             }
                             None => log_lines.push(format!("Unknown: '{cn}'")),
                         }
+                        log_scroll_up = 0; // auto-scroll to bottom on new output
                     }
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => { input.reset(); history_idx=None; }
                     KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) && input.value().is_empty() => return Ok(()),
