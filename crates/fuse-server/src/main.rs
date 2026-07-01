@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use clap::Parser;
 use fuser::MountOption;
@@ -32,6 +33,13 @@ struct Cli {
     /// strips environment variables.
     #[arg(long, default_value = "info")]
     log_level: String,
+
+    /// Timeout in seconds for pending access requests (default: 300 = 5 min).
+    /// When a read is denied (hash mismatch or already accessed), the server
+    /// waits this long for manual approval via `fuse-client grant` before
+    /// rejecting.
+    #[arg(long, default_value_t = 300)]
+    pending_timeout: u64,
 }
 
 fn main() {
@@ -47,6 +55,7 @@ fn main() {
 
     // Build initial state.
     let mut state = ServerState::new();
+    state.pending_timeout = Duration::from_secs(cli.pending_timeout);
     for spec in &cli.secret {
         match parse_secret(spec, &io) {
             Ok((name, content, hash)) => {

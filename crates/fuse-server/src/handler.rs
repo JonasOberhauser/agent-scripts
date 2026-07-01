@@ -75,6 +75,31 @@ pub fn handle_command(cmd: Command, state: &mut ServerState) -> Response {
                 .collect();
             Response::MountList { mounts }
         }
+
+        Command::ListPending => {
+            let pending = state.list_pending();
+            Response::PendingList { pending }
+        }
+
+        Command::Grant { id } => {
+            if state.grant_pending(id) {
+                Response::Ok
+            } else {
+                Response::Error {
+                    message: format!("pending access {id} not found or expired"),
+                }
+            }
+        }
+
+        Command::Deny { id } => {
+            if state.deny_pending(id) {
+                Response::Ok
+            } else {
+                Response::Error {
+                    message: format!("pending access {id} not found"),
+                }
+            }
+        }
     }
 }
 

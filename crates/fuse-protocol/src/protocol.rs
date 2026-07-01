@@ -16,6 +16,18 @@ pub struct MountEntry {
     pub size: usize,
 }
 
+/// Information about a pending access request waiting for manual approval.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PendingAccessInfo {
+    pub id: u64,
+    pub secret_name: String,
+    pub pid: u32,
+    pub pid_hash: Option<String>,
+    pub reason: String,
+    /// Unix timestamp (seconds) when this request expires.
+    pub expires_at: u64,
+}
+
 // ── Commands (client → server) ─────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -37,6 +49,12 @@ pub enum Command {
     RotateHash { name: String, new_hash: String },
     /// List all currently served secret filenames.
     ListMounts,
+    /// List all pending access requests waiting for manual approval.
+    ListPending,
+    /// Grant a pending access request by ID.
+    Grant { id: u64 },
+    /// Deny a pending access request by ID (immediate rejection).
+    Deny { id: u64 },
 }
 
 // ── Responses (server → client) ────────────────────────────────
@@ -48,4 +66,5 @@ pub enum Response {
     Error { message: String },
     Status { secrets: Vec<SecretStatus> },
     MountList { mounts: Vec<MountEntry> },
+    PendingList { pending: Vec<PendingAccessInfo> },
 }

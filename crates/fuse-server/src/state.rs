@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 /// One secret file tracked by the gatekeeper.
 #[derive(Debug, Clone)]
@@ -16,6 +17,18 @@ pub struct SecretRecord {
     pub read_progress: usize,
 }
 
+/// A pending access request waiting for manual approval.
+#[derive(Debug, Clone)]
+pub struct PendingAccess {
+    pub id: u64,
+    pub secret_name: String,
+    pub pid: u32,
+    pub pid_hash: Option<String>,
+    pub reason: String,
+    pub expires_at: Instant,
+    pub granted: bool,
+}
+
 /// Result of a FUSE read attempt.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ReadOutcome {
@@ -30,9 +43,23 @@ pub enum ReadOutcome {
 }
 
 /// Shared mutable state behind the FUSE filesystem and the socket server.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ServerState {
     pub secrets: HashMap<String, SecretRecord>,
+    pub pending: Vec<PendingAccess>,
+    pub next_pending_id: u64,
+    pub pending_timeout: Duration,
+}
+
+impl Default for ServerState {
+    fn default() -> Self {
+        Self {
+            secrets: HashMap::new(),
+            pending: Vec::new(),
+            next_pending_id: 1,
+            pending_timeout: Duration::from_secs(300),
+        }
+    }
 }
 
 impl ServerState {
@@ -165,6 +192,109 @@ impl ServerState {
         } else {
             false
         }
+    }
+
+    // ── pending access management ───────────────────────────────
+
+    /// Create a new pending access request.  Returns its ID.
+    pub fn create_pending(
+        &mut self,
+        secret_name: &str,
+        pid: u32,
+        pid_hash: Option<&str>,
+        reason: &str,
+    ) -> u64 {
+        let id = self.next_pending_id;
+        self.next_pending_id += 1;
+        self.pending.push(PendingAccess {
+            id,
+            secret_name: secret_name.to_string(),
+            pid,
+            pid_hash: pid_hash.map(|s| s.to_string()),
+            reason: reason.to_string(),
+            expires_at: Instant::now() + self.pending_timeout,
+            granted: false,
+        });
+        id
+    }
+
+    /// Mark a pending access as granted.  Returns `true` if the ID was found.
+    pub fn grant_pending(&mut self, id: u64) -> bool {
+        if let Some(p) = self.pending.iter_mut().find(|p| p.id == id) {
+            if p.expires_at > Instant::now() {
+                p.granted = true;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Remove (deny) a pending access by ID.  Returns `true` if found.
+    pub fn deny_pending(&mut self, id: u64) -> bool {
+        let before = self.pending.len();
+        self.pending.retain(|p| p.id != id);
+        self.pending.len() < before
+    }
+
+    /// Check whether a pending access has been granted and not expired.
+    pub fn is_pending_granted(&self, id: u64) -> bool {
+        self.pending
+            .iter()
+            .any(|p| p.id == id && p.granted && p.expires_at > Instant::now())
+    }
+
+    /// Remove a pending access by ID (cleanup after resolution).
+    pub fn remove_pending(&mut self, id: u64) {
+        self.pending.retain(|p| p.id != id);
+    }
+
+    /// Remove all expired pending accesses.
+    pub fn cleanup_expired(&mut self) {
+        let now = Instant::now();
+        self.pending.retain(|p| p.expires_at > now);
+    }
+
+    /// Return info about all non-expired pending accesses.
+    pub fn list_pending(&mut self) -> Vec<fuse_protocol::PendingAccessInfo> {
+        self.cleanup_expired();
+        let now = Instant::now();
+        let unix_now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        self.pending
+            .iter()
+            .filter(|p| p.expires_at > now)
+            .map(|p| {
+                let remaining = p.expires_at.duration_since(now).as_secs();
+                fuse_protocol::PendingAccessInfo {
+                    id: p.id,
+                    secret_name: p.secret_name.clone(),
+                    pid: p.pid,
+                    pid_hash: p.pid_hash.clone(),
+                    reason: p.reason.clone(),
+                    expires_at: unix_now + remaining,
+                }
+            })
+            .collect()
+    }
+
+    /// Force-grant a read: bypass hash/count checks, increment counter,
+    /// set reading_pid, advance read_progress.  Used after manual approval.
+    pub fn force_grant_read(
+        &mut self,
+        name: &str,
+        pid: u32,
+        offset: usize,
+        size: usize,
+    ) -> Option<Vec<u8>> {
+        let rec = self.secrets.get_mut(name)?;
+        rec.access_count += 1;
+        rec.reading_pid = Some(pid);
+        let end = offset.saturating_add(size).min(rec.content.len());
+        rec.read_progress = rec.read_progress.max(end);
+        Some(rec.content.clone())
     }
 }
 
