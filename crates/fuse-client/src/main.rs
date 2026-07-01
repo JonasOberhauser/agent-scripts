@@ -4,8 +4,48 @@ use std::path::{Path, PathBuf};
 use clap::Parser;
 use fuse_client::send_command;
 use fuse_protocol::{Command, Response, ServerStateFile, SystemIo, VERSION as CLIENT_VERSION};
-#[allow(unused_imports)]
-use rustyline::DefaultEditor;
+
+// ── Console abstraction ────────────────────────────────────────
+
+/// Output abstraction so plugins work in both CLI (stdout) and TUI
+/// (log area) modes without knowing which they're in.
+trait Console {
+    fn print_line(&mut self, text: &str);
+    fn print_error(&mut self, text: &str);
+}
+
+/// Prints to stdout / stderr — used in CLI mode.
+struct StdoutConsole;
+
+impl Console for StdoutConsole {
+    fn print_line(&mut self, text: &str) {
+        println!("{text}");
+    }
+    fn print_error(&mut self, text: &str) {
+        eprintln!("{text}");
+    }
+}
+
+/// Collects lines into a Vec — used in TUI mode where ratatui
+/// renders them in the log area.
+struct BufferConsole {
+    lines: Vec<String>,
+}
+
+impl BufferConsole {
+    fn new() -> Self {
+        Self { lines: Vec::new() }
+    }
+}
+
+impl Console for BufferConsole {
+    fn print_line(&mut self, text: &str) {
+        self.lines.push(text.to_string());
+    }
+    fn print_error(&mut self, text: &str) {
+        self.lines.push(format!("Error: {text}"));
+    }
+}
 
 // ── CLI (non-interactive) ──────────────────────────────────────
 
@@ -55,7 +95,7 @@ fn main() {
             match cmd {
                 Ok(command) => match send_command(&io, &cli.socket, command) {
                     Ok(resp) => {
-                        print_response(&resp);
+                        print_response(&resp, &mut StdoutConsole);
                         if matches!(resp, Response::Error { .. }) {
                             std::process::exit(1);
                         }
@@ -386,7 +426,7 @@ enum ShellAction {
 struct Plugin {
     name: &'static str,
     help: &'static str,
-    execute: fn(args: &str, io: &fuse_protocol::RealSystemIo, socket: &Path) -> ShellAction,
+    execute: fn(args: &str, io: &fuse_protocol::RealSystemIo, socket: &Path, out: &mut dyn Console) -> ShellAction,
 }
 
 fn all_plugins() -> Vec<Plugin> {
@@ -395,39 +435,39 @@ fn all_plugins() -> Vec<Plugin> {
             name: "status",
             help: "Show all secrets and access counts",
             
-            execute: |_, io, sock| {
-                run_simple(io, sock, Command::Status)
+            execute: |_, io, sock, out| {
+                run_simple(io, sock, Command::Status, out)
             },
         },
         Plugin {
             name: "mounts",
             help: "List mounted secret files",
             
-            execute: |_, io, sock| run_simple(io, sock, Command::ListMounts),
+            execute: |_, io, sock, out| run_simple(io, sock, Command::ListMounts, out),
         },
         Plugin {
             name: "reset",
             help: "Reset access counter for one or all secrets",
             
-            execute: |args, io, sock| {
+            execute: |args, io, sock, out| {
                 let name = args.split_whitespace().next().map(|s| s.to_string());
-                run_simple(io, sock, Command::Reset { name })
+                run_simple(io, sock, Command::Reset { name }, out)
             },
         },
         Plugin {
             name: "reset-all",
             help: "Reset all access counters",
             
-            execute: |_, io, sock| run_simple(io, sock, Command::Reset { name: None }),
+            execute: |_, io, sock, out| run_simple(io, sock, Command::Reset { name: None }, out),
         },
         Plugin {
             name: "add",
             help: "Add a new secret from a file",
             
-            execute: |args, io, sock| {
+            execute: |args, io, sock, out| {
                 let parts: Vec<&str> = args.trim().splitn(3, char::is_whitespace).collect();
                 if parts.len() < 3 {
-                    eprintln!("Usage: add NAME FILE HASH");
+                    out.print_error("Usage: add NAME FILE HASH");
                     return ShellAction::Continue;
                 }
                 let file = PathBuf::from(parts[1]);
@@ -436,9 +476,9 @@ fn all_plugins() -> Vec<Plugin> {
                         name: parts[0].to_string(),
                         content,
                         hash: parts[2].to_string(),
-                    }),
+                    }, out),
                     Err(e) => {
-                        eprintln!("Error reading file: {e}");
+                        out.print_error(&format!("Error reading file: {e}"));
                         ShellAction::Continue
                     }
                 }
@@ -448,46 +488,46 @@ fn all_plugins() -> Vec<Plugin> {
             name: "remove",
             help: "Remove a secret",
             
-            execute: |args, io, sock| {
+            execute: |args, io, sock, out| {
                 let name = args.trim();
                 if name.is_empty() {
-                    eprintln!("Usage: remove NAME");
+                    out.print_error("Usage: remove NAME");
                     return ShellAction::Continue;
                 }
-                run_simple(io, sock, Command::RemoveSecret { name: name.to_string() })
+                run_simple(io, sock, Command::RemoveSecret { name: name.to_string() }, out)
             },
         },
         Plugin {
             name: "rotate",
             help: "Change the allowed binary hash",
             
-            execute: |args, io, sock| {
+            execute: |args, io, sock, out| {
                 let parts: Vec<&str> = args.trim().splitn(2, char::is_whitespace).collect();
                 if parts.len() < 2 {
-                    eprintln!("Usage: rotate NAME HASH");
+                    out.print_error("Usage: rotate NAME HASH");
                     return ShellAction::Continue;
                 }
                 run_simple(io, sock, Command::RotateHash {
                     name: parts[0].to_string(),
                     new_hash: parts[1].to_string(),
-                })
+                }, out)
             },
         },
         Plugin {
             name: "pending",
             help: "Show pending access requests waiting for approval",
             
-            execute: |_, io, sock| run_simple(io, sock, Command::ListPending),
+            execute: |_, io, sock, out| run_simple(io, sock, Command::ListPending, out),
         },
         Plugin {
             name: "grant",
             help: "Grant a pending access request",
             
-            execute: |args, io, sock| {
+            execute: |args, io, sock, out| {
                 match args.trim().parse::<u64>() {
-                    Ok(id) => run_simple(io, sock, Command::Grant { id }),
+                    Ok(id) => run_simple(io, sock, Command::Grant { id }, out),
                     Err(_) => {
-                        eprintln!("Usage: grant ID (ID must be a number)");
+                        out.print_error("Usage: grant ID (ID must be a number)");
                         ShellAction::Continue
                     }
                 }
@@ -497,11 +537,11 @@ fn all_plugins() -> Vec<Plugin> {
             name: "deny",
             help: "Deny a pending access request",
             
-            execute: |args, io, sock| {
+            execute: |args, io, sock, out| {
                 match args.trim().parse::<u64>() {
-                    Ok(id) => run_simple(io, sock, Command::Deny { id }),
+                    Ok(id) => run_simple(io, sock, Command::Deny { id }, out),
                     Err(_) => {
-                        eprintln!("Usage: deny ID (ID must be a number)");
+                        out.print_error("Usage: deny ID (ID must be a number)");
                         ShellAction::Continue
                     }
                 }
@@ -510,12 +550,12 @@ fn all_plugins() -> Vec<Plugin> {
         Plugin {
             name: "version",
             help: "Show client and server versions",
-            execute: |_, io, sock| {
-                println!("Client: {}", CLIENT_VERSION);
+            execute: |_, io, sock, out| {
+                out.print_line(&format!("Client: {}", CLIENT_VERSION));
                 match send_command(io, sock, Command::GetVersion) {
-                    Ok(Response::Version { version }) => println!("Server: {version}"),
-                    Ok(_) => println!("Server: <unknown response>"),
-                    Err(e) => println!("Server: <unreachable: {e}>"),
+                    Ok(Response::Version { version }) => out.print_line(&format!("Server: {version}")),
+                    Ok(_) => out.print_line("Server: <unknown response>"),
+                    Err(e) => out.print_line(&format!("Server: <unreachable: {e}>")),
                 }
                 ShellAction::Continue
             },
@@ -524,8 +564,8 @@ fn all_plugins() -> Vec<Plugin> {
             name: "help",
             help: "Show available commands",
             
-            execute: |_, _, _| {
-                print_help();
+            execute: |_, _, _, out| {
+                print_help(out);
                 ShellAction::Continue
             },
         },
@@ -533,90 +573,87 @@ fn all_plugins() -> Vec<Plugin> {
             name: "exit",
             help: "Exit the shell",
             
-            execute: |_, _, _| ShellAction::Exit,
+            execute: |_, _, _, _| ShellAction::Exit,
         },
         Plugin {
             name: "quit",
             help: "Exit the shell",
             
-            execute: |_, _, _| ShellAction::Exit,
+            execute: |_, _, _, _| ShellAction::Exit,
         },
     ]
 }
 
-/// Send a command and print the response. Returns Continue.
 fn run_simple(
     io: &fuse_protocol::RealSystemIo,
     socket: &Path,
     cmd: Command,
+    out: &mut dyn Console,
 ) -> ShellAction {
     match send_command(io, socket, cmd) {
-        Ok(resp) => print_response(&resp),
-        Err(e) => eprintln!("Connection error: {e}"),
+        Ok(resp) => print_response(&resp, out),
+        Err(e) => out.print_error(&format!("Connection error: {e}")),
     }
     ShellAction::Continue
 }
 
-fn print_help() {
-    println!("COMMANDS:");
+fn print_help(out: &mut dyn Console) {
+    out.print_line("COMMANDS:");
     let max_name = all_plugins().iter().map(|p| p.name.len()).max().unwrap_or(0);
     for p in all_plugins() {
         if p.name == "exit" || p.name == "quit" {
             continue;
         }
-        println!("  {:<width$}  {}", p.name, p.help, width = max_name);
+        out.print_line(&format!("  {:<width$}  {}", p.name, p.help, width = max_name));
     }
-    println!("  {:<width$}  Exit the shell", "exit", width = max_name);
+    out.print_line(&format!("  {:<width$}  Exit the shell", "exit", width = max_name));
 }
 
 // ── Response printing ──────────────────────────────────────────
 
-fn print_response(resp: &Response) {
+fn print_response(resp: &Response, out: &mut dyn Console) {
     match resp {
-        Response::Ok => println!("OK"),
-        Response::Error { message } => eprintln!("Error: {message}"),
+        Response::Ok => out.print_line("OK"),
+        Response::Error { message } => out.print_error(message),
         Response::Status { secrets } => {
             if secrets.is_empty() {
-                println!("No secrets configured.");
+                out.print_line("No secrets configured.");
             } else {
-                println!("{:<24} {:>8} {:>8}  HASH", "NAME", "READS", "SIZE");
+                out.print_line(&format!("{:<24} {:>8} {:>8}  HASH", "NAME", "READS", "SIZE"));
                 for s in secrets {
-                    println!(
+                    out.print_line(&format!(
                         "{:<24} {:>8} {:>8}  {}",
                         s.name, s.access_count, s.size, s.allowed_hash
-                    );
+                    ));
                 }
             }
         }
         Response::MountList { mounts } => {
             if mounts.is_empty() {
-                println!("No secrets mounted.");
+                out.print_line("No secrets mounted.");
             } else {
                 for m in mounts {
-                    println!("  {} ({} bytes)", m.name, m.size);
+                    out.print_line(&format!("  {} ({} bytes)", m.name, m.size));
                 }
             }
         }
         Response::PendingList { pending } => {
             if pending.is_empty() {
-                println!("No pending access requests.");
+                out.print_line("No pending access requests.");
             } else {
-                println!("PENDING ACCESS REQUESTS:");
+                out.print_line("PENDING ACCESS REQUESTS:");
                 for p in pending {
-                    println!(
+                    out.print_line(&format!(
                         "  [{}] {} pid={} hash={} reason=\"{}\" expires_at={}",
-                        p.id,
-                        p.secret_name,
-                        p.pid,
+                        p.id, p.secret_name, p.pid,
                         p.pid_hash.as_deref().unwrap_or("<unknown>"),
-                        p.reason,
-                        p.expires_at
-                    );
+                        p.reason, p.expires_at
+                    ));
                 }
             }
         }
         Response::Version { version } => {
-            println!("Server version: {version}");
+            out.print_line(&format!("Server version: {version}"));
         }
     }
 }
@@ -747,7 +784,11 @@ fn interactive(
                         log_lines.push(format!("> {line}"));
                         let (cn, args) = line.trim().split_once(' ').unwrap_or((line.trim(),""));
                         match plugins.iter().find(|p| p.name==cn) {
-                            Some(pl) => { if let ShellAction::Exit = (pl.execute)(args, io, socket) { return Ok(()); } }
+                            Some(pl) => {
+                                let mut buf = BufferConsole::new();
+                                if let ShellAction::Exit = (pl.execute)(args, io, socket, &mut buf) { return Ok(()); }
+                                log_lines.extend(buf.lines);
+                            }
                             None => log_lines.push(format!("Unknown: '{cn}'")),
                         }
                     }
