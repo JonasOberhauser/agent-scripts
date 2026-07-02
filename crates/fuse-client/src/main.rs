@@ -754,8 +754,30 @@ fn interactive(
                 );
 
                 // ── Pending pop-up (overlays the log pane) ──
-                if !pending.is_empty() {
-                    let h = (pending.len() + 4) as u16;
+                if !pending.is_empty() && grant_idx.is_some() {
+                    let pl: Vec<Line> = {
+                        let mut lines = Vec::new();
+                        lines.push(Line::from(""));
+                        for (i, p) in pending.iter().enumerate() {
+                            let active = grant_idx == Some(i);
+                            let prefix = if active { "▶" } else { " " };
+                            lines.push(Line::from(format!(
+                                " {prefix} [{}] {}  (pid {})",
+                                p.id, p.secret_name, p.pid
+                            )));
+                            lines.push(Line::from(format!(
+                                "     hash: {}  reason: {}",
+                                p.pid_hash.as_deref().unwrap_or("<unknown>"),
+                                p.reason
+                            )));
+                            lines.push(Line::from(""));
+                        }
+                        lines.push(Line::from(
+                            " [y] Grant   [n] Deny   [↑↓] Navigate   [Esc] Close",
+                        ));
+                        lines
+                    };
+                    let h = pl.len() as u16 + 2; // +border
                     let pop = ratatui::layout::Rect {
                         x: chunks[0].x + 1,
                         y: chunks[0].y + 1,
@@ -763,25 +785,21 @@ fn interactive(
                         height: h.min(chunks[0].height.saturating_sub(2)),
                     };
                     f.render_widget(Clear, pop);
-                    let mut pl: Vec<Line> = vec![Line::from(format!(" {} pending request(s)", pending.len()))];
-                    for (i, p) in pending.iter().enumerate() {
-                        let m = if grant_idx == Some(i) { "▶" } else { "⚡" };
-                        pl.push(Line::from(format!(" {m} [{}] {} pid={} {}", p.id, p.secret_name, p.pid, p.reason)));
-                    }
-                    if let Some(idx) = grant_idx {
-                        pl.push(Line::from(""));
-                        pl.push(Line::from(format!("  Grant [{}]? [y/N]", pending[idx].id)));
-                    }
                     f.render_widget(
                         Paragraph::new(pl)
-                            .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Yellow)).title("⚠ Pending"))
+                            .block(
+                                Block::default()
+                                    .borders(Borders::ALL)
+                                    .border_style(Style::default().fg(Color::Yellow))
+                                    .title(format!("⚠ {} Pending Access Request(s)", pending.len())),
+                            )
                             .style(Style::default().bg(Color::Black)),
                         pop,
                     );
                 }
 
                 // ── Input pane (fixed at bottom) ──
-                let prompt = if pending.is_empty() { "fuse-client> ".into() } else { format!("({}p) fuse-client> ", pending.len()) };
+                let prompt = if pending.is_empty() { "> ".into() } else { format!("({}p) > ", pending.len()) };
                 f.render_widget(
                     Paragraph::new(format!("{prompt}{}", input.value()))
                         .block(Block::default().borders(Borders::ALL).title("Input")),
@@ -826,13 +844,17 @@ fn interactive(
                     _ => {}
                 }
 
-                // ── Grant mode (y/n for pending) ──
+                // ── Grant mode (y/n/Esc for pending) ──
                 if let Some(idx) = grant_idx {
                     match key.code {
+                        KeyCode::Esc => {
+                            grant_idx = None; // close popup, keep requests
+                            continue;
+                        }
                         KeyCode::Char('y') | KeyCode::Char('Y') => {
                             let p = pending[idx].clone();
                             let _ = send_command(io, socket, Command::Grant{ id: p.id });
-                            log_lines.push(format!("Granted [{}]", p.id));
+                            log_lines.push(format!("Granted [{}] {} (pid {})", p.id, p.secret_name, p.pid));
                             log_scroll_up = 0;
                             pending.remove(idx);
                             grant_idx = if pending.is_empty() { None } else { Some(idx.min(pending.len()-1)) };
@@ -841,7 +863,7 @@ fn interactive(
                         KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Enter => {
                             let p = pending[idx].clone();
                             let _ = send_command(io, socket, Command::Deny{ id: p.id });
-                            log_lines.push(format!("Denied [{}]", p.id));
+                            log_lines.push(format!("Denied [{}] {} (pid {})", p.id, p.secret_name, p.pid));
                             log_scroll_up = 0;
                             pending.remove(idx);
                             grant_idx = if pending.is_empty() { None } else { Some(idx.min(pending.len()-1)) };
@@ -849,8 +871,9 @@ fn interactive(
                         }
                         KeyCode::Up if idx > 0 => { grant_idx = Some(idx-1); continue }
                         KeyCode::Down if idx+1 < pending.len() => { grant_idx = Some(idx+1); continue }
-                        _ => {}
+                        _ => {} // block other keys while popup is open
                     }
+                    continue; // eat all unhandled keys while popup is open
                 }
 
                 // ── Normal input handling ──
@@ -901,9 +924,26 @@ fn interactive(
                 let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
                 let live: Vec<_> = np.into_iter().filter(|p| p.expires_at > now).collect();
                 if live != pending {
+                    let had_new = live.len() > pending.len();
+                    // Track highlighted request by ID to avoid jumping
+                    let current_id = grant_idx
+                        .and_then(|i| pending.get(i))
+                        .map(|p| p.id);
                     pending = live;
-                    if grant_idx.is_none() && !pending.is_empty() { grant_idx = Some(0); }
-                    if let Some(i) = grant_idx { if i >= pending.len() { grant_idx = if pending.is_empty() {None} else {Some(0)}; } }
+                    // Restore selection to same ID if still present
+                    if let Some(id) = current_id {
+                        grant_idx = pending.iter().position(|p| p.id == id);
+                    }
+                    // Auto-open popup when new requests arrive
+                    if had_new && grant_idx.is_none() && !pending.is_empty() {
+                        grant_idx = Some(0);
+                    }
+                    // Clamp
+                    if let Some(i) = grant_idx {
+                        if i >= pending.len() {
+                            grant_idx = if pending.is_empty() { None } else { Some(0) };
+                        }
+                    }
                 }
             }
         }
