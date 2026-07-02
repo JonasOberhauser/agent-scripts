@@ -53,6 +53,12 @@ fn main() {
         .init();
     let io = RealSystemIo::new();
 
+    info!("fuse-server v{} starting", fuse_protocol::VERSION);
+    info!("  mount-point: {}", cli.mount_point.display());
+    info!("  socket:      {}", cli.socket.display());
+    info!("  allow-other: {}", cli.allow_other);
+    info!("  pending-timeout: {}s", cli.pending_timeout);
+
     // Build initial state.
     let mut state = ServerState::new();
     state.pending_timeout = Duration::from_secs(cli.pending_timeout);
