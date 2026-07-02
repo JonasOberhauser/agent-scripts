@@ -811,7 +811,14 @@ fn interactive(
                 ));
             }).map_err(|e| e.to_string())?;
 
-            if event::poll(std::time::Duration::from_secs(3)).map_err(|e| e.to_string())? {
+            // Poll faster while popup is open so new requests appear quickly
+            let poll_timeout = if grant_idx.is_some() {
+                std::time::Duration::from_millis(500)
+            } else {
+                std::time::Duration::from_secs(3)
+            };
+
+            if event::poll(poll_timeout).map_err(|e| e.to_string())? {
                 let ev = event::read().map_err(|e| e.to_string())?;
                 let key = match ev {
                     Event::Mouse(mouse) => {
