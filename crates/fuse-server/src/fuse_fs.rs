@@ -30,6 +30,25 @@ pub struct GatekeeperFs<S: SystemIo> {
     inodes: Mutex<std::collections::HashMap<u64, String>>,
 }
 
+/// Result of a non-blocking read attempt.
+#[derive(Debug)]
+pub enum ReadResult {
+    /// Content served immediately.
+    Data(Vec<u8>),
+    /// Hard error (ENOENT, etc).
+    Error(i32),
+    /// Read denied — a pending access was created.  The caller should
+    /// spawn a thread to wait for a grant and then reply.
+    Pending {
+        pending_id: u64,
+        name: String,
+        pid: u32,
+        offset: usize,
+        size: u32,
+        timeout: std::time::Duration,
+    },
+}
+
 /// Result of a `statfs` query — exposed for unit testing.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StatfsData {
@@ -160,17 +179,20 @@ impl<S: SystemIo> GatekeeperFs<S> {
     /// detection).  `pid_hash` is the SHA-256 of the calling process's
     /// executable, or `None` if it could not be determined.  Forward-only
     /// reads are enforced: re-reading already-served bytes is denied.
-    pub fn do_read(
+    /// Non-blocking read attempt.  Returns Data, Error, or Pending.
+    /// When Pending, the caller should spawn a thread to wait for grant
+    /// and send the reply asynchronously.
+    pub fn try_read(
         &self,
         ino: u64,
         pid: u32,
         pid_hash: Option<&str>,
         offset: i64,
         size: u32,
-    ) -> Result<Vec<u8>, i32> {
+    ) -> ReadResult {
         let name = match self.inode_name(ino) {
             Some(n) => n,
-            None => return Err(libc::ENOENT),
+            None => return ReadResult::Error(libc::ENOENT),
         };
 
         let off = offset.max(0) as usize;
@@ -184,23 +206,23 @@ impl<S: SystemIo> GatekeeperFs<S> {
             ReadOutcome::Granted(content) => {
                 let start = off.min(content.len());
                 let end = (start + size as usize).min(content.len());
-                Ok(content[start..end].to_vec())
+                ReadResult::Data(content[start..end].to_vec())
             }
+            ReadOutcome::NotFound => ReadResult::Error(libc::ENOENT),
             ReadOutcome::AlreadyAccessed | ReadOutcome::HashMismatch { .. } => {
                 let reason = match &outcome {
-                    ReadOutcome::AlreadyAccessed => "already accessed".to_string(),
+                    ReadOutcome::AlreadyAccessed => "exceeded access limit".to_string(),
                     ReadOutcome::HashMismatch { got, expected } => {
                         format!("hash mismatch: got {got}, expected {expected}")
                     }
                     _ => unreachable!(),
                 };
 
-                // If pending timeout is zero, deny immediately (no pending).
                 let (pending_id, timeout) = {
                     let mut state = self.state.lock().expect("ServerState mutex poisoned");
                     if state.pending_timeout.is_zero() {
                         warn!("Denied read of '{name}' by pid {pid}: {reason}");
-                        return Err(libc::EACCES);
+                        return ReadResult::Error(libc::EACCES);
                     }
                     let id = state.create_pending(&name, pid, pid_hash, &reason);
                     let to = state.pending_timeout;
@@ -213,10 +235,45 @@ impl<S: SystemIo> GatekeeperFs<S> {
                     timeout.as_secs()
                 );
 
+                ReadResult::Pending {
+                    pending_id,
+                    name,
+                    pid,
+                    offset: off,
+                    size,
+                    timeout,
+                }
+            }
+        }
+    }
+
+    /// Blocking read — for unit tests only.  Production uses Filesystem::read
+    /// which spawns a thread for Pending results.
+    pub fn do_read(
+        &self,
+        ino: u64,
+        pid: u32,
+        pid_hash: Option<&str>,
+        offset: i64,
+        size: u32,
+    ) -> Result<Vec<u8>, i32> {
+        match self.try_read(ino, pid, pid_hash, offset, size) {
+            ReadResult::Data(data) => Ok(data),
+            ReadResult::Error(e) => Err(e),
+            ReadResult::Pending {
+                pending_id,
+                name,
+                pid,
+                offset,
+                size,
+                timeout,
+            } => {
                 let deadline = std::time::Instant::now() + timeout;
                 loop {
                     if std::time::Instant::now() > deadline {
-                        self.state.lock().expect("ServerState mutex poisoned")
+                        self.state
+                            .lock()
+                            .expect("ServerState mutex poisoned")
                             .remove_pending(pending_id);
                         warn!("Pending access {pending_id} timed out");
                         return Err(libc::EACCES);
@@ -231,14 +288,16 @@ impl<S: SystemIo> GatekeeperFs<S> {
                         warn!("Pending access {pending_id} granted — serving '{name}'");
                         let content = {
                             let mut state = self.state.lock().expect("ServerState mutex poisoned");
-                            state.force_grant_read(&name, pid, off, size as usize)
+                            state.force_grant_read(&name, pid, offset, size as usize)
                         };
-                        self.state.lock().expect("ServerState mutex poisoned")
+                        self.state
+                            .lock()
+                            .expect("ServerState mutex poisoned")
                             .remove_pending(pending_id);
 
                         return match content {
                             Some(data) => {
-                                let start = off.min(data.len());
+                                let start = offset.min(data.len());
                                 let end = (start + size as usize).min(data.len());
                                 Ok(data[start..end].to_vec())
                             }
@@ -249,7 +308,6 @@ impl<S: SystemIo> GatekeeperFs<S> {
                     std::thread::sleep(std::time::Duration::from_millis(500));
                 }
             }
-            ReadOutcome::NotFound => Err(libc::ENOENT),
         }
     }
 
@@ -339,12 +397,68 @@ impl<S: SystemIo> Filesystem for GatekeeperFs<S> {
             }
         };
 
-        match self.do_read(ino, pid, pid_hash.as_deref(), offset, size) {
-            Ok(data) => {
+        match self.try_read(ino, pid, pid_hash.as_deref(), offset, size) {
+            ReadResult::Data(data) => {
                 debug!("Granted read of ino {ino} to pid {pid}");
                 reply.data(&data);
             }
-            Err(e) => reply.error(e),
+            ReadResult::Error(e) => reply.error(e),
+            ReadResult::Pending {
+                pending_id,
+                name,
+                pid,
+                offset,
+                size,
+                timeout,
+            } => {
+                // Spawn a thread to wait for grant — keeps the FUSE session
+                // responsive to other requests while this read is pending.
+                let state = self.state.clone();
+                std::thread::spawn(move || {
+                    let deadline = std::time::Instant::now() + timeout;
+                    loop {
+                        if std::time::Instant::now() > deadline {
+                            state
+                                .lock()
+                                .expect("ServerState mutex poisoned")
+                                .remove_pending(pending_id);
+                            warn!("Pending access {pending_id} timed out");
+                            reply.error(libc::EACCES);
+                            return;
+                        }
+
+                        let granted = {
+                            let s = state.lock().expect("ServerState mutex poisoned");
+                            s.is_pending_granted(pending_id)
+                        };
+
+                        if granted {
+                            warn!("Pending access {pending_id} granted — serving '{name}'");
+                            let content = {
+                                let mut s = state.lock().expect("ServerState mutex poisoned");
+                                s.force_grant_read(&name, pid, offset, size as usize)
+                            };
+                            state
+                                .lock()
+                                .expect("ServerState mutex poisoned")
+                                .remove_pending(pending_id);
+
+                            match content {
+                                Some(data) => {
+                                    let start = offset.min(data.len());
+                                    let end = (start + size as usize).min(data.len());
+                                    reply.data(&data[start..end]);
+                                }
+                                None => reply.error(libc::ENOENT),
+                            }
+                            return;
+                        }
+
+                        std::thread::sleep(std::time::Duration::from_millis(500));
+                    }
+                });
+                // Return immediately — the thread sends the reply when ready.
+            }
         }
     }
 
