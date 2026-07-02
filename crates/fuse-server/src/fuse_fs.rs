@@ -130,6 +130,13 @@ impl<S: SystemIo> GatekeeperFs<S> {
         }
     }
 
+    /// Flags returned by open().  FOPEN_DIRECT_IO bypasses the kernel page
+    /// cache, ensuring every read syscall results in a separate FUSE_READ
+    /// request.  Without this, the kernel serializes/coalesces concurrent
+    /// reads to the same inode — blocking the second process until the
+    /// first read completes.
+    pub const OPEN_FLAGS: u32 = 1; // FOPEN_DIRECT_IO
+
     /// Process a read asynchronously — spawns a thread and returns a
     /// JoinHandle immediately. Used by Filesystem::read and by tests.
     pub fn process_read_async(
@@ -473,7 +480,8 @@ impl<S: SystemIo> Filesystem for GatekeeperFs<S> {
     }
 
     fn open(&mut self, _req: &Request<'_>, _ino: u64, _flags: i32, reply: ReplyOpen) {
-        reply.opened(0, 0);
+        // FOPEN_DIRECT_IO: bypass page cache so every read reaches the daemon.
+        reply.opened(0, Self::OPEN_FLAGS);
     }
 
     fn read(
@@ -627,6 +635,15 @@ mod tests {
         let fs = make_fs(&[]);
         let result = fs.do_getattr(0, 0, 9999);
         assert_eq!(result, Err(libc::ENOENT));
+    }
+
+    #[test]
+    fn open_returns_direct_io_flag() {
+        // FOPEN_DIRECT_IO is essential: without it, the kernel serializes
+        // concurrent reads to the same inode, blocking the second process
+        // until the first read completes.  This test catches if someone
+        // accidentally removes the flag.
+        assert_eq!(GatekeeperFs::<MockSystemIo>::OPEN_FLAGS, 1, "must be FOPEN_DIRECT_IO");
     }
 
     // ── do_read tests ────────────────────────────────────────────
