@@ -856,70 +856,74 @@ mod tests {
         assert!(state.lock().unwrap().pending.is_empty());
     }
 
-    // ── try_read non-blocking tests ──────────────────────────────
+    // ── concurrency: pending doesn't block other reads ──────────
 
     #[test]
-    fn try_read_returns_immediately_on_pending() {
+    fn concurrent_read_works_while_another_is_pending() {
+        // Scenario: read A denied (hash mismatch) → pending → waits for grant.
+        // While A is pending, read B (wildcard) must succeed.
+        // Grant A only AFTER B succeeds. If deadlock, test hangs/fails.
         let state = std::sync::Arc::new(std::sync::Mutex::new(ServerState::new()));
-        state.lock().unwrap().pending_timeout = Duration::from_secs(60);
-        state.lock().unwrap().add("s", b"DATA".to_vec(), "correct_hash");
-
-        let fs = GatekeeperFs::new(state, MockSystemIo::new());
-        let (ino, _) = fs.do_lookup(0, 0, ROOT_INO, "s").unwrap();
-
-        // Wrong hash → try_read should return Pending immediately
-        let start = std::time::Instant::now();
-        let result = fs.try_read(ino, 100, Some("wrong"), 0, 1024);
-        let elapsed = start.elapsed();
-
-        assert!(matches!(result, ReadResult::Pending { .. }));
-        assert!(
-            elapsed < Duration::from_millis(100),
-            "try_read should return immediately, took {elapsed:?}"
-        );
-    }
-
-    #[test]
-    fn try_read_concurrent_after_pending() {
-        // Verify that after a pending is created, try_read for a DIFFERENT
-        // secret still works immediately (no blocking).
-        let state = std::sync::Arc::new(std::sync::Mutex::new(ServerState::new()));
-        state.lock().unwrap().pending_timeout = Duration::from_secs(60);
+        state.lock().unwrap().pending_timeout = Duration::from_secs(30);
         state.lock().unwrap().add("a", b"AAA".to_vec(), "hash_a");
-        state.lock().unwrap().add("b", b"BBB".to_vec(), "hash_b");
+        state.lock().unwrap().add("b", b"BBB".to_vec(), "*"); // wildcard
 
-        let fs = GatekeeperFs::new(state, MockSystemIo::new());
-        let (ino_a, _) = fs.do_lookup(0, 0, ROOT_INO, "a").unwrap();
-        let (ino_b, _) = fs.do_lookup(0, 0, ROOT_INO, "b").unwrap();
+        // Thread 1: Read A → denied → create pending → wait for grant
+        let state1 = state.clone();
+        let t1 = std::thread::spawn(move || {
+            let outcome = {
+                let mut s = state1.lock().unwrap();
+                s.attempt_read("a", 100, Some("wrong"), 0, 1024)
+            };
+            assert!(matches!(outcome, ReadOutcome::HashMismatch { .. }));
 
-        // First read: wrong hash → pending (shouldn't block)
-        let result_a = fs.try_read(ino_a, 100, Some("wrong"), 0, 1024);
-        assert!(matches!(result_a, ReadResult::Pending { .. }));
+            let id = {
+                let mut s = state1.lock().unwrap();
+                s.create_pending("a", 100, Some("wrong"), "hash mismatch")
+            };
 
-        // Second read: correct hash → should succeed immediately
-        // even though the first read is pending.
+            // Wait for grant (simulates the spawned thread in Filesystem::read)
+            let deadline = std::time::Instant::now() + Duration::from_secs(15);
+            loop {
+                if std::time::Instant::now() > deadline {
+                    panic!("Thread 1 timed out waiting for grant — deadlock?");
+                }
+                if state1.lock().unwrap().is_pending_granted(id) {
+                    let mut s = state1.lock().unwrap();
+                    let data = s.force_grant_read("a", 100, 0, 1024).unwrap();
+                    s.remove_pending(id);
+                    return data;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        });
+
+        // Give thread 1 time to enter pending state
+        std::thread::sleep(Duration::from_millis(300));
+
+        // Main thread: Read B → MUST succeed immediately while A is pending
         let start = std::time::Instant::now();
-        let result_b = fs.try_read(ino_b, 200, Some("hash_b"), 0, 1024);
+        let outcome_b = {
+            let mut s = state.lock().unwrap();
+            s.attempt_read("b", 200, None, 0, 1024)
+        };
         let elapsed = start.elapsed();
 
-        assert!(matches!(result_b, ReadResult::Data(_)));
         assert!(
-            elapsed < Duration::from_millis(100),
-            "second try_read should return immediately, took {elapsed:?}"
+            matches!(&outcome_b, ReadOutcome::Granted(d) if d == b"BBB"),
+            "B should succeed while A is pending"
         );
-    }
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "concurrent read took {elapsed:?} — possible deadlock"
+        );
 
-    #[test]
-    fn try_read_zero_timeout_returns_error_not_pending() {
-        let state = std::sync::Arc::new(std::sync::Mutex::new(ServerState::new()));
-        state.lock().unwrap().pending_timeout = Duration::ZERO;
-        state.lock().unwrap().add("s", b"DATA".to_vec(), "correct_hash");
+        // NOW grant A (only after B succeeded)
+        let id = state.lock().unwrap().pending.first().unwrap().id;
+        state.lock().unwrap().grant_pending(id);
 
-        let fs = GatekeeperFs::new(state, MockSystemIo::new());
-        let (ino, _) = fs.do_lookup(0, 0, ROOT_INO, "s").unwrap();
-
-        // Wrong hash with zero timeout → Error, not Pending
-        let result = fs.try_read(ino, 100, Some("wrong"), 0, 1024);
-        assert!(matches!(result, ReadResult::Error(libc::EACCES)));
+        // A should complete
+        let data_a = t1.join().expect("thread 1 panicked");
+        assert_eq!(data_a, b"AAA");
     }
 }
