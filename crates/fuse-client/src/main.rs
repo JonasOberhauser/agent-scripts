@@ -256,12 +256,22 @@ fn start_server_from_state(
 
     // Spawn new server as independent daemon
     eprintln!("Starting server (v{})...", CLIENT_VERSION);
+    let log_path = std::path::Path::new("/tmp/fuse-gatekeeper.log");
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(log_path)
+        .unwrap_or_else(|e| { eprintln!("open log file: {e}"); std::process::exit(1); });
+    let log_file2 = log_file.try_clone().unwrap_or_else(|e| { eprintln!("dup log fd: {e}"); std::process::exit(1); });
+    eprintln!("  Log:       {}", log_path.display());
+
     use std::os::unix::process::CommandExt;
     let mut cmd = std::process::Command::new(&spawn_prog);
     cmd.args(&spawn_args)
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        .stdout(std::process::Stdio::from(log_file))
+        .stderr(std::process::Stdio::from(log_file2));
     unsafe {
         cmd.pre_exec(|| {
             libc::setsid();
