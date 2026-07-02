@@ -346,3 +346,60 @@ fn e2e_root_is_directory() {
     let meta = std::fs::metadata(dir.path()).unwrap();
     assert!(meta.is_dir());
 }
+
+// ── concurrent reads: pending doesn't block other operations ───
+
+#[test]
+fn e2e_pending_does_not_block_other_reads() {
+    if !fuse_available() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let hash = current_exe_hash();
+    let state = make_state(&[
+        // "blocked" has a wrong hash → read triggers pending
+        ("blocked", b"BLOCKED_DATA", "wrong_hash"),
+        // "open" has wildcard hash → read succeeds immediately
+        ("open", b"OPEN_DATA", "*"),
+    ]);
+    state.lock().unwrap().pending_timeout = std::time::Duration::from_secs(30);
+    let _session = mount_fs(state.clone(), dir.path());
+
+    // Spawn a thread that reads "blocked" — this will be pending (hash mismatch).
+    // The thread blocks because the FUSE read waits for a grant.
+    let blocked_path = dir.path().join("blocked");
+    let blocked_thread = std::thread::spawn(move || {
+        // This read blocks (pending) until grant or timeout
+        std::fs::read(&blocked_path)
+    });
+
+    // Give the pending read time to trigger
+    std::thread::sleep(std::time::Duration::from_secs(1));
+
+    // While "blocked" is pending, read "open" — this should succeed
+    // immediately, proving the FUSE session is still responsive.
+    let start = std::time::Instant::now();
+    let open_data = std::fs::read(dir.path().join("open")).unwrap();
+    let elapsed = start.elapsed();
+
+    assert_eq!(open_data, b"OPEN_DATA");
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "reading 'open' while 'blocked' is pending took {elapsed:?} — \
+         FUSE session may be blocked"
+    );
+
+    // Grant the pending read so the blocked thread can finish
+    let mut s = state.lock().unwrap();
+    if let Some(p) = s.pending.first() {
+        let id = p.id;
+        drop(s);
+        state.lock().unwrap().grant_pending(id);
+    }
+
+    // Wait for the blocked thread to complete
+    let blocked_result = blocked_thread.join().unwrap();
+    // It may succeed (if grant arrived in time) or fail (EACCES on timeout)
+    // — either way, the important thing is that "open" succeeded while it was pending.
+    let _ = blocked_result;
+}

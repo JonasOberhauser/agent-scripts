@@ -24,6 +24,7 @@ const TTL: Duration = Duration::ZERO;
 /// socket server so CRUD commands take effect immediately.
 pub struct GatekeeperFs<S: SystemIo> {
     state: std::sync::Arc<Mutex<ServerState>>,
+    #[allow(dead_code)]
     io: S,
     next_inode: AtomicU64,
     /// inode → secret-name  (root inode 1 is absent from this map)
@@ -389,32 +390,73 @@ impl<S: SystemIo> Filesystem for GatekeeperFs<S> {
         reply: ReplyData,
     ) {
         let pid = req.pid();
-        let pid_hash = match self.io.sha256_process_exe(pid) {
-            Ok(h) => Some(h),
-            Err(e) => {
-                warn!("Could not hash /proc/{pid}/exe: {e}");
-                None
+
+        // Look up the secret name on the main thread (fast, uses inode map).
+        let name = match self.inode_name(ino) {
+            Some(n) => n,
+            None => {
+                reply.error(libc::ENOENT);
+                return;
             }
         };
 
-        match self.try_read(ino, pid, pid_hash.as_deref(), offset, size) {
-            ReadResult::Data(data) => {
-                debug!("Granted read of ino {ino} to pid {pid}");
-                reply.data(&data);
-            }
-            ReadResult::Error(e) => reply.error(e),
-            ReadResult::Pending {
-                pending_id,
-                name,
-                pid,
-                offset,
-                size,
-                timeout,
-            } => {
-                // Spawn a thread to wait for grant — keeps the FUSE session
-                // responsive to other requests while this read is pending.
-                let state = self.state.clone();
-                std::thread::spawn(move || {
+        // Spawn a thread for the entire read: hash computation (potentially
+        // slow — reads /proc/{pid}/exe and hashes the binary), attempt_read,
+        // and pending wait if needed.  This keeps the FUSE session responsive.
+        let state = self.state.clone();
+        std::thread::spawn(move || {
+            let off = offset.max(0) as usize;
+
+            // Compute process hash (slow — reads the binary file)
+            let pid_hash = match fuse_protocol::RealSystemIo::new().sha256_process_exe(pid) {
+                Ok(h) => Some(h),
+                Err(e) => {
+                    warn!("Could not hash /proc/{pid}/exe: {e}");
+                    None
+                }
+            };
+
+            // Try to read
+            let outcome = {
+                let mut s = state.lock().expect("ServerState mutex poisoned");
+                s.attempt_read(&name, pid, pid_hash.as_deref(), off, size as usize)
+            };
+
+            match outcome {
+                ReadOutcome::Granted(content) => {
+                    debug!("Granted read of '{name}' to pid {pid}");
+                    let start = off.min(content.len());
+                    let end = (start + size as usize).min(content.len());
+                    reply.data(&content[start..end]);
+                }
+                ReadOutcome::NotFound => reply.error(libc::ENOENT),
+                ReadOutcome::AlreadyAccessed | ReadOutcome::HashMismatch { .. } => {
+                    let reason = match &outcome {
+                        ReadOutcome::AlreadyAccessed => "exceeded access limit".to_string(),
+                        ReadOutcome::HashMismatch { got, expected } => {
+                            format!("hash mismatch: got {got}, expected {expected}")
+                        }
+                        _ => unreachable!(),
+                    };
+
+                    let (pending_id, timeout) = {
+                        let mut s = state.lock().expect("ServerState mutex poisoned");
+                        if s.pending_timeout.is_zero() {
+                            warn!("Denied read of '{name}' by pid {pid}: {reason}");
+                            reply.error(libc::EACCES);
+                            return;
+                        }
+                        let id = s.create_pending(&name, pid, pid_hash.as_deref(), &reason);
+                        let to = s.pending_timeout;
+                        (id, to)
+                    };
+
+                    warn!(
+                        "Access pending for '{name}' by pid {pid}: {reason} \
+                         (id={pending_id}). Waiting up to {}s for grant...",
+                        timeout.as_secs()
+                    );
+
                     let deadline = std::time::Instant::now() + timeout;
                     loop {
                         if std::time::Instant::now() > deadline {
@@ -436,7 +478,7 @@ impl<S: SystemIo> Filesystem for GatekeeperFs<S> {
                             warn!("Pending access {pending_id} granted — serving '{name}'");
                             let content = {
                                 let mut s = state.lock().expect("ServerState mutex poisoned");
-                                s.force_grant_read(&name, pid, offset, size as usize)
+                                s.force_grant_read(&name, pid, off, size as usize)
                             };
                             state
                                 .lock()
@@ -445,7 +487,7 @@ impl<S: SystemIo> Filesystem for GatekeeperFs<S> {
 
                             match content {
                                 Some(data) => {
-                                    let start = offset.min(data.len());
+                                    let start = off.min(data.len());
                                     let end = (start + size as usize).min(data.len());
                                     reply.data(&data[start..end]);
                                 }
@@ -456,10 +498,10 @@ impl<S: SystemIo> Filesystem for GatekeeperFs<S> {
 
                         std::thread::sleep(std::time::Duration::from_millis(500));
                     }
-                });
-                // Return immediately — the thread sends the reply when ready.
+                }
             }
-        }
+        });
+        // Return immediately — the thread handles everything.
     }
 
     fn readdir(
@@ -812,5 +854,72 @@ mod tests {
 
         // After timeout, pending should be cleaned up
         assert!(state.lock().unwrap().pending.is_empty());
+    }
+
+    // ── try_read non-blocking tests ──────────────────────────────
+
+    #[test]
+    fn try_read_returns_immediately_on_pending() {
+        let state = std::sync::Arc::new(std::sync::Mutex::new(ServerState::new()));
+        state.lock().unwrap().pending_timeout = Duration::from_secs(60);
+        state.lock().unwrap().add("s", b"DATA".to_vec(), "correct_hash");
+
+        let fs = GatekeeperFs::new(state, MockSystemIo::new());
+        let (ino, _) = fs.do_lookup(0, 0, ROOT_INO, "s").unwrap();
+
+        // Wrong hash → try_read should return Pending immediately
+        let start = std::time::Instant::now();
+        let result = fs.try_read(ino, 100, Some("wrong"), 0, 1024);
+        let elapsed = start.elapsed();
+
+        assert!(matches!(result, ReadResult::Pending { .. }));
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "try_read should return immediately, took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn try_read_concurrent_after_pending() {
+        // Verify that after a pending is created, try_read for a DIFFERENT
+        // secret still works immediately (no blocking).
+        let state = std::sync::Arc::new(std::sync::Mutex::new(ServerState::new()));
+        state.lock().unwrap().pending_timeout = Duration::from_secs(60);
+        state.lock().unwrap().add("a", b"AAA".to_vec(), "hash_a");
+        state.lock().unwrap().add("b", b"BBB".to_vec(), "hash_b");
+
+        let fs = GatekeeperFs::new(state, MockSystemIo::new());
+        let (ino_a, _) = fs.do_lookup(0, 0, ROOT_INO, "a").unwrap();
+        let (ino_b, _) = fs.do_lookup(0, 0, ROOT_INO, "b").unwrap();
+
+        // First read: wrong hash → pending (shouldn't block)
+        let result_a = fs.try_read(ino_a, 100, Some("wrong"), 0, 1024);
+        assert!(matches!(result_a, ReadResult::Pending { .. }));
+
+        // Second read: correct hash → should succeed immediately
+        // even though the first read is pending.
+        let start = std::time::Instant::now();
+        let result_b = fs.try_read(ino_b, 200, Some("hash_b"), 0, 1024);
+        let elapsed = start.elapsed();
+
+        assert!(matches!(result_b, ReadResult::Data(_)));
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "second try_read should return immediately, took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn try_read_zero_timeout_returns_error_not_pending() {
+        let state = std::sync::Arc::new(std::sync::Mutex::new(ServerState::new()));
+        state.lock().unwrap().pending_timeout = Duration::ZERO;
+        state.lock().unwrap().add("s", b"DATA".to_vec(), "correct_hash");
+
+        let fs = GatekeeperFs::new(state, MockSystemIo::new());
+        let (ino, _) = fs.do_lookup(0, 0, ROOT_INO, "s").unwrap();
+
+        // Wrong hash with zero timeout → Error, not Pending
+        let result = fs.try_read(ino, 100, Some("wrong"), 0, 1024);
+        assert!(matches!(result, ReadResult::Error(libc::EACCES)));
     }
 }
