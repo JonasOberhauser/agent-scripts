@@ -111,6 +111,25 @@ pub fn run_agent<S: SystemIo>(io: &mut S, config: &AgentConfig) -> Result<RunRes
                 config.mount_point.display(),
                 config.mount_point.display(),
             ))?;
+
+            // Make the mount point 'shared' so that mount changes (FUSE
+            // unmount/remount on server restart) propagate to container
+            // bind mounts with 'slave' propagation.
+            {
+                let mount_str2 = config.mount_point.to_string_lossy().to_string();
+                let mut parts: Vec<String> = Vec::new();
+                if let Some(w) = wrapper {
+                    let (prog, prefix) = crate::config::split_wrapper(w);
+                    parts.push(prog);
+                    parts.extend(prefix);
+                }
+                parts.push("mount".to_string());
+                parts.push("--make-shared".to_string());
+                parts.push(mount_str2);
+                let prog = parts[0].clone();
+                let args: Vec<&str> = parts[1..].iter().map(|s| s.as_str()).collect();
+                let _ = io.run_command(&prog, &args);
+            }
         }
 
         let mount = config

@@ -309,7 +309,7 @@ pub fn build_container_args(config: &AgentConfig, setup_script: &str) -> Vec<Str
         "-v".into(),
         format!("{}_home:/root:z", config.agent_name()),
         "-v".into(),
-        format!("{}:/fuse:ro,z", config.host_fuse().display()),
+        format!("{}:/fuse:ro,z,slave", config.host_fuse().display()),
         "--workdir".into(),
         "/workspace".into(),
     ]);
