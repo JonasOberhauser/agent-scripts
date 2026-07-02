@@ -7,7 +7,7 @@ use fuser::{
     ReplyStatfs, Request,
 };
 use fuse_protocol::SystemIo;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::state::{ReadOutcome, ServerState};
 
@@ -128,6 +128,22 @@ impl<S: SystemIo> GatekeeperFs<S> {
             blksize: 512,
             flags: 0,
         }
+    }
+
+    /// Process a read asynchronously — spawns a thread and returns a
+    /// JoinHandle immediately. Used by Filesystem::read and by tests.
+    pub fn process_read_async(
+        &self,
+        ino: u64,
+        pid: u32,
+        offset: i64,
+        size: u32,
+    ) -> Option<std::thread::JoinHandle<Result<Vec<u8>, i32>>> {
+        let name = self.inode_name(ino)?;
+        let state = self.state.clone();
+        Some(std::thread::spawn(move || {
+            read_worker(&state, &name, pid, offset, size)
+        }))
     }
 
     // ── Core logic (testable without a live FUSE mount) ───────────
@@ -346,6 +362,88 @@ impl<S: SystemIo> GatekeeperFs<S> {
     }
 }
 
+/// Core read logic — runs in a spawned thread. Returns data or error.
+fn read_worker(
+    state: &std::sync::Arc<Mutex<ServerState>>,
+    name: &str,
+    pid: u32,
+    offset: i64,
+    size: u32,
+) -> Result<Vec<u8>, i32> {
+    let off = offset.max(0) as usize;
+
+    let pid_hash = match fuse_protocol::RealSystemIo::new().sha256_process_exe(pid) {
+        Ok(h) => Some(h),
+        Err(e) => {
+            warn!("Could not hash /proc/{pid}/exe: {e}");
+            None
+        }
+    };
+
+    let outcome = {
+        let mut s = state.lock().expect("ServerState mutex poisoned");
+        s.attempt_read(name, pid, pid_hash.as_deref(), off, size as usize)
+    };
+
+    match outcome {
+        ReadOutcome::Granted(content) => {
+            debug!("Granted read of '{name}' to pid {pid}");
+            let start = off.min(content.len());
+            let end = (start + size as usize).min(content.len());
+            Ok(content[start..end].to_vec())
+        }
+        ReadOutcome::NotFound => Err(libc::ENOENT),
+        ReadOutcome::AlreadyAccessed | ReadOutcome::HashMismatch { .. } => {
+            let reason = match &outcome {
+                ReadOutcome::AlreadyAccessed => "exceeded access limit".to_string(),
+                ReadOutcome::HashMismatch { got, expected } => {
+                    format!("hash mismatch: got {got}, expected {expected}")
+                }
+                _ => unreachable!(),
+            };
+
+            let (pending_id, timeout) = {
+                let mut s = state.lock().expect("ServerState mutex poisoned");
+                if s.pending_timeout.is_zero() {
+                    warn!("Denied read of '{name}' by pid {pid}: {reason}");
+                    return Err(libc::EACCES);
+                }
+                let id = s.create_pending(name, pid, pid_hash.as_deref(), &reason);
+                (id, s.pending_timeout)
+            };
+
+            warn!("Access pending for '{name}' by pid {pid}: {reason} (id={pending_id})");
+
+            let deadline = std::time::Instant::now() + timeout;
+            loop {
+                if std::time::Instant::now() > deadline {
+                    state.lock().expect("ServerState mutex poisoned").remove_pending(pending_id);
+                    warn!("Pending access {pending_id} timed out");
+                    return Err(libc::EACCES);
+                }
+
+                if state.lock().expect("ServerState mutex poisoned").is_pending_granted(pending_id) {
+                    warn!("Pending access {pending_id} granted — serving '{name}'");
+                    let content = {
+                        let mut s = state.lock().expect("ServerState mutex poisoned");
+                        s.force_grant_read(name, pid, off, size as usize)
+                    };
+                    state.lock().expect("ServerState mutex poisoned").remove_pending(pending_id);
+                    return content
+                        .map(|d| {
+                            let start = off.min(d.len());
+                            let end = (start + size as usize).min(d.len());
+                            d[start..end].to_vec()
+                        })
+                        .ok_or(libc::ENOENT);
+                }
+
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+        }
+    }
+}
+
 impl<S: SystemIo> Filesystem for GatekeeperFs<S> {
     fn lookup(
         &mut self,
@@ -390,8 +488,8 @@ impl<S: SystemIo> Filesystem for GatekeeperFs<S> {
         reply: ReplyData,
     ) {
         let pid = req.pid();
+        info!("FUSE read request: ino={ino} pid={pid} offset={offset} size={size}");
 
-        // Look up the secret name on the main thread (fast, uses inode map).
         let name = match self.inode_name(ino) {
             Some(n) => n,
             None => {
@@ -399,109 +497,15 @@ impl<S: SystemIo> Filesystem for GatekeeperFs<S> {
                 return;
             }
         };
+        info!("FUSE read: name='{name}' pid={pid} — spawning worker thread");
 
-        // Spawn a thread for the entire read: hash computation (potentially
-        // slow — reads /proc/{pid}/exe and hashes the binary), attempt_read,
-        // and pending wait if needed.  This keeps the FUSE session responsive.
         let state = self.state.clone();
         std::thread::spawn(move || {
-            let off = offset.max(0) as usize;
-
-            // Compute process hash (slow — reads the binary file)
-            let pid_hash = match fuse_protocol::RealSystemIo::new().sha256_process_exe(pid) {
-                Ok(h) => Some(h),
-                Err(e) => {
-                    warn!("Could not hash /proc/{pid}/exe: {e}");
-                    None
-                }
-            };
-
-            // Try to read
-            let outcome = {
-                let mut s = state.lock().expect("ServerState mutex poisoned");
-                s.attempt_read(&name, pid, pid_hash.as_deref(), off, size as usize)
-            };
-
-            match outcome {
-                ReadOutcome::Granted(content) => {
-                    debug!("Granted read of '{name}' to pid {pid}");
-                    let start = off.min(content.len());
-                    let end = (start + size as usize).min(content.len());
-                    reply.data(&content[start..end]);
-                }
-                ReadOutcome::NotFound => reply.error(libc::ENOENT),
-                ReadOutcome::AlreadyAccessed | ReadOutcome::HashMismatch { .. } => {
-                    let reason = match &outcome {
-                        ReadOutcome::AlreadyAccessed => "exceeded access limit".to_string(),
-                        ReadOutcome::HashMismatch { got, expected } => {
-                            format!("hash mismatch: got {got}, expected {expected}")
-                        }
-                        _ => unreachable!(),
-                    };
-
-                    let (pending_id, timeout) = {
-                        let mut s = state.lock().expect("ServerState mutex poisoned");
-                        if s.pending_timeout.is_zero() {
-                            warn!("Denied read of '{name}' by pid {pid}: {reason}");
-                            reply.error(libc::EACCES);
-                            return;
-                        }
-                        let id = s.create_pending(&name, pid, pid_hash.as_deref(), &reason);
-                        let to = s.pending_timeout;
-                        (id, to)
-                    };
-
-                    warn!(
-                        "Access pending for '{name}' by pid {pid}: {reason} \
-                         (id={pending_id}). Waiting up to {}s for grant...",
-                        timeout.as_secs()
-                    );
-
-                    let deadline = std::time::Instant::now() + timeout;
-                    loop {
-                        if std::time::Instant::now() > deadline {
-                            state
-                                .lock()
-                                .expect("ServerState mutex poisoned")
-                                .remove_pending(pending_id);
-                            warn!("Pending access {pending_id} timed out");
-                            reply.error(libc::EACCES);
-                            return;
-                        }
-
-                        let granted = {
-                            let s = state.lock().expect("ServerState mutex poisoned");
-                            s.is_pending_granted(pending_id)
-                        };
-
-                        if granted {
-                            warn!("Pending access {pending_id} granted — serving '{name}'");
-                            let content = {
-                                let mut s = state.lock().expect("ServerState mutex poisoned");
-                                s.force_grant_read(&name, pid, off, size as usize)
-                            };
-                            state
-                                .lock()
-                                .expect("ServerState mutex poisoned")
-                                .remove_pending(pending_id);
-
-                            match content {
-                                Some(data) => {
-                                    let start = off.min(data.len());
-                                    let end = (start + size as usize).min(data.len());
-                                    reply.data(&data[start..end]);
-                                }
-                                None => reply.error(libc::ENOENT),
-                            }
-                            return;
-                        }
-
-                        std::thread::sleep(std::time::Duration::from_millis(500));
-                    }
-                }
+            match read_worker(&state, &name, pid, offset, size) {
+                Ok(data) => reply.data(&data),
+                Err(e) => reply.error(e),
             }
         });
-        // Return immediately — the thread handles everything.
     }
 
     fn readdir(
@@ -925,5 +929,50 @@ mod tests {
         // A should complete
         let data_a = t1.join().expect("thread 1 panicked");
         assert_eq!(data_a, b"AAA");
+    }
+
+    #[test]
+    fn two_concurrent_pending_reads_both_create_pending() {
+        // Two reads for the SAME secret from DIFFERENT PIDs, both with
+        // wrong hash. Both should create separate pending accesses.
+        // Grant B only after A is granted — verifies both pendings exist
+        // and both can be independently granted.
+        let state = std::sync::Arc::new(std::sync::Mutex::new(ServerState::new()));
+        state.lock().unwrap().pending_timeout = Duration::from_secs(30);
+        state.lock().unwrap().add("s", b"SECRET".to_vec(), "correct_hash");
+
+        let fs = GatekeeperFs::new(state.clone(), MockSystemIo::new());
+        let (ino, _) = fs.do_lookup(0, 0, ROOT_INO, "s").unwrap();
+
+        // Start both reads concurrently via process_read_async
+        let handle_a = fs.process_read_async(ino, 100, 0, 1024).unwrap();
+        let handle_b = fs.process_read_async(ino, 200, 0, 1024).unwrap();
+
+        // Wait for both to enter pending state
+        std::thread::sleep(Duration::from_millis(500));
+
+        // Both pending accesses should exist
+        let pending_count = state.lock().unwrap().pending.len();
+        assert_eq!(
+            pending_count, 2,
+            "expected 2 pending accesses, found {pending_count}"
+        );
+
+        // Grant the first one (by finding its pending ID)
+        let ids: Vec<u64> = state.lock().unwrap().pending.iter().map(|p| p.id).collect();
+        state.lock().unwrap().grant_pending(ids[0]);
+
+        // Wait for A to complete
+        let result_a = handle_a.join().expect("A panicked");
+        assert_eq!(result_a.unwrap(), b"SECRET");
+
+        // B should still be pending (not auto-granted)
+        let remaining = state.lock().unwrap().pending.len();
+        assert_eq!(remaining, 1, "B should still be pending after A granted");
+
+        // Now grant B
+        state.lock().unwrap().grant_pending(ids[1]);
+        let result_b = handle_b.join().expect("B panicked");
+        assert_eq!(result_b.unwrap(), b"SECRET");
     }
 }
