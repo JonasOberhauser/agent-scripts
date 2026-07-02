@@ -49,6 +49,8 @@ pub struct ServerState {
     pub pending: Vec<PendingAccess>,
     pub next_pending_id: u64,
     pub pending_timeout: Duration,
+    /// Log file path — reported to fuse-client via GetLogPath.
+    pub log_path: String,
 }
 
 impl Default for ServerState {
@@ -58,6 +60,7 @@ impl Default for ServerState {
             pending: Vec::new(),
             next_pending_id: 1,
             pending_timeout: Duration::from_secs(300),
+            log_path: String::new(),
         }
     }
 }

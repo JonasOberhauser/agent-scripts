@@ -40,6 +40,11 @@ struct Cli {
     /// rejecting.
     #[arg(long, default_value_t = 300)]
     pending_timeout: u64,
+
+    /// Path where the server writes its log (for discovery by fuse-client).
+    /// Defaults to /tmp/fuse-gatekeeper.log.
+    #[arg(long, default_value = "/tmp/fuse-gatekeeper.log")]
+    log_path: PathBuf,
 }
 
 fn main() {
@@ -54,14 +59,19 @@ fn main() {
     let io = RealSystemIo::new();
 
     info!("fuse-server v{} starting", fuse_protocol::VERSION);
-    info!("  mount-point: {}", cli.mount_point.display());
-    info!("  socket:      {}", cli.socket.display());
-    info!("  allow-other: {}", cli.allow_other);
+    info!("  mount-point:     {}", cli.mount_point.display());
+    info!("  socket:          {}", cli.socket.display());
+    info!("  allow-other:     {}", cli.allow_other);
     info!("  pending-timeout: {}s", cli.pending_timeout);
+    info!("  log-path:        {}", cli.log_path.display());
+
+    // Store log path in state so fuse-client can discover it.
+    let log_path_str = cli.log_path.to_string_lossy().to_string();
 
     // Build initial state.
     let mut state = ServerState::new();
     state.pending_timeout = Duration::from_secs(cli.pending_timeout);
+    state.log_path = log_path_str;
     for spec in &cli.secret {
         match parse_secret(spec, &io) {
             Ok((name, content, hash)) => {

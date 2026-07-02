@@ -3,10 +3,10 @@ use std::path::{Path, PathBuf};
 use fuse_protocol::SystemIo;
 
 /// Well-known default Unix socket path for the shared fuse-server.
-pub const DEFAULT_SOCKET: &str = "/tmp/fuse-gatekeeper.sock";
+pub const DEFAULT_SOCKET: &str = fuse_protocol::DEFAULT_SOCKET;
 
 /// Well-known default FUSE mount point for the shared fuse-server.
-pub const DEFAULT_MOUNT_POINT: &str = "/tmp/fuse-gatekeeper-mnt";
+pub const DEFAULT_MOUNT_POINT: &str = fuse_protocol::DEFAULT_MOUNT_POINT;
 
 /// Which container runtime to use.
 #[derive(Debug, Clone, Copy, PartialEq, clap::ValueEnum)]
@@ -390,8 +390,8 @@ mod tests {
             image_name: "myimg".into(),
             memory: "16G".into(),
             cpus: "4".into(),
-            socket_path: PathBuf::from("/tmp/fuse-gatekeeper.sock"),
-            mount_point: PathBuf::from("/tmp/fuse-gatekeeper-mnt"),
+            socket_path: PathBuf::from(PathBuf::from(fuse_protocol::DEFAULT_SOCKET)),
+            mount_point: PathBuf::from(PathBuf::from(fuse_protocol::DEFAULT_MOUNT_POINT)),
             use_sudo: false,
             allow_other: false,
             pidns_host: false,
@@ -437,8 +437,8 @@ mod tests {
             image_name: "myimg".into(),
             memory: "16G".into(),
             cpus: "4".into(),
-            socket_path: PathBuf::from("/tmp/fuse-gatekeeper.sock"),
-            mount_point: PathBuf::from("/tmp/fuse-gatekeeper-mnt"),
+            socket_path: PathBuf::from(PathBuf::from(fuse_protocol::DEFAULT_SOCKET)),
+            mount_point: PathBuf::from(PathBuf::from(fuse_protocol::DEFAULT_MOUNT_POINT)),
             use_sudo: false,
             allow_other: false,
             pidns_host: true,

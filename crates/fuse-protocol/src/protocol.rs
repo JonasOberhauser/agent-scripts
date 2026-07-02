@@ -91,6 +91,8 @@ pub enum Command {
     // Older versions of fuse-client rely on this exact command to
     // detect version mismatches before restarting the server.
     GetVersion,
+    /// Request the server's log file path.
+    GetLogPath,
 }
 
 // ── Responses (server → client) ────────────────────────────────
@@ -105,4 +107,6 @@ pub enum Response {
     PendingList { pending: Vec<PendingAccessInfo> },
     /// Server protocol version.
     Version { version: String },
+    /// Server's log file path.
+    LogPath { path: String },
 }

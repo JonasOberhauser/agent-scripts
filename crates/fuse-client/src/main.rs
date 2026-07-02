@@ -72,6 +72,7 @@ enum Commands {
     Grant { id: u64 },
     Deny { id: u64 },
     GetVersion,
+    GetLogPath,
 }
 
 fn main() {
@@ -139,10 +140,9 @@ fn build_clap_command<S: SystemIo>(cmd: &Commands, io: &S) -> Result<Command, St
         Commands::Grant { id } => Command::Grant { id: *id },
         Commands::Deny { id } => Command::Deny { id: *id },
         Commands::GetVersion => Command::GetVersion,
+        Commands::GetLogPath => Command::GetLogPath,
     })
 }
-
-// ── Version check & server restart ─────────────────────────────
 
 fn check_version_or_restart(io: &fuse_protocol::RealSystemIo, socket: &Path) {
     let server_version = match send_command(io, socket, Command::GetVersion) {
@@ -169,6 +169,7 @@ fn check_version_or_restart(io: &fuse_protocol::RealSystemIo, socket: &Path) {
     );
 
     print!("Restart server to update? [y/N] ");
+    print!("Restart server to update? [y/N] ");
     stdio::stdout().flush().unwrap();
     let mut input = String::new();
     if stdio::stdin().read_line(&mut input).is_err() {
@@ -180,7 +181,29 @@ fn check_version_or_restart(io: &fuse_protocol::RealSystemIo, socket: &Path) {
         std::process::exit(1);
     }
 
-    restart_server(io, socket);
+    // Try to get the old server's log path so we can reuse it.
+    let log_path = match send_command(io, socket, Command::GetLogPath) {
+        Ok(Response::LogPath { path }) if !path.is_empty() => {
+            eprintln!("  Old server log: {path}");
+            Some(path)
+        }
+        _ => {
+            // Old server doesn't know GetLogPath — ask the user.
+            eprintln!("Old server doesn't support log path discovery.");
+            print!("Log file path (relative to cwd or absolute, Enter=/tmp/fuse-gatekeeper.log): ");
+            stdio::stdout().flush().unwrap();
+            let mut log_input = String::new();
+            let _ = stdio::stdin().read_line(&mut log_input);
+            let trimmed = log_input.trim();
+            if trimmed.is_empty() {
+                Some("/tmp/fuse-gatekeeper.log".to_string())
+            } else {
+                Some(trimmed.to_string())
+            }
+        }
+    };
+
+    restart_server(io, socket, log_path.as_deref());
 }
 
 /// Read the state file written by the orchestrator.
@@ -197,6 +220,7 @@ fn start_server_from_state(
     io: &fuse_protocol::RealSystemIo,
     socket: &Path,
     state: &ServerStateFile,
+    log_path: Option<&str>,
 ) {
     // Build server command
     let mut cmd_args: Vec<String> = vec![
@@ -210,6 +234,10 @@ fn start_server_from_state(
     cmd_args.push(state.log_level.clone());
     cmd_args.push("--pending-timeout".into());
     cmd_args.push(state.pending_timeout.to_string());
+    if let Some(lp) = log_path {
+        cmd_args.push("--log-path".into());
+        cmd_args.push(lp.into());
+    }
 
     let (spawn_prog, spawn_args): (String, Vec<String>) = if let Some(w) = &state.runtime_wrapper {
         let parts: Vec<String> = w.split_whitespace().map(|s| s.to_string()).collect();
@@ -256,15 +284,16 @@ fn start_server_from_state(
 
     // Spawn new server as independent daemon
     eprintln!("Starting server (v{})...", CLIENT_VERSION);
-    let log_path = std::path::Path::new("/tmp/fuse-gatekeeper.log");
+    let effective_log = log_path.unwrap_or("/tmp/fuse-gatekeeper.log");
+    let log_path_buf = std::path::PathBuf::from(effective_log);
     let log_file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(true)
         .write(true)
-        .open(log_path)
+        .open(&log_path_buf)
         .unwrap_or_else(|e| { eprintln!("open log file: {e}"); std::process::exit(1); });
     let log_file2 = log_file.try_clone().unwrap_or_else(|e| { eprintln!("dup log fd: {e}"); std::process::exit(1); });
-    eprintln!("  Log:       {}", log_path.display());
+    eprintln!("  Log:       {}", log_path_buf.display());
 
     use std::os::unix::process::CommandExt;
     let mut cmd = std::process::Command::new(&spawn_prog);
@@ -327,7 +356,7 @@ fn start_server_from_state(
     eprintln!("Server ready (v{}).", CLIENT_VERSION);
 }
 
-fn restart_server(io: &fuse_protocol::RealSystemIo, socket: &Path) {
+fn restart_server(io: &fuse_protocol::RealSystemIo, socket: &Path, log_path: Option<&str>) {
     let state = match read_state_file() {
         Some(s) => s,
         None => {
@@ -379,7 +408,7 @@ fn restart_server(io: &fuse_protocol::RealSystemIo, socket: &Path) {
     let _ = std::fs::remove_dir_all(&state.mount_point);
     std::thread::sleep(std::time::Duration::from_millis(500));
 
-    start_server_from_state(io, socket, &state);
+    start_server_from_state(io, socket, &state, log_path);
 }
 
 /// Called when the server is not running at all.  Offers to start it
@@ -396,7 +425,7 @@ fn check_start_server(io: &fuse_protocol::RealSystemIo, socket: &Path) {
     }
 
     match read_state_file() {
-        Some(state) => start_server_from_state(io, socket, &state),
+        Some(state) => start_server_from_state(io, socket, &state, None),
         None => {
             eprintln!(
                 "No state file found at /tmp/fuse-gatekeeper-state.json.\n\
@@ -665,6 +694,9 @@ fn print_response(resp: &Response, out: &mut dyn Console) {
         Response::Version { version } => {
             out.print_line(&format!("Server version: {version}"));
         }
+        Response::LogPath { path } => {
+            out.print_line(&format!("Log path: {path}"));
+        }
     }
 }
 
@@ -821,8 +853,8 @@ fn interactive(
                 ));
             }).map_err(|e| e.to_string())?;
 
-            // Poll faster while popup is open so new requests appear quickly
-            let poll_timeout = if grant_idx.is_some() {
+            // Poll faster when there are pending requests OR popup was recently open
+            let poll_timeout = if grant_idx.is_some() || !pending.is_empty() {
                 std::time::Duration::from_millis(500)
             } else {
                 std::time::Duration::from_secs(3)
