@@ -707,7 +707,7 @@ fn interactive(
     socket: &Path,
 ) -> Result<(), String> {
     use crossterm::{
-        event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind, EnableMouseCapture, DisableMouseCapture},
+        event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
         execute,
         terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     };
@@ -724,7 +724,17 @@ fn interactive(
     use tui_input::backend::crossterm::EventHandler;
 
     enable_raw_mode().map_err(|e| e.to_string())?;
-    execute!(std_io::stdout(), EnterAlternateScreen, EnableMouseCapture).map_err(|e| e.to_string())?;
+    // Alternate screen + alternate scroll mode (?1007h):
+    // Terminal converts scroll wheel to Up/Down arrow keys.
+    // No EnableMouseCapture — terminal handles text selection natively.
+    execute!(
+        std_io::stdout(),
+        EnterAlternateScreen,
+    ).map_err(|e| e.to_string())?;
+    // Enable alternate scroll mode
+    write!(std_io::stdout(), "\x1b[?1007h").map_err(|e| e.to_string())?;
+    std_io::stdout().flush().ok();
+
     let backend = CrosstermBackend::new(std_io::stdout());
     let mut terminal = Terminal::new(backend).map_err(|e| e.to_string())?;
 
@@ -735,7 +745,7 @@ fn interactive(
     let mut log_lines: Vec<String> = vec!["fuse-client TUI. Type 'help' for commands.".into()];
     let mut pending: Vec<fuse_protocol::PendingAccessInfo>;
     let mut grant_idx: Option<usize> = None;
-    let mut log_scroll_up: u16 = 0; // lines scrolled up from bottom (0 = auto-scroll to latest)
+    let mut log_scroll_up: u16 = 0;
 
     let poll = || match send_command(io, socket, Command::ListPending) {
         Ok(Response::PendingList { pending: p }) => p,
@@ -863,24 +873,13 @@ fn interactive(
             if event::poll(poll_timeout).map_err(|e| e.to_string())? {
                 let ev = event::read().map_err(|e| e.to_string())?;
                 let key = match ev {
-                    Event::Mouse(mouse) => {
-                        // Scroll wheel only affects the log pane
-                        let term_h = terminal.size().map(|s| s.height).unwrap_or(0);
-                        let log_h = term_h.saturating_sub(3);
-                        if mouse.row < log_h {
-                            match mouse.kind {
-                                MouseEventKind::ScrollUp => log_scroll_up = log_scroll_up.saturating_add(1),
-                                MouseEventKind::ScrollDown => log_scroll_up = log_scroll_up.saturating_sub(1),
-                                _ => {}
-                            }
-                        }
-                        continue;
-                    }
                     Event::Key(k) if k.kind == KeyEventKind::Press => k,
                     _ => continue,
                 };
 
-                // ── Log scrolling (always available) ──
+                // ── Log scrolling ──
+                // Up/Down scroll the log (scroll wheel arrives as Up/Down via ?1007h).
+                // History uses Ctrl+Up/Ctrl+Down (like bash).
                 match key.code {
                     KeyCode::PageUp => {
                         log_scroll_up = log_scroll_up.saturating_add(5);
@@ -888,6 +887,14 @@ fn interactive(
                     }
                     KeyCode::PageDown => {
                         log_scroll_up = log_scroll_up.saturating_sub(5);
+                        continue;
+                    }
+                    KeyCode::Up if !key.modifiers.contains(KeyModifiers::CONTROL) && grant_idx.is_none() => {
+                        log_scroll_up = log_scroll_up.saturating_add(1);
+                        continue;
+                    }
+                    KeyCode::Down if !key.modifiers.contains(KeyModifiers::CONTROL) && grant_idx.is_none() => {
+                        log_scroll_up = log_scroll_up.saturating_sub(1);
                         continue;
                     }
                     _ => {}
@@ -953,13 +960,14 @@ fn interactive(
                             if let Some(p) = plugins.iter().find(|pl| pl.name.starts_with(w)) { input = Input::new(p.name.into()); }
                         }
                     }
-                    KeyCode::Up if grant_idx.is_none() => {
+                    // History: Ctrl+Up/Ctrl+Down (plain Up/Down scrolls the log)
+                    KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         if !history.is_empty() {
                             history_idx = Some(match history_idx { Some(0)=>0, Some(i)=>i-1, None=>history.len()-1 });
                             input = Input::new(history[history_idx.unwrap()].clone());
                         }
                     }
-                    KeyCode::Down if grant_idx.is_none() => {
+                    KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         match history_idx {
                             Some(i) if i+1<history.len() => { history_idx=Some(i+1); input=Input::new(history[i+1].clone()); }
                             _ => { history_idx=None; input.reset(); }
@@ -998,8 +1006,11 @@ fn interactive(
         }
     })();
 
+    // Restore terminal
+    write!(std_io::stdout(), "\x1b[?1007l").ok();
+    std_io::stdout().flush().ok();
     disable_raw_mode().ok();
-    execute!(std_io::stdout(), LeaveAlternateScreen, DisableMouseCapture).ok();
+    execute!(std_io::stdout(), LeaveAlternateScreen).ok();
     println!("Goodbye.");
     result
 }
