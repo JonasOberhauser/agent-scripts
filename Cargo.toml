@@ -8,7 +8,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.11.0"
+version = "0.12.0"
 edition = "2021"
 license = "MIT"
 
@@ -17,6 +17,7 @@ fuse-protocol = { path = "crates/fuse-protocol" }
 fuse-server = { path = "crates/fuse-server" }
 fuse-client = { path = "crates/fuse-client" }
 run-agent = { path = "crates/run-agent" }
+servyi-servatui = { git = "https://github.com/servyi/servatui.git" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 clap = { version = "4", features = ["derive", "env"] }
