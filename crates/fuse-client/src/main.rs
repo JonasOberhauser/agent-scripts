@@ -1,8 +1,8 @@
 use std::io::{self as stdio, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use clap::Parser;
-use fuse_protocol::{Command, Response, ServerStateFile, VERSION as CLIENT_VERSION, client_protocols};
+use fuse_protocol::{Response, ServerStateFile, VERSION as CLIENT_VERSION, client_protocols};
 use servyi_servatui::{App, Console};
 
 // ── Console implementations ────────────────────────────────────

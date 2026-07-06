@@ -166,29 +166,3 @@ pub fn client_protocols() -> Vec<Protocol> {
             |_| Ok(Command::GetLogPath)),
     ]
 }
-
-// ═══════════════════════════════════════════════════════════════
-// Client-side send helper
-// ═══════════════════════════════════════════════════════════════
-
-use std::path::Path;
-use servyi_servatui::{SocketConnection, TypedConnection, BufferConsole, NoInput};
-
-pub fn send_via_protocol(
-    socket: &Path,
-    protocol_name: &str,
-    args: &str,
-) -> Result<Vec<String>, String> {
-    let protocols = client_protocols();
-    let proto = protocols.iter()
-        .find(|p| p.name == protocol_name)
-        .ok_or_else(|| format!("Unknown command: {protocol_name}"))?;
-
-    let mut conn = SocketConnection::connect(socket)?;
-    conn.send_typed(&protocol_name.to_string())?;
-
-    let mut console = BufferConsole::new();
-    let mut input = NoInput;
-    proto.run_client(args, &mut conn, &mut console, &mut input)?;
-    Ok(console.lines)
-}

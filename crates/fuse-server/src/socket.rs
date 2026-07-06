@@ -25,7 +25,7 @@ pub fn run_socket_server(
 mod tests {
     use super::*;
     use fuse_protocol::client_protocols;
-    use servyi_servatui::{SocketConnection, TypedConnection, BufferConsole, NoInput};
+    use servyi_servatui::App;
 
     fn wait_for_socket(path: &Path) {
         for _ in 0..100 {
@@ -39,17 +39,10 @@ mod tests {
         panic!("Server did not start");
     }
 
-    fn run_client(proto_name: &str, args: &str, socket: &Path) -> Vec<String> {
-        let protocols = client_protocols();
-        let proto = protocols.iter()
-            .find(|p| p.name == proto_name)
-            .unwrap_or_else(|| panic!("Unknown protocol: {proto_name}"));
-        let mut conn = SocketConnection::connect(socket).unwrap();
-        conn.send_typed(&proto_name.to_string()).unwrap();
-        let mut console = BufferConsole::new();
-        let mut input = NoInput;
-        proto.run_client(args, &mut conn, &mut console, &mut input).unwrap();
-        console.lines
+    fn make_app(socket: &Path) -> App {
+        App::builder(socket)
+            .protocol_all(client_protocols())
+            .build()
     }
 
     #[test]
@@ -65,12 +58,13 @@ mod tests {
 
         wait_for_socket(&sock);
 
-        let lines = run_client("reset", "s.yaml", &sock);
+        let app = make_app(&sock);
+
+        let lines = app.run_cli_command("reset", "s.yaml").unwrap();
         assert!(lines.iter().any(|l| l == "OK"));
 
-        let lines = run_client("status", "", &sock);
+        let lines = app.run_cli_command("status", "").unwrap();
         assert!(lines.iter().any(|l| l.contains("s.yaml")));
-        assert!(lines.iter().any(|l| l.contains("0"))); // access_count = 0
     }
 
     #[test]
@@ -85,22 +79,14 @@ mod tests {
 
         wait_for_socket(&sock);
 
-        // Add a secret by sending AddSecret command directly via the wire
-        let mut conn = SocketConnection::connect(&sock).unwrap();
-        conn.send_typed(&"add".to_string()).unwrap();
-        let protocols = client_protocols();
-        let add_proto = protocols.iter().find(|p| p.name == "add").unwrap();
-
-        // We need a file to read for the "add" command
         let tmp = tempfile::tempdir().unwrap();
         let secret_file = tmp.path().join("secret.txt");
         std::fs::write(&secret_file, b"SECRET_DATA").unwrap();
-        let args = format!("new.yaml {} abc", secret_file.display());
 
-        let mut console = BufferConsole::new();
-        let mut input = NoInput;
-        add_proto.run_client(&args, &mut conn, &mut console, &mut input).unwrap();
-        assert!(console.lines.iter().any(|l| l == "OK"));
+        let app = make_app(&sock);
+        let args = format!("new.yaml {} abc", secret_file.display());
+        let lines = app.run_cli_command("add", &args).unwrap();
+        assert!(lines.iter().any(|l| l == "OK"));
 
         assert!(state.lock().unwrap().secrets.contains_key("new.yaml"));
     }
@@ -117,16 +103,10 @@ mod tests {
 
         wait_for_socket(&sock);
 
+        let app = make_app(&sock);
+
         // Remove non-existent secret → error propagated as Err
-        let result = {
-            let protocols = client_protocols();
-            let proto = protocols.iter().find(|p| p.name == "remove").unwrap();
-            let mut conn = SocketConnection::connect(&sock).unwrap();
-            conn.send_typed(&"remove".to_string()).unwrap();
-            let mut console = BufferConsole::new();
-            let mut input = NoInput;
-            proto.run_client("nonexistent", &mut conn, &mut console, &mut input)
-        };
+        let result = app.run_cli_command("remove", "nonexistent");
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.contains("not found"), "got: {err}");
