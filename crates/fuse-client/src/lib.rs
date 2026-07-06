@@ -46,7 +46,8 @@ pub fn send_command(socket_path: &Path, cmd: &Command) -> Result<Response, Strin
     let resp: Response = serde_json::from_slice(&data)
         .map_err(|e| format!("Failed to parse response: {e}"))?;
 
-    conn.send_typed(&())?;
+    conn.send_typed(&())?; // client step 2 output
+    conn.send_typed(&())?; // sentinel
 
     Ok(resp)
 }

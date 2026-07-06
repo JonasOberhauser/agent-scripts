@@ -202,7 +202,8 @@ impl SystemIo for RealSystemIo {
         let mut reader = BufReader::new(&stream);
         let mut line = String::new();
         reader.read_line(&mut line)?;
-        stream.write_all(b"null\n")?;
+        stream.write_all(b"null\n")?; // client step 2 output
+        stream.write_all(b"null\n")?; // sentinel
         stream.flush()?;
         Ok(line.into_bytes())
     }

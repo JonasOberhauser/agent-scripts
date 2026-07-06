@@ -857,7 +857,7 @@ dependencies = [
 [[package]]
 name = "servyi-servatui"
 version = "0.2.0"
-source = "git+https://github.com/servyi/servatui.git#435361cbf6fc5cdef60d8bb833fe7faf05eb3701"
+source = "git+https://github.com/servyi/servatui.git#74601cf99eacd9b6eb55c5c5f861ba6c3cddcc37"
 dependencies = [
  "serde",
  "serde_json",
