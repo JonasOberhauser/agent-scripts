@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use fuse_protocol::SystemIo;
 use tracing::{info, warn};
 
-use crate::config::{build_container_args, AgentConfig};
+use crate::config::{build_create_args, build_exec_args, AgentConfig};
 
 /// Result of a completed agent session.
 #[derive(Debug)]
@@ -35,6 +35,7 @@ pub fn run_agent<S, F>(
     io: &mut S,
     config: &AgentConfig,
     send: &F,
+    restart_container: bool,
 ) -> Result<RunResult, String>
 where
     S: SystemIo,
@@ -272,9 +273,41 @@ where
         setup_rootless_docker();
     }
 
-    // ── 6. Run container (setup script creates symlinks inside) ──
+    // ── 6. Ensure persistent container is running ────────────────
+    let container_name = config.container_name();
+
+    if restart_container {
+        info!("Restarting container {container_name}...");
+        run_with_wrapper(io, wrapper, container_bin, &["stop", &container_name]);
+        run_with_wrapper(io, wrapper, container_bin, &["rm", "-f", &container_name]);
+    }
+
+    let container_running = check_container_running(io, wrapper, container_bin, &container_name);
+    if !container_running {
+        info!("Creating persistent container {container_name}...");
+        let create_args = build_create_args(config);
+        let create_refs: Vec<&str> = create_args.iter().map(|s| s.as_str()).collect();
+        match run_with_wrapper(io, wrapper, container_bin, &create_refs) {
+            Ok(o) if o.success() => {
+                info!("Container created.");
+            }
+            Ok(o) => {
+                return Err(format!(
+                    "Failed to create container: exit {}\nstdout: {}\nstderr: {}",
+                    o.status.unwrap_or(-1), o.stdout, o.stderr
+                ));
+            }
+            Err(e) => {
+                return Err(format!("Failed to create container: {e}"));
+            }
+        }
+    } else {
+        info!("Reusing running container {container_name}.");
+    }
+
+    // ── 7. Exec into container (setup script creates symlinks) ───
     let setup_script = build_setup_script(&loaded);
-    let args = build_container_args(config, &setup_script);
+    let args = build_exec_args(config, &setup_script);
     let exit_code = if let Some(w) = wrapper {
         let (prog, prefix) = crate::config::split_wrapper(w);
         let mut full: Vec<&str> = prefix.iter().map(|s| s.as_str()).collect();
@@ -286,9 +319,9 @@ where
         io.run_interactive(container_bin, &arg_refs).unwrap_or(-1)
     };
     if exit_code == 0 {
-        info!("Container exited with code 0.");
+        info!("Session exited with code 0.");
     } else {
-        warn!("Container exited with code {exit_code}.");
+        warn!("Session exited with code {exit_code}.");
     }
 
     // ── 7. Auto-reset all secret counters ────────────────────────
@@ -410,6 +443,38 @@ fn setup_rootless_docker() {
     let sock = format!("unix://{}", crate::config::rootless_docker_socket());
     std::env::set_var("DOCKER_HOST", &sock);
     info!("Docker rootless socket: {sock}");
+}
+
+/// Run a container runtime command, optionally prefixed with the wrapper.
+fn run_with_wrapper<S: SystemIo>(
+    io: &S,
+    wrapper: Option<&str>,
+    runtime: &str,
+    args: &[&str],
+) -> Result<fuse_protocol::CommandOutput, fuse_protocol::IoError> {
+    match wrapper {
+        Some(w) => {
+            let parts: Vec<&str> = w.split_whitespace().collect();
+            let mut full: Vec<&str> = parts[1..].to_vec();
+            full.push(runtime);
+            full.extend(args.iter());
+            io.run_command(parts[0], &full)
+        }
+        None => io.run_command(runtime, args),
+    }
+}
+
+/// Check whether a named container is currently running.
+fn check_container_running<S: SystemIo>(
+    io: &S,
+    wrapper: Option<&str>,
+    runtime: &str,
+    name: &str,
+) -> bool {
+    match run_with_wrapper(io, wrapper, runtime, &["inspect", "-f", "{{.State.Running}}", name]) {
+        Ok(o) if o.success() => o.stdout.trim() == "true",
+        _ => false,
+    }
 }
 
 /// Write a state file so `fuse-client` can restart the server with the same
@@ -566,7 +631,7 @@ mod tests {
     fn missing_workspace_dirs_errors() {
         let mut mock = MockSystemIo::new();
         let cfg = test_config();
-        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()));
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()), false);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("not found"));
     }
@@ -577,7 +642,7 @@ mod tests {
             .with_file("/home/user/secrets.yaml", b"DATA");
 
         let cfg = test_config();
-        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()));
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()), false);
 
         assert!(result.is_ok(), "got: {:?}", result.err());
         let run = result.unwrap();
@@ -592,7 +657,7 @@ mod tests {
         mock.unix_connected = true;
 
         let cfg = test_config();
-        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()));
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()), false);
 
         assert!(result.is_ok(), "got: {:?}", result.err());
         assert!(!result.unwrap().server_was_spawned);
@@ -604,7 +669,7 @@ mod tests {
         cfg.secrets = vec![];
 
         let mut mock = base_mock();
-        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()));
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()), false);
         assert!(result.is_ok(), "got: {:?}", result.err());
     }
 
@@ -622,7 +687,7 @@ mod tests {
         let mut mock = base_mock()
             .with_file("/home/user/key.json", b"KEY");
 
-        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()));
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()), false);
         assert!(result.is_ok(), "got: {:?}", result.err());
     }
 
@@ -639,7 +704,7 @@ mod tests {
         let mut mock = base_mock()
             .with_file("/home/user/key.json", b"KEY");
 
-        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()));
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()), false);
         assert!(result.is_ok(), "got: {:?}", result.err());
     }
 
@@ -658,7 +723,7 @@ mod tests {
             .with_file("/home/user/secrets/key1.json", b"K1")
             .with_file("/home/user/secrets/subdir/key2.json", b"K2");
 
-        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()));
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()), false);
         assert!(result.is_ok(), "got: {:?}", result.err());
     }
 
@@ -676,7 +741,7 @@ mod tests {
             .with_file("/home/user/secrets/key1.json", b"K1")
             .with_file("/home/user/secrets/key2.json", b"K2");
 
-        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()));
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()), false);
         assert!(result.is_ok(), "got: {:?}", result.err());
     }
 
@@ -698,7 +763,7 @@ mod tests {
             .with_file("/home/user/key.json", b"KEY")
             .with_file("/home/user/secrets/token.json", b"TOK");
 
-        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()));
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()), false);
         assert!(result.is_ok(), "got: {:?}", result.err());
     }
 
@@ -711,7 +776,7 @@ mod tests {
             .with_file("/home/user/secrets.yaml", b"DATA");
 
         let cfg = test_config();
-        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()));
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()), false);
         assert!(result.is_ok(), "got: {:?}", result.err());
         assert!(
             !mock.files.contains_key("/tmp/fgk.sock"),
@@ -727,7 +792,7 @@ mod tests {
             .with_file("/home/user/secrets.yaml", b"DATA");
 
         let cfg = test_config();
-        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()));
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()), false);
         assert!(result.is_err());
     }
 
@@ -740,7 +805,7 @@ mod tests {
             .with_file("/home/user/secrets.yaml", b"DATA");
 
         let cfg = test_config();
-        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()));
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()), false);
         assert!(result.is_ok(), "got: {:?}", result.err());
     }
 
@@ -755,7 +820,7 @@ mod tests {
             .with_file("/home/user/secrets.yaml", b"DATA");
 
         let cfg = test_config();
-        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()));
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()), false);
         // Mount cleanup is best-effort: remove_path failure is silently
         // ignored, and create_dir_all succeeds on the existing directory.
         // The actual mount failure would happen later in the real FUSE server.
@@ -770,7 +835,7 @@ mod tests {
             .with_file("/home/user/secrets.yaml", b"DATA");
 
         let cfg = test_config();
-        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()));
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()), false);
         assert!(result.is_ok());
         assert!(!mock.spawned.is_empty(), "should have spawned fuse-server");
         assert!(
@@ -788,7 +853,7 @@ mod tests {
         let mut mock = base_mock()
             .with_file("/home/user/secrets.yaml", b"DATA");
 
-        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()));
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()), false);
         assert!(result.is_ok());
         assert!(
             mock.spawn_contains(0, &["--allow-other"]),
@@ -804,7 +869,7 @@ mod tests {
         let mut mock = base_mock()
             .with_file("/home/user/secrets.yaml", b"DATA");
 
-        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()));
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()), false);
         assert!(result.is_ok());
         assert!(
             mock.spawn_contains(0, &["--allow-other"]),
@@ -821,7 +886,7 @@ mod tests {
         let mut mock = base_mock()
             .with_file("/home/user/secrets.yaml", b"DATA");
 
-        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()));
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()), false);
         assert!(result.is_ok());
         assert!(!mock.spawned.is_empty());
         // Without wrapper: prog="sudo", args=["-n", "fuse-server", ...]
@@ -840,7 +905,7 @@ mod tests {
         let mut mock = base_mock()
             .with_file("/home/user/secrets.yaml", b"DATA");
 
-        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()));
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()), false);
         assert!(result.is_ok());
 
         let calls = mock.interactive_calls.borrow();
@@ -860,7 +925,7 @@ mod tests {
         let mut mock = base_mock()
             .with_file("/home/user/secrets.yaml", b"DATA");
 
-        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()));
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()), false);
         assert!(result.is_ok());
 
         let calls = mock.interactive_calls.borrow();
@@ -878,7 +943,7 @@ mod tests {
             .with_spawn_error("command not found");
 
         let cfg = test_config();
-        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()));
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()), false);
         assert!(result.is_err());
     }
 
@@ -890,7 +955,7 @@ mod tests {
             .with_file("/home/user/secrets.yaml", b"DATA");
 
         let cfg = test_config();
-        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()));
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()), false);
         assert!(result.is_ok());
         // No stale socket or mount point, so no removals attempted
         assert!(!mock.spawned.is_empty());

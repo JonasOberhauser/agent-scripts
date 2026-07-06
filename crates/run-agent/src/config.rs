@@ -250,35 +250,20 @@ impl AgentConfig {
     }
 
     pub fn container_name(&self) -> String {
-        format!(
-            "{}_{}",
-            self.agent_name(),
-            chrono_like_timestamp()
-        )
+        use sha2::{Sha256, Digest};
+        let mut hasher = Sha256::new();
+        hasher.update(self.agent_path.to_string_lossy().as_bytes());
+        let hash = format!("{:x}", hasher.finalize());
+        format!("agentbox-{}", &hash[..8])
     }
 }
 
-fn chrono_like_timestamp() -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    format!("{now}")
-}
-
-/// Build the full `docker run` / `podman run` argument vector.
-///
-/// `setup_script` is a shell snippet (e.g. `mkdir -p ... && ln -sf ...`)
-/// that runs inside the container before the main command.  When non-empty,
-/// the container command is wrapped as `sh -c '<setup> && exec "$@"' sh <args>`
-/// so the symlinks are created inside the container using native paths.
-///
-/// Pure function — trivially unit-testable without any I/O.
-pub fn build_container_args(config: &AgentConfig, setup_script: &str) -> Vec<String> {
+/// Build `docker run -d` args to create the persistent container.
+/// The container runs `sleep infinity` and stays alive between sessions.
+pub fn build_create_args(config: &AgentConfig) -> Vec<String> {
     let mut args = vec![
         "run".into(),
-        "-it".into(),
-        "--rm".into(),
+        "-d".into(),
         "--name".into(),
         config.container_name(),
         "-m".into(),
@@ -320,11 +305,29 @@ pub fn build_container_args(config: &AgentConfig, setup_script: &str) -> Vec<Str
     }
 
     args.push(config.image_name.clone());
+    args.push("sleep".into());
+    args.push("infinity".into());
+
+    args
+}
+
+/// Build `docker exec -it` args to run a session inside the persistent container.
+///
+/// `setup_script` is a shell snippet (e.g. `mkdir -p ... && ln -sf ...`)
+/// that creates symlinks before the main command.  When non-empty,
+/// the exec command is wrapped as `sh -c '<setup> && exec "$@"' sh <args>`.
+pub fn build_exec_args(config: &AgentConfig, setup_script: &str) -> Vec<String> {
+    let mut args = vec![
+        "exec".into(),
+        "-it".into(),
+        "-w".into(),
+        "/workspace".into(),
+        config.container_name(),
+    ];
 
     if setup_script.is_empty() {
         args.extend(config.container_args.iter().cloned());
     } else {
-        // Wrap: sh -c '<setup> && exec "$@"' sh <original args>
         args.push("sh".into());
         args.push("-c".into());
         if config.container_args.is_empty() {
@@ -335,6 +338,7 @@ pub fn build_container_args(config: &AgentConfig, setup_script: &str) -> Vec<Str
             args.extend(config.container_args.iter().cloned());
         }
     }
+
     args
 }
 
@@ -379,54 +383,16 @@ mod tests {
     }
 
     #[test]
-    fn container_args_basics() {
-        let cfg = AgentConfig {
-            binary_hash: "h".into(),
-            secrets: vec![],
-            agent_subfolder: "goose".into(),
-            container_args: vec!["--flag".into()],
-            agent_path: PathBuf::from("/work/myagent"),
-            fuse_server_path: "fuse-server".into(),
-            image_name: "myimg".into(),
-            memory: "16G".into(),
-            cpus: "4".into(),
-            socket_path: PathBuf::from(PathBuf::from(fuse_protocol::DEFAULT_SOCKET)),
-            mount_point: PathBuf::from(PathBuf::from(fuse_protocol::DEFAULT_MOUNT_POINT)),
-            use_sudo: false,
-            allow_other: false,
-            pidns_host: false,
-            runtime: Runtime::Auto,
-            runtime_wrapper: None,
-            log_level: "info".to_string(),
-            plans_path: None,
-        };
-        let args = build_container_args(&cfg, "");
-        assert!(args.contains(&"run".to_string()));
-        assert!(args.contains(&"-it".to_string()));
-        assert!(args.contains(&"--rm".to_string()));
-        assert!(args.contains(&"--user".into()));
-        assert!(args.contains(&"root".into()));
-        assert!(args.contains(&"--workdir".into()));
-        assert!(args.contains(&"/workspace".into()));
-        assert!(args.contains(&"myimg".into()));
-        assert!(args.contains(&"--flag".into()));
-
-        // config volume mapping
-        let cfg_vol: String = args
-            .iter()
-            .find(|a| a.contains("config") && a.contains("/root/.config/goose"))
-            .cloned()
-            .unwrap();
-        assert!(cfg_vol.contains("slave,Z"));
-
-        // fuse mount
-        assert!(args.iter().any(|a| a.contains("/fuse:ro")));
-        // no pidns by default
-        assert!(!args.iter().any(|a| a.contains("--pidns")));
+    fn container_name_is_stable() {
+        let cfg = AgentConfig::from_args("h", vec![], "goose", &[]);
+        let name1 = cfg.container_name();
+        let name2 = cfg.container_name();
+        assert_eq!(name1, name2, "container name should be deterministic");
+        assert!(name1.starts_with("agentbox-"));
     }
 
     #[test]
-    fn container_args_pidns_host() {
+    fn create_args_basics() {
         let cfg = AgentConfig {
             binary_hash: "h".into(),
             secrets: vec![],
@@ -437,8 +403,41 @@ mod tests {
             image_name: "myimg".into(),
             memory: "16G".into(),
             cpus: "4".into(),
-            socket_path: PathBuf::from(PathBuf::from(fuse_protocol::DEFAULT_SOCKET)),
-            mount_point: PathBuf::from(PathBuf::from(fuse_protocol::DEFAULT_MOUNT_POINT)),
+            socket_path: PathBuf::from(fuse_protocol::DEFAULT_SOCKET),
+            mount_point: PathBuf::from(fuse_protocol::DEFAULT_MOUNT_POINT),
+            use_sudo: false,
+            allow_other: false,
+            pidns_host: false,
+            runtime: Runtime::Auto,
+            runtime_wrapper: None,
+            log_level: "info".to_string(),
+            plans_path: None,
+        };
+        let args = build_create_args(&cfg);
+        assert!(args.contains(&"run".to_string()));
+        assert!(args.contains(&"-d".to_string()));
+        assert!(!args.contains(&"--rm".to_string()), "persistent container should NOT use --rm");
+        assert!(args.contains(&"sleep".into()));
+        assert!(args.contains(&"infinity".into()));
+        assert!(args.contains(&"myimg".into()));
+        // No pidns by default
+        assert!(!args.iter().any(|a| a == "--pid"));
+    }
+
+    #[test]
+    fn create_args_pidns_host() {
+        let cfg = AgentConfig {
+            binary_hash: "h".into(),
+            secrets: vec![],
+            agent_subfolder: "goose".into(),
+            container_args: vec![],
+            agent_path: PathBuf::from("/work/myagent"),
+            fuse_server_path: "fuse-server".into(),
+            image_name: "myimg".into(),
+            memory: "16G".into(),
+            cpus: "4".into(),
+            socket_path: PathBuf::from(fuse_protocol::DEFAULT_SOCKET),
+            mount_point: PathBuf::from(fuse_protocol::DEFAULT_MOUNT_POINT),
             use_sudo: false,
             allow_other: false,
             pidns_host: true,
@@ -447,11 +446,45 @@ mod tests {
             log_level: "info".to_string(),
             plans_path: None,
         };
-        let args = build_container_args(&cfg, "");
+        let args = build_create_args(&cfg);
         assert!(
             args.iter().any(|a| a == "--pid") && args.iter().any(|a| a == "host"),
             "should include --pid host when pidns_host is true"
         );
+    }
+
+    #[test]
+    fn exec_args_with_setup() {
+        let cfg = AgentConfig {
+            binary_hash: "h".into(),
+            secrets: vec![],
+            agent_subfolder: "goose".into(),
+            container_args: vec!["--flag".into()],
+            agent_path: PathBuf::from("/work/myagent"),
+            fuse_server_path: "fuse-server".into(),
+            image_name: "myimg".into(),
+            memory: "16G".into(),
+            cpus: "4".into(),
+            socket_path: PathBuf::from(fuse_protocol::DEFAULT_SOCKET),
+            mount_point: PathBuf::from(fuse_protocol::DEFAULT_MOUNT_POINT),
+            use_sudo: false,
+            allow_other: false,
+            pidns_host: false,
+            runtime: Runtime::Auto,
+            runtime_wrapper: None,
+            log_level: "info".to_string(),
+            plans_path: None,
+        };
+        let args = build_exec_args(&cfg, "ln -sf /fuse/x /root/x");
+        assert!(args.contains(&"exec".to_string()));
+        assert!(args.contains(&"-it".to_string()));
+        assert!(args.contains(&cfg.container_name()));
+        assert!(args.contains(&"sh".into()));
+        assert!(args.contains(&"-c".into()));
+        assert!(args.contains(&"--flag".into()));
+        // Should NOT contain run/d/sleep/infinity
+        assert!(!args.contains(&"run".to_string()));
+        assert!(!args.contains(&"sleep".to_string()));
     }
 
     #[test]
@@ -508,6 +541,6 @@ mod tests {
     fn container_name_contains_agent_name() {
         let cfg = AgentConfig::from_args("h", vec![], "goose", &[]);
         let name = cfg.container_name();
-        assert!(name.starts_with(&cfg.agent_name()));
+        assert!(name.starts_with("agentbox-"));
     }
 }

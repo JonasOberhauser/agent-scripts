@@ -5,6 +5,8 @@ use clap::Parser;
 use run_agent::{
     run_agent, AgentConfig, Runtime, SecretMapping, DEFAULT_MOUNT_POINT, DEFAULT_SOCKET,
 };
+
+use fuse_protocol::SystemIo;
 use tracing::error;
 use tracing_subscriber::EnvFilter;
 
@@ -84,6 +86,14 @@ struct Cli {
     #[arg(long, default_value = "info")]
     log_level: String,
 
+    /// Stop and remove the persistent container, then exit.
+    #[arg(long)]
+    stop: bool,
+
+    /// Stop and remove the persistent container, then create a fresh one.
+    #[arg(long)]
+    restart_container: bool,
+
     /// Extra arguments passed to the container command.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     container_args: Vec<String>,
@@ -132,6 +142,31 @@ fn main() -> ExitCode {
 
     let mut io = fuse_protocol::RealSystemIo::new();
 
+    // Handle --stop: stop container and exit
+    if cli.stop {
+        let name = config.container_name();
+        let wrapper = config.runtime_wrapper.as_deref();
+        let bin = config.runtime.resolve(&io, wrapper).unwrap_or("podman");
+        eprintln!("Stopping container {name}...");
+        match wrapper {
+            Some(w) => {
+                let parts: Vec<&str> = w.split_whitespace().collect();
+                let mut a: Vec<&str> = parts[1..].to_vec();
+                a.extend(&[bin, "stop", &name]);
+                let _ = io.run_command(parts[0], &a);
+                let mut b: Vec<&str> = parts[1..].to_vec();
+                b.extend(&[bin, "rm", "-f", &name]);
+                let _ = io.run_command(parts[0], &b);
+            }
+            None => {
+                let _ = io.run_command(bin, &["stop", &name]);
+                let _ = io.run_command(bin, &["rm", "-f", &name]);
+            }
+        }
+        eprintln!("Done.");
+        return ExitCode::SUCCESS;
+    }
+
     let app = servyi_servatui::App::builder(&config.socket_path)
         .protocol_all(fuse_protocol::client_protocols())
         .build();
@@ -140,7 +175,7 @@ fn main() -> ExitCode {
         app.run_cli_command(name, args).map(|_| ())
     };
 
-    match run_agent(&mut io, &config, &send) {
+    match run_agent(&mut io, &config, &send, cli.restart_container) {
         Ok(result) => {
             if result.container_exit_code != 0 {
                 return ExitCode::from(result.container_exit_code as u8);
