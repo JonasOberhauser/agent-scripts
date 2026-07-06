@@ -18,7 +18,7 @@ pub fn run_socket_server(
         socket: socket_path.to_path_buf(),
         protocols: server_protocols(),
     };
-    handle.run(&state)
+    handle.run(state)
 }
 
 #[cfg(test)]
