@@ -1,5 +1,6 @@
 pub mod fuse_fs;
 pub mod handler;
+pub mod protocols;
 pub mod socket;
 pub mod state;
 

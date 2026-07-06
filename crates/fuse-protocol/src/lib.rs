@@ -2,6 +2,7 @@ pub mod error;
 pub mod io;
 pub mod protocol;
 pub mod real_io;
+pub mod servatui_protocols;
 
 /// Semantic version of the fuse-server/fuse-client protocol.
 /// Both client and server must share the same version.
@@ -30,3 +31,4 @@ pub use error::IoError;
 pub use io::{CommandOutput, IoProvider, SystemIo, Transport};
 pub use protocol::{Command, MountEntry, PendingAccessInfo, Response, SecretStatus, ServerStateFile, StateSecretEntry};
 pub use real_io::{MockSystemIo, RealSystemIo};
+pub use servatui_protocols::{client_protocols, print_response, send_via_protocol};

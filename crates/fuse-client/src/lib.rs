@@ -1,51 +1,52 @@
 use std::path::Path;
 
-use fuse_protocol::{Command, IoError, Response, SystemIo};
+use fuse_protocol::{Command, Response};
+use servyi_servatui::{SocketConnection, TypedConnection, RawConnection};
 
 /// Check whether a fuse-server is listening at `socket_path`.
-pub fn server_exists<S: SystemIo>(io: &S, socket_path: &Path) -> bool {
-    io.try_unix_connect(socket_path)
+pub fn server_exists(socket_path: &Path) -> bool {
+    SocketConnection::server_exists(socket_path)
 }
 
-/// Connect to the fuse-server, send one [`Command`], and read the [`Response`].
-pub fn send_command<S: SystemIo>(
-    io: &S,
-    socket_path: &Path,
-    cmd: Command,
-) -> Result<Response, IoError> {
-    let json = serde_json::to_vec(&cmd)?;
-    let raw = io.unix_send_recv(socket_path, &json)?;
-    let resp: Response = serde_json::from_slice(&raw)?;
+/// Map a Command variant to its servatui protocol name.
+pub fn command_name(cmd: &Command) -> &'static str {
+    match cmd {
+        Command::Status => "status",
+        Command::Reset { name: None } => "reset-all",
+        Command::Reset { name: Some(_) } => "reset",
+        Command::AddSecret { .. } => "add",
+        Command::RemoveSecret { .. } => "remove",
+        Command::RotateHash { .. } => "rotate",
+        Command::ListMounts => "mounts",
+        Command::ListPending => "pending",
+        Command::Grant { .. } => "grant",
+        Command::Deny { .. } => "deny",
+        Command::GetVersion => "version",
+        Command::GetLogPath => "logpath",
+    }
+}
+
+/// Connect to the fuse-server, send one Command, receive the Response.
+/// Uses servatui's wire protocol (protocol name → request → response → sentinel).
+pub fn send_command(socket_path: &Path, cmd: &Command) -> Result<Response, String> {
+    let proto_name = command_name(cmd);
+    let mut conn = SocketConnection::connect(socket_path)?;
+
+    conn.send_typed(&proto_name.to_string())?;
+    conn.send_typed(cmd)?;
+
+    let data = conn.recv_bytes()?;
+
+    if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&data) {
+        if let Some(err) = val.get("__error__").and_then(|v| v.as_str()) {
+            return Err(err.to_string());
+        }
+    }
+
+    let resp: Response = serde_json::from_slice(&data)
+        .map_err(|e| format!("Failed to parse response: {e}"))?;
+
+    conn.send_typed(&())?;
+
     Ok(resp)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn send_command_uses_mock() {
-        let mock = fuse_protocol::MockSystemIo::new()
-            .with_unix_response(br#"{"type":"ok"}"#);
-        let resp = send_command(
-            &mock,
-            std::path::Path::new("/sock"),
-            Command::Status,
-        )
-        .unwrap();
-        assert_eq!(resp, Response::Ok);
-    }
-
-    #[test]
-    fn server_exists_false_when_not_connected() {
-        let mock = fuse_protocol::MockSystemIo::new();
-        assert!(!server_exists(&mock, std::path::Path::new("/sock")));
-    }
-
-    #[test]
-    fn server_exists_true_when_connected() {
-        let mut mock = fuse_protocol::MockSystemIo::new();
-        mock.unix_connected = true;
-        assert!(server_exists(&mock, std::path::Path::new("/sock")));
-    }
 }

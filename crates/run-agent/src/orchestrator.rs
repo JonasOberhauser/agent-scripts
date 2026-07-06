@@ -1,10 +1,29 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use fuse_protocol::{Command, SystemIo};
+use fuse_protocol::{Command, Response, SystemIo};
 use tracing::{info, warn};
 
 use crate::config::{build_container_args, AgentConfig};
+
+/// Send a command to the fuse-server via the servatui wire protocol.
+/// Uses `SystemIo::unix_send_recv_servatui` so mocks work in tests.
+fn send_cmd<S: SystemIo>(io: &S, socket: &Path, cmd: &Command) -> Result<Response, String> {
+    let proto_name = fuse_client::command_name(cmd);
+    let cmd_json = serde_json::to_vec(cmd).map_err(|e| e.to_string())?;
+    let raw = io.unix_send_recv_servatui(socket, proto_name, &cmd_json)
+        .map_err(|e| e.0)?;
+
+    if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&raw) {
+        if let Some(err) = val.get("__error__").and_then(|v| v.as_str()) {
+            return Err(err.to_string());
+        }
+    }
+
+    let resp: Response = serde_json::from_slice(&raw)
+        .map_err(|e| format!("Failed to parse response: {e}"))?;
+    Ok(resp)
+}
 
 /// Result of a completed agent session.
 #[derive(Debug)]
@@ -50,7 +69,7 @@ pub fn run_agent<S: SystemIo>(io: &mut S, config: &AgentConfig) -> Result<RunRes
     let socket = &config.socket_path;
     let mut server_was_spawned = false;
 
-    if fuse_client::server_exists(io, socket) {
+    if io.try_unix_connect(socket) {
         info!("Reusing existing fuse-server at {}", socket.display());
     } else {
         // ── 3. Spawn independent server ───────────────────────────
@@ -286,7 +305,7 @@ pub fn run_agent<S: SystemIo>(io: &mut S, config: &AgentConfig) -> Result<RunRes
     // ── 7. Auto-reset all secret counters ────────────────────────
     let mut reset_ok = true;
     for s in &loaded {
-        match fuse_client::send_command(io, socket, Command::Reset {
+        match send_cmd(io, socket, &Command::Reset {
             name: Some(s.fuse_name.clone()),
         }) {
             Ok(fuse_protocol::Response::Ok) => {
@@ -363,7 +382,7 @@ fn load_secret_recursive<S: SystemIo>(
         .read_file(host)
         .map_err(|e| format!("read secret {}: {e}", host.display()))?;
 
-    match fuse_client::send_command(io, socket, Command::AddSecret {
+    match send_cmd(io, socket, &Command::AddSecret {
         name: fuse_name.clone(),
         content,
         hash: config.binary_hash.clone(),

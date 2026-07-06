@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 fuse-protocol = { workspace = true }
+servyi-servatui = { workspace = true }
 serde_json = { workspace = true }
 clap = { workspace = true }
 tracing = { workspace = true }

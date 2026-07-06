@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use clap::Parser;
 use fuse_client::send_command;
-use fuse_protocol::{Command, Response, ServerStateFile, SystemIo, VERSION as CLIENT_VERSION};
+use fuse_protocol::{Command, Response, ServerStateFile, VERSION as CLIENT_VERSION};
 
 // ── Console abstraction ────────────────────────────────────────
 
@@ -81,20 +81,19 @@ fn main() {
         .init();
 
     let cli = Cli::parse();
-    let io = fuse_protocol::RealSystemIo::new();
 
     // Check server: if running, verify version; if not, offer to start.
-    if io.try_unix_connect(&cli.socket) {
-        check_version_or_restart(&io, &cli.socket);
+    if fuse_client::server_exists(&cli.socket) {
+        check_version_or_restart(&cli.socket);
     } else {
-        check_start_server(&io, &cli.socket);
+        check_start_server(&cli.socket);
     }
 
     match &cli.command {
         Some(cmd) => {
-            let cmd = build_clap_command(cmd, &io);
-            match cmd {
-                Ok(command) => match send_command(&io, &cli.socket, command) {
+            let command = build_clap_command(cmd);
+            match command {
+                Ok(c) => match send_command(&cli.socket, &c) {
                     Ok(resp) => {
                         print_response(&resp, &mut StdoutConsole);
                         if matches!(resp, Response::Error { .. }) {
@@ -113,7 +112,7 @@ fn main() {
             }
         }
         None => {
-            if let Err(e) = interactive(&io, &cli.socket) {
+            if let Err(e) = interactive(&cli.socket) {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
             }
@@ -121,13 +120,13 @@ fn main() {
     }
 }
 
-fn build_clap_command<S: SystemIo>(cmd: &Commands, io: &S) -> Result<Command, String> {
+fn build_clap_command(cmd: &Commands) -> Result<Command, String> {
     Ok(match cmd {
         Commands::Reset { name } => Command::Reset { name: name.clone() },
         Commands::ResetAll => Command::Reset { name: None },
         Commands::Status => Command::Status,
         Commands::AddSecret { name, file, hash } => {
-            let content = io.read_file(file).map_err(|e| e.0)?;
+            let content = std::fs::read(file).map_err(|e| e.to_string())?;
             Command::AddSecret { name: name.clone(), content, hash: hash.clone() }
         }
         Commands::RemoveSecret { name } => Command::RemoveSecret { name: name.clone() },
@@ -144,16 +143,13 @@ fn build_clap_command<S: SystemIo>(cmd: &Commands, io: &S) -> Result<Command, St
     })
 }
 
-fn check_version_or_restart(io: &fuse_protocol::RealSystemIo, socket: &Path) {
-    let server_version = match send_command(io, socket, Command::GetVersion) {
+fn check_version_or_restart(socket: &Path) {
+    let server_version = match send_command(socket, &Command::GetVersion) {
         Ok(Response::Version { version }) => version,
         Ok(_) => {
-            // Server responded but doesn't understand GetVersion — it's
-            // an older version.  This IS a mismatch.
             "<unknown (old server)>".to_string()
         }
         Err(e) => {
-            // Can't communicate at all — proceed without version check.
             eprintln!("Warning: cannot query server version: {e}");
             return;
         }
@@ -169,7 +165,6 @@ fn check_version_or_restart(io: &fuse_protocol::RealSystemIo, socket: &Path) {
     );
 
     print!("Restart server to update? [y/N] ");
-    print!("Restart server to update? [y/N] ");
     stdio::stdout().flush().unwrap();
     let mut input = String::new();
     if stdio::stdin().read_line(&mut input).is_err() {
@@ -182,7 +177,7 @@ fn check_version_or_restart(io: &fuse_protocol::RealSystemIo, socket: &Path) {
     }
 
     // Try to get the old server's log path so we can reuse it.
-    let log_path = match send_command(io, socket, Command::GetLogPath) {
+    let log_path = match send_command(socket, &Command::GetLogPath) {
         Ok(Response::LogPath { path }) if !path.is_empty() => {
             eprintln!("  Old server log: {path}");
             Some(path)
@@ -203,21 +198,16 @@ fn check_version_or_restart(io: &fuse_protocol::RealSystemIo, socket: &Path) {
         }
     };
 
-    restart_server(io, socket, log_path.as_deref());
+    restart_server(socket, log_path.as_deref());
 }
 
-/// Read the state file written by the orchestrator.
 fn read_state_file() -> Option<ServerStateFile> {
     let state_path = Path::new("/tmp/fuse-gatekeeper-state.json");
-    let io = fuse_protocol::RealSystemIo::new();
-    let data = io.read_file(state_path).ok()?;
+    let data = std::fs::read(state_path).ok()?;
     serde_json::from_slice(&data).ok()
 }
 
-/// Spawn a new fuse-server from a state file, wait for the socket,
-/// and restore all secrets.  Used by both restart and start-if-not-running.
 fn start_server_from_state(
-    io: &fuse_protocol::RealSystemIo,
     socket: &Path,
     state: &ServerStateFile,
     log_path: Option<&str>,
@@ -322,7 +312,7 @@ fn start_server_from_state(
     eprintln!("Waiting for server...");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
-        if io.try_unix_connect(socket) {
+        if fuse_client::server_exists(socket) {
             break;
         }
         if std::time::Instant::now() > deadline {
@@ -335,14 +325,14 @@ fn start_server_from_state(
     // Re-add secrets
     eprintln!("Restoring {} secret(s)...", state.secrets.len());
     for entry in &state.secrets {
-        let content = match io.read_file(Path::new(&entry.host_path)) {
+        let content = match std::fs::read(Path::new(&entry.host_path)) {
             Ok(data) => data,
             Err(e) => {
                 eprintln!("  Skip {}: cannot read {}: {e}", entry.fuse_name, entry.host_path);
                 continue;
             }
         };
-        match send_command(io, socket, Command::AddSecret {
+        match send_command(socket, &Command::AddSecret {
             name: entry.fuse_name.clone(),
             content,
             hash: entry.hash.clone(),
@@ -356,7 +346,7 @@ fn start_server_from_state(
     eprintln!("Server ready (v{}).", CLIENT_VERSION);
 }
 
-fn restart_server(io: &fuse_protocol::RealSystemIo, socket: &Path, log_path: Option<&str>) {
+fn restart_server(socket: &Path, log_path: Option<&str>) {
     let state = match read_state_file() {
         Some(s) => s,
         None => {
@@ -366,7 +356,7 @@ fn restart_server(io: &fuse_protocol::RealSystemIo, socket: &Path, log_path: Opt
     };
 
     // Try to get current secret status (for display)
-    let status_info = match send_command(io, socket, Command::Status) {
+    let status_info = match send_command(socket, &Command::Status) {
         Ok(Response::Status { secrets }) => {
             let names: Vec<&str> = secrets.iter().map(|s| s.name.as_str()).collect();
             format!("{} secret(s): {}", secrets.len(), names.join(", "))
@@ -389,7 +379,7 @@ fn restart_server(io: &fuse_protocol::RealSystemIo, socket: &Path, log_path: Opt
 
     // Wait for socket to disappear
     for _ in 0..30 {
-        if !io.try_unix_connect(socket) {
+        if !fuse_client::server_exists(socket) {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(200));
@@ -408,12 +398,10 @@ fn restart_server(io: &fuse_protocol::RealSystemIo, socket: &Path, log_path: Opt
     let _ = std::fs::remove_dir_all(&state.mount_point);
     std::thread::sleep(std::time::Duration::from_millis(500));
 
-    start_server_from_state(io, socket, &state, log_path);
+    start_server_from_state(socket, &state, log_path);
 }
 
-/// Called when the server is not running at all.  Offers to start it
-/// from the state file.
-fn check_start_server(io: &fuse_protocol::RealSystemIo, socket: &Path) {
+fn check_start_server(socket: &Path) {
     print!("Server is not running. Start it? [y/N] ");
     stdio::stdout().flush().unwrap();
     let mut input = String::new();
@@ -425,7 +413,7 @@ fn check_start_server(io: &fuse_protocol::RealSystemIo, socket: &Path) {
     }
 
     match read_state_file() {
-        Some(state) => start_server_from_state(io, socket, &state, None),
+        Some(state) => start_server_from_state(socket, &state, None),
         None => {
             eprintln!(
                 "No state file found at /tmp/fuse-gatekeeper-state.json.\n\
@@ -465,7 +453,7 @@ enum ShellAction {
 struct Plugin {
     name: &'static str,
     help: &'static str,
-    execute: fn(args: &str, io: &fuse_protocol::RealSystemIo, socket: &Path, out: &mut dyn Console) -> ShellAction,
+    execute: fn(args: &str, socket: &Path, out: &mut dyn Console) -> ShellAction,
 }
 
 fn all_plugins() -> Vec<Plugin> {
@@ -473,45 +461,40 @@ fn all_plugins() -> Vec<Plugin> {
         Plugin {
             name: "status",
             help: "Show all secrets and access counts",
-            
-            execute: |_, io, sock, out| {
-                run_simple(io, sock, Command::Status, out)
+            execute: |_, sock, out| {
+                run_simple(sock, Command::Status, out)
             },
         },
         Plugin {
             name: "mounts",
             help: "List mounted secret files",
-            
-            execute: |_, io, sock, out| run_simple(io, sock, Command::ListMounts, out),
+            execute: |_, sock, out| run_simple(sock, Command::ListMounts, out),
         },
         Plugin {
             name: "reset",
             help: "Reset access counter for one or all secrets",
-            
-            execute: |args, io, sock, out| {
+            execute: |args, sock, out| {
                 let name = args.split_whitespace().next().map(|s| s.to_string());
-                run_simple(io, sock, Command::Reset { name }, out)
+                run_simple(sock, Command::Reset { name }, out)
             },
         },
         Plugin {
             name: "reset-all",
             help: "Reset all access counters",
-            
-            execute: |_, io, sock, out| run_simple(io, sock, Command::Reset { name: None }, out),
+            execute: |_, sock, out| run_simple(sock, Command::Reset { name: None }, out),
         },
         Plugin {
             name: "add",
             help: "Add a new secret from a file",
-            
-            execute: |args, io, sock, out| {
+            execute: |args, sock, out| {
                 let parts: Vec<&str> = args.trim().splitn(3, char::is_whitespace).collect();
                 if parts.len() < 3 {
                     out.print_error("Usage: add NAME FILE HASH");
                     return ShellAction::Continue;
                 }
                 let file = PathBuf::from(parts[1]);
-                match io.read_file(&file) {
-                    Ok(content) => run_simple(io, sock, Command::AddSecret {
+                match std::fs::read(&file) {
+                    Ok(content) => run_simple(sock, Command::AddSecret {
                         name: parts[0].to_string(),
                         content,
                         hash: parts[2].to_string(),
@@ -526,27 +509,25 @@ fn all_plugins() -> Vec<Plugin> {
         Plugin {
             name: "remove",
             help: "Remove a secret",
-            
-            execute: |args, io, sock, out| {
+            execute: |args, sock, out| {
                 let name = args.trim();
                 if name.is_empty() {
                     out.print_error("Usage: remove NAME");
                     return ShellAction::Continue;
                 }
-                run_simple(io, sock, Command::RemoveSecret { name: name.to_string() }, out)
+                run_simple(sock, Command::RemoveSecret { name: name.to_string() }, out)
             },
         },
         Plugin {
             name: "rotate",
             help: "Change the allowed binary hash",
-            
-            execute: |args, io, sock, out| {
+            execute: |args, sock, out| {
                 let parts: Vec<&str> = args.trim().splitn(2, char::is_whitespace).collect();
                 if parts.len() < 2 {
                     out.print_error("Usage: rotate NAME HASH");
                     return ShellAction::Continue;
                 }
-                run_simple(io, sock, Command::RotateHash {
+                run_simple(sock, Command::RotateHash {
                     name: parts[0].to_string(),
                     new_hash: parts[1].to_string(),
                 }, out)
@@ -555,16 +536,14 @@ fn all_plugins() -> Vec<Plugin> {
         Plugin {
             name: "pending",
             help: "Show pending access requests waiting for approval",
-            
-            execute: |_, io, sock, out| run_simple(io, sock, Command::ListPending, out),
+            execute: |_, sock, out| run_simple(sock, Command::ListPending, out),
         },
         Plugin {
             name: "grant",
             help: "Grant a pending access request",
-            
-            execute: |args, io, sock, out| {
+            execute: |args, sock, out| {
                 match args.trim().parse::<u64>() {
-                    Ok(id) => run_simple(io, sock, Command::Grant { id }, out),
+                    Ok(id) => run_simple(sock, Command::Grant { id }, out),
                     Err(_) => {
                         out.print_error("Usage: grant ID (ID must be a number)");
                         ShellAction::Continue
@@ -575,10 +554,9 @@ fn all_plugins() -> Vec<Plugin> {
         Plugin {
             name: "deny",
             help: "Deny a pending access request",
-            
-            execute: |args, io, sock, out| {
+            execute: |args, sock, out| {
                 match args.trim().parse::<u64>() {
-                    Ok(id) => run_simple(io, sock, Command::Deny { id }, out),
+                    Ok(id) => run_simple(sock, Command::Deny { id }, out),
                     Err(_) => {
                         out.print_error("Usage: deny ID (ID must be a number)");
                         ShellAction::Continue
@@ -589,9 +567,9 @@ fn all_plugins() -> Vec<Plugin> {
         Plugin {
             name: "version",
             help: "Show client and server versions",
-            execute: |_, io, sock, out| {
+            execute: |_, sock, out| {
                 out.print_line(&format!("Client: {}", CLIENT_VERSION));
-                match send_command(io, sock, Command::GetVersion) {
+                match send_command(sock, &Command::GetVersion) {
                     Ok(Response::Version { version }) => out.print_line(&format!("Server: {version}")),
                     Ok(_) => out.print_line("Server: <unknown response>"),
                     Err(e) => out.print_line(&format!("Server: <unreachable: {e}>")),
@@ -602,8 +580,7 @@ fn all_plugins() -> Vec<Plugin> {
         Plugin {
             name: "help",
             help: "Show available commands",
-            
-            execute: |_, _, _, out| {
+            execute: |_, _, out| {
                 print_help(out);
                 ShellAction::Continue
             },
@@ -611,25 +588,22 @@ fn all_plugins() -> Vec<Plugin> {
         Plugin {
             name: "exit",
             help: "Exit the shell",
-            
-            execute: |_, _, _, _| ShellAction::Exit,
+            execute: |_, _, _| ShellAction::Exit,
         },
         Plugin {
             name: "quit",
             help: "Exit the shell",
-            
-            execute: |_, _, _, _| ShellAction::Exit,
+            execute: |_, _, _| ShellAction::Exit,
         },
     ]
 }
 
 fn run_simple(
-    io: &fuse_protocol::RealSystemIo,
     socket: &Path,
     cmd: Command,
     out: &mut dyn Console,
 ) -> ShellAction {
-    match send_command(io, socket, cmd) {
+    match send_command(socket, &cmd) {
         Ok(resp) => print_response(&resp, out),
         Err(e) => out.print_error(&format!("Connection error: {e}")),
     }
@@ -703,7 +677,6 @@ fn print_response(resp: &Response, out: &mut dyn Console) {
 // ── Interactive shell (ratatui + tui-input) ────────────────────
 
 fn interactive(
-    io: &fuse_protocol::RealSystemIo,
     socket: &Path,
 ) -> Result<(), String> {
     use crossterm::{
@@ -747,7 +720,7 @@ fn interactive(
     let mut grant_idx: Option<usize> = None;
     let mut log_scroll_up: u16 = 0;
 
-    let poll = || match send_command(io, socket, Command::ListPending) {
+    let poll = || match send_command(socket, &Command::ListPending) {
         Ok(Response::PendingList { pending: p }) => p,
         _ => Vec::new(),
     };
@@ -909,7 +882,7 @@ fn interactive(
                         }
                         KeyCode::Char('y') | KeyCode::Char('Y') => {
                             let p = pending[idx].clone();
-                            let _ = send_command(io, socket, Command::Grant{ id: p.id });
+                            let _ = send_command(socket, &Command::Grant{ id: p.id });
                             log_lines.push(format!("Granted [{}] {} (pid {})", p.id, p.secret_name, p.pid));
                             log_scroll_up = 0;
                             pending.remove(idx);
@@ -918,7 +891,7 @@ fn interactive(
                         }
                         KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Enter => {
                             let p = pending[idx].clone();
-                            let _ = send_command(io, socket, Command::Deny{ id: p.id });
+                            let _ = send_command(socket, &Command::Deny{ id: p.id });
                             log_lines.push(format!("Denied [{}] {} (pid {})", p.id, p.secret_name, p.pid));
                             log_scroll_up = 0;
                             pending.remove(idx);
@@ -945,7 +918,7 @@ fn interactive(
                         match plugins.iter().find(|p| p.name==cn) {
                             Some(pl) => {
                                 let mut buf = BufferConsole::new();
-                                if let ShellAction::Exit = (pl.execute)(args, io, socket, &mut buf) { return Ok(()); }
+                                if let ShellAction::Exit = (pl.execute)(args, socket, &mut buf) { return Ok(()); }
                                 log_lines.extend(buf.lines);
                             }
                             None => log_lines.push(format!("Unknown: '{cn}'")),
