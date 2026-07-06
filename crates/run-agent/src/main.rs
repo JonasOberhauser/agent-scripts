@@ -131,7 +131,16 @@ fn main() -> ExitCode {
     }
 
     let mut io = fuse_protocol::RealSystemIo::new();
-    match run_agent(&mut io, &config) {
+
+    let app = servyi_servatui::App::builder(&config.socket_path)
+        .protocol_all(fuse_protocol::client_protocols())
+        .build();
+
+    let send = |name: &str, args: &str| -> Result<(), String> {
+        app.run_cli_command(name, args).map(|_| ())
+    };
+
+    match run_agent(&mut io, &config, &send) {
         Ok(result) => {
             if result.container_exit_code != 0 {
                 return ExitCode::from(result.container_exit_code as u8);

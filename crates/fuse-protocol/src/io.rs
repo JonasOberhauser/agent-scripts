@@ -65,16 +65,6 @@ pub trait SystemIo {
     /// Send a blob over a Unix domain socket (newline-terminated) and read
     /// one line of response.
     fn unix_send_recv(&self, path: &Path, data: &[u8]) -> Result<Vec<u8>, IoError>;
-
-    /// Send a servatui-protocol request over a Unix domain socket.
-    /// Performs the full multi-line exchange: protocol name, request data,
-    /// reads one line of response, sends sentinel.
-    fn unix_send_recv_servatui(
-        &self,
-        path: &Path,
-        proto_name: &str,
-        data: &[u8],
-    ) -> Result<Vec<u8>, IoError>;
 }
 
 /// Bidirectional message transport, generic over input `I` and output `O`.

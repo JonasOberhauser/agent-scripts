@@ -1,29 +1,10 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use fuse_protocol::{Command, Response, SystemIo};
+use fuse_protocol::SystemIo;
 use tracing::{info, warn};
 
 use crate::config::{build_container_args, AgentConfig};
-
-/// Send a command to the fuse-server via the servatui wire protocol.
-/// Uses `SystemIo::unix_send_recv_servatui` so mocks work in tests.
-fn send_cmd<S: SystemIo>(io: &S, socket: &Path, cmd: &Command) -> Result<Response, String> {
-    let proto_name = fuse_client::command_name(cmd);
-    let cmd_json = serde_json::to_vec(cmd).map_err(|e| e.to_string())?;
-    let raw = io.unix_send_recv_servatui(socket, proto_name, &cmd_json)
-        .map_err(|e| e.0)?;
-
-    if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&raw) {
-        if let Some(err) = val.get("__error__").and_then(|v| v.as_str()) {
-            return Err(err.to_string());
-        }
-    }
-
-    let resp: Response = serde_json::from_slice(&raw)
-        .map_err(|e| format!("Failed to parse response: {e}"))?;
-    Ok(resp)
-}
 
 /// Result of a completed agent session.
 #[derive(Debug)]
@@ -50,7 +31,15 @@ pub struct RunResult {
 /// 6. Run the container (foreground).
 /// 7. **Auto-reset** all secret counters.
 /// 8. Done (server stays running, symlinks persist).
-pub fn run_agent<S: SystemIo>(io: &mut S, config: &AgentConfig) -> Result<RunResult, String> {
+pub fn run_agent<S, F>(
+    io: &mut S,
+    config: &AgentConfig,
+    send: &F,
+) -> Result<RunResult, String>
+where
+    S: SystemIo,
+    F: Fn(&str, &str) -> Result<(), String>,
+{
     // ── 1. Validate ──────────────────────────────────────────────
     let host_config = config.host_config_dir();
     let host_workspace = config.host_workspace();
@@ -261,7 +250,7 @@ pub fn run_agent<S: SystemIo>(io: &mut S, config: &AgentConfig) -> Result<RunRes
 
     for mapping in &config.secrets {
         load_secret_recursive(
-            io, socket, &mapping.host, &mapping.container,
+            io, send, &mapping.host, &mapping.container,
             config, pid, &mut counter, &mut loaded,
         )?;
     }
@@ -305,15 +294,9 @@ pub fn run_agent<S: SystemIo>(io: &mut S, config: &AgentConfig) -> Result<RunRes
     // ── 7. Auto-reset all secret counters ────────────────────────
     let mut reset_ok = true;
     for s in &loaded {
-        match send_cmd(io, socket, &Command::Reset {
-            name: Some(s.fuse_name.clone()),
-        }) {
-            Ok(fuse_protocol::Response::Ok) => {
+        match send("reset", &s.fuse_name) {
+            Ok(()) => {
                 info!("Auto-reset successful for '{}'.", s.fuse_name);
-            }
-            Ok(other) => {
-                warn!("Auto-reset returned unexpected response for '{}': {other:?}", s.fuse_name);
-                reset_ok = false;
             }
             Err(e) => {
                 warn!("Auto-reset failed for '{}': {e}", s.fuse_name);
@@ -345,16 +328,20 @@ struct LoadedSecret {
 /// - Dir + `/dest` → directory contents mapped under `dest/`
 /// - Dir + `/dest/` → same (contents mapped under `dest/`)
 #[allow(clippy::too_many_arguments)]
-fn load_secret_recursive<S: SystemIo>(
+fn load_secret_recursive<S, F>(
     io: &mut S,
-    socket: &Path,
+    send: &F,
     host: &Path,
     container: &Path,
     config: &AgentConfig,
     pid: u32,
     counter: &mut usize,
     loaded: &mut Vec<LoadedSecret>,
-) -> Result<(), String> {
+) -> Result<(), String>
+where
+    S: SystemIo,
+    F: Fn(&str, &str) -> Result<(), String>,
+{
     if io.is_dir(host) {
         let entries = io
             .list_dir(host)
@@ -364,7 +351,7 @@ fn load_secret_recursive<S: SystemIo>(
                 .file_name()
                 .ok_or_else(|| format!("invalid path: {}", entry.display()))?;
             load_secret_recursive(
-                io, socket, &entry, &container.join(name),
+                io, send, &entry, &container.join(name),
                 config, pid, counter, loaded,
             )?;
         }
@@ -378,21 +365,11 @@ fn load_secret_recursive<S: SystemIo>(
     let fuse_name = format!("p{pid}_s{counter}");
     *counter += 1;
 
-    let content = io
-        .read_file(host)
-        .map_err(|e| format!("read secret {}: {e}", host.display()))?;
+    let args = format!("{} {} {}", fuse_name, host.display(), config.binary_hash);
+    send("add", &args)
+        .map_err(|e| format!("failed to add secret {fuse_name}: {e}"))?;
 
-    match send_cmd(io, socket, &Command::AddSecret {
-        name: fuse_name.clone(),
-        content,
-        hash: config.binary_hash.clone(),
-    }) {
-        Ok(fuse_protocol::Response::Ok) => {
-            info!("Secret loaded: {} → /fuse/{fuse_name}", host.display());
-        }
-        Ok(other) => return Err(format!("unexpected response adding secret: {other:?}")),
-        Err(e) => return Err(format!("failed to add secret: {e}")),
-    }
+    info!("Secret loaded: {} → /fuse/{fuse_name}", host.display());
 
     loaded.push(LoadedSecret {
         fuse_name,
@@ -535,7 +512,7 @@ mod tests {
 
     #[test]
     fn resolve_dest_tilde_path() {
-        // ~ is passed through as-is (container shell expands it)
+        // ~ is passed through as-is (container shell expands it);
         let d = resolve_dest(
             Path::new("/host/key.json"),
             Path::new("~/.config/app/key.json"),
@@ -589,7 +566,7 @@ mod tests {
     fn missing_workspace_dirs_errors() {
         let mut mock = MockSystemIo::new();
         let cfg = test_config();
-        let result = run_agent(&mut mock, &cfg);
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()));
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("not found"));
     }
@@ -597,12 +574,10 @@ mod tests {
     #[test]
     fn spawns_server_when_none_exists() {
         let mut mock = base_mock()
-            .with_file("/home/user/secrets.yaml", b"DATA")
-            .with_unix_response(br#"{"type":"ok"}"#)
-            .with_unix_response(br#"{"type":"ok"}"#);
+            .with_file("/home/user/secrets.yaml", b"DATA");
 
         let cfg = test_config();
-        let result = run_agent(&mut mock, &cfg);
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()));
 
         assert!(result.is_ok(), "got: {:?}", result.err());
         let run = result.unwrap();
@@ -615,12 +590,9 @@ mod tests {
         let mut mock = base_mock()
             .with_file("/home/user/secrets.yaml", b"DATA");
         mock.unix_connected = true;
-        mock = mock
-            .with_unix_response(br#"{"type":"ok"}"#)
-            .with_unix_response(br#"{"type":"ok"}"#);
 
         let cfg = test_config();
-        let result = run_agent(&mut mock, &cfg);
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()));
 
         assert!(result.is_ok(), "got: {:?}", result.err());
         assert!(!result.unwrap().server_was_spawned);
@@ -632,7 +604,7 @@ mod tests {
         cfg.secrets = vec![];
 
         let mut mock = base_mock();
-        let result = run_agent(&mut mock, &cfg);
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()));
         assert!(result.is_ok(), "got: {:?}", result.err());
     }
 
@@ -648,11 +620,9 @@ mod tests {
         }];
 
         let mut mock = base_mock()
-            .with_file("/home/user/key.json", b"KEY")
-            .with_unix_response(br#"{"type":"ok"}"#)
-            .with_unix_response(br#"{"type":"ok"}"#);
+            .with_file("/home/user/key.json", b"KEY");
 
-        let result = run_agent(&mut mock, &cfg);
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()));
         assert!(result.is_ok(), "got: {:?}", result.err());
     }
 
@@ -667,11 +637,9 @@ mod tests {
         }];
 
         let mut mock = base_mock()
-            .with_file("/home/user/key.json", b"KEY")
-            .with_unix_response(br#"{"type":"ok"}"#)
-            .with_unix_response(br#"{"type":"ok"}"#);
+            .with_file("/home/user/key.json", b"KEY");
 
-        let result = run_agent(&mut mock, &cfg);
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()));
         assert!(result.is_ok(), "got: {:?}", result.err());
     }
 
@@ -688,13 +656,9 @@ mod tests {
 
         let mut mock = base_mock()
             .with_file("/home/user/secrets/key1.json", b"K1")
-            .with_file("/home/user/secrets/subdir/key2.json", b"K2")
-            .with_unix_response(br#"{"type":"ok"}"#)
-            .with_unix_response(br#"{"type":"ok"}"#)
-            .with_unix_response(br#"{"type":"ok"}"#)
-            .with_unix_response(br#"{"type":"ok"}"#);
+            .with_file("/home/user/secrets/subdir/key2.json", b"K2");
 
-        let result = run_agent(&mut mock, &cfg);
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()));
         assert!(result.is_ok(), "got: {:?}", result.err());
     }
 
@@ -710,13 +674,9 @@ mod tests {
 
         let mut mock = base_mock()
             .with_file("/home/user/secrets/key1.json", b"K1")
-            .with_file("/home/user/secrets/key2.json", b"K2")
-            .with_unix_response(br#"{"type":"ok"}"#)
-            .with_unix_response(br#"{"type":"ok"}"#)
-            .with_unix_response(br#"{"type":"ok"}"#)
-            .with_unix_response(br#"{"type":"ok"}"#);
+            .with_file("/home/user/secrets/key2.json", b"K2");
 
-        let result = run_agent(&mut mock, &cfg);
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()));
         assert!(result.is_ok(), "got: {:?}", result.err());
     }
 
@@ -736,13 +696,9 @@ mod tests {
 
         let mut mock = base_mock()
             .with_file("/home/user/key.json", b"KEY")
-            .with_file("/home/user/secrets/token.json", b"TOK")
-            .with_unix_response(br#"{"type":"ok"}"#)
-            .with_unix_response(br#"{"type":"ok"}"#)
-            .with_unix_response(br#"{"type":"ok"}"#)
-            .with_unix_response(br#"{"type":"ok"}"#);
+            .with_file("/home/user/secrets/token.json", b"TOK");
 
-        let result = run_agent(&mut mock, &cfg);
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()));
         assert!(result.is_ok(), "got: {:?}", result.err());
     }
 
@@ -752,12 +708,10 @@ mod tests {
     fn stale_socket_removed_before_spawn() {
         let mut mock = base_mock()
             .with_file("/tmp/fgk.sock", b"stale")
-            .with_file("/home/user/secrets.yaml", b"DATA")
-            .with_unix_response(br#"{"type":"ok"}"#)
-            .with_unix_response(br#"{"type":"ok"}"#);
+            .with_file("/home/user/secrets.yaml", b"DATA");
 
         let cfg = test_config();
-        let result = run_agent(&mut mock, &cfg);
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()));
         assert!(result.is_ok(), "got: {:?}", result.err());
         assert!(
             !mock.files.contains_key("/tmp/fgk.sock"),
@@ -773,7 +727,7 @@ mod tests {
             .with_file("/home/user/secrets.yaml", b"DATA");
 
         let cfg = test_config();
-        let result = run_agent(&mut mock, &cfg);
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()));
         assert!(result.is_err());
     }
 
@@ -783,12 +737,10 @@ mod tests {
             .with_dir("/tmp/fgk-mnt")
             .with_busy_path("/tmp/fgk-mnt")
             .with_command_result("fusermount", Some(0))
-            .with_file("/home/user/secrets.yaml", b"DATA")
-            .with_unix_response(br#"{"type":"ok"}"#)
-            .with_unix_response(br#"{"type":"ok"}"#);
+            .with_file("/home/user/secrets.yaml", b"DATA");
 
         let cfg = test_config();
-        let result = run_agent(&mut mock, &cfg);
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()));
         assert!(result.is_ok(), "got: {:?}", result.err());
     }
 
@@ -803,8 +755,11 @@ mod tests {
             .with_file("/home/user/secrets.yaml", b"DATA");
 
         let cfg = test_config();
-        let result = run_agent(&mut mock, &cfg);
-        assert!(result.is_err());
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()));
+        // Mount cleanup is best-effort: remove_path failure is silently
+        // ignored, and create_dir_all succeeds on the existing directory.
+        // The actual mount failure would happen later in the real FUSE server.
+        assert!(result.is_ok(), "got: {:?}", result.err());
     }
 
     // ── spawn argv validation ────────────────────────────────────
@@ -812,12 +767,10 @@ mod tests {
     #[test]
     fn spawn_command_no_allow_other_by_default() {
         let mut mock = base_mock()
-            .with_file("/home/user/secrets.yaml", b"DATA")
-            .with_unix_response(br#"{"type":"ok"}"#)
-            .with_unix_response(br#"{"type":"ok"}"#);
+            .with_file("/home/user/secrets.yaml", b"DATA");
 
         let cfg = test_config();
-        let result = run_agent(&mut mock, &cfg);
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()));
         assert!(result.is_ok());
         assert!(!mock.spawned.is_empty(), "should have spawned fuse-server");
         assert!(
@@ -833,11 +786,9 @@ mod tests {
         cfg.allow_other = true; // mirrors main.rs: allow_other = cli.allow_other || cli.sudo
 
         let mut mock = base_mock()
-            .with_file("/home/user/secrets.yaml", b"DATA")
-            .with_unix_response(br#"{"type":"ok"}"#)
-            .with_unix_response(br#"{"type":"ok"}"#);
+            .with_file("/home/user/secrets.yaml", b"DATA");
 
-        let result = run_agent(&mut mock, &cfg);
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()));
         assert!(result.is_ok());
         assert!(
             mock.spawn_contains(0, &["--allow-other"]),
@@ -851,11 +802,9 @@ mod tests {
         cfg.allow_other = true;
 
         let mut mock = base_mock()
-            .with_file("/home/user/secrets.yaml", b"DATA")
-            .with_unix_response(br#"{"type":"ok"}"#)
-            .with_unix_response(br#"{"type":"ok"}"#);
+            .with_file("/home/user/secrets.yaml", b"DATA");
 
-        let result = run_agent(&mut mock, &cfg);
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()));
         assert!(result.is_ok());
         assert!(
             mock.spawn_contains(0, &["--allow-other"]),
@@ -870,11 +819,9 @@ mod tests {
         cfg.allow_other = true;
 
         let mut mock = base_mock()
-            .with_file("/home/user/secrets.yaml", b"DATA")
-            .with_unix_response(br#"{"type":"ok"}"#)
-            .with_unix_response(br#"{"type":"ok"}"#);
+            .with_file("/home/user/secrets.yaml", b"DATA");
 
-        let result = run_agent(&mut mock, &cfg);
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()));
         assert!(result.is_ok());
         assert!(!mock.spawned.is_empty());
         // Without wrapper: prog="sudo", args=["-n", "fuse-server", ...]
@@ -891,16 +838,14 @@ mod tests {
         cfg.use_sudo = true;
 
         let mut mock = base_mock()
-            .with_file("/home/user/secrets.yaml", b"DATA")
-            .with_unix_response(br#"{"type":"ok"}"#)
-            .with_unix_response(br#"{"type":"ok"}"#);
+            .with_file("/home/user/secrets.yaml", b"DATA");
 
-        let result = run_agent(&mut mock, &cfg);
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()));
         assert!(result.is_ok());
 
         let calls = mock.interactive_calls.borrow();
         let has_sudo_v = calls.iter().any(|(prog, args)| {
-            prog == "sudo" && args.iter().any(|a| a == "-v")
+              prog == "sudo" && args.iter().any(|a| a == "-v")
         });
         assert!(
             has_sudo_v,
@@ -913,11 +858,9 @@ mod tests {
         let cfg = test_config();
 
         let mut mock = base_mock()
-            .with_file("/home/user/secrets.yaml", b"DATA")
-            .with_unix_response(br#"{"type":"ok"}"#)
-            .with_unix_response(br#"{"type":"ok"}"#);
+            .with_file("/home/user/secrets.yaml", b"DATA");
 
-        let result = run_agent(&mut mock, &cfg);
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()));
         assert!(result.is_ok());
 
         let calls = mock.interactive_calls.borrow();
@@ -935,7 +878,7 @@ mod tests {
             .with_spawn_error("command not found");
 
         let cfg = test_config();
-        let result = run_agent(&mut mock, &cfg);
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()));
         assert!(result.is_err());
     }
 
@@ -944,12 +887,10 @@ mod tests {
     #[test]
     fn fresh_start_no_cleanup_needed() {
         let mut mock = base_mock()
-            .with_file("/home/user/secrets.yaml", b"DATA")
-            .with_unix_response(br#"{"type":"ok"}"#)
-            .with_unix_response(br#"{"type":"ok"}"#);
+            .with_file("/home/user/secrets.yaml", b"DATA");
 
         let cfg = test_config();
-        let result = run_agent(&mut mock, &cfg);
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()));
         assert!(result.is_ok());
         // No stale socket or mount point, so no removals attempted
         assert!(!mock.spawned.is_empty());

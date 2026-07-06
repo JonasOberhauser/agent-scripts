@@ -117,7 +117,7 @@ mod tests {
 
         wait_for_socket(&sock);
 
-        // Remove non-existent secret → error
+        // Remove non-existent secret → error propagated as Err
         let result = {
             let protocols = client_protocols();
             let proto = protocols.iter().find(|p| p.name == "remove").unwrap();
@@ -127,9 +127,8 @@ mod tests {
             let mut input = NoInput;
             proto.run_client("nonexistent", &mut conn, &mut console, &mut input)
         };
-        // The error response is rendered by print_response, not propagated as Err
-        // because handle_command returns Response::Error, not Result::Err
-        // So the client sees it as a normal response with "Error: ..." in the output
-        assert!(result.is_ok());
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("not found"), "got: {err}");
     }
 }

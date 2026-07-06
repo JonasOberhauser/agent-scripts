@@ -12,7 +12,11 @@ fn server_protocol(name: &'static str, help: &'static str) -> Protocol {
         .client(|cmd: Command, _out, _input| Ok(cmd))
         .server_ctx(|cmd: Command, ctx: &Arc<Mutex<ServerState>>| {
             let mut state = ctx.lock().expect("ServerState mutex poisoned");
-            Ok(handle_command(cmd, &mut state))
+            let resp = handle_command(cmd, &mut state);
+            match resp {
+                Response::Error { message } => Err(message),
+                other => Ok(other),
+            }
         })
         .client(|resp: Response, out, _input| {
             fuse_protocol::print_response(&resp, out);

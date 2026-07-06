@@ -2,49 +2,24 @@ use std::io::{self as stdio, Write};
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
-use fuse_client::send_command;
-use fuse_protocol::{Command, Response, ServerStateFile, VERSION as CLIENT_VERSION};
+use fuse_protocol::{Command, Response, ServerStateFile, VERSION as CLIENT_VERSION, client_protocols};
+use servyi_servatui::{App, Console};
 
-// ── Console abstraction ────────────────────────────────────────
+// ── Console implementations ────────────────────────────────────
 
-/// Output abstraction so plugins work in both CLI (stdout) and TUI
-/// (log area) modes without knowing which they're in.
-trait Console {
-    fn print_line(&mut self, text: &str);
-    fn print_error(&mut self, text: &str);
-}
-
-/// Prints to stdout / stderr — used in CLI mode.
 struct StdoutConsole;
-
 impl Console for StdoutConsole {
-    fn print_line(&mut self, text: &str) {
-        println!("{text}");
-    }
-    fn print_error(&mut self, text: &str) {
-        eprintln!("{text}");
-    }
+    fn print_line(&mut self, text: &str) { println!("{text}"); }
+    fn print_error(&mut self, text: &str) { eprintln!("{text}"); }
 }
 
-/// Collects lines into a Vec — used in TUI mode where ratatui
-/// renders them in the log area.
-struct BufferConsole {
-    lines: Vec<String>,
-}
-
+struct BufferConsole { lines: Vec<String> }
 impl BufferConsole {
-    fn new() -> Self {
-        Self { lines: Vec::new() }
-    }
+    fn new() -> Self { Self { lines: Vec::new() } }
 }
-
 impl Console for BufferConsole {
-    fn print_line(&mut self, text: &str) {
-        self.lines.push(text.to_string());
-    }
-    fn print_error(&mut self, text: &str) {
-        self.lines.push(format!("Error: {text}"));
-    }
+    fn print_line(&mut self, text: &str) { self.lines.push(text.to_string()); }
+    fn print_error(&mut self, text: &str) { self.lines.push(format!("Error: {text}")); }
 }
 
 // ── CLI (non-interactive) ──────────────────────────────────────
@@ -54,7 +29,6 @@ impl Console for BufferConsole {
 struct Cli {
     #[arg(short, long, env = "FUSE_GATEKEEPER_SOCKET", default_value = "/tmp/fuse-gatekeeper.sock")]
     socket: PathBuf,
-
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -82,29 +56,24 @@ fn main() {
 
     let cli = Cli::parse();
 
-    // Check server: if running, verify version; if not, offer to start.
-    if fuse_client::server_exists(&cli.socket) {
-        check_version_or_restart(&cli.socket);
+    let app = App::builder(&cli.socket)
+        .protocol_all(client_protocols())
+        .build();
+
+    if app.server_running() {
+        check_version_or_restart(&app);
     } else {
-        check_start_server(&cli.socket);
+        check_start_server(&app);
     }
 
     match &cli.command {
         Some(cmd) => {
-            let command = build_clap_command(cmd);
-            match command {
-                Ok(c) => match send_command(&cli.socket, &c) {
-                    Ok(resp) => {
-                        print_response(&resp, &mut StdoutConsole);
-                        if matches!(resp, Response::Error { .. }) {
-                            std::process::exit(1);
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("Connection error: {e}");
-                        std::process::exit(1);
-                    }
-                },
+            let (proto_name, args) = build_clap_command(cmd);
+            match app.run_cli_command(&proto_name, &args) {
+                Ok(lines) => {
+                    let mut out = StdoutConsole;
+                    for line in lines { out.print_line(&line); }
+                }
                 Err(e) => {
                     eprintln!("Error: {e}");
                     std::process::exit(1);
@@ -112,7 +81,7 @@ fn main() {
             }
         }
         None => {
-            if let Err(e) = interactive(&cli.socket) {
+            if let Err(e) = interactive(&app) {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
             }
@@ -120,34 +89,37 @@ fn main() {
     }
 }
 
-fn build_clap_command(cmd: &Commands) -> Result<Command, String> {
-    Ok(match cmd {
-        Commands::Reset { name } => Command::Reset { name: name.clone() },
-        Commands::ResetAll => Command::Reset { name: None },
-        Commands::Status => Command::Status,
+fn build_clap_command(cmd: &Commands) -> (String, String) {
+    match cmd {
+        Commands::Reset { name } => ("reset".into(), name.clone().unwrap_or_default()),
+        Commands::ResetAll => ("reset-all".into(), "".into()),
+        Commands::Status => ("status".into(), "".into()),
         Commands::AddSecret { name, file, hash } => {
-            let content = std::fs::read(file).map_err(|e| e.to_string())?;
-            Command::AddSecret { name: name.clone(), content, hash: hash.clone() }
+            ("add".into(), format!("{name} {} {hash}", file.display()))
         }
-        Commands::RemoveSecret { name } => Command::RemoveSecret { name: name.clone() },
-        Commands::RotateHash { name, hash } => Command::RotateHash {
-            name: name.clone(),
-            new_hash: hash.clone(),
-        },
-        Commands::ListMounts => Command::ListMounts,
-        Commands::Pending => Command::ListPending,
-        Commands::Grant { id } => Command::Grant { id: *id },
-        Commands::Deny { id } => Command::Deny { id: *id },
-        Commands::GetVersion => Command::GetVersion,
-        Commands::GetLogPath => Command::GetLogPath,
-    })
+        Commands::RemoveSecret { name } => ("remove".into(), name.clone()),
+        Commands::RotateHash { name, hash } => ("rotate".into(), format!("{name} {hash}")),
+        Commands::ListMounts => ("mounts".into(), "".into()),
+        Commands::Pending => ("pending".into(), "".into()),
+        Commands::Grant { id } => ("grant".into(), id.to_string()),
+        Commands::Deny { id } => ("deny".into(), id.to_string()),
+        Commands::GetVersion => ("version".into(), "".into()),
+        Commands::GetLogPath => ("logpath".into(), "".into()),
+    }
 }
 
-fn check_version_or_restart(socket: &Path) {
-    let server_version = match send_command(socket, &Command::GetVersion) {
-        Ok(Response::Version { version }) => version,
-        Ok(_) => {
-            "<unknown (old server)>".to_string()
+// ── Version check & server restart ─────────────────────────────
+
+fn check_version_or_restart(app: &App) {
+    let server_version = match app.run_cli_command_raw("version", "") {
+        Ok((_, raw)) => {
+            serde_json::from_slice::<Response>(&raw)
+                .ok()
+                .and_then(|r| match r {
+                    Response::Version { version } => Some(version),
+                    _ => None,
+                })
+                .unwrap_or_else(|| "<unknown (old server)>".to_string())
         }
         Err(e) => {
             eprintln!("Warning: cannot query server version: {e}");
@@ -156,13 +128,10 @@ fn check_version_or_restart(socket: &Path) {
     };
 
     if server_version == CLIENT_VERSION {
-        return; // Match
+        return;
     }
 
-    eprintln!(
-        "Version mismatch: client={}, server={}",
-        CLIENT_VERSION, server_version
-    );
+    eprintln!("Version mismatch: client={}, server={}", CLIENT_VERSION, server_version);
 
     print!("Restart server to update? [y/N] ");
     stdio::stdout().flush().unwrap();
@@ -176,50 +145,46 @@ fn check_version_or_restart(socket: &Path) {
         std::process::exit(1);
     }
 
-    // Try to get the old server's log path so we can reuse it.
-    let log_path = match send_command(socket, &Command::GetLogPath) {
-        Ok(Response::LogPath { path }) if !path.is_empty() => {
-            eprintln!("  Old server log: {path}");
-            Some(path)
+    let log_path = match app.run_cli_command_raw("logpath", "") {
+        Ok((_, raw)) => {
+            serde_json::from_slice::<Response>(&raw)
+                .ok()
+                .and_then(|r| match r {
+                    Response::LogPath { path } if !path.is_empty() => {
+                        eprintln!("  Old server log: {path}");
+                        Some(path)
+                    }
+                    _ => None,
+                })
         }
-        _ => {
-            // Old server doesn't know GetLogPath — ask the user.
-            eprintln!("Old server doesn't support log path discovery.");
-            print!("Log file path (relative to cwd or absolute, Enter=/tmp/fuse-gatekeeper.log): ");
-            stdio::stdout().flush().unwrap();
-            let mut log_input = String::new();
-            let _ = stdio::stdin().read_line(&mut log_input);
-            let trimmed = log_input.trim();
-            if trimmed.is_empty() {
-                Some("/tmp/fuse-gatekeeper.log".to_string())
-            } else {
-                Some(trimmed.to_string())
-            }
-        }
+        Err(_) => None,
     };
 
-    restart_server(socket, log_path.as_deref());
+    let log_path: Option<String> = Some(log_path.unwrap_or_else(|| {
+        eprintln!("Old server doesn't support log path discovery.");
+        print!("Log file path (relative to cwd or absolute, Enter=/tmp/fuse-gatekeeper.log): ");
+        stdio::stdout().flush().unwrap();
+        let mut log_input = String::new();
+        let _ = stdio::stdin().read_line(&mut log_input);
+        let trimmed = log_input.trim();
+        if trimmed.is_empty() { "/tmp/fuse-gatekeeper.log".to_string() }
+        else { trimmed.to_string() }
+    }));
+
+    restart_server(app, log_path.as_deref());
 }
 
 fn read_state_file() -> Option<ServerStateFile> {
-    let state_path = Path::new("/tmp/fuse-gatekeeper-state.json");
-    let data = std::fs::read(state_path).ok()?;
+    let data = std::fs::read("/tmp/fuse-gatekeeper-state.json").ok()?;
     serde_json::from_slice(&data).ok()
 }
 
-fn start_server_from_state(
-    socket: &Path,
-    state: &ServerStateFile,
-    log_path: Option<&str>,
-) {
-    // Build server command
+fn start_server_from_state(app: &App, state: &ServerStateFile, log_path: Option<&str>) {
     let mut cmd_args: Vec<String> = vec![
         "--mount-point".into(), state.mount_point.clone(),
         "--socket".into(), state.socket.clone(),
     ];
-    if state.allow_other {
-        cmd_args.push("--allow-other".into());
-    }
+    if state.allow_other { cmd_args.push("--allow-other".into()); }
     cmd_args.push("--log-level".into());
     cmd_args.push(state.log_level.clone());
     cmd_args.push("--pending-timeout".into());
@@ -239,25 +204,15 @@ fn start_server_from_state(
         (state.server_binary.clone(), cmd_args)
     };
 
-    eprintln!(
-        "  Binary:   {}",
-        state.server_binary
-    );
+    eprintln!("  Binary:   {}", state.server_binary);
     eprintln!("  Wrapper:  {}", state.runtime_wrapper.as_deref().unwrap_or("(none)"));
     eprintln!("  Program:  {spawn_prog}");
     eprintln!("  Args:     {}", spawn_args.join(" "));
-    eprintln!("  Mount:    {}", state.mount_point);
-    eprintln!("  Socket:   {}", state.socket);
 
-    // Check binary exists
-    if std::process::Command::new(&spawn_prog)
-        .arg("--help")
-        .output().is_err()
-    {
+    if std::process::Command::new(&spawn_prog).arg("--help").output().is_err() {
         eprintln!("  WARNING: cannot execute '{spawn_prog}' — check PATH");
     }
 
-    // Clean up stale mount point and socket before spawning
     eprintln!("  Cleaning up stale mount/socket...");
     if let Some(w) = &state.runtime_wrapper {
         let wparts: Vec<&str> = w.split_whitespace().collect();
@@ -272,14 +227,11 @@ fn start_server_from_state(
     std::thread::sleep(std::time::Duration::from_millis(500));
     let _ = std::fs::create_dir_all(&state.mount_point);
 
-    // Spawn new server as independent daemon
     eprintln!("Starting server (v{})...", CLIENT_VERSION);
     let effective_log = log_path.unwrap_or("/tmp/fuse-gatekeeper.log");
     let log_path_buf = std::path::PathBuf::from(effective_log);
     let log_file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
+        .create(true).truncate(true).write(true)
         .open(&log_path_buf)
         .unwrap_or_else(|e| { eprintln!("open log file: {e}"); std::process::exit(1); });
     let log_file2 = log_file.try_clone().unwrap_or_else(|e| { eprintln!("dup log fd: {e}"); std::process::exit(1); });
@@ -291,16 +243,9 @@ fn start_server_from_state(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::from(log_file))
         .stderr(std::process::Stdio::from(log_file2));
-    unsafe {
-        cmd.pre_exec(|| {
-            libc::setsid();
-            Ok(())
-        });
-    }
+    unsafe { cmd.pre_exec(|| { libc::setsid(); Ok(()) }); }
     match cmd.spawn() {
-        Ok(child) => {
-            eprintln!("  Spawned pid {}", child.id());
-        }
+        Ok(child) => eprintln!("  Spawned pid {}", child.id()),
         Err(e) => {
             eprintln!("Failed to start server: {e}");
             eprintln!("Start it manually with: run-agent ...");
@@ -308,13 +253,10 @@ fn start_server_from_state(
         }
     }
 
-    // Wait for socket
     eprintln!("Waiting for server...");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
-        if fuse_client::server_exists(socket) {
-            break;
-        }
+        if app.server_running() { break; }
         if std::time::Instant::now() > deadline {
             eprintln!("Server did not start within 10s. Start it manually.");
             std::process::exit(1);
@@ -322,31 +264,18 @@ fn start_server_from_state(
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
 
-    // Re-add secrets
     eprintln!("Restoring {} secret(s)...", state.secrets.len());
     for entry in &state.secrets {
-        let content = match std::fs::read(Path::new(&entry.host_path)) {
-            Ok(data) => data,
-            Err(e) => {
-                eprintln!("  Skip {}: cannot read {}: {e}", entry.fuse_name, entry.host_path);
-                continue;
-            }
-        };
-        match send_command(socket, &Command::AddSecret {
-            name: entry.fuse_name.clone(),
-            content,
-            hash: entry.hash.clone(),
-        }) {
-            Ok(Response::Ok) => eprintln!("  Restored {}", entry.fuse_name),
-            Ok(other) => eprintln!("  Error restoring {}: {other:?}", entry.fuse_name),
+        let args = format!("{} {} {}", entry.fuse_name, entry.host_path, entry.hash);
+        match app.run_cli_command("add", &args) {
+            Ok(_) => eprintln!("  Restored {}", entry.fuse_name),
             Err(e) => eprintln!("  Error restoring {}: {e}", entry.fuse_name),
         }
     }
-
     eprintln!("Server ready (v{}).", CLIENT_VERSION);
 }
 
-fn restart_server(socket: &Path, log_path: Option<&str>) {
+fn restart_server(app: &App, log_path: Option<&str>) {
     let state = match read_state_file() {
         Some(s) => s,
         None => {
@@ -355,17 +284,23 @@ fn restart_server(socket: &Path, log_path: Option<&str>) {
         }
     };
 
-    // Try to get current secret status (for display)
-    let status_info = match send_command(socket, &Command::Status) {
-        Ok(Response::Status { secrets }) => {
-            let names: Vec<&str> = secrets.iter().map(|s| s.name.as_str()).collect();
-            format!("{} secret(s): {}", secrets.len(), names.join(", "))
+    let status_info = match app.run_cli_command_raw("status", "") {
+        Ok((_, raw)) => {
+            serde_json::from_slice::<Response>(&raw)
+                .ok()
+                .and_then(|r| match r {
+                    Response::Status { secrets } => {
+                        let names: Vec<&str> = secrets.iter().map(|s| s.name.as_str()).collect();
+                        Some(format!("{} secret(s): {}", secrets.len(), names.join(", ")))
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| "could not query current secrets".to_string())
         }
-        _ => "could not query current secrets".to_string(),
+        Err(_) => "could not query current secrets".to_string(),
     };
     eprintln!("Current server state: {status_info}");
 
-    // Kill old server using pkill (state file PID may be the orchestrator)
     eprintln!("Stopping old server...");
     if let Some(w) = &state.runtime_wrapper {
         let wparts: Vec<&str> = w.split_whitespace().collect();
@@ -377,15 +312,11 @@ fn restart_server(socket: &Path, log_path: Option<&str>) {
     }
     std::thread::sleep(std::time::Duration::from_secs(2));
 
-    // Wait for socket to disappear
     for _ in 0..30 {
-        if !fuse_client::server_exists(socket) {
-            break;
-        }
+        if !app.server_running() { break; }
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
 
-    // Clean up stale FUSE mount so the new server can mount cleanly
     if let Some(w) = &state.runtime_wrapper {
         let wparts: Vec<&str> = w.split_whitespace().collect();
         let mut umount_args: Vec<&str> = wparts[1..].to_vec();
@@ -398,22 +329,18 @@ fn restart_server(socket: &Path, log_path: Option<&str>) {
     let _ = std::fs::remove_dir_all(&state.mount_point);
     std::thread::sleep(std::time::Duration::from_millis(500));
 
-    start_server_from_state(socket, &state, log_path);
+    start_server_from_state(app, &state, log_path);
 }
 
-fn check_start_server(socket: &Path) {
+fn check_start_server(app: &App) {
     print!("Server is not running. Start it? [y/N] ");
     stdio::stdout().flush().unwrap();
     let mut input = String::new();
-    if stdio::stdin().read_line(&mut input).is_err() {
-        return;
-    }
-    if input.trim().to_lowercase() != "y" {
-        return;
-    }
+    if stdio::stdin().read_line(&mut input).is_err() { return; }
+    if input.trim().to_lowercase() != "y" { return; }
 
     match read_state_file() {
-        Some(state) => start_server_from_state(socket, &state, None),
+        Some(state) => start_server_from_state(app, &state, None),
         None => {
             eprintln!(
                 "No state file found at /tmp/fuse-gatekeeper-state.json.\n\
@@ -441,244 +368,71 @@ fn ask_reset_anyway() {
 
 // ── Plugin system ──────────────────────────────────────────────
 
-/// What a command plugin returns after execution.
-enum ShellAction {
-    Continue,
-    Exit,
-}
+enum ShellAction { Continue, Exit }
 
-/// A single command plugin.  Each plugin owns its argument parsing
-/// (the raw remaining text after the command name) and execution logic.
-/// This eliminates duplication between CLI and interactive modes.
 struct Plugin {
     name: &'static str,
     help: &'static str,
-    execute: fn(args: &str, socket: &Path, out: &mut dyn Console) -> ShellAction,
+    execute: fn(args: &str, app: &App, out: &mut dyn Console) -> ShellAction,
+}
+
+fn run_simple(app: &App, proto_name: &str, args: &str, out: &mut dyn Console) -> ShellAction {
+    match app.run_cli_command(proto_name, args) {
+        Ok(lines) => { for l in lines { out.print_line(&l); } }
+        Err(e) => out.print_error(&format!("Connection error: {e}")),
+    }
+    ShellAction::Continue
 }
 
 fn all_plugins() -> Vec<Plugin> {
     vec![
-        Plugin {
-            name: "status",
-            help: "Show all secrets and access counts",
-            execute: |_, sock, out| {
-                run_simple(sock, Command::Status, out)
-            },
-        },
-        Plugin {
-            name: "mounts",
-            help: "List mounted secret files",
-            execute: |_, sock, out| run_simple(sock, Command::ListMounts, out),
-        },
-        Plugin {
-            name: "reset",
-            help: "Reset access counter for one or all secrets",
-            execute: |args, sock, out| {
-                let name = args.split_whitespace().next().map(|s| s.to_string());
-                run_simple(sock, Command::Reset { name }, out)
-            },
-        },
-        Plugin {
-            name: "reset-all",
-            help: "Reset all access counters",
-            execute: |_, sock, out| run_simple(sock, Command::Reset { name: None }, out),
-        },
-        Plugin {
-            name: "add",
-            help: "Add a new secret from a file",
-            execute: |args, sock, out| {
-                let parts: Vec<&str> = args.trim().splitn(3, char::is_whitespace).collect();
-                if parts.len() < 3 {
-                    out.print_error("Usage: add NAME FILE HASH");
-                    return ShellAction::Continue;
-                }
-                let file = PathBuf::from(parts[1]);
-                match std::fs::read(&file) {
-                    Ok(content) => run_simple(sock, Command::AddSecret {
-                        name: parts[0].to_string(),
-                        content,
-                        hash: parts[2].to_string(),
-                    }, out),
-                    Err(e) => {
-                        out.print_error(&format!("Error reading file: {e}"));
-                        ShellAction::Continue
-                    }
-                }
-            },
-        },
-        Plugin {
-            name: "remove",
-            help: "Remove a secret",
-            execute: |args, sock, out| {
-                let name = args.trim();
-                if name.is_empty() {
-                    out.print_error("Usage: remove NAME");
-                    return ShellAction::Continue;
-                }
-                run_simple(sock, Command::RemoveSecret { name: name.to_string() }, out)
-            },
-        },
-        Plugin {
-            name: "rotate",
-            help: "Change the allowed binary hash",
-            execute: |args, sock, out| {
-                let parts: Vec<&str> = args.trim().splitn(2, char::is_whitespace).collect();
-                if parts.len() < 2 {
-                    out.print_error("Usage: rotate NAME HASH");
-                    return ShellAction::Continue;
-                }
-                run_simple(sock, Command::RotateHash {
-                    name: parts[0].to_string(),
-                    new_hash: parts[1].to_string(),
-                }, out)
-            },
-        },
-        Plugin {
-            name: "pending",
-            help: "Show pending access requests waiting for approval",
-            execute: |_, sock, out| run_simple(sock, Command::ListPending, out),
-        },
-        Plugin {
-            name: "grant",
-            help: "Grant a pending access request",
-            execute: |args, sock, out| {
-                match args.trim().parse::<u64>() {
-                    Ok(id) => run_simple(sock, Command::Grant { id }, out),
-                    Err(_) => {
-                        out.print_error("Usage: grant ID (ID must be a number)");
-                        ShellAction::Continue
-                    }
-                }
-            },
-        },
-        Plugin {
-            name: "deny",
-            help: "Deny a pending access request",
-            execute: |args, sock, out| {
-                match args.trim().parse::<u64>() {
-                    Ok(id) => run_simple(sock, Command::Deny { id }, out),
-                    Err(_) => {
-                        out.print_error("Usage: deny ID (ID must be a number)");
-                        ShellAction::Continue
-                    }
-                }
-            },
-        },
-        Plugin {
-            name: "version",
-            help: "Show client and server versions",
-            execute: |_, sock, out| {
+        Plugin { name: "status", help: "Show all secrets and access counts",
+            execute: |args, app, out| run_simple(app, "status", args, out) },
+        Plugin { name: "mounts", help: "List mounted secret files",
+            execute: |args, app, out| run_simple(app, "mounts", args, out) },
+        Plugin { name: "reset", help: "Reset access counter for one or all secrets",
+            execute: |args, app, out| run_simple(app, "reset", args, out) },
+        Plugin { name: "reset-all", help: "Reset all access counters",
+            execute: |args, app, out| run_simple(app, "reset-all", args, out) },
+        Plugin { name: "add", help: "Add a new secret from a file",
+            execute: |args, app, out| run_simple(app, "add", args, out) },
+        Plugin { name: "remove", help: "Remove a secret",
+            execute: |args, app, out| run_simple(app, "remove", args, out) },
+        Plugin { name: "rotate", help: "Change the allowed binary hash",
+            execute: |args, app, out| run_simple(app, "rotate", args, out) },
+        Plugin { name: "pending", help: "Show pending access requests",
+            execute: |args, app, out| run_simple(app, "pending", args, out) },
+        Plugin { name: "grant", help: "Grant a pending access request",
+            execute: |args, app, out| run_simple(app, "grant", args, out) },
+        Plugin { name: "deny", help: "Deny a pending access request",
+            execute: |args, app, out| run_simple(app, "deny", args, out) },
+        Plugin { name: "version", help: "Show client and server versions",
+            execute: |_, app, out| {
                 out.print_line(&format!("Client: {}", CLIENT_VERSION));
-                match send_command(sock, &Command::GetVersion) {
-                    Ok(Response::Version { version }) => out.print_line(&format!("Server: {version}")),
-                    Ok(_) => out.print_line("Server: <unknown response>"),
-                    Err(e) => out.print_line(&format!("Server: <unreachable: {e}>")),
-                }
-                ShellAction::Continue
-            },
-        },
-        Plugin {
-            name: "help",
-            help: "Show available commands",
-            execute: |_, _, out| {
-                print_help(out);
-                ShellAction::Continue
-            },
-        },
-        Plugin {
-            name: "exit",
-            help: "Exit the shell",
-            execute: |_, _, _| ShellAction::Exit,
-        },
-        Plugin {
-            name: "quit",
-            help: "Exit the shell",
-            execute: |_, _, _| ShellAction::Exit,
-        },
+                run_simple(app, "version", "", out)
+            } },
+        Plugin { name: "help", help: "Show available commands",
+            execute: |_, _, out| { print_help(out); ShellAction::Continue } },
+        Plugin { name: "exit", help: "Exit the shell",
+            execute: |_, _, _| ShellAction::Exit },
+        Plugin { name: "quit", help: "Exit the shell",
+            execute: |_, _, _| ShellAction::Exit },
     ]
-}
-
-fn run_simple(
-    socket: &Path,
-    cmd: Command,
-    out: &mut dyn Console,
-) -> ShellAction {
-    match send_command(socket, &cmd) {
-        Ok(resp) => print_response(&resp, out),
-        Err(e) => out.print_error(&format!("Connection error: {e}")),
-    }
-    ShellAction::Continue
 }
 
 fn print_help(out: &mut dyn Console) {
     out.print_line("COMMANDS:");
     let max_name = all_plugins().iter().map(|p| p.name.len()).max().unwrap_or(0);
     for p in all_plugins() {
-        if p.name == "exit" || p.name == "quit" {
-            continue;
-        }
+        if p.name == "exit" || p.name == "quit" { continue; }
         out.print_line(&format!("  {:<width$}  {}", p.name, p.help, width = max_name));
     }
     out.print_line(&format!("  {:<width$}  Exit the shell", "exit", width = max_name));
 }
 
-// ── Response printing ──────────────────────────────────────────
-
-fn print_response(resp: &Response, out: &mut dyn Console) {
-    match resp {
-        Response::Ok => out.print_line("OK"),
-        Response::Error { message } => out.print_error(message),
-        Response::Status { secrets } => {
-            if secrets.is_empty() {
-                out.print_line("No secrets configured.");
-            } else {
-                out.print_line(&format!("{:<24} {:>8} {:>8}  HASH", "NAME", "READS", "SIZE"));
-                for s in secrets {
-                    out.print_line(&format!(
-                        "{:<24} {:>8} {:>8}  {}",
-                        s.name, s.access_count, s.size, s.allowed_hash
-                    ));
-                }
-            }
-        }
-        Response::MountList { mounts } => {
-            if mounts.is_empty() {
-                out.print_line("No secrets mounted.");
-            } else {
-                for m in mounts {
-                    out.print_line(&format!("  {} ({} bytes)", m.name, m.size));
-                }
-            }
-        }
-        Response::PendingList { pending } => {
-            if pending.is_empty() {
-                out.print_line("No pending access requests.");
-            } else {
-                out.print_line("PENDING ACCESS REQUESTS:");
-                for p in pending {
-                    out.print_line(&format!(
-                        "  [{}] {} pid={} hash={} reason=\"{}\" expires_at={}",
-                        p.id, p.secret_name, p.pid,
-                        p.pid_hash.as_deref().unwrap_or("<unknown>"),
-                        p.reason, p.expires_at
-                    ));
-                }
-            }
-        }
-        Response::Version { version } => {
-            out.print_line(&format!("Server version: {version}"));
-        }
-        Response::LogPath { path } => {
-            out.print_line(&format!("Log path: {path}"));
-        }
-    }
-}
-
 // ── Interactive shell (ratatui + tui-input) ────────────────────
 
-fn interactive(
-    socket: &Path,
-) -> Result<(), String> {
+fn interactive(app: &App) -> Result<(), String> {
     use crossterm::{
         event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
         execute,
@@ -697,14 +451,7 @@ fn interactive(
     use tui_input::backend::crossterm::EventHandler;
 
     enable_raw_mode().map_err(|e| e.to_string())?;
-    // Alternate screen + alternate scroll mode (?1007h):
-    // Terminal converts scroll wheel to Up/Down arrow keys.
-    // No EnableMouseCapture — terminal handles text selection natively.
-    execute!(
-        std_io::stdout(),
-        EnterAlternateScreen,
-    ).map_err(|e| e.to_string())?;
-    // Enable alternate scroll mode
+    execute!(std_io::stdout(), EnterAlternateScreen).map_err(|e| e.to_string())?;
     write!(std_io::stdout(), "\x1b[?1007h").map_err(|e| e.to_string())?;
     std_io::stdout().flush().ok();
 
@@ -720,39 +467,42 @@ fn interactive(
     let mut grant_idx: Option<usize> = None;
     let mut log_scroll_up: u16 = 0;
 
-    let poll = || match send_command(socket, &Command::ListPending) {
-        Ok(Response::PendingList { pending: p }) => p,
-        _ => Vec::new(),
+    let poll = || match app.run_cli_command_raw("pending", "") {
+        Ok((_, raw)) => {
+            serde_json::from_slice::<Response>(&raw)
+                .ok()
+                .and_then(|r| match r {
+                    Response::PendingList { pending } => Some(pending),
+                    _ => None,
+                })
+                .unwrap_or_default()
+        }
+        Err(_) => Vec::new(),
     };
     pending = poll();
     if !pending.is_empty() { grant_idx = Some(0); }
 
     let result = (|| {
         loop {
-            // Clamp scroll to valid range (can't exceed the log content)
             let term_h = terminal.size().map(|s| s.height as usize).unwrap_or(24);
-            let log_h = term_h.saturating_sub(3).saturating_sub(2); // input pane + borders
+            let log_h = term_h.saturating_sub(3).saturating_sub(2);
             let max_scroll = log_lines.len().saturating_sub(log_h);
             log_scroll_up = ((log_scroll_up as usize).min(max_scroll)) as u16;
 
             terminal.draw(|f| {
-                // Two-pane layout: 80% log (top), 3 lines input (bottom)
                 let chunks = Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([Constraint::Min(3), Constraint::Length(3)])
                     .split(f.area());
 
-                // ── Log pane (scrollable) ──
-                let log_height = chunks[0].height.saturating_sub(2) as usize; // -border
+                let log_height = chunks[0].height.saturating_sub(2) as usize;
                 let total = log_lines.len();
                 let base_scroll = total.saturating_sub(log_height) as u16;
                 let scroll = base_scroll.saturating_sub(log_scroll_up);
 
                 let title = if log_scroll_up > 0 {
                     format!("Log (↑{} lines scrolled)", log_scroll_up)
-                } else {
-                    "Log".to_string()
-                };
+                } else { "Log".to_string() };
 
                 let lines: Vec<Line> = log_lines.iter().map(|s| Line::from(s.as_str())).collect();
                 f.render_widget(
@@ -763,8 +513,6 @@ fn interactive(
                     chunks[0],
                 );
 
-                // Scrollbar: content = max_scroll + 1 makes ratatui's formula
-                // produce: thumb_end = 100% at bottom, thumb_size = log_height/total * track.
                 let max_scroll = total.saturating_sub(log_height);
                 let clamped = (log_scroll_up as usize).min(max_scroll);
                 let mut sb_state = ScrollbarState::new(max_scroll + 1)
@@ -772,13 +520,11 @@ fn interactive(
                     .viewport_content_length(log_height);
                 f.render_stateful_widget(
                     Scrollbar::new(ScrollbarOrientation::VerticalRight)
-                        .begin_symbol(None)
-                        .end_symbol(None),
+                        .begin_symbol(None).end_symbol(None),
                     chunks[0].inner(ratatui::layout::Margin { horizontal: 0, vertical: 1 }),
                     &mut sb_state,
                 );
 
-                // ── Pending pop-up (overlays the log pane) ──
                 if !pending.is_empty() && grant_idx.is_some() {
                     let pl: Vec<Line> = {
                         let mut lines = Vec::new();
@@ -787,43 +533,35 @@ fn interactive(
                             let active = grant_idx == Some(i);
                             let prefix = if active { "▶" } else { " " };
                             lines.push(Line::from(format!(
-                                " {prefix} [{}] {}  (pid {})",
-                                p.id, p.secret_name, p.pid
+                                " {prefix} [{}] {}  (pid {})", p.id, p.secret_name, p.pid
                             )));
                             lines.push(Line::from(format!(
                                 "     hash: {}  reason: {}",
-                                p.pid_hash.as_deref().unwrap_or("<unknown>"),
-                                p.reason
+                                p.pid_hash.as_deref().unwrap_or("<unknown>"), p.reason
                             )));
                             lines.push(Line::from(""));
                         }
-                        lines.push(Line::from(
-                            " [y] Grant   [n] Deny   [↑↓] Navigate   [Esc] Close",
-                        ));
+                        lines.push(Line::from(" [y] Grant   [n] Deny   [↑↓] Navigate   [Esc] Close"));
                         lines
                     };
-                    let h = pl.len() as u16 + 2; // +border
+                    let h = pl.len() as u16 + 2;
                     let pop = ratatui::layout::Rect {
-                        x: chunks[0].x + 1,
-                        y: chunks[0].y + 1,
+                        x: chunks[0].x + 1, y: chunks[0].y + 1,
                         width: chunks[0].width.saturating_sub(2),
                         height: h.min(chunks[0].height.saturating_sub(2)),
                     };
                     f.render_widget(Clear, pop);
                     f.render_widget(
                         Paragraph::new(pl)
-                            .block(
-                                Block::default()
-                                    .borders(Borders::ALL)
-                                    .border_style(Style::default().fg(Color::Yellow))
-                                    .title(format!("⚠ {} Pending Access Request(s)", pending.len())),
-                            )
+                            .block(Block::default()
+                                .borders(Borders::ALL)
+                                .border_style(Style::default().fg(Color::Yellow))
+                                .title(format!("⚠ {} Pending Access Request(s)", pending.len())))
                             .style(Style::default().bg(Color::Black)),
                         pop,
                     );
                 }
 
-                // ── Input pane (fixed at bottom) ──
                 let prompt = if pending.is_empty() { "> ".into() } else { format!("({}p) > ", pending.len()) };
                 f.render_widget(
                     Paragraph::new(format!("{prompt}{}", input.value()))
@@ -836,7 +574,6 @@ fn interactive(
                 ));
             }).map_err(|e| e.to_string())?;
 
-            // Poll faster when there are pending requests OR popup was recently open
             let poll_timeout = if grant_idx.is_some() || !pending.is_empty() {
                 std::time::Duration::from_millis(500)
             } else {
@@ -850,39 +587,24 @@ fn interactive(
                     _ => continue,
                 };
 
-                // ── Log scrolling ──
-                // Up/Down scroll the log (scroll wheel arrives as Up/Down via ?1007h).
-                // History uses Ctrl+Up/Ctrl+Down (like bash).
                 match key.code {
-                    KeyCode::PageUp => {
-                        log_scroll_up = log_scroll_up.saturating_add(5);
-                        continue;
-                    }
-                    KeyCode::PageDown => {
-                        log_scroll_up = log_scroll_up.saturating_sub(5);
-                        continue;
-                    }
+                    KeyCode::PageUp => { log_scroll_up = log_scroll_up.saturating_add(5); continue; }
+                    KeyCode::PageDown => { log_scroll_up = log_scroll_up.saturating_sub(5); continue; }
                     KeyCode::Up if !key.modifiers.contains(KeyModifiers::CONTROL) && grant_idx.is_none() => {
-                        log_scroll_up = log_scroll_up.saturating_add(1);
-                        continue;
+                        log_scroll_up = log_scroll_up.saturating_add(1); continue;
                     }
                     KeyCode::Down if !key.modifiers.contains(KeyModifiers::CONTROL) && grant_idx.is_none() => {
-                        log_scroll_up = log_scroll_up.saturating_sub(1);
-                        continue;
+                        log_scroll_up = log_scroll_up.saturating_sub(1); continue;
                     }
                     _ => {}
                 }
 
-                // ── Grant mode (y/n/Esc for pending) ──
                 if let Some(idx) = grant_idx {
                     match key.code {
-                        KeyCode::Esc => {
-                            grant_idx = None; // close popup, keep requests
-                            continue;
-                        }
+                        KeyCode::Esc => { grant_idx = None; continue; }
                         KeyCode::Char('y') | KeyCode::Char('Y') => {
                             let p = pending[idx].clone();
-                            let _ = send_command(socket, &Command::Grant{ id: p.id });
+                            let _ = app.run_cli_command("grant", &p.id.to_string());
                             log_lines.push(format!("Granted [{}] {} (pid {})", p.id, p.secret_name, p.pid));
                             log_scroll_up = 0;
                             pending.remove(idx);
@@ -891,7 +613,7 @@ fn interactive(
                         }
                         KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Enter => {
                             let p = pending[idx].clone();
-                            let _ = send_command(socket, &Command::Deny{ id: p.id });
+                            let _ = app.run_cli_command("deny", &p.id.to_string());
                             log_lines.push(format!("Denied [{}] {} (pid {})", p.id, p.secret_name, p.pid));
                             log_scroll_up = 0;
                             pending.remove(idx);
@@ -900,12 +622,11 @@ fn interactive(
                         }
                         KeyCode::Up if idx > 0 => { grant_idx = Some(idx-1); continue }
                         KeyCode::Down if idx+1 < pending.len() => { grant_idx = Some(idx+1); continue }
-                        _ => {} // block other keys while popup is open
+                        _ => {}
                     }
-                    continue; // eat all unhandled keys while popup is open
+                    continue;
                 }
 
-                // ── Normal input handling ──
                 match key.code {
                     KeyCode::Enter => {
                         let line = input.value().to_string();
@@ -918,22 +639,23 @@ fn interactive(
                         match plugins.iter().find(|p| p.name==cn) {
                             Some(pl) => {
                                 let mut buf = BufferConsole::new();
-                                if let ShellAction::Exit = (pl.execute)(args, socket, &mut buf) { return Ok(()); }
+                                if let ShellAction::Exit = (pl.execute)(args, app, &mut buf) { return Ok(()); }
                                 log_lines.extend(buf.lines);
                             }
                             None => log_lines.push(format!("Unknown: '{cn}'")),
                         }
-                        log_scroll_up = 0; // auto-scroll to bottom on new output
+                        log_scroll_up = 0;
                     }
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => { input.reset(); history_idx=None; }
                     KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) && input.value().is_empty() => return Ok(()),
                     KeyCode::Tab => {
                         let w = input.value().split_whitespace().next().unwrap_or("");
                         if !w.is_empty() && !input.value().contains(' ') {
-                            if let Some(p) = plugins.iter().find(|pl| pl.name.starts_with(w)) { input = Input::new(p.name.into()); }
+                            if let Some(p) = plugins.iter().find(|pl| pl.name.starts_with(w)) {
+                                input = Input::new(p.name.into());
+                            }
                         }
                     }
-                    // History: Ctrl+Up/Ctrl+Down (plain Up/Down scrolls the log)
                     KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         if !history.is_empty() {
                             history_idx = Some(match history_idx { Some(0)=>0, Some(i)=>i-1, None=>history.len()-1 });
@@ -949,37 +671,25 @@ fn interactive(
                     _ => { let _ = input.handle_event(&Event::Key(key)); }
                 }
             } else {
-                // Timeout: poll pending
                 let np = poll();
                 let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
                 let live: Vec<_> = np.into_iter().filter(|p| p.expires_at > now).collect();
                 if live != pending {
                     let had_new = live.len() > pending.len();
-                    // Track highlighted request by ID to avoid jumping
-                    let current_id = grant_idx
-                        .and_then(|i| pending.get(i))
-                        .map(|p| p.id);
+                    let current_id = grant_idx.and_then(|i| pending.get(i)).map(|p| p.id);
                     pending = live;
-                    // Restore selection to same ID if still present
                     if let Some(id) = current_id {
                         grant_idx = pending.iter().position(|p| p.id == id);
                     }
-                    // Auto-open popup when new requests arrive
-                    if had_new && grant_idx.is_none() && !pending.is_empty() {
-                        grant_idx = Some(0);
-                    }
-                    // Clamp
+                    if had_new && grant_idx.is_none() && !pending.is_empty() { grant_idx = Some(0); }
                     if let Some(i) = grant_idx {
-                        if i >= pending.len() {
-                            grant_idx = if pending.is_empty() { None } else { Some(0) };
-                        }
+                        if i >= pending.len() { grant_idx = if pending.is_empty() { None } else { Some(0) }; }
                     }
                 }
             }
         }
     })();
 
-    // Restore terminal
     write!(std_io::stdout(), "\x1b[?1007l").ok();
     std_io::stdout().flush().ok();
     disable_raw_mode().ok();

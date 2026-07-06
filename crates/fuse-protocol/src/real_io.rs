@@ -184,29 +184,6 @@ impl SystemIo for RealSystemIo {
         reader.read_line(&mut line)?;
         Ok(line.into_bytes())
     }
-
-    fn unix_send_recv_servatui(
-        &self,
-        path: &Path,
-        proto_name: &str,
-        data: &[u8],
-    ) -> Result<Vec<u8>, IoError> {
-        use std::io::{BufRead, BufReader, Write};
-        let mut stream = std::os::unix::net::UnixStream::connect(path)
-            .map_err(|e| IoError(format!("connect {}: {e}", path.display())))?;
-        stream.write_all(proto_name.as_bytes())?;
-        stream.write_all(b"\n")?;
-        stream.write_all(data)?;
-        stream.write_all(b"\n")?;
-        stream.flush()?;
-        let mut reader = BufReader::new(&stream);
-        let mut line = String::new();
-        reader.read_line(&mut line)?;
-        stream.write_all(b"null\n")?; // client step 2 output
-        stream.write_all(b"null\n")?; // sentinel
-        stream.flush()?;
-        Ok(line.into_bytes())
-    }
 }
 
 /// In-memory mock [`SystemIo`] for tests.  All operations are deterministic and
@@ -423,18 +400,6 @@ impl SystemIo for MockSystemIo {
     }
 
     fn unix_send_recv(&self, _path: &Path, _data: &[u8]) -> Result<Vec<u8>, IoError> {
-        self.unix_responses
-            .borrow_mut()
-            .pop_front()
-            .ok_or_else(|| IoError("no queued unix response".into()))
-    }
-
-    fn unix_send_recv_servatui(
-        &self,
-        _path: &Path,
-        _proto_name: &str,
-        _data: &[u8],
-    ) -> Result<Vec<u8>, IoError> {
         self.unix_responses
             .borrow_mut()
             .pop_front()

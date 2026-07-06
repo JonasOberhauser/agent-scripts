@@ -735,11 +735,11 @@ name = "run-agent"
 version = "0.13.0"
 dependencies = [
  "clap",
- "fuse-client",
  "fuse-protocol",
  "libc",
  "serde",
  "serde_json",
+ "servyi-servatui",
  "tempfile",
  "tracing",
  "tracing-subscriber",
@@ -857,7 +857,7 @@ dependencies = [
 [[package]]
 name = "servyi-servatui"
 version = "0.2.0"
-source = "git+https://github.com/servyi/servatui.git#74601cf99eacd9b6eb55c5c5f861ba6c3cddcc37"
+source = "git+https://github.com/servyi/servatui.git#8388983cb50c436976d27a75bd3d40f16849561c"
 dependencies = [
  "serde",
  "serde_json",
