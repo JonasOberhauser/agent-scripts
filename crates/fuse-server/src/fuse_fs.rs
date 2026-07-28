@@ -74,7 +74,7 @@ impl<S: SystemIo> GatekeeperFs<S> {
     }
 
     fn assign_inode(&self, name: &str) -> u64 {
-        let mut map = self.inodes.lock().expect("inode map mutex poisoned");
+        let mut map = self.inodes.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(&ino) = map.iter().find(|(_, n)| n.as_str() == name).map(|(k, _)| k) {
             return ino;
         }
@@ -87,7 +87,7 @@ impl<S: SystemIo> GatekeeperFs<S> {
         if ino == ROOT_INO {
             return None;
         }
-        self.inodes.lock().expect("inode map mutex poisoned").get(&ino).cloned()
+        self.inodes.lock().unwrap_or_else(|e| e.into_inner()).get(&ino).cloned()
     }
 
     fn file_attr(&self, ino: u64, size: u64, uid: u32, gid: u32) -> FileAttr {
@@ -169,7 +169,7 @@ impl<S: SystemIo> GatekeeperFs<S> {
         if parent != ROOT_INO {
             return Err(libc::ENOENT);
         }
-        let state = self.state.lock().expect("ServerState mutex poisoned");
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(rec) = state.secrets.get(name) {
             let ino = self.assign_inode(name);
             let attr = self.file_attr(ino, rec.content.len() as u64, uid, gid);
@@ -188,7 +188,7 @@ impl<S: SystemIo> GatekeeperFs<S> {
             Some(n) => n,
             None => return Err(libc::ENOENT),
         };
-        let state = self.state.lock().expect("ServerState mutex poisoned");
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(rec) = state.secrets.get(&name) {
             Ok(self.file_attr(ino, rec.content.len() as u64, uid, gid))
         } else {
@@ -222,7 +222,7 @@ impl<S: SystemIo> GatekeeperFs<S> {
         let off = offset.max(0) as usize;
 
         let outcome = {
-            let mut state = self.state.lock().expect("ServerState mutex poisoned");
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             state.attempt_read(&name, pid, pid_hash, off, size as usize)
         };
 
@@ -243,7 +243,7 @@ impl<S: SystemIo> GatekeeperFs<S> {
                 };
 
                 let (pending_id, timeout) = {
-                    let mut state = self.state.lock().expect("ServerState mutex poisoned");
+                    let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
                     if state.pending_timeout.is_zero() {
                         warn!("Denied read of '{name}' by pid {pid}: {reason}");
                         return ReadResult::Error(libc::EACCES);
@@ -304,14 +304,14 @@ impl<S: SystemIo> GatekeeperFs<S> {
                     }
 
                     let granted = {
-                        let state = self.state.lock().expect("ServerState mutex poisoned");
+                        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
                         state.is_pending_granted(pending_id)
                     };
 
                     if granted {
                         warn!("Pending access {pending_id} granted — serving '{name}'");
                         let content = {
-                            let mut state = self.state.lock().expect("ServerState mutex poisoned");
+                            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
                             state.force_grant_read(&name, pid, offset, size as usize)
                         };
                         self.state
@@ -337,7 +337,7 @@ impl<S: SystemIo> GatekeeperFs<S> {
 
     /// List all entries in the root directory.
     pub fn do_readdir(&self) -> Vec<(u64, FileType, String)> {
-        let state = self.state.lock().expect("ServerState mutex poisoned");
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let mut entries: Vec<(u64, FileType, String)> = vec![
             (ROOT_INO, FileType::Directory, ".".to_string()),
             (ROOT_INO, FileType::Directory, "..".to_string()),
@@ -351,7 +351,7 @@ impl<S: SystemIo> GatekeeperFs<S> {
 
     /// Filesystem statistics for `statfs`.
     pub fn do_statfs(&self) -> Result<StatfsData, i32> {
-        let state = self.state.lock().expect("ServerState mutex poisoned");
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let total_size: usize = state.secrets.values().map(|r| r.content.len()).max().unwrap_or(0);
         let num_files = state.secrets.len() as u64;
         drop(state);
@@ -388,7 +388,7 @@ fn read_worker(
     };
 
     let outcome = {
-        let mut s = state.lock().expect("ServerState mutex poisoned");
+        let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
         s.attempt_read(name, pid, pid_hash.as_deref(), off, size as usize)
     };
 
@@ -410,7 +410,7 @@ fn read_worker(
             };
 
             let (pending_id, timeout) = {
-                let mut s = state.lock().expect("ServerState mutex poisoned");
+                let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
                 if s.pending_timeout.is_zero() {
                     warn!("Denied read of '{name}' by pid {pid}: {reason}");
                     return Err(libc::EACCES);
@@ -424,18 +424,18 @@ fn read_worker(
             let deadline = std::time::Instant::now() + timeout;
             loop {
                 if std::time::Instant::now() > deadline {
-                    state.lock().expect("ServerState mutex poisoned").remove_pending(pending_id);
+                    state.lock().unwrap_or_else(|e| e.into_inner()).remove_pending(pending_id);
                     warn!("Pending access {pending_id} timed out");
                     return Err(libc::EACCES);
                 }
 
-                if state.lock().expect("ServerState mutex poisoned").is_pending_granted(pending_id) {
+                if state.lock().unwrap_or_else(|e| e.into_inner()).is_pending_granted(pending_id) {
                     warn!("Pending access {pending_id} granted — serving '{name}'");
                     let content = {
-                        let mut s = state.lock().expect("ServerState mutex poisoned");
+                        let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
                         s.force_grant_read(name, pid, off, size as usize)
                     };
-                    state.lock().expect("ServerState mutex poisoned").remove_pending(pending_id);
+                    state.lock().unwrap_or_else(|e| e.into_inner()).remove_pending(pending_id);
                     return content
                         .map(|d| {
                             let start = off.min(d.len());

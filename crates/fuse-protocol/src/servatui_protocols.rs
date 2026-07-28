@@ -106,7 +106,7 @@ pub fn client_protocols() -> Vec<Protocol> {
 
         cmd_protocol("add", "Add a new secret from a file",
             |args| {
-                let parts: Vec<&str> = args.trim().splitn(3, char::is_whitespace).collect();
+                let parts: Vec<&str> = args.split_whitespace().collect();
                 if parts.len() < 3 {
                     return Err("Usage: add NAME FILE HASH".into());
                 }
@@ -130,7 +130,7 @@ pub fn client_protocols() -> Vec<Protocol> {
 
         cmd_protocol("rotate", "Change the allowed binary hash",
             |args| {
-                let parts: Vec<&str> = args.trim().splitn(2, char::is_whitespace).collect();
+                let parts: Vec<&str> = args.split_whitespace().collect();
                 if parts.len() < 2 {
                     return Err("Usage: rotate NAME HASH".into());
                 }

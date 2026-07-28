@@ -34,6 +34,12 @@ impl SystemIo for RealSystemIo {
         Ok(())
     }
 
+    fn set_file_mode(&self, path: &Path, mode: u32) -> Result<(), IoError> {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
+        Ok(())
+    }
+
     fn file_exists(&self, path: &Path) -> bool {
         path.exists()
     }
@@ -301,6 +307,10 @@ impl SystemIo for MockSystemIo {
     fn write_file(&mut self, path: &Path, data: &[u8]) -> Result<(), IoError> {
         self.files
             .insert(path.to_string_lossy().to_string(), data.to_vec());
+        Ok(())
+    }
+
+    fn set_file_mode(&self, _path: &Path, _mode: u32) -> Result<(), IoError> {
         Ok(())
     }
 

@@ -604,8 +604,10 @@ fn interactive(app: &App) -> Result<(), String> {
                         KeyCode::Esc => { grant_idx = None; continue; }
                         KeyCode::Char('y') | KeyCode::Char('Y') => {
                             let p = pending[idx].clone();
-                            let _ = app.run_cli_command("grant", &p.id.to_string());
-                            log_lines.push(format!("Granted [{}] {} (pid {})", p.id, p.secret_name, p.pid));
+                            match app.run_cli_command("grant", &p.id.to_string()) {
+                                Ok(_) => log_lines.push(format!("Granted [{}] {} (pid {})", p.id, p.secret_name, p.pid)),
+                                Err(e) => log_lines.push(format!("Grant failed [{}]: {e}", p.id)),
+                            }
                             log_scroll_up = 0;
                             pending.remove(idx);
                             grant_idx = if pending.is_empty() { None } else { Some(idx.min(pending.len()-1)) };
@@ -613,8 +615,10 @@ fn interactive(app: &App) -> Result<(), String> {
                         }
                         KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Enter => {
                             let p = pending[idx].clone();
-                            let _ = app.run_cli_command("deny", &p.id.to_string());
-                            log_lines.push(format!("Denied [{}] {} (pid {})", p.id, p.secret_name, p.pid));
+                            match app.run_cli_command("deny", &p.id.to_string()) {
+                                Ok(_) => log_lines.push(format!("Denied [{}] {} (pid {})", p.id, p.secret_name, p.pid)),
+                                Err(e) => log_lines.push(format!("Deny failed [{}]: {e}", p.id)),
+                            }
                             log_scroll_up = 0;
                             pending.remove(idx);
                             grant_idx = if pending.is_empty() { None } else { Some(idx.min(pending.len()-1)) };

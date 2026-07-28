@@ -11,7 +11,7 @@ fn server_protocol(name: &'static str, help: &'static str) -> Protocol {
         .parse(|_| -> Result<Command, String> { unreachable!("parse is never called on server") })
         .client(|cmd: Command, _out, _input| Ok(cmd))
         .server_ctx(|cmd: Command, ctx: &Mutex<ServerState>| {
-            let mut state = ctx.lock().expect("ServerState mutex poisoned");
+            let mut state = ctx.lock().unwrap_or_else(|e| e.into_inner());
             let resp = handle_command(cmd, &mut state);
             match resp {
                 Response::Error { message } => Err(message),

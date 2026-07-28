@@ -511,6 +511,8 @@ fn write_state_file<S: SystemIo>(config: &AgentConfig, loaded: &[LoadedSecret], 
     let state_path = std::path::Path::new(fuse_protocol::STATE_FILE);
     if let Err(e) = io.write_file(state_path, json.as_bytes()) {
         warn!("Failed to write state file: {e}");
+    } else if let Err(e) = io.set_file_mode(state_path, 0o600) {
+        warn!("Failed to set state file permissions: {e}");
     }
 }
 

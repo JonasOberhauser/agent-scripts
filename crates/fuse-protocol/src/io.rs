@@ -21,6 +21,7 @@ impl CommandOutput {
 pub trait SystemIo {
     fn read_file(&self, path: &Path) -> Result<Vec<u8>, IoError>;
     fn write_file(&mut self, path: &Path, data: &[u8]) -> Result<(), IoError>;
+    fn set_file_mode(&self, path: &Path, mode: u32) -> Result<(), IoError>;
     fn file_exists(&self, path: &Path) -> bool;
     fn create_dir_all(&self, path: &Path) -> Result<(), IoError>;
     fn remove_path(&mut self, path: &Path) -> Result<(), IoError>;
