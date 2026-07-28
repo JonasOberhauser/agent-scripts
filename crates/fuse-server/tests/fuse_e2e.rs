@@ -31,16 +31,16 @@ fn current_exe_hash() -> String {
         .expect("failed to hash test binary")
 }
 
-fn make_state(secrets: &[(&str, &[u8], &str)]) -> Arc<Mutex<ServerState>> {
-    let mut state = ServerState::new();
+fn make_state(secrets: &[(&str, &[u8], &str)]) -> Arc<ServerState> {
+    let state = ServerState::new();
     for (name, content, hash) in secrets {
         state.add(*name, content.to_vec(), *hash);
     }
-    Arc::new(Mutex::new(state))
+    Arc::new(state)
 }
 
 fn mount_fs(
-    state: Arc<Mutex<ServerState>>,
+    state: Arc<ServerState>,
     mount_point: &std::path::Path,
 ) -> BackgroundSession {
     let fs = GatekeeperFs::new(state, RealSystemIo::new());
@@ -244,14 +244,11 @@ fn e2e_dynamic_add_visible() {
     let dir = tempfile::tempdir().unwrap();
     let hash = current_exe_hash();
     let state = make_state(&[]);
-    let state_handle = Arc::clone(&state);
+    let state_handle = std::sync::Arc::clone(&state);
     let _session = mount_fs(state, dir.path());
 
     // Add a secret AFTER the filesystem is mounted.
-    state_handle
-        .lock()
-        .unwrap()
-        .add("dynamic", b"ADDED_LATER".to_vec(), &hash);
+    state_handle.add("dynamic", b"ADDED_LATER".to_vec(), &hash);
 
     // With TTL=0 the kernel always re-validates, so the new file is
     // immediately visible.
@@ -269,7 +266,7 @@ fn e2e_reset_allows_reread() {
     let dir = tempfile::tempdir().unwrap();
     let hash = current_exe_hash();
     let state = make_state(&[("s", b"DATA", &hash)]);
-    let state_handle = Arc::clone(&state);
+    let state_handle = std::sync::Arc::clone(&state);
     let _session = mount_fs(state, dir.path());
 
     // First read succeeds.
@@ -280,7 +277,7 @@ fn e2e_reset_allows_reread() {
     assert_eq!(err.raw_os_error(), Some(libc::EACCES));
 
     // Reset via shared state.
-    state_handle.lock().unwrap().reset(Some("s"));
+    state_handle.reset(Some("s"));
 
     // Third read succeeds again.
     let data = std::fs::read(dir.path().join("s")).unwrap();
@@ -362,7 +359,7 @@ fn e2e_pending_does_not_block_other_reads() {
         // "open" has wildcard hash → read succeeds immediately
         ("open", b"OPEN_DATA", "*"),
     ]);
-    state.lock().unwrap().pending_timeout = std::time::Duration::from_secs(30);
+    *state.pending_timeout.lock().unwrap() = std::time::Duration::from_secs(30);
     let _session = mount_fs(state.clone(), dir.path());
 
     // Spawn a thread that reads "blocked" — this will be pending (hash mismatch).
@@ -390,11 +387,9 @@ fn e2e_pending_does_not_block_other_reads() {
     );
 
     // Grant the pending read so the blocked thread can finish
-    let mut s = state.lock().unwrap();
-    if let Some(p) = s.pending.first() {
-        let id = p.id;
-        drop(s);
-        state.lock().unwrap().grant_pending(id);
+    let id = state.pending.iter().next().map(|p| p.id);
+    if let Some(id) = id {
+        state.grant_pending(id);
     }
 
     // Wait for the blocked thread to complete

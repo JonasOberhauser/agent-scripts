@@ -70,7 +70,7 @@ fn main() {
 
     // Build initial state.
     let mut state = ServerState::new();
-    state.pending_timeout = Duration::from_secs(cli.pending_timeout);
+    state.pending_timeout = std::sync::Mutex::new(Duration::from_secs(cli.pending_timeout));
     state.log_path = log_path_str;
     for spec in &cli.secret {
         match parse_secret(spec, &io) {
@@ -84,7 +84,7 @@ fn main() {
             }
         }
     }
-    let state = Arc::new(Mutex::new(state));
+    let state = Arc::new(state);
 
     // Ensure mount point exists.
     if !cli.mount_point.exists() {

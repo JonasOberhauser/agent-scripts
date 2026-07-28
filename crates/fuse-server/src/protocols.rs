@@ -1,5 +1,3 @@
-use std::sync::Mutex;
-
 use servyi_servatui::{Plugin, Protocol, ShellAction};
 use fuse_protocol::{Command, Response};
 
@@ -10,9 +8,8 @@ fn server_protocol(name: &'static str, help: &'static str) -> Protocol {
     Plugin::new(name, help)
         .parse(|_| -> Result<Command, String> { unreachable!("parse is never called on server") })
         .client(|cmd: Command, _out, _input| Ok(cmd))
-        .server_ctx(|cmd: Command, ctx: &Mutex<ServerState>| {
-            let mut state = ctx.lock().unwrap_or_else(|e| e.into_inner());
-            let resp = handle_command(cmd, &mut state);
+        .server_ctx(|cmd: Command, ctx: &ServerState| {
+            let resp = handle_command(cmd, ctx);
             match resp {
                 Response::Error { message } => Err(message),
                 other => Ok(other),

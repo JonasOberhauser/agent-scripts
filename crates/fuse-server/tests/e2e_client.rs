@@ -47,11 +47,11 @@ fn e2e_client_binary_against_server() {
     let socket = dir.path().join("e2e.sock");
 
     // Start socket server with one pre-loaded secret
-    let state = Arc::new(Mutex::new({
-        let mut s = ServerState::new();
+    let state = Arc::new({
+        let s = ServerState::new();
         s.add("existing.yaml", b"DATA1".to_vec(), "hash1");
         s
-    }));
+    });
 
     let sock = socket.clone();
     let st = Arc::clone(&state);

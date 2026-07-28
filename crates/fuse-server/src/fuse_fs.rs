@@ -9,7 +9,9 @@ use fuser::{
 use fuse_protocol::SystemIo;
 use tracing::{debug, info, warn};
 
-use crate::state::{ReadOutcome, ServerState};
+use std::sync::Arc;
+
+use crate::state::{lock_secret, ReadOutcome, ServerState};
 
 const ROOT_INO: u64 = 1;
 
@@ -23,7 +25,7 @@ const TTL: Duration = Duration::ZERO;
 /// The FUSE gatekeeper filesystem.  Shares `Arc<Mutex<ServerState>>` with the
 /// socket server so CRUD commands take effect immediately.
 pub struct GatekeeperFs<S: SystemIo> {
-    state: std::sync::Arc<Mutex<ServerState>>,
+    state: Arc<ServerState>,
     #[allow(dead_code)]
     io: S,
     next_inode: AtomicU64,
@@ -64,7 +66,7 @@ pub struct StatfsData {
 }
 
 impl<S: SystemIo> GatekeeperFs<S> {
-    pub fn new(state: std::sync::Arc<Mutex<ServerState>>, io: S) -> Self {
+    pub fn new(state: Arc<ServerState>, io: S) -> Self {
         Self {
             state,
             io,
@@ -169,8 +171,8 @@ impl<S: SystemIo> GatekeeperFs<S> {
         if parent != ROOT_INO {
             return Err(libc::ENOENT);
         }
-        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(rec) = state.secrets.get(name) {
+        if let Some(entry) = self.state.secrets.get(name) {
+            let rec = lock_secret(entry.value(), name);
             let ino = self.assign_inode(name);
             let attr = self.file_attr(ino, rec.content.len() as u64, uid, gid);
             Ok((ino, attr))
@@ -188,8 +190,8 @@ impl<S: SystemIo> GatekeeperFs<S> {
             Some(n) => n,
             None => return Err(libc::ENOENT),
         };
-        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(rec) = state.secrets.get(&name) {
+        if let Some(entry) = self.state.secrets.get(&name) {
+            let rec = lock_secret(entry.value(), &name);
             Ok(self.file_attr(ino, rec.content.len() as u64, uid, gid))
         } else {
             Err(libc::ENOENT)
@@ -221,16 +223,11 @@ impl<S: SystemIo> GatekeeperFs<S> {
 
         let off = offset.max(0) as usize;
 
-        let outcome = {
-            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            state.attempt_read(&name, pid, pid_hash, off, size as usize)
-        };
+        let outcome = self.state.attempt_read(&name, pid, pid_hash, off, size as usize);
 
         match outcome {
             ReadOutcome::Granted(content) => {
-                let start = off.min(content.len());
-                let end = (start + size as usize).min(content.len());
-                ReadResult::Data(content[start..end].to_vec())
+                ReadResult::Data(content)
             }
             ReadOutcome::NotFound => ReadResult::Error(libc::ENOENT),
             ReadOutcome::AlreadyAccessed | ReadOutcome::HashMismatch { .. } => {
@@ -242,25 +239,21 @@ impl<S: SystemIo> GatekeeperFs<S> {
                     _ => unreachable!(),
                 };
 
-                let (pending_id, timeout) = {
-                    let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-                    if state.pending_timeout.is_zero() {
-                        warn!("Denied read of '{name}' by pid {pid}: {reason}");
-                        return ReadResult::Error(libc::EACCES);
-                    }
-                    let id = state.create_pending(&name, pid, pid_hash, &reason);
-                    let to = state.pending_timeout;
-                    (id, to)
-                };
+                if self.state.pending_timeout.lock().unwrap().is_zero() {
+                    warn!("Denied read of '{name}' by pid {pid}: {reason}");
+                    return ReadResult::Error(libc::EACCES);
+                }
+                let id = self.state.create_pending(&name, pid, pid_hash, &reason);
+                let timeout = *self.state.pending_timeout.lock().unwrap();
 
                 warn!(
                     "Access pending for '{name}' by pid {pid}: {reason} \
-                     (id={pending_id}). Waiting up to {}s for grant...",
+                     (id={id}). Waiting up to {}s for grant...",
                     timeout.as_secs()
                 );
 
                 ReadResult::Pending {
-                    pending_id,
+                    pending_id: id,
                     name,
                     pid,
                     offset: off,
@@ -295,36 +288,18 @@ impl<S: SystemIo> GatekeeperFs<S> {
                 let deadline = std::time::Instant::now() + timeout;
                 loop {
                     if std::time::Instant::now() > deadline {
-                        self.state
-                            .lock()
-                            .expect("ServerState mutex poisoned")
-                            .remove_pending(pending_id);
+                        self.state.remove_pending(pending_id);
                         warn!("Pending access {pending_id} timed out");
                         return Err(libc::EACCES);
                     }
 
-                    let granted = {
-                        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-                        state.is_pending_granted(pending_id)
-                    };
-
-                    if granted {
+                    if self.state.is_pending_granted(pending_id) {
                         warn!("Pending access {pending_id} granted — serving '{name}'");
-                        let content = {
-                            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-                            state.force_grant_read(&name, pid, offset, size as usize)
-                        };
-                        self.state
-                            .lock()
-                            .expect("ServerState mutex poisoned")
-                            .remove_pending(pending_id);
+                        let content = self.state.force_grant_read(&name, pid, offset, size as usize);
+                        self.state.remove_pending(pending_id);
 
                         return match content {
-                            Some(data) => {
-                                let start = offset.min(data.len());
-                                let end = (start + size as usize).min(data.len());
-                                Ok(data[start..end].to_vec())
-                            }
+                            Some(data) => Ok(data),
                             None => Err(libc::ENOENT),
                         };
                     }
@@ -337,24 +312,27 @@ impl<S: SystemIo> GatekeeperFs<S> {
 
     /// List all entries in the root directory.
     pub fn do_readdir(&self) -> Vec<(u64, FileType, String)> {
-        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let mut entries: Vec<(u64, FileType, String)> = vec![
             (ROOT_INO, FileType::Directory, ".".to_string()),
             (ROOT_INO, FileType::Directory, "..".to_string()),
         ];
-        for name in state.secrets.keys() {
-            let ino = self.assign_inode(name);
-            entries.push((ino, FileType::RegularFile, name.clone()));
+        for entry in self.state.secrets.iter() {
+            let ino = self.assign_inode(entry.key());
+            entries.push((ino, FileType::RegularFile, entry.key().clone()));
         }
         entries
     }
 
-    /// Filesystem statistics for `statfs`.
     pub fn do_statfs(&self) -> Result<StatfsData, i32> {
-        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let total_size: usize = state.secrets.values().map(|r| r.content.len()).max().unwrap_or(0);
-        let num_files = state.secrets.len() as u64;
-        drop(state);
+        let entries: Vec<(String, Arc<std::sync::Mutex<crate::state::SecretRecord>>)> =
+            self.state.secrets.iter()
+                .map(|e| (e.key().clone(), Arc::clone(e.value())))
+                .collect();
+        let total_size: usize = entries.iter()
+            .map(|(name, rec_arc)| lock_secret(rec_arc, name).content.len())
+            .max()
+            .unwrap_or(0);
+        let num_files = self.state.secrets.len() as u64;
 
         Ok(StatfsData {
             blocks: (total_size as u64).div_ceil(512),
@@ -371,7 +349,7 @@ impl<S: SystemIo> GatekeeperFs<S> {
 
 /// Core read logic — runs in a spawned thread. Returns data or error.
 fn read_worker(
-    state: &std::sync::Arc<Mutex<ServerState>>,
+    state: &Arc<ServerState>,
     name: &str,
     pid: u32,
     offset: i64,
@@ -387,17 +365,12 @@ fn read_worker(
         }
     };
 
-    let outcome = {
-        let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
-        s.attempt_read(name, pid, pid_hash.as_deref(), off, size as usize)
-    };
+    let outcome = state.attempt_read(name, pid, pid_hash.as_deref(), off, size as usize);
 
     match outcome {
         ReadOutcome::Granted(content) => {
             debug!("Granted read of '{name}' to pid {pid}");
-            let start = off.min(content.len());
-            let end = (start + size as usize).min(content.len());
-            Ok(content[start..end].to_vec())
+            Ok(content)
         }
         ReadOutcome::NotFound => Err(libc::ENOENT),
         ReadOutcome::AlreadyAccessed | ReadOutcome::HashMismatch { .. } => {
@@ -409,40 +382,28 @@ fn read_worker(
                 _ => unreachable!(),
             };
 
-            let (pending_id, timeout) = {
-                let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
-                if s.pending_timeout.is_zero() {
-                    warn!("Denied read of '{name}' by pid {pid}: {reason}");
-                    return Err(libc::EACCES);
-                }
-                let id = s.create_pending(name, pid, pid_hash.as_deref(), &reason);
-                (id, s.pending_timeout)
-            };
+            if state.pending_timeout.lock().unwrap().is_zero() {
+                warn!("Denied read of '{name}' by pid {pid}: {reason}");
+                return Err(libc::EACCES);
+            }
+            let pending_id = state.create_pending(name, pid, pid_hash.as_deref(), &reason);
+            let timeout = *state.pending_timeout.lock().unwrap();
 
             warn!("Access pending for '{name}' by pid {pid}: {reason} (id={pending_id})");
 
             let deadline = std::time::Instant::now() + timeout;
             loop {
                 if std::time::Instant::now() > deadline {
-                    state.lock().unwrap_or_else(|e| e.into_inner()).remove_pending(pending_id);
+                    state.remove_pending(pending_id);
                     warn!("Pending access {pending_id} timed out");
                     return Err(libc::EACCES);
                 }
 
-                if state.lock().unwrap_or_else(|e| e.into_inner()).is_pending_granted(pending_id) {
+                if state.is_pending_granted(pending_id) {
                     warn!("Pending access {pending_id} granted — serving '{name}'");
-                    let content = {
-                        let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
-                        s.force_grant_read(name, pid, off, size as usize)
-                    };
-                    state.lock().unwrap_or_else(|e| e.into_inner()).remove_pending(pending_id);
-                    return content
-                        .map(|d| {
-                            let start = off.min(d.len());
-                            let end = (start + size as usize).min(d.len());
-                            d[start..end].to_vec()
-                        })
-                        .ok_or(libc::ENOENT);
+                    let content = state.force_grant_read(name, pid, off, size as usize);
+                    state.remove_pending(pending_id);
+                    return content.ok_or(libc::ENOENT);
                 }
 
                 std::thread::sleep(std::time::Duration::from_millis(500));
@@ -555,12 +516,12 @@ mod tests {
     use fuse_protocol::MockSystemIo;
 
     fn make_fs(secrets: &[(&str, &[u8], &str)]) -> GatekeeperFs<MockSystemIo> {
-        let mut state = ServerState::new();
-        state.pending_timeout = Duration::ZERO;
+        let state = ServerState::new();
+        *state.pending_timeout.lock().unwrap() = Duration::ZERO;
         for (name, content, hash) in secrets {
             state.add(*name, content.to_vec(), *hash);
         }
-        let state = std::sync::Arc::new(std::sync::Mutex::new(state));
+        let state = std::sync::Arc::new(state);
         GatekeeperFs::new(state, MockSystemIo::new())
     }
 
@@ -740,7 +701,7 @@ mod tests {
         assert_eq!(fs.do_read(ino, 200, Some("h"), 0, 1024), Err(libc::EACCES));
         // Reset via shared state
         {
-            let mut state = fs.state.lock().unwrap();
+            let state = fs.state.clone();
             state.reset(Some("s"));
         }
         // After reset, same PID can read again
@@ -802,14 +763,14 @@ mod tests {
 
     #[test]
     fn dynamic_add_visible_after_lookup() {
-        let state = std::sync::Arc::new(std::sync::Mutex::new(ServerState::new()));
+        let state = std::sync::Arc::new(ServerState::new());
         let fs = GatekeeperFs::new(state.clone(), MockSystemIo::new());
 
         // Initially no secrets
         assert_eq!(fs.do_lookup(0, 0, ROOT_INO, "new"), Err(libc::ENOENT));
 
         // Add via shared state (simulates socket AddSecret)
-        state.lock().unwrap().add("new", b"DATA".to_vec(), "hash");
+        state.add("new", b"DATA".to_vec(), "hash");
 
         // Now visible
         let (ino, attr) = fs.do_lookup(0, 0, ROOT_INO, "new").unwrap();
@@ -822,20 +783,17 @@ mod tests {
 
     #[test]
     fn pending_granted_serves_content() {
-        let state = std::sync::Arc::new(std::sync::Mutex::new(ServerState::new()));
-        state.lock().unwrap().pending_timeout = Duration::from_secs(10);
-        state.lock().unwrap().add("s", b"SECRET".to_vec(), "good_hash");
+        let state = std::sync::Arc::new(ServerState::new());
+        *state.pending_timeout.lock().unwrap() = Duration::from_secs(10);
+        state.add("s", b"SECRET".to_vec(), "good_hash");
         let state_clone = state.clone();
 
         // Spawn a thread to grant the pending access after 200ms
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(200));
-            // Grant the first pending access
-            let mut s = state_clone.lock().unwrap();
-            if let Some(p) = s.pending.first() {
-                let id = p.id;
-                drop(s);
-                state_clone.lock().unwrap().grant_pending(id);
+            let id = state_clone.pending.iter().next().map(|p| p.id);
+            if let Some(id) = id {
+                state_clone.grant_pending(id);
             }
         });
 
@@ -849,9 +807,9 @@ mod tests {
 
     #[test]
     fn pending_timeout_denies() {
-        let state = std::sync::Arc::new(std::sync::Mutex::new(ServerState::new()));
-        state.lock().unwrap().pending_timeout = Duration::from_millis(100);
-        state.lock().unwrap().add("s", b"SECRET".to_vec(), "good_hash");
+        let state = std::sync::Arc::new(ServerState::new());
+        *state.pending_timeout.lock().unwrap() = Duration::from_millis(100);
+        state.add("s", b"SECRET".to_vec(), "good_hash");
 
         let fs = GatekeeperFs::new(state, MockSystemIo::new());
         let (ino, _) = fs.do_lookup(0, 0, ROOT_INO, "s").unwrap();
@@ -863,9 +821,9 @@ mod tests {
 
     #[test]
     fn pending_creates_and_removes_entry() {
-        let state = std::sync::Arc::new(std::sync::Mutex::new(ServerState::new()));
-        state.lock().unwrap().pending_timeout = Duration::from_millis(100);
-        state.lock().unwrap().add("s", b"X".to_vec(), "h");
+        let state = std::sync::Arc::new(ServerState::new());
+        *state.pending_timeout.lock().unwrap() = Duration::from_millis(100);
+        state.add("s", b"X".to_vec(), "h");
 
         let fs = GatekeeperFs::new(state.clone(), MockSystemIo::new());
         let (ino, _) = fs.do_lookup(0, 0, ROOT_INO, "s").unwrap();
@@ -874,45 +832,34 @@ mod tests {
         let _ = fs.do_read(ino, 42, Some("wrong"), 0, 1024);
 
         // After timeout, pending should be cleaned up
-        assert!(state.lock().unwrap().pending.is_empty());
+        assert!(state.pending.is_empty());
     }
 
     // ── concurrency: pending doesn't block other reads ──────────
 
     #[test]
     fn concurrent_read_works_while_another_is_pending() {
-        // Scenario: read A denied (hash mismatch) → pending → waits for grant.
-        // While A is pending, read B (wildcard) must succeed.
-        // Grant A only AFTER B succeeds. If deadlock, test hangs/fails.
-        let state = std::sync::Arc::new(std::sync::Mutex::new(ServerState::new()));
-        state.lock().unwrap().pending_timeout = Duration::from_secs(30);
-        state.lock().unwrap().add("a", b"AAA".to_vec(), "hash_a");
-        state.lock().unwrap().add("b", b"BBB".to_vec(), "*"); // wildcard
+        let state = std::sync::Arc::new(ServerState::new());
+        *state.pending_timeout.lock().unwrap() = Duration::from_secs(30);
+        state.add("a", b"AAA".to_vec(), "hash_a");
+        state.add("b", b"BBB".to_vec(), "*");
 
         // Thread 1: Read A → denied → create pending → wait for grant
         let state1 = state.clone();
         let t1 = std::thread::spawn(move || {
-            let outcome = {
-                let mut s = state1.lock().unwrap();
-                s.attempt_read("a", 100, Some("wrong"), 0, 1024)
-            };
+            let outcome = state1.attempt_read("a", 100, Some("wrong"), 0, 1024);
             assert!(matches!(outcome, ReadOutcome::HashMismatch { .. }));
 
-            let id = {
-                let mut s = state1.lock().unwrap();
-                s.create_pending("a", 100, Some("wrong"), "hash mismatch")
-            };
+            let id = state1.create_pending("a", 100, Some("wrong"), "hash mismatch");
 
-            // Wait for grant (simulates the spawned thread in Filesystem::read)
             let deadline = std::time::Instant::now() + Duration::from_secs(15);
             loop {
                 if std::time::Instant::now() > deadline {
                     panic!("Thread 1 timed out waiting for grant — deadlock?");
                 }
-                if state1.lock().unwrap().is_pending_granted(id) {
-                    let mut s = state1.lock().unwrap();
-                    let data = s.force_grant_read("a", 100, 0, 1024).unwrap();
-                    s.remove_pending(id);
+                if state1.is_pending_granted(id) {
+                    let data = state1.force_grant_read("a", 100, 0, 1024).unwrap();
+                    state1.remove_pending(id);
                     return data;
                 }
                 std::thread::sleep(Duration::from_millis(50));
@@ -924,10 +871,7 @@ mod tests {
 
         // Main thread: Read B → MUST succeed immediately while A is pending
         let start = std::time::Instant::now();
-        let outcome_b = {
-            let mut s = state.lock().unwrap();
-            s.attempt_read("b", 200, None, 0, 1024)
-        };
+        let outcome_b = state.attempt_read("b", 200, None, 0, 1024);
         let elapsed = start.elapsed();
 
         assert!(
@@ -940,8 +884,8 @@ mod tests {
         );
 
         // NOW grant A (only after B succeeded)
-        let id = state.lock().unwrap().pending.first().unwrap().id;
-        state.lock().unwrap().grant_pending(id);
+        let id = state.pending.iter().next().unwrap().id;
+        state.grant_pending(id);
 
         // A should complete
         let data_a = t1.join().expect("thread 1 panicked");
@@ -950,13 +894,9 @@ mod tests {
 
     #[test]
     fn two_concurrent_pending_reads_both_create_pending() {
-        // Two reads for the SAME secret from DIFFERENT PIDs, both with
-        // wrong hash. Both should create separate pending accesses.
-        // Grant B only after A is granted — verifies both pendings exist
-        // and both can be independently granted.
-        let state = std::sync::Arc::new(std::sync::Mutex::new(ServerState::new()));
-        state.lock().unwrap().pending_timeout = Duration::from_secs(30);
-        state.lock().unwrap().add("s", b"SECRET".to_vec(), "correct_hash");
+        let state = std::sync::Arc::new(ServerState::new());
+        *state.pending_timeout.lock().unwrap() = Duration::from_secs(30);
+        state.add("s", b"SECRET".to_vec(), "correct_hash");
 
         let fs = GatekeeperFs::new(state.clone(), MockSystemIo::new());
         let (ino, _) = fs.do_lookup(0, 0, ROOT_INO, "s").unwrap();
@@ -969,26 +909,26 @@ mod tests {
         std::thread::sleep(Duration::from_millis(500));
 
         // Both pending accesses should exist
-        let pending_count = state.lock().unwrap().pending.len();
+        let pending_count = state.pending.len();
         assert_eq!(
             pending_count, 2,
             "expected 2 pending accesses, found {pending_count}"
         );
 
         // Grant the first one (by finding its pending ID)
-        let ids: Vec<u64> = state.lock().unwrap().pending.iter().map(|p| p.id).collect();
-        state.lock().unwrap().grant_pending(ids[0]);
+        let ids: Vec<u64> = state.pending.iter().map(|p| p.id).collect();
+        state.grant_pending(ids[0]);
 
         // Wait for A to complete
         let result_a = handle_a.join().expect("A panicked");
         assert_eq!(result_a.unwrap(), b"SECRET");
 
         // B should still be pending (not auto-granted)
-        let remaining = state.lock().unwrap().pending.len();
+        let remaining = state.pending.len();
         assert_eq!(remaining, 1, "B should still be pending after A granted");
 
         // Now grant B
-        state.lock().unwrap().grant_pending(ids[1]);
+        state.grant_pending(ids[1]);
         let result_b = handle_b.join().expect("B panicked");
         assert_eq!(result_b.unwrap(), b"SECRET");
     }

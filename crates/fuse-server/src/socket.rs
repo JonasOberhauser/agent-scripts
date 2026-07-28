@@ -1,5 +1,5 @@
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use servyi_servatui::ServerHandle;
 use tracing::info;
@@ -10,7 +10,7 @@ use crate::state::ServerState;
 /// Run the CRUD socket server using servatui. Blocks the calling thread.
 pub fn run_socket_server(
     socket_path: &Path,
-    state: Arc<Mutex<ServerState>>,
+    state: Arc<ServerState>,
 ) -> Result<(), String> {
     info!("Socket server listening at {}", socket_path.display());
 
@@ -26,6 +26,7 @@ mod tests {
     use super::*;
     use fuse_protocol::client_protocols;
     use servyi_servatui::App;
+    use std::sync::Arc;
 
     fn wait_for_socket(path: &Path) {
         for _ in 0..100 {
@@ -49,8 +50,8 @@ mod tests {
     fn socket_round_trip_reset() {
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("test.sock");
-        let state = Arc::new(Mutex::new(ServerState::new()));
-        state.lock().unwrap().add("s.yaml", b"DATA".to_vec(), "h1");
+        let state = Arc::new(ServerState::new());
+        state.add("s.yaml", b"DATA".to_vec(), "h1");
 
         let sock2 = sock.clone();
         let state2 = Arc::clone(&state);
@@ -71,7 +72,7 @@ mod tests {
     fn socket_add_then_status() {
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("test2.sock");
-        let state = Arc::new(Mutex::new(ServerState::new()));
+        let state = Arc::new(ServerState::new());
 
         let sock2 = sock.clone();
         let state2 = Arc::clone(&state);
@@ -88,14 +89,14 @@ mod tests {
         let lines = app.run_cli_command("add", &args).unwrap();
         assert!(lines.iter().any(|l| l == "OK"));
 
-        assert!(state.lock().unwrap().secrets.contains_key("new.yaml"));
+        assert!(state.secrets.contains_key("new.yaml"));
     }
 
     #[test]
     fn socket_error_propagates() {
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("err.sock");
-        let state = Arc::new(Mutex::new(ServerState::new()));
+        let state = Arc::new(ServerState::new());
 
         let sock2 = sock.clone();
         let state2 = Arc::clone(&state);
