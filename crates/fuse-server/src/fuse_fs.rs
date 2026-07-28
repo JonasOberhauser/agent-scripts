@@ -293,6 +293,11 @@ impl<S: SystemIo> GatekeeperFs<S> {
                         return Err(libc::EACCES);
                     }
 
+                    if !self.state.pending.contains_key(&pending_id) {
+                        warn!("Pending access {pending_id} denied");
+                        return Err(libc::EACCES);
+                    }
+
                     if self.state.is_pending_granted(pending_id) {
                         warn!("Pending access {pending_id} granted — serving '{name}'");
                         let content = self.state.force_grant_read(&name, pid, offset, size as usize);
@@ -396,6 +401,11 @@ fn read_worker(
                 if std::time::Instant::now() > deadline {
                     state.remove_pending(pending_id);
                     warn!("Pending access {pending_id} timed out");
+                    return Err(libc::EACCES);
+                }
+
+                if !state.pending.contains_key(&pending_id) {
+                    warn!("Pending access {pending_id} denied");
                     return Err(libc::EACCES);
                 }
 
@@ -817,6 +827,51 @@ mod tests {
         // Wrong hash → pending → no grant → timeout → EACCES
         let result = fs.do_read(ino, 42, Some("wrong_hash"), 0, 1024);
         assert_eq!(result, Err(libc::EACCES));
+    }
+
+    #[test]
+    fn pending_denied_returns_quickly() {
+        let state = std::sync::Arc::new(ServerState::new());
+        *state.pending_timeout.lock().unwrap() = Duration::from_secs(30);
+        state.add("s", b"SECRET".to_vec(), "good_hash");
+
+        let state_for_fs = state.clone();
+
+        // Thread: read with wrong hash → pending → blocks waiting for grant
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let fs = GatekeeperFs::new(state_for_fs, MockSystemIo::new());
+            let (ino, _) = fs.do_lookup(0, 0, ROOT_INO, "s").unwrap();
+            let result = fs.do_read(ino, 42, Some("wrong_hash"), 0, 1024);
+            let _ = tx.send(result);
+        });
+
+        // Wait for the pending to be created
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(state.pending.len(), 1, "pending should exist");
+
+        // Deny the pending
+        let pending_id = state.pending.iter().next().map(|p| p.id).unwrap();
+        assert!(state.deny_pending(pending_id), "deny should succeed");
+        assert!(state.pending.is_empty(), "pending should be removed after deny");
+
+        // The read should return quickly with EACCES after deny.
+        // BUG: the worker only checks is_pending_granted, not whether
+        // the pending still exists. After deny removes it, the worker
+        // sees is_pending_granted=false (same as "not yet granted")
+        // and keeps polling until the 30-second timeout.
+        match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(result) => {
+                assert_eq!(result, Err(libc::EACCES), "denied read should return EACCES");
+            }
+            Err(_) => {
+                panic!(
+                    "Read did not return within 5s after deny — \
+                     worker doesn't detect deny, keeps polling until {}s timeout",
+                    30
+                );
+            }
+        }
     }
 
     #[test]

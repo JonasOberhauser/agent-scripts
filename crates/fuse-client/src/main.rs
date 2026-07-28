@@ -505,6 +505,7 @@ fn interactive(app: &App) -> Result<(), String> {
                 } else { "Log".to_string() };
 
                 let lines: Vec<Line> = log_lines.iter().map(|s| Line::from(s.as_str())).collect();
+                f.render_widget(Clear, chunks[0]);
                 f.render_widget(
                     Paragraph::new(lines)
                         .scroll((scroll, 0))
