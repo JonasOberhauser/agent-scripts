@@ -891,7 +891,7 @@ dependencies = [
 [[package]]
 name = "servyi-servatui"
 version = "0.2.0"
-source = "git+https://github.com/servyi/servatui.git#461841714a9066865c7bb3df9247f4138df8f6bd"
+source = "git+https://github.com/servyi/servatui.git#db75f101b63f2f6546645e5df8a803d4ef9013ed"
 dependencies = [
  "base64",
  "crossterm",
