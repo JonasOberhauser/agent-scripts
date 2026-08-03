@@ -1,50 +1,57 @@
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use clap::Parser;
 use fuser::MountOption;
 use fuse_protocol::{RealSystemIo, SystemIo};
 use fuse_server::{GatekeeperFs, ServerState};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 #[derive(Parser)]
 #[command(name = "fuse-server", about = "FUSE gatekeeper filesystem + CRUD socket server")]
 struct Cli {
-    /// Directory to mount the FUSE filesystem.
     #[arg(short, long)]
     mount_point: PathBuf,
-
-    /// Path for the Unix domain socket.
     #[arg(short, long, default_value = "/tmp/fuse-gatekeeper.sock")]
     socket: PathBuf,
-
-    /// Initial secret: <name>:<file_path>:<sha256_of_allowed_binary>
-    /// Can be repeated for multiple secrets.
     #[arg(long, value_name = "NAME:FILE:HASH")]
     secret: Vec<String>,
-
-    /// Allow other users to access the mount.
     #[arg(long)]
     allow_other: bool,
-
-    /// Log level (e.g. "info", "debug", "warn").
-    /// Only used when RUST_LOG is not set, since spawn_independent + sudo
-    /// strips environment variables.
     #[arg(long, default_value = "info")]
     log_level: String,
-
-    /// Timeout in seconds for pending access requests (default: 300 = 5 min).
-    /// When a read is denied (hash mismatch or already accessed), the server
-    /// waits this long for manual approval via `fuse-client grant` before
-    /// rejecting.
     #[arg(long, default_value_t = 300)]
     pending_timeout: u64,
-
-    /// Path where the server writes its log (for discovery by fuse-client).
-    /// Defaults to /tmp/fuse-gatekeeper.log.
     #[arg(long, default_value = "/tmp/fuse-gatekeeper.log")]
     log_path: PathBuf,
+}
+
+/// Pre-computed CString for async-signal-safe unlink in the signal handler.
+static CLEANUP_SOCKET: OnceLock<std::ffi::CString> = OnceLock::new();
+
+/// Signal handler: removes the socket file and exits.
+/// Only uses async-signal-safe functions (unlink, _exit).
+extern "C" fn shutdown_handler(_sig: libc::c_int) {
+    if let Some(path) = CLEANUP_SOCKET.get() {
+        unsafe { libc::unlink(path.as_ptr()); }
+    }
+    // _exit is async-signal-safe; std::process::exit is NOT (runs atexit handlers).
+    unsafe { libc::_exit(130); } // 128 + SIGINT(2)
+}
+
+/// Try to unmount a stale FUSE mount at `mount_point`.
+/// Tries fusermount, fusermount3, then umount -l.
+fn unmount_if_mounted(mount_point: &Path) {
+    for (cmd, flag) in [("fusermount", "-uz"), ("fusermount3", "-uz"), ("umount", "-l")] {
+        match std::process::Command::new(cmd).arg(flag).arg(mount_point).output() {
+            Ok(output) if output.status.success() => {
+                info!("Unmounted stale mount at {} via {} {}", mount_point.display(), cmd, flag);
+                return;
+            }
+            _ => {}
+        }
+    }
 }
 
 fn main() {
@@ -65,13 +72,45 @@ fn main() {
     info!("  pending-timeout: {}s", cli.pending_timeout);
     info!("  log-path:        {}", cli.log_path.display());
 
-    // Store log path in state so fuse-client can discover it.
-    let log_path_str = cli.log_path.to_string_lossy().to_string();
+    // ── Startup cleanup: take over from stale instance ───────────
 
-    // Build initial state.
+    // 1. If socket exists and is connectable, another server is running.
+    if cli.socket.exists() {
+        if std::os::unix::net::UnixStream::connect(&cli.socket).is_ok() {
+            error!("Server already running at {}. Use 'fuse-client' or kill the existing process.", cli.socket.display());
+            std::process::exit(1);
+        }
+        // Socket exists but not connectable — stale, remove it.
+        warn!("Removing stale socket at {}", cli.socket.display());
+        let _ = std::fs::remove_file(&cli.socket);
+    }
+
+    // 2. Unmount any stale FUSE mount before we try to mount.
+    unmount_if_mounted(&cli.mount_point);
+
+    // 3. Ensure mount point directory exists.
+    if !cli.mount_point.exists() {
+        if let Err(e) = std::fs::create_dir_all(&cli.mount_point) {
+            error!("Failed to create mount point {}: {e}", cli.mount_point.display());
+            std::process::exit(1);
+        }
+    }
+
+    // ── Install shutdown handler ─────────────────────────────────
+    // On SIGINT/SIGTERM: unlink socket, then _exit.
+    // The kernel automatically releases the FUSE mount when the process dies.
+    if let Ok(socket_cstr) = std::ffi::CString::new(cli.socket.to_string_lossy().as_bytes()) {
+        CLEANUP_SOCKET.set(socket_cstr).ok();
+    }
+    unsafe {
+        libc::signal(libc::SIGINT, shutdown_handler as usize);
+        libc::signal(libc::SIGTERM, shutdown_handler as usize);
+    }
+
+    // ── Build state ──────────────────────────────────────────────
     let mut state = ServerState::new();
     state.pending_timeout = std::sync::Mutex::new(Duration::from_secs(cli.pending_timeout));
-    state.log_path = log_path_str;
+    state.log_path = cli.log_path.to_string_lossy().to_string();
     for spec in &cli.secret {
         match parse_secret(spec, &io) {
             Ok((name, content, hash)) => {
@@ -86,58 +125,33 @@ fn main() {
     }
     let state = Arc::new(state);
 
-    // Ensure mount point exists.
-    if !cli.mount_point.exists() {
-        if let Err(e) = std::fs::create_dir_all(&cli.mount_point) {
-            error!("Failed to create mount point {}: {e}", cli.mount_point.display());
-            std::process::exit(1);
-        }
-    }
-
-    // Start socket server in background.
+    // ── Start socket server ──────────────────────────────────────
     let socket_path = cli.socket.clone();
     let socket_state = Arc::clone(&state);
-
     std::thread::spawn(move || {
         if let Err(e) = fuse_server::run_socket_server(&socket_path, socket_state) {
             error!("Socket server error: {e}");
         }
     });
 
-    // Wait for socket to appear AND be connectable.  Checking only
-    // `.exists()` is not enough — a stale socket file from a previous
-    // run may linger even though the bind failed.
+    // Wait for socket to be connectable.
     let mut socket_ready = false;
     for _ in 0..200 {
         if cli.socket.exists() {
-            match std::os::unix::net::UnixStream::connect(&cli.socket) {
-                Ok(_) => {
-                    socket_ready = true;
-                    break;
-                }
-                Err(_) => {
-                    // File exists but nobody is listening — stale.
-                    error!(
-                        "Socket file exists at {} but is not connectable.\n\
-                         This is likely a stale socket from a previous run.\n\
-                         Remove it and retry:\n  rm -f {}  (or: sudo rm -f {})",
-                        cli.socket.display(),
-                        cli.socket.display(),
-                        cli.socket.display(),
-                    );
-                    std::process::exit(1);
-                }
+            if std::os::unix::net::UnixStream::connect(&cli.socket).is_ok() {
+                socket_ready = true;
+                break;
             }
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     if !socket_ready {
         error!("Socket server did not start in time");
-        std::process::exit(1);
+        cleanup_and_exit(&cli.socket, &cli.mount_point, 1);
     }
     info!("Socket ready at {}", cli.socket.display());
 
-    // Mount FUSE.
+    // ── Mount FUSE (blocks until unmounted or signal) ────────────
     let mut options = vec![MountOption::FSName("gatekeeper".into())];
     if cli.allow_other {
         options.push(MountOption::AllowOther);
@@ -150,9 +164,19 @@ fn main() {
         Ok(()) => info!("FUSE unmounted cleanly."),
         Err(e) => {
             error!("FUSE mount error: {e}");
-            std::process::exit(1);
+            cleanup_and_exit(&cli.socket, &cli.mount_point, 1);
         }
     }
+
+    // ── Normal shutdown cleanup ──────────────────────────────────
+    cleanup_and_exit(&cli.socket, &cli.mount_point, 0);
+}
+
+/// Remove socket and unmount. Called on normal exit or error.
+fn cleanup_and_exit(socket: &Path, mount_point: &Path, code: i32) {
+    let _ = std::fs::remove_file(socket);
+    unmount_if_mounted(mount_point);
+    std::process::exit(code);
 }
 
 fn parse_secret(spec: &str, io: &RealSystemIo) -> Result<(String, Vec<u8>, String), String> {
