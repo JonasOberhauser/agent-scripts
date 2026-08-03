@@ -138,9 +138,16 @@ fn main() {
     let mut socket_ready = false;
     for _ in 0..200 {
         if cli.socket.exists() {
-            if std::os::unix::net::UnixStream::connect(&cli.socket).is_ok() {
-                socket_ready = true;
-                break;
+            info!("Socket file exists, probing connectability...");
+            match std::os::unix::net::UnixStream::connect(&cli.socket) {
+                Ok(_) => {
+                    info!("Socket probe succeeded — this connect+drop will trigger server-side 'connection closed'");
+                    socket_ready = true;
+                    break;
+                }
+                Err(e) => {
+                    // Not ready yet
+                }
             }
         }
         std::thread::sleep(std::time::Duration::from_millis(10));

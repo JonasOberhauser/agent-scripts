@@ -68,6 +68,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "base64"
+version = "0.22.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
+
+[[package]]
 name = "bitflags"
 version = "2.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -885,8 +891,9 @@ dependencies = [
 [[package]]
 name = "servyi-servatui"
 version = "0.2.0"
-source = "git+https://github.com/servyi/servatui.git#07821d7ea384b4220f273db5742c595f134cf55f"
+source = "git+https://github.com/servyi/servatui.git#461841714a9066865c7bb3df9247f4138df8f6bd"
 dependencies = [
+ "base64",
  "crossterm",
  "ratatui",
  "serde",
