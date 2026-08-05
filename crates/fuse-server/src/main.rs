@@ -103,8 +103,8 @@ fn main() {
         CLEANUP_SOCKET.set(socket_cstr).ok();
     }
     unsafe {
-        libc::signal(libc::SIGINT, shutdown_handler as usize);
-        libc::signal(libc::SIGTERM, shutdown_handler as usize);
+        libc::signal(libc::SIGINT, shutdown_handler as *const () as usize);
+        libc::signal(libc::SIGTERM, shutdown_handler as *const () as usize);
     }
 
     // ── Build state ──────────────────────────────────────────────
@@ -145,7 +145,7 @@ fn main() {
                     socket_ready = true;
                     break;
                 }
-                Err(e) => {
+                Err(_) => {
                     // Not ready yet
                 }
             }

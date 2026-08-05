@@ -160,7 +160,11 @@ pub fn client_protocols() -> Vec<Protocol> {
             }),
 
         cmd_protocol("version", "Show server version",
-            |_| Ok(Command::GetVersion)),
+            |_| Ok(Command::GetVersion))
+            .offline(|_args, out| {
+                out.print_line(&format!("Client version: {} (server not running)", crate::VERSION));
+                Ok(())
+            }),
 
         cmd_protocol("logpath", "Show server log file path",
             |_| Ok(Command::GetLogPath)),

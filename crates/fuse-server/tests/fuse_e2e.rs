@@ -11,7 +11,7 @@
 //!
 //! On a system with `/dev/fuse`, all tests should run and pass.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use fuse_protocol::{RealSystemIo, SystemIo};
 use fuse_server::{GatekeeperFs, ServerState};
@@ -352,7 +352,7 @@ fn e2e_pending_does_not_block_other_reads() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
-    let hash = current_exe_hash();
+    let _hash = current_exe_hash();
     let state = make_state(&[
         // "blocked" has a wrong hash → read triggers pending
         ("blocked", b"BLOCKED_DATA", "wrong_hash"),

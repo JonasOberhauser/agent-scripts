@@ -153,8 +153,6 @@ fn read_state_file() -> Option<ServerStateFile> {
 }
 
 fn start_server_from_state(app: &App, state: &ServerStateFile, log_path: Option<&str>) {
-    use fuse_protocol::Response;
-
     let mut cmd_args: Vec<String> = vec![
         "--mount-point".into(), state.mount_point.clone(),
         "--socket".into(), state.socket.clone(),

@@ -4,7 +4,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use fuse_protocol::VERSION;
 use fuse_server::{run_socket_server, ServerState};
@@ -31,10 +31,8 @@ fn run_client(socket: &Path, args: &[&str]) -> (String, String, i32) {
 
 fn wait_for_server(socket: &Path) {
     for _ in 0..200 {
-        if socket.exists() {
-            if std::os::unix::net::UnixStream::connect(socket).is_ok() {
-                return;
-            }
+        if socket.exists() && std::os::unix::net::UnixStream::connect(socket).is_ok() {
+            return;
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }

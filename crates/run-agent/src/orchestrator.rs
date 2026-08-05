@@ -278,8 +278,8 @@ where
 
     if restart_container {
         info!("Restarting container {container_name}...");
-        run_with_wrapper(io, wrapper, container_bin, &["stop", &container_name]);
-        run_with_wrapper(io, wrapper, container_bin, &["rm", "-f", &container_name]);
+        let _ = run_with_wrapper(io, wrapper, container_bin, &["stop", &container_name]);
+        let _ = run_with_wrapper(io, wrapper, container_bin, &["rm", "-f", &container_name]);
     }
 
     let container_running = check_container_running(io, wrapper, container_bin, &container_name);

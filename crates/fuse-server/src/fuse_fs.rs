@@ -970,9 +970,10 @@ mod tests {
             "expected 2 pending accesses, found {pending_count}"
         );
 
-        // Grant the first one (by finding its pending ID)
-        let ids: Vec<u64> = state.pending.iter().map(|p| p.id).collect();
-        state.grant_pending(ids[0]);
+        // Grant A's pending entry. Match by pid: DashMap iteration order is
+        // shard-based, NOT insertion order, so the first id is not reliably A's.
+        let id_a = state.pending.iter().find(|p| p.pid == 100).expect("A pending exists").id;
+        state.grant_pending(id_a);
 
         // Wait for A to complete
         let result_a = handle_a.join().expect("A panicked");
@@ -982,8 +983,9 @@ mod tests {
         let remaining = state.pending.len();
         assert_eq!(remaining, 1, "B should still be pending after A granted");
 
-        // Now grant B
-        state.grant_pending(ids[1]);
+        // Now grant B (pid 200)
+        let id_b = state.pending.iter().find(|p| p.pid == 200).expect("B pending exists").id;
+        state.grant_pending(id_b);
         let result_b = handle_b.join().expect("B panicked");
         assert_eq!(result_b.unwrap(), b"SECRET");
     }

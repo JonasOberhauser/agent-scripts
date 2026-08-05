@@ -30,10 +30,8 @@ mod tests {
 
     fn wait_for_socket(path: &Path) {
         for _ in 0..100 {
-            if path.exists() {
-                if std::os::unix::net::UnixStream::connect(path).is_ok() {
-                    return;
-                }
+            if path.exists() && std::os::unix::net::UnixStream::connect(path).is_ok() {
+                return;
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
