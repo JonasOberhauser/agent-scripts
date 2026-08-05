@@ -351,7 +351,7 @@ checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
 
 [[package]]
 name = "fuse-client"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "clap",
  "crossterm",
@@ -370,7 +370,7 @@ dependencies = [
 
 [[package]]
 name = "fuse-protocol"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "libc",
  "serde",
@@ -382,7 +382,7 @@ dependencies = [
 
 [[package]]
 name = "fuse-server"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "clap",
  "dashmap",
@@ -765,7 +765,7 @@ checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
 
 [[package]]
 name = "run-agent"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "clap",
  "fuse-protocol",
@@ -890,8 +890,8 @@ dependencies = [
 
 [[package]]
 name = "servyi-servatui"
-version = "0.3.1"
-source = "git+https://github.com/servyi/servatui.git#a3461c8100438f9bbe77ca73b43be06ac3ac41f5"
+version = "0.3.2"
+source = "git+https://github.com/servyi/servatui.git#738ff72b2aca405a24680f8bccd5c9be4757460f"
 dependencies = [
  "base64",
  "crossterm",
