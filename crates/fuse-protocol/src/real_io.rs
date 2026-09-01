@@ -221,6 +221,7 @@ pub struct MockSystemIo {
     pub command_results: HashMap<String, Option<i32>>,
     pub interactive_exit: i32,
     pub interactive_calls: std::cell::RefCell<Vec<(String, Vec<String>)>>,
+    pub command_calls: std::cell::RefCell<Vec<(String, Vec<String>)>>,
     pub spawned: Vec<(String, Vec<String>)>,
     pub spawn_error_msg: Option<String>,
     pub busy_paths: std::cell::RefCell<std::collections::HashSet<String>>,
@@ -347,6 +348,10 @@ impl SystemIo for MockSystemIo {
     }
 
     fn run_command(&self, program: &str, args: &[&str]) -> Result<CommandOutput, IoError> {
+        self.command_calls.borrow_mut().push((
+            program.to_string(),
+            args.iter().map(|s| s.to_string()).collect(),
+        ));
         let status = if let Some(s) = self.command_results.get(program) {
             *s
         } else {

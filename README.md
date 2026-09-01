@@ -79,7 +79,11 @@ sha256sum $(which goose)
    from the current directory; it stays alive between sessions)
 3. `exec` into it: a setup script symlinks the secrets, then runs your command
    — with no extra arguments you get an **interactive bash shell**
-4. On exit, **auto-reset** the one-read counter via `fuse-client`
+4. **Pre-flight every secret** before the exec: the source file must exist and
+   the FUSE mount must answer a `stat` within 3s. A stale/dead mount (the
+   state that makes the box hang on first read) aborts with instructions
+   (`fusermount3 -u <mount>`) instead of wedging the session.
+5. On exit, **auto-reset** the one-read counter via `fuse-client`
 
 Use `'*'` as the checksum to skip binary verification (simplest for manual
 logins; real hashes need `--pidns-host` so the server can read `/proc/<pid>/exe`).

@@ -259,6 +259,26 @@ where
     // Write state file so fuse-client can restart the server if needed.
     write_state_file(config, &loaded, io);
 
+    // ── 4.5 Pre-flight: every hosted secret must be reachable ───
+    // A stale or dead FUSE mount would hang the box on first read with no
+    // diagnostic; fail fast with an actionable message instead.
+    let results = crate::preflight::run(
+        io,
+        &loaded,
+        &config.mount_point,
+        crate::preflight::DEFAULT_TIMEOUT_SECS,
+    );
+    for r in &results {
+        if r.ok {
+            info!("{r}");
+        } else {
+            warn!("{r}");
+        }
+    }
+    if let Some(err) = crate::preflight::failure_summary(&results) {
+        return Err(err);
+    }
+
     // ── 5. Detect container runtime ──────────────────────────────
     let wrapper = config.runtime_wrapper.as_deref();
     let container_bin = match config.runtime.resolve(io, wrapper) {
@@ -347,10 +367,10 @@ where
 }
 
 /// A secret loaded into the FUSE server, ready to be symlinked.
-struct LoadedSecret {
-    fuse_name: String,
-    container: PathBuf,
-    host_path: PathBuf,
+pub(crate) struct LoadedSecret {
+    pub(crate) fuse_name: String,
+    pub(crate) container: PathBuf,
+    pub(crate) host_path: PathBuf,
 }
 
 /// Recursively load a secret file or directory into the FUSE server.
@@ -947,6 +967,29 @@ mod tests {
         let cfg = test_config();
         let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()), false);
         assert!(result.is_err());
+    }
+
+    // ── pre-flight (stale mount aborts before container start) ────
+
+    #[test]
+    fn run_agent_aborts_on_stale_mount_without_starting_container() {
+        // `timeout` exit 124 = the FUSE mount never answered the probe,
+        // i.e. exactly the state that hangs the box on first read.
+        let mut mock = base_mock()
+            .with_file("/home/user/secrets.yaml", b"DATA")
+            .with_command_result("timeout", Some(124));
+
+        let cfg = test_config();
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()), false);
+        let err = result.expect_err("must abort on stale mount");
+        assert!(err.contains("pre-flight"), "got: {err}");
+        assert!(err.to_lowercase().contains("hang"), "got: {err}");
+        // The container must NOT have been created or exec'd into.
+        assert!(
+            mock.interactive_calls.borrow().is_empty(),
+            "no container interaction may happen after pre-flight failure: {:?}",
+            mock.interactive_calls.borrow()
+        );
     }
 
     // ── fresh start (no stale state) ─────────────────────────────
