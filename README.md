@@ -66,19 +66,29 @@ cargo test
 sha256sum $(which goose)
 # e.g. 9f86d081884c7d65...
 
-# 2. Run
+# 2. Run (secret is passed as HOST:CONTAINER)
 ./target/release/run-agent \
     9f86d081884c7d65... \
-    production.yaml \
-    goose
+    goose \
+    --secret ~/prod-config.yaml:/root/.config/goose/production.yaml
 ```
 
 `run-agent` will:
-1. Spawn `fuse-server` (mounting the secret, gated by the hash)
-2. Symlink the config file into the container's config dir
-3. Launch the container (docker or podman, detected automatically)
-4. On container exit, **auto-reset** the counter via `fuse-client`
-5. Clean up the symlink
+1. Spawn (or reuse) the shared `fuse-server`, loading the secret gated by the hash
+2. Ensure a **persistent container** exists (named `agentbox-<hash>`, derived
+   from the current directory; it stays alive between sessions)
+3. `exec` into it: a setup script symlinks the secrets, then runs your command
+   — with no extra arguments you get an **interactive bash shell**
+4. On exit, **auto-reset** the one-read counter via `fuse-client`
+
+Use `'*'` as the checksum to skip binary verification (simplest for manual
+logins; real hashes need `--pidns-host` so the server can read `/proc/<pid>/exe`).
+
+Lifecycle:
+```bash
+run-agent ... --restart-container   # recreate the box fresh
+run-agent --stop                    # stop and remove it
+```
 
 ### Option B — Manual step-by-step
 
@@ -151,18 +161,34 @@ SHA-256 and serves the content exactly **once**.
 ## run-agent options
 
 ```
-run-agent [OPTIONS] <BINARY_CHECKSUM> <HOST_CONFIG_FILE> <AGENT_SUBFOLDER> [CONTAINER_ARGS]...
+run-agent [OPTIONS] <BINARY_CHECKSUM> <AGENT_SUBFOLDER> [CONTAINER_ARGS]...
 
 Arguments:
-  <BINARY_CHECKSUM>    SHA-256 of the allowed agent binary
-  <HOST_CONFIG_FILE>   Host path to the secret config file
+  <BINARY_CHECKSUM>    SHA-256 of the allowed agent binary, or '*' to skip
+                       binary verification
   <AGENT_SUBFOLDER>    Guest subfolder under ~/.config/ (e.g. `goose`)
+  [CONTAINER_ARGS]...  Command to run in the container; none = interactive bash
 
 Options:
-      --fuse-server <PATH>   Path to fuse-server binary [default: fuse-server]
-      --image <NAME>         Container image name [default: agentbox]
-      --memory <LIMIT>       Container memory limit [default: 224G]
-      --cpus <N>             Container CPU limit [default: 90]
+      --secret <HOST:CONTAINER>     Secret to serve through FUSE (repeatable).
+                                    Directories are mapped recursively.
+      --fuse-server <PATH>          Path to fuse-server binary [default: fuse-server,
+                                    resolved next to run-agent first]
+      --socket <PATH>               Unix socket [default: /tmp/fuse-gatekeeper.sock]
+                                    [env: FUSE_GATEKEEPER_SOCKET]
+      --mount-point <PATH>          FUSE mount point [default: /tmp/fuse-gatekeeper-mnt]
+      --sudo                        Run fuse-server under sudo (implies --allow-other)
+      --allow-other                 Let other UIDs read the mount (rootful runtimes)
+      --pidns-host                  Share the host PID namespace (needed for real
+                                    binary-hash verification)
+      --runtime <RUNTIME>           Container runtime: auto, docker or podman [default: auto]
+      --runtime-wrapper <CMD>       Wrap the runtime call (e.g. "flatpak-spawn --host")
+      --image <NAME>                Container image name [default: agentbox]
+      --memory <LIMIT>              Container memory limit [default: 224G]
+      --cpus <N>                    Container CPU limit [default: 90]
+      --log-level <LEVEL>           fuse-server log level [default: info]
+      --stop                        Stop and remove the persistent container, then exit
+      --restart-container           Recreate the persistent container from scratch
 ```
 
 ## Project layout
