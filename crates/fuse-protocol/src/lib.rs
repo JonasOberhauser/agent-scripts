@@ -31,4 +31,7 @@ pub use error::IoError;
 pub use io::{CommandOutput, IoProvider, SystemIo, Transport};
 pub use protocol::{Command, MountEntry, PendingAccessInfo, Response, SecretStatus, ServerStateFile, StateSecretEntry};
 pub use real_io::{MockSystemIo, RealSystemIo};
-pub use servatui_protocols::{client_protocols, print_response};
+pub use servatui_protocols::{
+    client_protocols, client_protocols_with_pending, poll_pending_once, print_response,
+    PendingIds,
+};

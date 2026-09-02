@@ -62,7 +62,25 @@ fn main() {
             }
         }
         None => {
-            if let Err(e) = app.run_tui() {
+            // Interactive mode: poll the server for pending access requests
+            // in the background so grant/deny can complete active IDs.
+            // On poll failure the last known list is kept.
+            let pending: fuse_protocol::PendingIds =
+                std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            {
+                let pending = pending.clone();
+                let socket = cli.socket.clone();
+                std::thread::spawn(move || loop {
+                    if let Ok(ids) = fuse_protocol::poll_pending_once(&socket) {
+                        *pending.lock().unwrap() = ids;
+                    }
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                });
+            }
+            let tui_app = App::builder(&cli.socket)
+                .protocol_all(fuse_protocol::client_protocols_with_pending(pending))
+                .build();
+            if let Err(e) = tui_app.run_tui() {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
             }

@@ -87,7 +87,18 @@ fn cmd_protocol(
         .finalize(|| Ok(ShellAction::Continue))
 }
 
+/// Shared, polled snapshot of the currently active (pending) request IDs.
+/// A background poller in the client replaces the whole list on every
+/// successful poll; completers read it without a server round-trip.
+pub type PendingIds = std::sync::Arc<std::sync::Mutex<Vec<u64>>>;
+
 pub fn client_protocols() -> Vec<Protocol> {
+    client_protocols_with_pending(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())))
+}
+
+/// Like [`client_protocols`], but `grant`/`deny` complete the request ID
+/// from `pending` (see [`PendingIds`]).
+pub fn client_protocols_with_pending(pending: PendingIds) -> Vec<Protocol> {
     vec![
         cmd_protocol("status", "Show all secrets and access counts",
             |_| Ok(Command::Status)),
@@ -152,6 +163,13 @@ pub fn client_protocols() -> Vec<Protocol> {
                     Ok(id) => Ok(Command::Grant { id }),
                     Err(_) => Err("Usage: grant ID (ID must be a number)".into()),
                 }
+            })
+            .complete({
+                let ids = pending.clone();
+                move |s| {
+                    let snapshot = ids.lock().unwrap().clone();
+                    pending_completions(&snapshot, s)
+                }
             }),
 
         cmd_protocol("deny", "Deny a pending access request",
@@ -159,6 +177,13 @@ pub fn client_protocols() -> Vec<Protocol> {
                 match args.trim().parse::<u64>() {
                     Ok(id) => Ok(Command::Deny { id }),
                     Err(_) => Err("Usage: deny ID (ID must be a number)".into()),
+                }
+            })
+            .complete({
+                let ids = pending.clone();
+                move |s| {
+                    let snapshot = ids.lock().unwrap().clone();
+                    pending_completions(&snapshot, s)
                 }
             }),
 
@@ -211,6 +236,47 @@ pub(crate) fn complete_first_secret(
         .filter(|n| n.starts_with(arg))
         .map(|n| format!("{cmd} {n}"))
         .collect()
+}
+
+/// Complete the numeric request-ID argument of `grant`/`deny` from the
+/// polled snapshot of active requests.
+pub(crate) fn pending_completions(ids: &[u64], confirmed: &str) -> Vec<String> {
+    let mut tokens = confirmed.split_whitespace();
+    let Some(cmd) = tokens.next() else {
+        return Vec::new();
+    };
+    if !confirmed.contains(' ') {
+        return Vec::new();
+    }
+    let arg = tokens.next().unwrap_or("");
+    if tokens.next().is_some() {
+        return Vec::new(); // grant/deny take exactly one argument
+    }
+    ids.iter()
+        .map(|id| id.to_string())
+        .filter(|id| id.starts_with(arg))
+        .map(|id| format!("{cmd} {id}"))
+        .collect()
+}
+
+/// Extract the pending request IDs from a `ListPending` response.
+pub(crate) fn pending_ids(resp: &crate::Response) -> Vec<u64> {
+    match resp {
+        crate::Response::PendingList { pending } => pending.iter().map(|p| p.id).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// One poll cycle: ask the running server for its pending access requests.
+/// The caller keeps the previous snapshot when this errors (server down,
+/// stale socket, ...). Connect failures already carry actionable messages
+/// from the transport layer.
+pub fn poll_pending_once(socket: &std::path::Path) -> Result<Vec<u64>, String> {
+    use servyi_servatui::TypedConnection;
+    let mut conn = servyi_servatui::SocketConnection::connect(socket)?;
+    conn.send_typed(&Command::ListPending)?;
+    let resp: crate::Response = conn.recv_typed()?;
+    Ok(pending_ids(&resp))
 }
 
 #[cfg(test)]
@@ -309,5 +375,105 @@ mod tests {
             assert!(p.completer().is_none(), "{name} needs no completer");
         }
     }
+
+    // ── pending-request ID completion (grant / deny) ─────────────
+
+    #[test]
+    fn pending_completions_filter_ids() {
+        let ids = [4u64, 42, 7];
+        assert_eq!(
+            pending_completions(&ids, "grant 4"),
+            vec!["grant 4".to_string(), "grant 42".to_string()]
+        );
+        assert_eq!(pending_completions(&ids, "deny 7"), vec!["deny 7".to_string()]);
+        // Empty prefix right after the space: all IDs.
+        assert_eq!(pending_completions(&ids, "grant ").len(), 3);
+        // No space yet / second token: nothing.
+        assert!(pending_completions(&ids, "grant").is_empty());
+        assert!(pending_completions(&ids, "grant 4 x").is_empty());
+    }
+
+    #[test]
+    fn pending_ids_extracted_from_response() {
+        let resp = crate::Response::PendingList {
+            pending: vec![
+                crate::PendingAccessInfo {
+                    id: 11,
+                    secret_name: "s".into(),
+                    pid: 1,
+                    pid_hash: None,
+                    reason: "r".into(),
+                    expires_at: 0,
+                },
+                crate::PendingAccessInfo {
+                    id: 22,
+                    secret_name: "s".into(),
+                    pid: 2,
+                    pid_hash: None,
+                    reason: "r".into(),
+                    expires_at: 0,
+                },
+            ],
+        };
+        assert_eq!(pending_ids(&resp), vec![11, 22]);
+    }
+
+    #[test]
+    fn grant_deny_complete_from_live_snapshot() {
+        let shared: PendingIds = std::sync::Arc::new(std::sync::Mutex::new(vec![5u64, 51]));
+        let protocols = client_protocols_with_pending(shared.clone());
+        for name in ["grant", "deny"] {
+            // Fresh snapshot per command: the loop's last step mutates it.
+            *shared.lock().unwrap() = vec![5u64, 51];
+            let p = protocols.iter().find(|p| p.name == name).unwrap();
+            let completer = p.completer().expect("completer registered");
+            assert_eq!(completer("grant 5"), vec!["grant 5".to_string(), "grant 51".to_string()]);
+
+            // The poller updates the snapshot — the completer sees new IDs.
+            *shared.lock().unwrap() = vec![9u64];
+            assert_eq!(completer("deny 9"), vec!["deny 9".to_string()]);
+            assert!(completer("deny 5").is_empty(), "stale ID must be gone");
+        }
+    }
+
+    #[test]
+    fn poll_pending_once_round_trips_over_real_socket() {
+        use std::io::{BufRead, BufReader, Write};
+        let dir = std::env::temp_dir().join(format!("fuse-poll-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("poll.sock");
+        let _ = std::fs::remove_file(&path);
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            assert!(line.contains("list_pending"), "must ask for pending, got: {line}");
+            let mut w = stream;
+            let resp = crate::Response::PendingList {
+                pending: vec![crate::PendingAccessInfo {
+                    id: 77,
+                    secret_name: "s".into(),
+                    pid: 1,
+                    pid_hash: None,
+                    reason: "r".into(),
+                    expires_at: 0,
+                }],
+            };
+            writeln!(w, "{}", serde_json::to_string(&resp).unwrap()).unwrap();
+        });
+
+        let ids = poll_pending_once(&path).expect("poll must succeed");
+        assert_eq!(ids, vec![77]);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn poll_pending_once_missing_socket_errors() {
+        assert!(poll_pending_once(std::path::Path::new("/no-such-fuse.sock")).is_err());
+    }
 }
+
 
