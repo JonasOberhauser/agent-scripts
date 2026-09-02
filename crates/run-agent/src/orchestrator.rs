@@ -58,13 +58,35 @@ where
     // ── 2. Probe for existing server ─────────────────────────────
     let socket = &config.socket_path;
     let mut server_was_spawned = false;
+    let mut spawned_server_pid = 0u32;
+    let mut server_healthy = false;
 
     if io.try_unix_connect(socket) {
-        info!("Reusing existing fuse-server at {}", socket.display());
-    } else {
+        // A successful connect() is not proof of life: a crashed or wedged
+        // server leaves the socket behind and the kernel still accepts on
+        // the backlog — later adds then die with 'Broken pipe'.  Do a real
+        // read-only round-trip before trusting the server.
+        match send("status", "") {
+            Ok(()) => {
+                info!("Reusing existing fuse-server at {}", socket.display());
+                server_healthy = true;
+            }
+            Err(e) => {
+                warn!(
+                    "fuse-server at {} accepted a connection but failed the health check ({e}) \
+                     — it is stale or wedged; respawning a fresh server",
+                    socket.display()
+                );
+            }
+        }
+    }
+
+    if !server_healthy {
         // ── 3. Spawn independent server ───────────────────────────
         server_was_spawned = true;
-        info!("No fuse-server found — spawning a new one.");
+        if !io.try_unix_connect(socket) {
+            info!("No fuse-server found — spawning a new one.");
+        }
 
         // Clean up stale socket file (e.g., root-owned from a previous
         // --sudo run, or leftover from a crashed server).
@@ -215,6 +237,7 @@ where
         let pid = io
             .spawn_independent(&spawn_prog, &spawn_args, Some(std::path::Path::new(log_str)))
             .map_err(|e| format!("spawn fuse-server: {e}"))?;
+        spawned_server_pid = pid;
         info!(
             "fuse-server spawned as independent daemon (pid {pid}, wrapper={}, sudo={}).",
             config.runtime_wrapper.is_some(),
@@ -257,7 +280,7 @@ where
     }
 
     // Write state file so fuse-client can restart the server if needed.
-    write_state_file(config, &loaded, io);
+    write_state_file(config, &loaded, io, spawned_server_pid);
 
     // ── 4.5 Pre-flight: every hosted secret must be reachable ───
     // A stale or dead FUSE mount would hang the box on first read with no
@@ -499,10 +522,15 @@ fn check_container_running<S: SystemIo>(
 
 /// Write a state file so `fuse-client` can restart the server with the same
 /// secrets when a version mismatch is detected.
-fn write_state_file<S: SystemIo>(config: &AgentConfig, loaded: &[LoadedSecret], io: &mut S) {
+fn write_state_file<S: SystemIo>(
+    config: &AgentConfig,
+    loaded: &[LoadedSecret],
+    io: &mut S,
+    server_pid: u32,
+) {
     let state = fuse_protocol::ServerStateFile {
         version: fuse_protocol::VERSION.to_string(),
-        server_pid: std::process::id(),
+        server_pid,
         server_binary: config.fuse_server_path.to_string_lossy().to_string(),
         mount_point: config.mount_point.to_string_lossy().to_string(),
         socket: config.socket_path.to_string_lossy().to_string(),
@@ -989,6 +1017,49 @@ mod tests {
             mock.interactive_calls.borrow().is_empty(),
             "no container interaction may happen after pre-flight failure: {:?}",
             mock.interactive_calls.borrow()
+        );
+    }
+
+    // ── reuse vs. respawn (zombie server detection) ──────────────
+
+    #[test]
+    fn unhealthy_reused_server_is_respawned() {
+        // The socket accepts connections (kernel backlog) but the server
+        // behind it is a zombie: the health round-trip fails and adds die
+        // with 'Broken pipe'.  run-agent must respawn a fresh server.
+        let mut mock = base_mock().with_file("/home/user/secrets.yaml", b"DATA");
+        mock.unix_connected = true;
+
+        let probed = std::cell::Cell::new(false);
+        let send = |name: &str, _args: &str| -> Result<(), String> {
+            if name == "status" && !probed.get() {
+                probed.set(true);
+                return Err("server closed the connection".into());
+            }
+            Ok(())
+        };
+
+        let cfg = test_config();
+        let result = run_agent(&mut mock, &cfg, &send, false);
+        assert!(result.is_ok(), "got: {:?}", result.err());
+        assert!(probed.get(), "a health probe must have been attempted");
+        assert!(
+            !mock.spawned.is_empty(),
+            "the zombie server must be replaced by a fresh spawn"
+        );
+    }
+
+    #[test]
+    fn healthy_reused_server_is_not_respawned() {
+        let mut mock = base_mock().with_file("/home/user/secrets.yaml", b"DATA");
+        mock.unix_connected = true;
+
+        let cfg = test_config();
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()), false);
+        assert!(result.is_ok());
+        assert!(
+            mock.spawned.is_empty(),
+            "a healthy server must be reused, not respawned"
         );
     }
 
