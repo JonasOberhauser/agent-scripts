@@ -325,28 +325,60 @@ where
         let _ = run_with_wrapper(io, wrapper, container_bin, &["rm", "-f", &container_name]);
     }
 
-    let container_running = check_container_running(io, wrapper, container_bin, &container_name);
-    if !container_running {
-        info!("Creating persistent container {container_name}...");
-        let create_args = build_create_args(config);
-        let create_refs: Vec<&str> = create_args.iter().map(|s| s.as_str()).collect();
-        match run_with_wrapper(io, wrapper, container_bin, &create_refs) {
-            Ok(o) if o.success() => {
-                info!("Container created.");
-            }
-            Ok(o) => {
-                return Err(format!(
-                    "Failed to create container: exit {}\nstdout: {}\nstderr: {}",
-                    o.status.unwrap_or(-1), o.stdout, o.stderr
-                ));
-            }
-            Err(e) => {
-                return Err(format!("Failed to create container: {e}"));
+    match check_container_running(io, wrapper, container_bin, &container_name) {
+        Some(true) => {
+            info!("Reusing running container {container_name}.");
+        }
+        Some(false) => {
+            // The container exists but is stopped.  `start` (never recreate)
+            // re-applies the `-v` binds against the CURRENT host mounts —
+            // which also heals a /fuse bind that went stale across a
+            // host-side FUSE remount — and preserves all container data.
+            info!(
+                "Container {container_name} exists but is stopped — starting it \
+                 (bind mounts are re-applied, data preserved)..."
+            );
+            match run_with_wrapper(io, wrapper, container_bin, &["start", &container_name]) {
+                Ok(o) if o.success() => {
+                    info!("Container started.");
+                }
+                Ok(o) => {
+                    return Err(format!(
+                        "Failed to start container {}: exit {}\nstdout: {}\nstderr: {}",
+                        container_name,
+                        o.status.unwrap_or(-1),
+                        o.stdout,
+                        o.stderr
+                    ));
+                }
+                Err(e) => {
+                    return Err(format!("Failed to start container {container_name}: {e}"));
+                }
             }
         }
-    } else {
-        info!("Reusing running container {container_name}.");
+        None => {
+            info!("Creating persistent container {container_name}...");
+            let create_args = build_create_args(config);
+            let create_refs: Vec<&str> = create_args.iter().map(|s| s.as_str()).collect();
+            match run_with_wrapper(io, wrapper, container_bin, &create_refs) {
+                Ok(o) if o.success() => {
+                    info!("Container created.");
+                }
+                Ok(o) => {
+                    return Err(format!(
+                        "Failed to create container: exit {}\nstdout: {}\nstderr: {}",
+                        o.status.unwrap_or(-1), o.stdout, o.stderr
+                    ));
+                }
+                Err(e) => {
+                    return Err(format!("Failed to create container: {e}"));
+                }
+            }
+        }
     }
+
+    // ── 6.5 Container-side FUSE pre-flight (heal stale /fuse binds) ──
+    verify_container_fuse(io, wrapper, container_bin, &container_name, &loaded)?;
 
     // ── 7. Exec into container (setup script creates symlinks) ───
     let setup_script = build_setup_script(&loaded);
@@ -508,16 +540,106 @@ fn run_with_wrapper<S: SystemIo>(
 }
 
 /// Check whether a named container is currently running.
+/// Inspect a container's running state.
+/// `Some(is_running)` when the container exists; `None` when it does not.
 fn check_container_running<S: SystemIo>(
     io: &S,
     wrapper: Option<&str>,
     runtime: &str,
     name: &str,
-) -> bool {
+) -> Option<bool> {
     match run_with_wrapper(io, wrapper, runtime, &["inspect", "-f", "{{.State.Running}}", name]) {
-        Ok(o) if o.success() => o.stdout.trim() == "true",
-        _ => false,
+        Ok(o) if o.success() => Some(o.stdout.trim() == "true"),
+        _ => None,
     }
+}
+
+/// Verify every secret is reachable INSIDE the container at `/fuse/<name>`.
+///
+/// A persistent container created before a host-side FUSE remount keeps its
+/// bind to the dead mount — reads then fail with "Transport endpoint is not
+/// connected" (or hang) with no hint what's wrong.  The probe runs
+/// `timeout stat` via `exec` so a wedged mount cannot block the host either.
+/// On failure the container is stopped and **started** (never removed —
+/// user data is preserved): `start` re-applies the `-v` binds against the
+/// current host mount, healing the stale bind.  Aborts with guidance if the
+/// re-probe still fails.
+fn verify_container_fuse<S: SystemIo>(
+    io: &S,
+    wrapper: Option<&str>,
+    container_bin: &str,
+    container_name: &str,
+    loaded: &[LoadedSecret],
+) -> Result<(), String> {
+    if loaded.is_empty() {
+        return Ok(());
+    }
+    let secs = crate::preflight::DEFAULT_TIMEOUT_SECS.to_string();
+    let probe_failed = |io: &S| -> Vec<String> {
+        loaded
+            .iter()
+            .filter(|s| {
+                let path = format!("/fuse/{}", s.fuse_name);
+                run_with_wrapper(
+                    io,
+                    wrapper,
+                    container_bin,
+                    &["exec", container_name, "timeout", &secs, "stat", "-c", "%s", &path],
+                )
+                .map(|o| !o.success())
+                .unwrap_or(true)
+            })
+            .map(|s| s.fuse_name.clone())
+            .collect()
+    };
+
+    let failed = probe_failed(io);
+    if failed.is_empty() {
+        info!("Container {container_name}: /fuse answers for all secrets.");
+        return Ok(());
+    }
+    for name in &failed {
+        warn!(
+            "stale bind inside {container_name}: stat /fuse/{name} failed — \
+             healing via stop/start (binds are re-applied, data is preserved)"
+        );
+    }
+    let _ = run_with_wrapper(io, wrapper, container_bin, &["stop", container_name]);
+    match run_with_wrapper(io, wrapper, container_bin, &["start", container_name]) {
+        Ok(o) if o.success() => {}
+        Ok(o) => {
+            return Err(format!(
+                "failed to restart container {container_name} after stale /fuse: exit {}\n\
+                 stdout: {}\nstderr: {}",
+                o.status.unwrap_or(-1),
+                o.stdout,
+                o.stderr
+            ))
+        }
+        Err(e) => {
+            return Err(format!(
+                "failed to restart container {container_name} after stale /fuse: {e}"
+            ))
+        }
+    }
+
+    let still = probe_failed(io);
+    if still.is_empty() {
+        info!("Healed: /fuse re-bound and answering inside {container_name}.");
+        return Ok(());
+    }
+    let paths: Vec<String> = still.iter().map(|n| format!("/fuse/{n}")).collect();
+    Err(format!(
+        "the container's /fuse bind is stale and a stop/start did not heal it \
+         (failing: {}).\n\
+         The host-side mount is healthy (see the earlier pre-flight), but this \
+         container was created against an older mount.\n\
+         Options:\n  \
+         - inspect the mounts manually: {container_bin} exec {container_name} ls -l /fuse\n  \
+         - recreate the box with --restart-container (WARNING: discards changes \
+           made inside the container)",
+        paths.join(", "),
+    ))
 }
 
 /// Write a state file so `fuse-client` can restart the server with the same
@@ -1060,6 +1182,131 @@ mod tests {
         assert!(
             mock.spawned.is_empty(),
             "a healthy server must be reused, not respawned"
+        );
+    }
+
+    // ── container lifecycle + container-side FUSE pre-flight ─────
+
+    #[test]
+    fn stopped_container_is_started_not_recreated() {
+        // inspect succeeds (container exists) but Running != true.
+        let mut mock = base_mock().with_file("/home/user/secrets.yaml", b"DATA");
+        let cfg = test_config();
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()), false);
+        assert!(result.is_ok(), "got: {:?}", result.err());
+        let calls = mock.command_calls.borrow();
+        assert!(
+            calls
+                .iter()
+                .any(|(_, a)| a.first().map(|s| s.as_str()) == Some("start")),
+            "a stopped container must be started (re-applies binds): {calls:?}"
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|(_, a)| a.first().map(|s| s.as_str()) == Some("run")),
+            "an existing container must NOT be recreated (would fail anyway): {calls:?}"
+        );
+    }
+
+    #[test]
+    fn missing_container_is_created() {
+        // inspect fails → the container does not exist → create it.
+        let mut mock = base_mock()
+            .with_file("/home/user/secrets.yaml", b"DATA")
+            .with_command_result_when("podman", "inspect", Some(1));
+        let cfg = test_config();
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()), false);
+        assert!(result.is_ok(), "got: {:?}", result.err());
+        let calls = mock.command_calls.borrow();
+        assert!(
+            calls
+                .iter()
+                .any(|(_, a)| a.first().map(|s| s.as_str()) == Some("run")),
+            "a missing container must be created: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn stale_container_fuse_is_healed_by_restart() {
+        // Running container, but /fuse inside is the stale bind from before
+        // a host remount: the first exec probe fails; stop/start re-applies
+        // the bind and the re-probe succeeds.
+        let mut mock = base_mock().with_file("/home/user/secrets.yaml", b"DATA");
+        mock.command_stdout = "true".into(); // inspect → Running = true
+        mock.unix_connected = true;
+        mock = mock.with_command_result_when_n("podman", "exec", Some(1), 1);
+
+        let cfg = test_config();
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()), false);
+        assert!(
+            result.is_ok(),
+            "stop/start heal must recover the session: {:?}",
+            result.err()
+        );
+        let calls = mock.command_calls.borrow();
+        assert!(
+            calls
+                .iter()
+                .any(|(_, a)| a.first().map(|s| s.as_str()) == Some("stop")),
+            "heal must stop the container: {calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|(_, a)| a.first().map(|s| s.as_str()) == Some("start")),
+            "heal must start the container: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|(_, a)| a.iter().any(|x| x == "rm")),
+            "heal must NEVER remove the container (user data!): {calls:?}"
+        );
+    }
+
+    #[test]
+    fn unhealable_container_fuse_aborts_with_guidance() {
+        let mut mock = base_mock().with_file("/home/user/secrets.yaml", b"DATA");
+        mock.command_stdout = "true".into();
+        mock.unix_connected = true;
+        mock = mock.with_command_result_when("podman", "exec", Some(1)); // always fails
+
+        let cfg = test_config();
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()), false);
+        let err = result.expect_err("must abort when /fuse cannot be healed");
+        assert!(
+            err.contains("restart-container"),
+            "must mention --restart-container as the last resort: {err}"
+        );
+        assert!(
+            !mock.command_calls
+                .borrow()
+                .iter()
+                .any(|(_, a)| a.iter().any(|x| x == "rm")),
+            "must never rm the container on its own"
+        );
+    }
+
+    #[test]
+    fn container_probe_goes_through_exec_with_timeout() {
+        // AGENTS.md argv discipline: the probe must run `timeout stat`
+        // INSIDE the container so a wedged mount cannot block the host.
+        let mut mock = base_mock().with_file("/home/user/secrets.yaml", b"DATA");
+        mock.command_stdout = "true".into();
+        let cfg = test_config();
+        let _ = run_agent(&mut mock, &cfg, &|_, _| Ok(()), false);
+        let calls = mock.command_calls.borrow();
+        let probe = calls
+            .iter()
+            .find(|(_, a)| a.first().map(|s| s.as_str()) == Some("exec"))
+            .expect("an exec probe must happen before the session");
+        assert!(
+            probe.1.contains(&"timeout".to_string())
+                && probe.1.contains(&"stat".to_string()),
+            "probe must be `timeout stat`: {probe:?}"
+        );
+        assert!(
+            probe.1.iter().any(|a| a.contains("/fuse/p")),
+            "probe must stat the fuse-side secret path: {probe:?}"
         );
     }
 

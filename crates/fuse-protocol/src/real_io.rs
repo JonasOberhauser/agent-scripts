@@ -210,6 +210,25 @@ impl SystemIo for RealSystemIo {
 ///   succeeding while other commands fail).
 /// - **Interactive call tracking**: `interactive_calls` records every
 ///   `run_interactive` invocation so tests can assert on argv.
+/// - **Command call tracking**: `command_calls` records every `run_command`
+///   invocation so tests can assert on argv.
+/// - **Argv-scoped command results**: `with_command_result_when` controls
+///   `run_command` results per program **and** argument substring (e.g.,
+///   fail only the `exec` probe while `stop`/`start` succeed), optionally
+///   only for the first N matching calls (`with_command_result_when_n`).
+#[derive(Default)]
+pub struct CommandArgRule {
+    /// Program name the rule applies to.
+    pub program: String,
+    /// Rule matches when any argument contains this substring.
+    pub arg_contains: String,
+    /// Exit status to return while the rule applies.
+    pub status: Option<i32>,
+    /// Matching calls left before the rule expires; `None` = unlimited.
+    pub uses_left: std::cell::Cell<Option<usize>>,
+}
+
+/// In-memory mock of [`SystemIo`] for unit tests.
 #[derive(Default)]
 pub struct MockSystemIo {
     pub files: HashMap<String, Vec<u8>>,
@@ -219,6 +238,10 @@ pub struct MockSystemIo {
     pub command_stdout: String,
     pub command_status: Option<i32>,
     pub command_results: HashMap<String, Option<i32>>,
+    /// Argv-scoped command results: match when the program equals and any
+    /// argument contains `arg_contains`.  `remaining` counts down; when it
+    /// hits zero the rule stops applying (0 = unlimited).
+    pub command_arg_results: std::cell::RefCell<Vec<CommandArgRule>>,
     pub interactive_exit: i32,
     pub interactive_calls: std::cell::RefCell<Vec<(String, Vec<String>)>>,
     pub command_calls: std::cell::RefCell<Vec<(String, Vec<String>)>>,
@@ -281,6 +304,41 @@ impl MockSystemIo {
     /// `Some(non-zero)` = failure, `None` = command not found.
     pub fn with_command_result(mut self, program: &str, status: Option<i32>) -> Self {
         self.command_results.insert(program.to_string(), status);
+        self
+    }
+
+    /// Fail/succeed `run_command` only for calls to `program` where some
+    /// argument contains `arg_contains` (unlimited matches).
+    pub fn with_command_result_when(
+        self,
+        program: &str,
+        arg_contains: &str,
+        status: Option<i32>,
+    ) -> Self {
+        self.command_arg_results.borrow_mut().push(CommandArgRule {
+            program: program.to_string(),
+            arg_contains: arg_contains.to_string(),
+            status,
+            uses_left: std::cell::Cell::new(None),
+        });
+        self
+    }
+
+    /// Like [`with_command_result_when`], but the rule expires after `n`
+    /// matching calls (later calls fall through to broader rules/defaults).
+    pub fn with_command_result_when_n(
+        self,
+        program: &str,
+        arg_contains: &str,
+        status: Option<i32>,
+        n: usize,
+    ) -> Self {
+        self.command_arg_results.borrow_mut().push(CommandArgRule {
+            program: program.to_string(),
+            arg_contains: arg_contains.to_string(),
+            status,
+            uses_left: std::cell::Cell::new(Some(n)),
+        });
         self
     }
 
@@ -352,6 +410,26 @@ impl SystemIo for MockSystemIo {
             program.to_string(),
             args.iter().map(|s| s.to_string()).collect(),
         ));
+        // Argv-scoped rules take precedence, most recently added first, and
+        // expire once their countdown reaches zero (`None` = unlimited).
+        {
+            let rules = self.command_arg_results.borrow();
+            if let Some(rule) = rules.iter().rev().find(|r| {
+                r.program == program
+                    && r.uses_left.get().is_none_or(|n| n > 0)
+                    && args.iter().any(|a| a.contains(&r.arg_contains))
+            }) {
+                let status = rule.status;
+                if let Some(n) = rule.uses_left.get() {
+                    rule.uses_left.set(Some(n.saturating_sub(1)));
+                }
+                return Ok(CommandOutput {
+                    stdout: self.command_stdout.clone(),
+                    stderr: String::new(),
+                    status,
+                });
+            }
+        }
         let status = if let Some(s) = self.command_results.get(program) {
             *s
         } else {
@@ -527,6 +605,32 @@ mod tests {
         assert!(fm.success());
         let um = mock.run_command("umount", &["-l", "/mnt"]).unwrap();
         assert!(!um.success(), "None status = command not found");
+    }
+
+    #[test]
+    fn mock_arg_scoped_rule_limited_and_unlimited() {
+        use super::SystemIo;
+        // Limited rule: fails exactly the first matching call, then expires.
+        let mock = MockSystemIo::new().with_command_result_when_n(
+            "podman",
+            "exec",
+            Some(1),
+            1,
+        );
+        let first = mock.run_command("podman", &["exec", "c1", "stat", "/x"]).unwrap();
+        assert!(!first.success(), "first matching call must fail");
+        let second = mock.run_command("podman", &["exec", "c1", "stat", "/x"]).unwrap();
+        assert!(second.success(), "expired rule must fall through to defaults");
+
+        // Unlimited rule (uses_left = None): keeps applying.
+        let mock = MockSystemIo::new().with_command_result_when("podman", "exec", Some(1));
+        for _ in 0..3 {
+            let r = mock.run_command("podman", &["exec", "c1", "stat", "/x"]).unwrap();
+            assert!(!r.success());
+        }
+        // Non-matching argv unaffected.
+        let other = mock.run_command("podman", &["start", "c1"]).unwrap();
+        assert!(other.success());
     }
 
     #[test]

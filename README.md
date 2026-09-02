@@ -79,10 +79,15 @@ sha256sum $(which goose)
    from the current directory; it stays alive between sessions)
 3. `exec` into it: a setup script symlinks the secrets, then runs your command
    — with no extra arguments you get an **interactive bash shell**
-4. **Pre-flight every secret** before the exec: the source file must exist and
-   the FUSE mount must answer a `stat` within 3s. A stale/dead mount (the
-   state that makes the box hang on first read) aborts with instructions
-   (`fusermount3 -u <mount>`) instead of wedging the session.
+4. **Pre-flight every secret** on both sides before the exec:
+   - *host*: the source file must exist and the FUSE mount must answer a
+     `stat` within 3s — a stale/dead mount aborts with unmount instructions
+     instead of wedging the session.
+   - *container*: `stat /fuse/<secret>` is probed via `exec` (with its own
+     `timeout`); a stale bind — e.g. a box created before a host remount —
+     is healed by a **stop/start** of the container, which re-applies the
+     `-v` binds against the current mount and preserves all container data.
+     Containers that exist but are stopped are `start`ed (never recreated).
 5. On exit, **auto-reset** the one-read counter via `fuse-client`
 
 Use `'*'` as the checksum to skip binary verification (simplest for manual
