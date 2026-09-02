@@ -131,6 +131,12 @@ impl SystemIo for RealSystemIo {
         Ok(status.code().unwrap_or(-1))
     }
 
+    fn sleep_ms(&self, ms: u64) {
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+    }
+
+    fn heal_terminal(&self) {}
+
     fn sha256_file(&self, path: &Path) -> Result<String, IoError> {
         let data = std::fs::read(path)?;
         Ok(hex_sha256(&data))
@@ -245,6 +251,8 @@ pub struct MockSystemIo {
     pub interactive_exit: i32,
     pub interactive_calls: std::cell::RefCell<Vec<(String, Vec<String>)>>,
     pub command_calls: std::cell::RefCell<Vec<(String, Vec<String>)>>,
+    pub sleeps: std::cell::RefCell<Vec<u64>>,
+    pub heal_terminal_calls: std::cell::Cell<usize>,
     pub spawned: Vec<(String, Vec<String>)>,
     pub spawn_error_msg: Option<String>,
     pub busy_paths: std::cell::RefCell<std::collections::HashSet<String>>,
@@ -472,6 +480,14 @@ impl SystemIo for MockSystemIo {
             args.iter().map(|s| s.to_string()).collect(),
         ));
         Ok(self.interactive_exit)
+    }
+
+    fn sleep_ms(&self, ms: u64) {
+        self.sleeps.borrow_mut().push(ms);
+    }
+
+    fn heal_terminal(&self) {
+        self.heal_terminal_calls.set(self.heal_terminal_calls.get() + 1);
     }
 
     fn sha256_file(&self, path: &Path) -> Result<String, IoError> {

@@ -42,6 +42,13 @@ pub trait SystemIo {
     /// Run a process inheriting the caller's stdin/stdout/stderr (foreground).
     /// Returns the exit code.
     fn run_interactive(&self, program: &str, args: &[&str]) -> Result<i32, IoError>;
+    /// Wait for the given time. Abstracted so tests can assert on the
+    /// ordering of wait-vs-command sequences.
+    fn sleep_ms(&self, ms: u64);
+    /// Best-effort restore of this process's terminal (raw mode, mouse
+    /// capture, alternate screen) after a foreground child may have died
+    /// without restoring it itself.
+    fn heal_terminal(&self);
     fn sha256_file(&self, path: &Path) -> Result<String, IoError>;
     fn sha256_process_exe(&self, pid: u32) -> Result<String, IoError>;
     fn is_symlink(&self, path: &Path) -> bool;

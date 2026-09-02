@@ -1310,6 +1310,104 @@ mod tests {
         );
     }
 
+    // ── gentle shutdown: terminals must survive container teardown ──
+
+    #[test]
+    fn stale_fuse_heal_terms_container_processes_before_stop() {
+        // Same scenario as stale_container_fuse_is_healed_by_restart, but
+        // the teardown must be GENTLE: TERM the in-container processes
+        // first (a TUI then restores the user's terminal over its
+        // still-connected pty), wait out a grace period, and only then
+        // `stop -t 2`. A bare `stop` SIGKILLs exec sessions when PID 1
+        // exits and severs their ptys mid-restore.
+        let mut mock = base_mock().with_file("/home/user/secrets.yaml", b"DATA");
+        mock.command_stdout = "true".into();
+        mock.unix_connected = true;
+        mock = mock.with_command_result_when_n("podman", "exec", Some(1), 1);
+
+        let cfg = test_config();
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()), false);
+        assert!(result.is_ok(), "got: {:?}", result.err());
+
+        let calls = mock.command_calls.borrow();
+        let stop_idx = calls
+            .iter()
+            .position(|(_, a)| a.first().map(|s| s.as_str()) == Some("stop"))
+            .expect("heal must stop the container");
+        assert!(
+            calls[stop_idx].1.contains(&"-t".to_string())
+                && calls[stop_idx].1.contains(&"2".to_string()),
+            "stop must carry a short explicit grace period (-t 2): {:?}",
+            calls[stop_idx]
+        );
+        let sweep_idx = calls
+            .iter()
+            .position(|(_, a)| {
+                a.first().map(|s| s.as_str()) == Some("exec")
+                    && a.iter().any(|x| x.contains("/proc/[0-9]*"))
+            })
+            .expect("heal must TERM in-container processes before stopping");
+        assert!(
+            sweep_idx < stop_idx,
+            "the TERM sweep must precede the stop: sweep at {sweep_idx}, stop at {stop_idx}"
+        );
+        let sweep = calls[sweep_idx]
+            .1
+            .iter()
+            .find(|x| x.contains("/proc/[0-9]*"))
+            .unwrap();
+        assert!(
+            sweep.contains("kill -TERM") && sweep.contains("!= 1"),
+            "sweep must TERM every process except PID 1: {sweep}"
+        );
+        assert!(
+            mock.sleeps.borrow().contains(&1500),
+            "a grace period must separate the TERM sweep from the stop"
+        );
+    }
+
+    #[test]
+    fn restart_container_terms_processes_before_rm() {
+        let mut mock = base_mock().with_file("/home/user/secrets.yaml", b"DATA");
+        let cfg = test_config();
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()), true);
+        assert!(result.is_ok(), "got: {:?}", result.err());
+        let calls = mock.command_calls.borrow();
+        let rm_idx = calls
+            .iter()
+            .position(|(_, a)| a.iter().any(|x| x == "rm"))
+            .expect("restart must remove the container");
+        let sweep_idx = calls
+            .iter()
+            .position(|(_, a)| a.iter().any(|x| x.contains("/proc/[0-9]*")))
+            .expect("restart must TERM in-container processes first");
+        assert!(
+            sweep_idx < rm_idx,
+            "the TERM sweep must precede the rm: sweep at {sweep_idx}, rm at {rm_idx}"
+        );
+    }
+
+    #[test]
+    fn interactive_session_ends_with_terminal_heal() {
+        // If the foreground session dies hard (container killed under it),
+        // the host tty keeps the child's raw mode / mouse capture. When
+        // run_interactive returns, run-agent still owns that tty and must
+        // heal it.
+        let mut mock = base_mock().with_file("/home/user/secrets.yaml", b"DATA");
+        let cfg = test_config();
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()), false);
+        assert!(result.is_ok());
+        assert!(
+            !mock.interactive_calls.borrow().is_empty(),
+            "precondition: the interactive session ran"
+        );
+        assert_eq!(
+            mock.heal_terminal_calls.get(),
+            1,
+            "the host terminal must be healed exactly once after the session"
+        );
+    }
+
     // ── fresh start (no stale state) ─────────────────────────────
 
     #[test]
