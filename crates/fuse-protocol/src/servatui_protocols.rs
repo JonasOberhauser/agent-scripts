@@ -99,7 +99,8 @@ pub fn client_protocols() -> Vec<Protocol> {
             |args| {
                 let name = args.split_whitespace().next().map(|s| s.to_string());
                 Ok(Command::Reset { name })
-            }),
+            })
+            .complete(|s| complete_first_secret(std::path::Path::new(crate::STATE_FILE), s, true)),
 
         cmd_protocol("reset-all", "Reset all access counters",
             |_| Ok(Command::Reset { name: None })),
@@ -126,7 +127,8 @@ pub fn client_protocols() -> Vec<Protocol> {
                     return Err("Usage: remove NAME".into());
                 }
                 Ok(Command::RemoveSecret { name: name.to_string() })
-            }),
+            })
+            .complete(|s| complete_first_secret(std::path::Path::new(crate::STATE_FILE), s, true)),
 
         cmd_protocol("rotate", "Change the allowed binary hash",
             |args| {
@@ -138,7 +140,8 @@ pub fn client_protocols() -> Vec<Protocol> {
                     name: parts[0].to_string(),
                     new_hash: parts[1].to_string(),
                 })
-            }),
+            })
+            .complete(|s| complete_first_secret(std::path::Path::new(crate::STATE_FILE), s, false)),
 
         cmd_protocol("pending", "Show pending access requests",
             |_| Ok(Command::ListPending)),
@@ -170,3 +173,141 @@ pub fn client_protocols() -> Vec<Protocol> {
             |_| Ok(Command::GetLogPath)),
     ]
 }
+
+/// Complete the FIRST secret-name argument of `reset`/`remove`/`rotate`
+/// from the orchestrator's state file (client-side, no server round-trip).
+///
+/// `complete_after_space`: `reset`/`remove` have the name as their only
+/// argument, so an empty prefix (just typed the space) suggests all names.
+/// `rotate NAME HASH` must NOT complete once the name is finished and the
+/// hash has started — a trailing space means the hash is being typed.
+pub(crate) fn complete_first_secret(
+    state_path: &std::path::Path,
+    confirmed: &str,
+    complete_after_space: bool,
+) -> Vec<String> {
+    let mut tokens = confirmed.split_whitespace();
+    let Some(cmd) = tokens.next() else {
+        return Vec::new();
+    };
+    // The argument must have been started (a space after the command).
+    if !confirmed.contains(' ') {
+        return Vec::new();
+    }
+    let arg = tokens.next().unwrap_or("");
+    if tokens.next().is_some() {
+        return Vec::new(); // a second argument has started
+    }
+    if !complete_after_space && confirmed.ends_with(char::is_whitespace) {
+        return Vec::new(); // e.g. `rotate NAME `: the hash is being typed
+    }
+    let names: Vec<String> = std::fs::read(state_path)
+        .ok()
+        .and_then(|data| serde_json::from_slice::<crate::ServerStateFile>(&data).ok())
+        .map(|state| state.secrets.iter().map(|s| s.fuse_name.clone()).collect())
+        .unwrap_or_default();
+    names
+        .into_iter()
+        .filter(|n| n.starts_with(arg))
+        .map(|n| format!("{cmd} {n}"))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state_file(names: &[&str]) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static SEQ: AtomicU32 = AtomicU32::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        // Unique per call: parallel tests must not share (and race on) one
+        // file, and fs::write is not atomic.
+        let dir = std::env::temp_dir().join(format!(
+            "fuse-comp-test-{}-{seq}-{:?}",
+            std::process::id(),
+            names
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        let json = format!(
+            r#"{{"version":"0.20.0","server_pid":1,"server_binary":"","mount_point":"","socket":"","allow_other":false,"log_level":"info","pending_timeout":0,"runtime_wrapper":null,"secrets":[{}]}}"#,
+            names
+                .iter()
+                .map(|n| format!(r#"{{"fuse_name":"{n}","host_path":"/x","hash":"h"}}"#))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        std::fs::write(&path, json).unwrap();
+        path
+    }
+
+    #[test]
+    fn reset_completes_filtered_secret_names() {
+        let p = state_file(&["p1_s0", "p2_s1"]);
+        assert_eq!(
+            complete_first_secret(&p, "reset p1", true),
+            vec!["reset p1_s0".to_string()]
+        );
+        assert_eq!(
+            complete_first_secret(&p, "reset ", true),
+            vec!["reset p1_s0".to_string(), "reset p2_s1".to_string()]
+        );
+        // No space yet → the command itself is still being completed.
+        assert!(complete_first_secret(&p, "reset", true).is_empty());
+    }
+
+    #[test]
+    fn remove_completes_all_names_on_empty_prefix() {
+        let p = state_file(&["p1_s0", "p2_s1"]);
+        assert_eq!(
+            complete_first_secret(&p, "remove ", true).len(),
+            2
+        );
+    }
+
+    #[test]
+    fn rotate_stops_after_the_name() {
+        let p = state_file(&["p1_s0"]);
+        assert_eq!(
+            complete_first_secret(&p, "rotate p", false),
+            vec!["rotate p1_s0".to_string()]
+        );
+        // Name finished, hash being typed: no suggestions.
+        assert!(complete_first_secret(&p, "rotate p1_s0 ", false).is_empty());
+    }
+
+    #[test]
+    fn third_token_never_completes() {
+        let p = state_file(&["p1_s0"]);
+        assert!(complete_first_secret(&p, "reset p1_s0 x", true).is_empty());
+    }
+
+    #[test]
+    fn missing_state_file_means_no_suggestions() {
+        assert!(complete_first_secret(
+            std::path::Path::new("/nonexistent-fuse-state.json"),
+            "reset ",
+            true
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn name_commands_register_completers() {
+        let protocols = client_protocols();
+        for name in ["reset", "remove", "rotate"] {
+            let p = protocols
+                .iter()
+                .find(|p| p.name == name)
+                .unwrap_or_else(|| panic!("{name} missing"));
+            assert!(p.completer().is_some(), "{name} must register a completer");
+        }
+        // Arg-less commands keep the builtin name completion only.
+        for name in ["status", "mounts", "version"] {
+            let p = protocols.iter().find(|p| p.name == name).unwrap();
+            assert!(p.completer().is_none(), "{name} needs no completer");
+        }
+    }
+}
+
