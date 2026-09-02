@@ -351,7 +351,7 @@ checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
 
 [[package]]
 name = "fuse-client"
-version = "0.22.0"
+version = "0.22.1"
 dependencies = [
  "clap",
  "crossterm",
@@ -370,7 +370,7 @@ dependencies = [
 
 [[package]]
 name = "fuse-protocol"
-version = "0.22.0"
+version = "0.22.1"
 dependencies = [
  "libc",
  "serde",
@@ -382,7 +382,7 @@ dependencies = [
 
 [[package]]
 name = "fuse-server"
-version = "0.22.0"
+version = "0.22.1"
 dependencies = [
  "clap",
  "dashmap",
@@ -765,7 +765,7 @@ checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
 
 [[package]]
 name = "run-agent"
-version = "0.22.0"
+version = "0.22.1"
 dependencies = [
  "clap",
  "fuse-protocol",
@@ -890,8 +890,8 @@ dependencies = [
 
 [[package]]
 name = "servyi-servatui"
-version = "0.6.2"
-source = "git+https://github.com/servyi/servatui.git#1544f7ee33a68ed0aa0831caf3d8f3daf9648f38"
+version = "0.7.0"
+source = "git+https://github.com/servyi/servatui.git#541cac23938b459d7c63cdaefeb07c2853614f9a"
 dependencies = [
  "base64",
  "crossterm",
@@ -899,6 +899,7 @@ dependencies = [
  "ratatui",
  "serde",
  "serde_json",
+ "signal-hook",
  "textwrap",
  "tui-input",
 ]

@@ -321,7 +321,7 @@ where
 
     if restart_container {
         info!("Restarting container {container_name}...");
-        let _ = run_with_wrapper(io, wrapper, container_bin, &["stop", &container_name]);
+        gentle_stop(io, wrapper, container_bin, &container_name);
         let _ = run_with_wrapper(io, wrapper, container_bin, &["rm", "-f", &container_name]);
     }
 
@@ -393,6 +393,10 @@ where
         let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
         io.run_interactive(container_bin, &arg_refs).unwrap_or(-1)
     };
+    // The session may have died hard (e.g. the container was stopped
+    // under it) without restoring the terminal it borrowed from us —
+    // heal ours before saying goodbye.
+    io.heal_terminal();
     if exit_code == 0 {
         info!("Session exited with code 0.");
     } else {
@@ -554,6 +558,37 @@ fn check_container_running<S: SystemIo>(
     }
 }
 
+/// Stop a container gently: give in-container processes a chance to shut
+/// down before the teardown SIGKILLs them and severs their ptys.
+///
+/// `docker/podman stop` signals PID 1 only; when it exits, the remaining
+/// (exec'd) processes are killed hard and their ptys are torn down — a
+/// TUI dying that way cannot restore the host-side terminal it borrowed,
+/// leaving the user's shell with mouse capture on and a dead scroll
+/// wheel. A TERM sweep first lets cooperative processes (servatui TUIs
+/// restore on SIGTERM/SIGHUP) clean up over their still-connected ptys.
+///
+/// The sweep walks /proc in pure shell (no pkill needed in the image) and
+/// skips PID 1 (signalling the init would race the intended stop).
+/// Best-effort: failures are ignored, `stop` follows regardless.
+fn gentle_stop<S: SystemIo>(
+    io: &S,
+    wrapper: Option<&str>,
+    container_bin: &str,
+    container_name: &str,
+) {
+    let sweep = "for p in /proc/[0-9]*; do pid=${p##*/}; if [ \"$pid\" != 1 ]; then \
+                 kill -TERM \"$pid\" 2>/dev/null; fi; done; true";
+    let _ = run_with_wrapper(
+        io,
+        wrapper,
+        container_bin,
+        &["exec", container_name, "sh", "-c", sweep],
+    );
+    io.sleep_ms(1500);
+    let _ = run_with_wrapper(io, wrapper, container_bin, &["stop", "-t", "2", container_name]);
+}
+
 /// Verify every secret is reachable INSIDE the container at `/fuse/<name>`.
 ///
 /// A persistent container created before a host-side FUSE remount keeps its
@@ -604,7 +639,7 @@ fn verify_container_fuse<S: SystemIo>(
              healing via stop/start (binds are re-applied, data is preserved)"
         );
     }
-    let _ = run_with_wrapper(io, wrapper, container_bin, &["stop", container_name]);
+    gentle_stop(io, wrapper, container_bin, container_name);
     match run_with_wrapper(io, wrapper, container_bin, &["start", container_name]) {
         Ok(o) if o.success() => {}
         Ok(o) => {

@@ -4,6 +4,13 @@ use std::path::{Path, PathBuf};
 use crate::io::{CommandOutput, SystemIo};
 use crate::IoError;
 
+/// Disable sequences for everything a foreground TUI may have enabled on
+/// our tty: mouse capture (1000/1002/1003/1015/1006 — SGR mouse is the
+/// dead-scroll-wheel culprit), alternate screen (1049), hidden cursor
+/// (25h). Mirrors servatui's terminal_restore; keep in sync.
+const TERMINAL_RESTORE_BYTES: &[u8] =
+    b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1015l\x1b[?1006l\x1b[?1049l\x1b[?25h";
+
 fn hex_sha256(data: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(data);
@@ -135,7 +142,23 @@ impl SystemIo for RealSystemIo {
         std::thread::sleep(std::time::Duration::from_millis(ms));
     }
 
-    fn heal_terminal(&self) {}
+    fn heal_terminal(&self) {
+        use std::io::IsTerminal;
+        use std::io::Write;
+        if !std::io::stdout().is_terminal() {
+            return;
+        }
+        // Raw mode first: stty sane restores line discipline and default
+        // special chars on our stdin (the tty the child borrowed).
+        let _ = std::process::Command::new("stty").arg("sane").status();
+        // Then the escape-level modes stty knows nothing about: mouse
+        // capture (incl. SGR 1006 — the dead-scroll-wheel culprit),
+        // alternate screen, hidden cursor. Mirrors servatui's restore
+        // sequence; keep in sync with its terminal_restore module.
+        let mut out = std::io::stdout();
+        let _ = out.write_all(TERMINAL_RESTORE_BYTES);
+        let _ = out.flush();
+    }
 
     fn sha256_file(&self, path: &Path) -> Result<String, IoError> {
         let data = std::fs::read(path)?;
