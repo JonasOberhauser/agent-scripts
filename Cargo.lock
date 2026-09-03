@@ -361,6 +361,7 @@ dependencies = [
  "rustyline",
  "serde",
  "serde_json",
+ "servatui-display",
  "servyi-servatui",
  "tempfile",
  "tracing",
@@ -889,9 +890,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "servatui-display"
+version = "0.1.0"
+source = "git+https://github.com/servyi/servatui.git#2f977df1355aded015831b83875642e2fe68a66b"
+dependencies = [
+ "crossterm",
+ "ratatui",
+ "servyi-servatui",
+]
+
+[[package]]
 name = "servyi-servatui"
-version = "0.7.0"
-source = "git+https://github.com/servyi/servatui.git#69e79586a0121d202304c332f6084fc2ad2e8a22"
+version = "0.7.1"
+source = "git+https://github.com/servyi/servatui.git#2f977df1355aded015831b83875642e2fe68a66b"
 dependencies = [
  "base64",
  "crossterm",

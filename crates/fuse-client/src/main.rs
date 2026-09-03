@@ -4,6 +4,8 @@ use clap::Parser;
 use fuse_protocol::{client_protocols, ServerStateFile, VERSION as CLIENT_VERSION};
 use servyi_servatui::App;
 
+mod pending_layer;
+
 #[derive(Parser)]
 #[command(name = "fuse-client", about = "Send CRUD commands to the fuse-server")]
 struct Cli {
@@ -77,10 +79,12 @@ fn main() {
                     std::thread::sleep(std::time::Duration::from_secs(1));
                 });
             }
-            let tui_app = App::builder(&cli.socket)
-                .protocol_all(fuse_protocol::client_protocols_with_pending(pending))
-                .build();
-            if let Err(e) = tui_app.run_tui() {
+            let protocols = fuse_protocol::client_protocols_with_pending(pending.clone());
+            let mut display = servatui_display::Display::new();
+            display.add_layer(Box::new(pending_layer::PendingBadgeLayer::new(pending)));
+            // Display::run drives run_tui_with_events: the badge layer's
+            // frame/route closures ride the overlay + event hooks.
+            if let Err(e) = display.run(&cli.socket, &protocols) {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
             }
