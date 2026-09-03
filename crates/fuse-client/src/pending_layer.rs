@@ -230,6 +230,19 @@ pub fn all_button_rect(row: Rect, grant: bool) -> Rect {
     Rect { x, y: row.y, width: w, height: 1 }
 }
 
+/// The panel title on the DEFAULT background (bold, underlined) — the
+/// layer-color backdrop would make it hard to read. The line repaints
+/// the full panel width so no backdrop color bleeds through.
+pub fn title_line(width: u16, shown: usize, total: usize) -> Line<'static> {
+    let text = format!(" pending requests: {shown}/{total} ");
+    let pad = (width as usize).saturating_sub(text.chars().count());
+    let style = Style::default().bg(Color::Reset).add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+    Line::from(vec![
+        Span::styled(text, style),
+        Span::styled(" ".repeat(pad), Style::default().bg(Color::Reset)),
+    ])
+}
+
 /// Identifying text for the requesting process: its name, or `#pid`.
 pub fn requester(req: &PendingAccessInfo) -> String {
     match &req.process_name {
@@ -331,12 +344,12 @@ impl DisplayLayer for PendingPanelLayer {
 
         let panel = panel_rect(ctx.terminal_area);
         let total = self.pending.lock().unwrap().len();
-        let title = format!(" pending requests: {}/{} ", occupied(&self.slots).len(), total);
         widgets.push(WidgetEntry {
             name: PANEL_NAME,
-            widget: Box::new(Paragraph::new(Line::styled(
-                title,
-                Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+            widget: Box::new(Paragraph::new(title_line(
+                panel.width,
+                occupied(&self.slots).len(),
+                total,
             ))),
             area: panel,
         });
@@ -480,6 +493,12 @@ impl DisplayLayer for PendingPanelLayer {
 
     fn tab_label(&self) -> char {
         'p'
+    }
+
+    /// No taskbar cell (and nothing clickable) while idle — the panel
+    /// owns no widgets then; the slot stays reserved for its return.
+    fn hide_when_empty(&self) -> bool {
+        true
     }
 }
 
@@ -665,6 +684,18 @@ mod tests {
             colors.iter().filter(|c| c.is_none()).count() >= 2,
             "id/name/words stay uncolored: {colors:?}"
         );
+    }
+
+    /// The title must live on the default background (readable) and
+    /// cover the full width so no layer color bleeds through.
+    #[test]
+    fn title_is_default_bg_full_width() {
+        let line = title_line(PANEL_WIDTH, 5, 6);
+        let len: usize = line.spans.iter().map(|s| s.content.len()).sum();
+        assert_eq!(len, PANEL_WIDTH as usize);
+        for span in &line.spans {
+            assert_eq!(span.style.bg, Some(Color::Reset));
+        }
     }
 
     #[test]
@@ -864,6 +895,11 @@ mod tests {
                 widgets.iter().filter(|w| w.name == PANEL_NAME).count(),
                 0,
                 "no panel widgets while idle"
+            );
+            assert_eq!(
+                widgets.iter().filter(|w| w.name == "display.taskbar").count(),
+                1,
+                "hide_when_empty: only the builtin taskbar cell while idle"
             );
         }
     }
