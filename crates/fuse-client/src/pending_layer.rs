@@ -304,6 +304,46 @@ fn button_to_command(button: &Button, id: u64) -> Command {
     }
 }
 
+/// Registers/unregisters the panel layer as the snapshot transitions
+/// empty <-> non-empty, so an idle terminal shows no panel and no taskbar
+/// cell. The poller calls [`PanelVisibility::reconcile`] after every
+/// successful poll. Lock discipline: never hold the pending lock while
+/// taking the display lock (frame runs the other order).
+pub struct PanelVisibility {
+    id: Option<servatui_display::LayerId>,
+    pending: PendingIds,
+    socket: PathBuf,
+}
+
+impl PanelVisibility {
+    pub fn new(pending: PendingIds, socket: impl Into<PathBuf>) -> Self {
+        Self { id: None, pending, socket: socket.into() }
+    }
+
+    /// Whether the layer is currently registered.
+    #[cfg(test)]
+    pub fn is_registered(&self) -> bool {
+        self.id.is_some()
+    }
+
+    pub fn reconcile(&mut self, display: &mut servatui_display::Display) {
+        let empty = self.pending.lock().unwrap().is_empty();
+        match (self.id, empty) {
+            (None, false) => {
+                self.id = Some(display.add_layer(Box::new(PendingPanelLayer::new(
+                    self.pending.clone(),
+                    self.socket.clone(),
+                ))));
+            }
+            (Some(id), true) => {
+                display.remove_layer(id);
+                self.id = None;
+            }
+            _ => {}
+        }
+    }
+}
+
 impl DisplayLayer for PendingPanelLayer {
     fn on_overlay(&mut self, ctx: &mut LayerCtx, widgets: &mut Vec<WidgetEntry>) -> StackIntent {
         self.refresh_from_snapshot();
@@ -815,10 +855,40 @@ mod tests {
         );
     }
 
+    /// The layer exists only while requests are pending: no panel and no
+    /// taskbar cell while idle, both back when the first request arrives.
+    #[test]
+    fn layer_registers_only_while_pending() {
+        let pending: PendingIds = Arc::new(Mutex::new(Vec::new()));
+        let mut vis = PanelVisibility::new(pending.clone(), "/nonexistent.sock");
+        let mut display = servatui_display::Display::with_palette(vec![Color::Blue]);
+
+        vis.reconcile(&mut display);
+        assert!(!vis.is_registered(), "no layer while empty");
+        let mut widgets = vec![WidgetEntry {
+            name: servyi_servatui::WIDGET_INPUT,
+            widget: Box::new(Paragraph::new("")),
+            area: Rect::new(0, 23, 80, 1),
+        }];
+        display.frame(&mut widgets);
+        assert_eq!(
+            widgets.iter().filter(|w| w.name == PANEL_NAME).count(),
+            0,
+            "no panel widgets while empty"
+        );
+
+        *pending.lock().unwrap() = ids(&[31]);
+        vis.reconcile(&mut display);
+        assert!(vis.is_registered(), "layer back once a request exists");
+
+        *pending.lock().unwrap() = Vec::new();
+        vis.reconcile(&mut display);
+        assert!(!vis.is_registered(), "layer gone again once idle");
+    }
+
     /// Enter on the all-row denies every pending request.
     #[test]
-    fn enter_on_all_row_denies_all() {
-        let dir = tempfile::tempdir().unwrap();
+    fn enter_on_all_row_denies_all() {        let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("panel3.sock");
         let seen = fake_server(&sock, vec![31, 37]);
 

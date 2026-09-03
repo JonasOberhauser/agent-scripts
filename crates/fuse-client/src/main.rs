@@ -69,6 +69,8 @@ fn main() {
             // On poll failure the last known list is kept.
             let pending: fuse_protocol::PendingIds =
                 std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let protocols = fuse_protocol::client_protocols_with_pending(pending.clone());
+            // Poller: snapshot only (the Display is not Send).
             {
                 let pending = pending.clone();
                 let socket = cli.socket.clone();
@@ -79,15 +81,28 @@ fn main() {
                     std::thread::sleep(std::time::Duration::from_secs(1));
                 });
             }
-            let protocols = fuse_protocol::client_protocols_with_pending(pending.clone());
-            let mut display = servatui_display::Display::new();
-            display.add_layer(Box::new(pending_layer::PendingPanelLayer::new(
-                pending,
+            // The panel layer registers/unregisters as the snapshot
+            // transitions empty <-> busy — reconciled at frame rate, so a
+            // hidden-while-idle panel never leaves a stale taskbar cell.
+            // Main-thread only (the Display's layers are not Send).
+            let display: std::rc::Rc<
+                std::cell::RefCell<servatui_display::Display>,
+            > = std::rc::Rc::new(std::cell::RefCell::new(servatui_display::Display::new()));
+            let mut visibility =
+                pending_layer::PanelVisibility::new(pending.clone(), cli.socket.clone());
+            visibility.reconcile(&mut display.borrow_mut());
+            let frame_display = display.clone();
+            let event_display = display.clone();
+            if let Err(e) = servyi_servatui::run_tui_with_events(
                 &cli.socket,
-            )));
-            // Display::run drives run_tui_with_events: the badge layer's
-            // frame/route closures ride the overlay + event hooks.
-            if let Err(e) = display.run(&cli.socket, &protocols) {
+                &protocols,
+                move |widgets| {
+                    let mut display = frame_display.borrow_mut();
+                    visibility.reconcile(&mut display);
+                    display.frame(widgets);
+                },
+                move |ev| event_display.borrow_mut().route_event(ev),
+            ) {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
             }
