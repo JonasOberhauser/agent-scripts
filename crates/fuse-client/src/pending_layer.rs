@@ -257,6 +257,8 @@ pub struct PendingPanelLayer {
     rows: Vec<Rect>,
     /// When the panel last polled the server (rate-limited self-polling).
     last_poll: Option<std::time::Instant>,
+    /// Request ids present in the last frame; a NEW id raises the panel.
+    seen: std::collections::HashSet<u64>,
 }
 
 /// How often the panel polls the server for pending requests.
@@ -272,6 +274,7 @@ impl PendingPanelLayer {
             buttons: Vec::new(),
             rows: Vec::new(),
             last_poll: None,
+            seen: std::collections::HashSet::new(),
         }
     }
 
@@ -330,6 +333,17 @@ impl DisplayLayer for PendingPanelLayer {
             }
         }
         self.refresh_from_snapshot();
+        // A NEW pending request (one not present in the last frame) raises
+        // the panel above everything — requests are time-limited, so the
+        // panel must be visible even if the user focused the builtin
+        // input line. Disappeared ids leave `seen`, so a re-appearing id
+        // (e.g. after a server restart) counts as new again.
+        let ids: Vec<u64> = self.pending.lock().unwrap().iter().map(|p| p.id).collect();
+        let has_new = ids.iter().any(|id| !self.seen.contains(id));
+        self.seen.retain(|id| ids.contains(id));
+        self.seen.extend(ids.iter().copied());
+        let intent = if has_new { StackIntent::Top } else { StackIntent::Keep };
+
         self.buttons.clear();
         self.rows.clear();
         if !self.slots.iter().any(|s| s.is_some()) {
@@ -387,7 +401,7 @@ impl DisplayLayer for PendingPanelLayer {
             area: all_row,
         });
 
-        StackIntent::Keep
+        intent
     }
 
     fn on_event(&mut self, ev: &Event, _ctx: &LayerCtx) -> EventResult {
@@ -689,6 +703,40 @@ mod tests {
             assert!(span.style.bg.is_none(), "no bg: {:?}", span.style);
             assert!(span.style.add_modifier.is_empty(), "no modifiers: {:?}", span.style);
         }
+    }
+
+    /// A NEW pending request raises the panel above everything (it is
+    /// time-limited and must be visible even when the user focused the
+    /// builtin input line); already-seen requests never steal the focus.
+    #[test]
+    fn new_request_raises_panel_to_top() {
+        let pending: PendingIds = Arc::new(Mutex::new(ids(&[31])));
+        let mut display = servatui_display::Display::with_palette(Vec::new());
+        let panel = display
+            .add_layer(Box::new(PendingPanelLayer::new(pending.clone(), "/nonexistent.sock")));
+        frame_with_pending(&mut display);
+        assert_eq!(display.topmost(), Some(panel));
+
+        // User focuses the builtin input line: the panel sinks below.
+        display.activate(servatui_display::LayerId::BUILTIN);
+        assert_eq!(display.topmost(), Some(servatui_display::LayerId::BUILTIN));
+
+        // Same request set (already seen): the panel stays below.
+        frame_with_pending(&mut display);
+        assert_eq!(
+            display.topmost(),
+            Some(servatui_display::LayerId::BUILTIN),
+            "seen requests must not steal the focus"
+        );
+
+        // A NEW request arrives: the panel raises itself.
+        *pending.lock().unwrap() = ids(&[31, 77]);
+        frame_with_pending(&mut display);
+        assert_eq!(display.topmost(), Some(panel), "a new request raises the panel");
+
+        // And stays up on subsequent frames without further Top intent.
+        frame_with_pending(&mut display);
+        assert_eq!(display.topmost(), Some(panel));
     }
 
     #[test]
