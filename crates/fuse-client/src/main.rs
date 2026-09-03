@@ -64,43 +64,33 @@ fn main() {
             }
         }
         None => {
-            // Interactive mode: poll the server for pending access requests
-            // in the background so grant/deny can complete active IDs.
-            // On poll failure the last known list is kept.
             let pending: fuse_protocol::PendingIds =
                 std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
             let protocols = fuse_protocol::client_protocols_with_pending(pending.clone());
-            // Poller: snapshot only (the Display is not Send).
-            {
-                let pending = pending.clone();
-                let socket = cli.socket.clone();
-                std::thread::spawn(move || loop {
-                    if let Ok(list) = fuse_protocol::poll_pending_info(&socket) {
-                        *pending.lock().unwrap() = list;
-                    }
-                    std::thread::sleep(std::time::Duration::from_secs(1));
-                });
-            }
-            // The panel layer registers/unregisters as the snapshot
-            // transitions empty <-> busy — reconciled at frame rate, so a
-            // hidden-while-idle panel never leaves a stale taskbar cell.
-            // Main-thread only (the Display's layers are not Send).
+            // One pending layer, registered for the whole session: it
+            // polls on its own (rate-limited inside on_overlay) and hides
+            // itself while idle, so its identity — and look — never
+            // changes. The display runs with an empty palette: no
+            // colored layer background, only the button brackets are
+            // colored. Main-thread only (the Display's layers are not
+            // Send).
             let display: std::rc::Rc<
                 std::cell::RefCell<servatui_display::Display>,
-            > = std::rc::Rc::new(std::cell::RefCell::new(servatui_display::Display::new()));
-            let mut visibility =
-                pending_layer::PanelVisibility::new(pending.clone(), cli.socket.clone());
-            visibility.reconcile(&mut display.borrow_mut());
+            > = std::rc::Rc::new(std::cell::RefCell::new(
+                servatui_display::Display::with_palette(Vec::new()),
+            ));
+            display
+                .borrow_mut()
+                .add_layer(Box::new(pending_layer::PendingPanelLayer::new(
+                    pending,
+                    cli.socket.clone(),
+                )));
             let frame_display = display.clone();
             let event_display = display.clone();
             if let Err(e) = servyi_servatui::run_tui_with_events(
                 &cli.socket,
                 &protocols,
-                move |widgets| {
-                    let mut display = frame_display.borrow_mut();
-                    visibility.reconcile(&mut display);
-                    display.frame(widgets);
-                },
+                move |widgets| frame_display.borrow_mut().frame(widgets),
                 move |ev| event_display.borrow_mut().route_event(ev),
             ) {
                 eprintln!("Error: {e}");

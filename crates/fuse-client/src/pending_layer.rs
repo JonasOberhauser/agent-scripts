@@ -248,7 +248,12 @@ pub struct PendingPanelLayer {
     buttons: Vec<(Button, Rect)>,
     /// Panel rows as laid out in the last frame.
     rows: Vec<Rect>,
+    /// When the panel last polled the server (rate-limited self-polling).
+    last_poll: Option<std::time::Instant>,
 }
+
+/// How often the panel polls the server for pending requests.
+pub const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 impl PendingPanelLayer {
     pub fn new(pending: PendingIds, socket: impl Into<PathBuf>) -> Self {
@@ -259,6 +264,7 @@ impl PendingPanelLayer {
             cursor: Cursor::All { grant: true },
             buttons: Vec::new(),
             rows: Vec::new(),
+            last_poll: None,
         }
     }
 
@@ -304,48 +310,18 @@ fn button_to_command(button: &Button, id: u64) -> Command {
     }
 }
 
-/// Registers/unregisters the panel layer as the snapshot transitions
-/// empty <-> non-empty, so an idle terminal shows no panel and no taskbar
-/// cell. The poller calls [`PanelVisibility::reconcile`] after every
-/// successful poll. Lock discipline: never hold the pending lock while
-/// taking the display lock (frame runs the other order).
-pub struct PanelVisibility {
-    id: Option<servatui_display::LayerId>,
-    pending: PendingIds,
-    socket: PathBuf,
-}
-
-impl PanelVisibility {
-    pub fn new(pending: PendingIds, socket: impl Into<PathBuf>) -> Self {
-        Self { id: None, pending, socket: socket.into() }
-    }
-
-    /// Whether the layer is currently registered.
-    #[cfg(test)]
-    pub fn is_registered(&self) -> bool {
-        self.id.is_some()
-    }
-
-    pub fn reconcile(&mut self, display: &mut servatui_display::Display) {
-        let empty = self.pending.lock().unwrap().is_empty();
-        match (self.id, empty) {
-            (None, false) => {
-                self.id = Some(display.add_layer(Box::new(PendingPanelLayer::new(
-                    self.pending.clone(),
-                    self.socket.clone(),
-                ))));
-            }
-            (Some(id), true) => {
-                display.remove_layer(id);
-                self.id = None;
-            }
-            _ => {}
-        }
-    }
-}
-
 impl DisplayLayer for PendingPanelLayer {
     fn on_overlay(&mut self, ctx: &mut LayerCtx, widgets: &mut Vec<WidgetEntry>) -> StackIntent {
+        // Self-polling: the panel owns the 1s poll cadence (the frame
+        // loop ticks every ~100ms, so a fresh request appears within one
+        // interval). Errors keep the last state — the server may be down.
+        let now = std::time::Instant::now();
+        if self.last_poll.is_none_or(|t| now.duration_since(t) >= POLL_INTERVAL) {
+            self.last_poll = Some(now);
+            if let Ok(list) = poll_pending_info(&self.socket) {
+                *self.pending.lock().unwrap() = list;
+            }
+        }
         self.refresh_from_snapshot();
         self.buttons.clear();
         self.rows.clear();
@@ -360,7 +336,7 @@ impl DisplayLayer for PendingPanelLayer {
             name: PANEL_NAME,
             widget: Box::new(Paragraph::new(Line::styled(
                 title,
-                Style::default().fg(Color::Black).bg(ctx.color).add_modifier(Modifier::BOLD),
+                Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
             ))),
             area: panel,
         });
@@ -369,10 +345,7 @@ impl DisplayLayer for PendingPanelLayer {
             let row = row_rect(panel, i);
             self.rows.push(row);
             let line = match &self.slots[i] {
-                None => Line::styled(
-                    " ".repeat(row.width as usize),
-                    Style::default().bg(ctx.color),
-                ),
+                None => Line::raw(" ".repeat(row.width as usize)),
                 Some(req) => {
                     let cur_here = self.cursor == Cursor::Request { slot: i, grant: true }
                         || self.cursor == Cursor::Request { slot: i, grant: false };
@@ -381,7 +354,7 @@ impl DisplayLayer for PendingPanelLayer {
                     let grant = request_button_rect(row, true);
                     self.buttons.push((Button::Deny { id: req.id }, deny));
                     self.buttons.push((Button::Grant { id: req.id }, grant));
-                    request_line(req, row.width, cur_here, grant_sel, ctx.color)
+                    request_line(req, row.width, cur_here, grant_sel)
                 }
             };
             widgets.push(WidgetEntry {
@@ -402,9 +375,8 @@ impl DisplayLayer for PendingPanelLayer {
             name: PANEL_NAME,
             widget: Box::new(Paragraph::new(all_row_line(
                 all_row.width,
-                self.cursor == Cursor::All { grant: true } || self.cursor == Cursor::All { grant: false },
+                matches!(self.cursor, Cursor::All { .. }),
                 grant_sel,
-                ctx.color,
             ))),
             area: all_row,
         });
@@ -515,66 +487,57 @@ fn contains(area: &Rect, col: u16, row: u16) -> bool {
     col >= area.x && col < area.x + area.width && row >= area.y && row < area.y + area.height
 }
 
-/// One request line: `id name ... [deny] [grant]`, buttons highlighted
-/// when the cursor is on this row/button.
+/// One request line: `id name ... [deny] [grant]`. Only the brackets
+/// carry the action color (red/green); the words stay in the normal
+/// text color. The cursor-selected button is reversed.
 fn request_line(
     req: &PendingAccessInfo,
     width: u16,
     cursor_here: bool,
     grant_selected: bool,
-    color: Color,
 ) -> Line<'static> {
-    let base = Style::default().bg(color).fg(Color::White);
-    let id = Span::styled(format!("{:>3} ", req.id), base.add_modifier(Modifier::BOLD));
+    let id = Span::styled(
+        format!("{:>3} ", req.id),
+        Style::default().add_modifier(Modifier::BOLD),
+    );
     let name_max = (width as usize).saturating_sub(
         3 + 1 + DENY_BTN.len() + BTN_GAP as usize + GRANT_BTN.len() + 1,
     );
     let name = truncate_pad(&requester(req), name_max);
-    let name = Span::styled(format!("{name} "), base);
 
-    let (deny_style, grant_style) = if cursor_here {
-        let sel = base
-            .fg(Color::Black)
-            .add_modifier(Modifier::BOLD | Modifier::REVERSED);
-        let unsel = base.fg(Color::Black);
-        if grant_selected {
-            (unsel, sel)
-        } else {
-            (sel, unsel)
-        }
-    } else {
-        (base.fg(Color::Red), base.fg(Color::Green))
-    };
-    Line::from(vec![
-        id,
-        name,
-        Span::styled(format!("{DENY_BTN} "), deny_style),
-        Span::styled(GRANT_BTN, grant_style),
-    ])
+    let mut spans = vec![id, Span::raw(format!("{name} "))];
+    spans.extend(button_spans(DENY_BTN, Color::Red, cursor_here && !grant_selected));
+    spans.push(Span::raw(" "));
+    spans.extend(button_spans(GRANT_BTN, Color::Green, cursor_here && grant_selected));
+    Line::from(spans)
 }
 
-/// The all-row: `[deny all] [grant all]` right-aligned.
-fn all_row_line(width: u16, cursor_here: bool, grant_selected: bool, color: Color) -> Line<'static> {
-    let base = Style::default().bg(color).fg(Color::White);
-    let (deny_style, grant_style) = if cursor_here {
-        let sel = base
-            .fg(Color::Black)
-            .add_modifier(Modifier::BOLD | Modifier::REVERSED);
-        let unsel = base.fg(Color::Black);
-        if grant_selected {
-            (unsel, sel)
-        } else {
-            (sel, unsel)
-        }
-    } else {
-        (base.fg(Color::Red), base.fg(Color::Green))
-    };
+/// A button as colored brackets around plain text (`[deny]`); the
+/// selected button is reversed instead, so the cursor stays obvious.
+fn button_spans(label: &str, color: Color, selected: bool) -> Vec<Span<'static>> {
+    if selected {
+        return vec![Span::styled(
+            label.to_string(),
+            Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD),
+        )];
+    }
+    let word = &label[1..label.len() - 1];
+    vec![
+        Span::styled("[", Style::default().fg(color)),
+        Span::raw(word.to_string()),
+        Span::styled("]", Style::default().fg(color)),
+    ]
+}
+
+/// The all-row: `[deny all] [grant all]` right-aligned, same bracket
+/// coloring as the per-request buttons.
+fn all_row_line(width: u16, cursor_here: bool, grant_selected: bool) -> Line<'static> {
     let pad = (width as usize).saturating_sub(DENY_ALL_BTN.len() + 1 + GRANT_ALL_BTN.len());
-    Line::from(vec![
-        Span::styled(" ".repeat(pad), base),
-        Span::styled(format!("{DENY_ALL_BTN} "), deny_style),
-        Span::styled(GRANT_ALL_BTN, grant_style),
-    ])
+    let mut spans = vec![Span::raw(" ".repeat(pad))];
+    spans.extend(button_spans(DENY_ALL_BTN, Color::Red, cursor_here && !grant_selected));
+    spans.push(Span::raw(" "));
+    spans.extend(button_spans(GRANT_ALL_BTN, Color::Green, cursor_here && grant_selected));
+    Line::from(spans)
 }
 
 /// Clamp to `max` columns, padded to exactly `max`.
@@ -855,35 +818,55 @@ mod tests {
         );
     }
 
-    /// The layer exists only while requests are pending: no panel and no
-    /// taskbar cell while idle, both back when the first request arrives.
+    /// While idle the layer contributes nothing — it hides itself (no
+    /// panel widgets at all) until a request exists again.
     #[test]
-    fn layer_registers_only_while_pending() {
+    fn frame_without_pending_pushes_no_panel() {
         let pending: PendingIds = Arc::new(Mutex::new(Vec::new()));
-        let mut vis = PanelVisibility::new(pending.clone(), "/nonexistent.sock");
-        let mut display = servatui_display::Display::with_palette(vec![Color::Blue]);
+        let mut display = servatui_display::Display::with_palette(Vec::new());
+        display.add_layer(Box::new(PendingPanelLayer::new(pending, "/nonexistent.sock")));
+        for _ in 0..2 {
+            let mut widgets = vec![WidgetEntry {
+                name: servyi_servatui::WIDGET_INPUT,
+                widget: Box::new(Paragraph::new("")),
+                area: Rect::new(0, 23, 80, 1),
+            }];
+            display.frame(&mut widgets);
+            assert_eq!(
+                widgets.iter().filter(|w| w.name == PANEL_NAME).count(),
+                0,
+                "no panel widgets while idle"
+            );
+        }
+    }
 
-        vis.reconcile(&mut display);
-        assert!(!vis.is_registered(), "no layer while empty");
-        let mut widgets = vec![WidgetEntry {
-            name: servyi_servatui::WIDGET_INPUT,
-            widget: Box::new(Paragraph::new("")),
-            area: Rect::new(0, 23, 80, 1),
-        }];
-        display.frame(&mut widgets);
+    /// The panel polls on its own inside on_overlay, rate-limited to one
+    /// poll per POLL_INTERVAL: three frames in quick succession trigger
+    /// exactly one `pending` query on the wire.
+    #[test]
+    fn self_polling_is_rate_limited() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("rate.sock");
+        let seen = fake_server(&sock, vec![31]);
+
+        let pending: PendingIds = Arc::new(Mutex::new(Vec::new()));
+        let mut display = servatui_display::Display::with_palette(Vec::new());
+        display.add_layer(Box::new(PendingPanelLayer::new(pending.clone(), &sock)));
+        frame_with_pending(&mut display);
         assert_eq!(
-            widgets.iter().filter(|w| w.name == PANEL_NAME).count(),
-            0,
-            "no panel widgets while empty"
+            pending.lock().unwrap().iter().map(|p| p.id).collect::<Vec<_>>(),
+            vec![31],
+            "the first frame polls and fills the snapshot"
         );
-
-        *pending.lock().unwrap() = ids(&[31]);
-        vis.reconcile(&mut display);
-        assert!(vis.is_registered(), "layer back once a request exists");
-
-        *pending.lock().unwrap() = Vec::new();
-        vis.reconcile(&mut display);
-        assert!(!vis.is_registered(), "layer gone again once idle");
+        frame_with_pending(&mut display);
+        frame_with_pending(&mut display);
+        let polls = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(name, _)| name == "pending")
+            .count();
+        assert_eq!(polls, 1, "frames within one interval poll at most once");
     }
 
     /// Enter on the all-row denies every pending request.
