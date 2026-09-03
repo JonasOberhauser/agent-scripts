@@ -110,4 +110,50 @@ mod tests {
         let err = result.unwrap_err();
         assert!(err.contains("not found"), "got: {err}");
     }
+
+    /// Regression: the TUI's background poller (`poll_pending_once`) must
+    /// speak the REAL server wire protocol — protocol-name first, then the
+    /// ListPending payload. It used to send the command as the first
+    /// message, which the server's name dispatch rejects, so the poller
+    /// errored forever and the pending badge never appeared.
+    #[test]
+    fn poll_pending_once_reads_real_server() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("poll.sock");
+        let state = Arc::new(ServerState::new());
+        state.add("s.yaml", b"DATA".to_vec(), "h1");
+        let id_a = state.create_pending("s.yaml", 42, Some("h42"), "read request");
+        let id_b = state.create_pending("s.yaml", 43, None, "read request");
+
+        let sock2 = sock.clone();
+        let state2 = Arc::clone(&state);
+        let _handle = std::thread::spawn(move || run_socket_server(&sock2, state2));
+
+        wait_for_socket(&sock);
+
+        let ids = fuse_protocol::poll_pending_once(&sock)
+            .expect("poll must succeed against the real server dispatch");
+        let mut want = vec![id_a, id_b];
+        let mut got = ids;
+        want.sort_unstable();
+        got.sort_unstable();
+        assert_eq!(got, want);
+
+        // Grant: the entry STAYS listed (granted=true) until the FUSE
+        // reader consumes it — the badge disappearing on grant alone
+        // would be wrong. Deny removes immediately.
+        let app = make_app(&sock);
+        let lines = app.run_cli_command("grant", &id_a.to_string()).unwrap();
+        assert!(lines.iter().any(|l| l == "OK"), "got: {lines:?}");
+        assert!(state.is_pending_granted(id_a), "grant must mark the entry");
+        let ids = fuse_protocol::poll_pending_once(&sock).unwrap();
+        let mut got = ids;
+        got.sort_unstable();
+        assert_eq!(got, want, "granted-but-unconsumed requests stay listed");
+
+        let lines = app.run_cli_command("deny", &id_b.to_string()).unwrap();
+        assert!(lines.iter().any(|l| l == "OK"), "got: {lines:?}");
+        let ids = fuse_protocol::poll_pending_once(&sock).unwrap();
+        assert_eq!(ids, vec![id_a], "denied requests disappear immediately");
+    }
 }

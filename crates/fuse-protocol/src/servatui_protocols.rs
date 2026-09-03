@@ -274,8 +274,13 @@ pub(crate) fn pending_ids(resp: &crate::Response) -> Vec<u64> {
 pub fn poll_pending_once(socket: &std::path::Path) -> Result<Vec<u64>, String> {
     use servyi_servatui::TypedConnection;
     let mut conn = servyi_servatui::SocketConnection::connect(socket)?;
+    // The server dispatches on the FIRST wire message (the protocol name);
+    // the command payload is the client step's output. Mirrors the wire
+    // sequence of run_cli_command("pending", ...), closed by the sentinel.
+    conn.send_typed(&"pending".to_string())?;
     conn.send_typed(&Command::ListPending)?;
     let resp: crate::Response = conn.recv_typed()?;
+    conn.send_typed(&())?;
     Ok(pending_ids(&resp))
 }
 
@@ -450,7 +455,18 @@ mod tests {
             let mut reader = BufReader::new(stream.try_clone().unwrap());
             let mut line = String::new();
             reader.read_line(&mut line).unwrap();
-            assert!(line.contains("list_pending"), "must ask for pending, got: {line}");
+            // The FIRST wire message is the protocol NAME (the server
+            // dispatches on it); the command payload comes second.
+            assert!(
+                line.trim() == "\"pending\"",
+                "first message must be the protocol name \"pending\", got: {line}"
+            );
+            line.clear();
+            reader.read_line(&mut line).unwrap();
+            assert!(
+                line.contains("list_pending"),
+                "second message must be the ListPending command, got: {line}"
+            );
             let mut w = stream;
             let resp = crate::Response::PendingList {
                 pending: vec![crate::PendingAccessInfo {
@@ -463,6 +479,11 @@ mod tests {
                 }],
             };
             writeln!(w, "{}", serde_json::to_string(&resp).unwrap()).unwrap();
+            // The client closes the conversation with the `()` sentinel;
+            // a well-mannered server drains it before dropping the socket.
+            line.clear();
+            reader.read_line(&mut line).unwrap();
+            assert!(line.trim() == "null", "closing sentinel must be (), got: {line}");
         });
 
         let ids = poll_pending_once(&path).expect("poll must succeed");
