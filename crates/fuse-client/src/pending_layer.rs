@@ -15,7 +15,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
 use ratatui::widgets::Paragraph;
-use servatui_display::{DisplayLayer, EventResult, LayerCtx};
+use servatui_display::{DisplayLayer, EventResult, LayerCtx, StackIntent};
 use servyi_servatui::WidgetEntry;
 
 /// Widget name of the badge (ownership/hit-testing key of the display).
@@ -60,9 +60,11 @@ impl PendingBadgeLayer {
 }
 
 impl DisplayLayer for PendingBadgeLayer {
-    fn on_overlay(&mut self, ctx: &mut LayerCtx, widgets: &mut Vec<WidgetEntry>) {
+    fn on_overlay(&mut self, ctx: &mut LayerCtx, widgets: &mut Vec<WidgetEntry>) -> StackIntent {
         let ids = self.pending.lock().unwrap().clone();
-        let Some(text) = badge_text(&ids) else { return };
+        let Some(text) = badge_text(&ids) else { return StackIntent::Keep };
+        // Pending access requests are time-limited: the badge must stay
+        // visible, never occluded by other layers' backdrops.
         let area = badge_rect(text.chars().count(), ctx.terminal_area);
         widgets.push(WidgetEntry {
             name: BADGE_NAME,
@@ -75,6 +77,7 @@ impl DisplayLayer for PendingBadgeLayer {
             ))),
             area,
         });
+        StackIntent::Top
     }
 
     fn on_event(&mut self, ev: &Event, ctx: &LayerCtx) -> EventResult {
@@ -123,6 +126,28 @@ mod tests {
 
     fn mouse(kind: MouseEventKind, col: u16, row: u16) -> Event {
         Event::Mouse(MouseEvent { kind, column: col, row, modifiers: KeyModifiers::NONE })
+    }
+    /// The layer demands the top of the stack only while requests are
+    /// pending; idle it keeps its position (no attention stealing).
+    #[test]
+    fn intent_top_only_while_pending() {
+        use servatui_display::LayerId;
+        let pending: PendingIds = Arc::new(Mutex::new(vec![31]));
+        let mut layer = PendingBadgeLayer::new(pending.clone());
+        let mut ctx = LayerCtx {
+            id: LayerId::BUILTIN,
+            color: Color::Blue,
+            terminal_area: Rect::new(0, 0, 80, 24),
+            my_widgets: &[],
+        };
+        let mut widgets = Vec::new();
+        assert_eq!(layer.on_overlay(&mut ctx, &mut widgets), StackIntent::Top);
+        assert_eq!(widgets.len(), 1, "badge pushed while pending");
+
+        *pending.lock().unwrap() = vec![];
+        widgets.clear();
+        assert_eq!(layer.on_overlay(&mut ctx, &mut widgets), StackIntent::Keep);
+        assert!(widgets.is_empty(), "no badge while idle");
     }
 
     #[test]
