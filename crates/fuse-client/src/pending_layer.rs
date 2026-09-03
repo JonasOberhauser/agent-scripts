@@ -496,10 +496,8 @@ fn request_line(
     cursor_here: bool,
     grant_selected: bool,
 ) -> Line<'static> {
-    let id = Span::styled(
-        format!("{:>3} ", req.id),
-        Style::default().add_modifier(Modifier::BOLD),
-    );
+    let base = Style::default().fg(Color::Black);
+    let id = Span::styled(format!("{:>3} ", req.id), base.add_modifier(Modifier::BOLD));
     let name_max = (width as usize).saturating_sub(
         3 + 1 + DENY_BTN.len() + BTN_GAP as usize + GRANT_BTN.len() + 1,
     );
@@ -522,10 +520,11 @@ fn button_spans(label: &str, color: Color, selected: bool) -> Vec<Span<'static>>
         )];
     }
     let word = &label[1..label.len() - 1];
+    let brackets = Style::default().fg(color);
     vec![
-        Span::styled("[", Style::default().fg(color)),
+        Span::styled("[", brackets),
         Span::raw(word.to_string()),
-        Span::styled("]", Style::default().fg(color)),
+        Span::styled("]", brackets),
     ]
 }
 
@@ -636,6 +635,35 @@ mod tests {
             cursor_up(&slots, c),
             Cursor::All { grant: true },
             "up from the top wraps to the all-row"
+        );
+    }
+
+    /// Style contract: no span overrides the background — the layer's
+    /// servatui-assigned color backdrop shows through untouched. Words
+    /// carry no color; only the brackets (and the reversed selection) do.
+    #[test]
+    fn rows_keep_the_layer_backdrop() {
+        for &grant_sel in &[false, true] {
+            for line in [
+                request_line(&pending_info(31), PANEL_WIDTH, true, grant_sel),
+                all_row_line(PANEL_WIDTH, true, grant_sel),
+            ] {
+                for span in &line.spans {
+                    assert!(
+                        span.style.bg.is_none(),
+                        "span {:?} must not override the layer backdrop",
+                        span.content
+                    );
+                }
+            }
+        }
+        let line = request_line(&pending_info(31), PANEL_WIDTH, false, false);
+        let colors: Vec<Option<Color>> = line.spans.iter().map(|s| s.style.fg).collect();
+        assert!(colors.contains(&Some(Color::Red),), "deny brackets red: {colors:?}");
+        assert!(colors.contains(&Some(Color::Green)), "grant brackets green: {colors:?}");
+        assert!(
+            colors.iter().filter(|c| c.is_none()).count() >= 2,
+            "id/name/words stay uncolored: {colors:?}"
         );
     }
 

@@ -77,7 +77,7 @@ fn main() {
             let display: std::rc::Rc<
                 std::cell::RefCell<servatui_display::Display>,
             > = std::rc::Rc::new(std::cell::RefCell::new(
-                servatui_display::Display::with_palette(Vec::new()),
+                servatui_display::Display::new(),
             ));
             display
                 .borrow_mut()
