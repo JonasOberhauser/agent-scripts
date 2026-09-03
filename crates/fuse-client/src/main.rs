@@ -73,15 +73,18 @@ fn main() {
                 let pending = pending.clone();
                 let socket = cli.socket.clone();
                 std::thread::spawn(move || loop {
-                    if let Ok(ids) = fuse_protocol::poll_pending_once(&socket) {
-                        *pending.lock().unwrap() = ids;
+                    if let Ok(list) = fuse_protocol::poll_pending_info(&socket) {
+                        *pending.lock().unwrap() = list;
                     }
                     std::thread::sleep(std::time::Duration::from_secs(1));
                 });
             }
             let protocols = fuse_protocol::client_protocols_with_pending(pending.clone());
             let mut display = servatui_display::Display::new();
-            display.add_layer(Box::new(pending_layer::PendingBadgeLayer::new(pending)));
+            display.add_layer(Box::new(pending_layer::PendingPanelLayer::new(
+                pending,
+                &cli.socket,
+            )));
             // Display::run drives run_tui_with_events: the badge layer's
             // frame/route closures ride the overlay + event hooks.
             if let Err(e) = display.run(&cli.socket, &protocols) {

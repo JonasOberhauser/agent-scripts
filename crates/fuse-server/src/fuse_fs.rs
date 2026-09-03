@@ -13,6 +13,14 @@ use std::sync::Arc;
 
 use crate::state::{lock_secret, ReadOutcome, ServerState};
 
+/// Best-effort name of the requesting process (`/proc/<pid>/comm`),
+/// shown in pending-request panels; `None` when unreadable.
+fn process_name(pid: u32) -> Option<String> {
+    std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .ok()
+        .map(|s| s.trim().to_string())
+}
+
 const ROOT_INO: u64 = 1;
 
 /// TTL for kernel cache entries.  Set to zero so the kernel always
@@ -243,7 +251,13 @@ impl<S: SystemIo> GatekeeperFs<S> {
                     warn!("Denied read of '{name}' by pid {pid}: {reason}");
                     return ReadResult::Error(libc::EACCES);
                 }
-                let id = self.state.create_pending(&name, pid, pid_hash, &reason);
+                let id = self.state.create_pending(
+                    &name,
+                    pid,
+                    pid_hash,
+                    &reason,
+                    process_name(pid).as_deref(),
+                );
                 let timeout = *self.state.pending_timeout.lock().unwrap();
 
                 warn!(
@@ -391,7 +405,13 @@ fn read_worker(
                 warn!("Denied read of '{name}' by pid {pid}: {reason}");
                 return Err(libc::EACCES);
             }
-            let pending_id = state.create_pending(name, pid, pid_hash.as_deref(), &reason);
+            let pending_id = state.create_pending(
+                name,
+                pid,
+                pid_hash.as_deref(),
+                &reason,
+                process_name(pid).as_deref(),
+            );
             let timeout = *state.pending_timeout.lock().unwrap();
 
             warn!("Access pending for '{name}' by pid {pid}: {reason} (id={pending_id})");
@@ -905,7 +925,7 @@ mod tests {
             let outcome = state1.attempt_read("a", 100, Some("wrong"), 0, 1024);
             assert!(matches!(outcome, ReadOutcome::HashMismatch { .. }));
 
-            let id = state1.create_pending("a", 100, Some("wrong"), "hash mismatch");
+            let id = state1.create_pending("a", 100, Some("wrong"), "hash mismatch", None);
 
             let deadline = std::time::Instant::now() + Duration::from_secs(15);
             loop {

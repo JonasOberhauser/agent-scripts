@@ -20,6 +20,7 @@ pub struct SecretRecord {
 pub struct PendingAccess {
     pub id: u64,
     pub secret_name: String,
+    pub process_name: Option<String>,
     pub pid: u32,
     pub pid_hash: Option<String>,
     pub reason: String,
@@ -194,11 +195,13 @@ impl ServerState {
         pid: u32,
         pid_hash: Option<&str>,
         reason: &str,
+        process_name: Option<&str>,
     ) -> u64 {
         let id = self.next_pending_id.fetch_add(1, Ordering::SeqCst);
         self.pending.insert(id, PendingAccess {
             id,
             secret_name: secret_name.to_string(),
+            process_name: process_name.map(|s| s.to_string()),
             pid,
             pid_hash: pid_hash.map(|s| s.to_string()),
             reason: reason.to_string(),
@@ -253,6 +256,7 @@ impl ServerState {
                 fuse_protocol::PendingAccessInfo {
                     id: p.id,
                     secret_name: p.secret_name.clone(),
+                    process_name: p.process_name.clone(),
                     pid: p.pid,
                     pid_hash: p.pid_hash.clone(),
                     reason: p.reason.clone(),

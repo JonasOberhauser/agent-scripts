@@ -1,6 +1,6 @@
 use servyi_servatui::{Console, Plugin, Protocol, ShellAction};
 
-use crate::protocol::{Command, Response};
+use crate::protocol::{Command, PendingAccessInfo, Response};
 
 // ═══════════════════════════════════════════════════════════════
 // Response rendering
@@ -87,10 +87,24 @@ fn cmd_protocol(
         .finalize(|| Ok(ShellAction::Continue))
 }
 
-/// Shared, polled snapshot of the currently active (pending) request IDs.
+/// Shared, polled snapshot of the currently pending access requests.
 /// A background poller in the client replaces the whole list on every
-/// successful poll; completers read it without a server round-trip.
-pub type PendingIds = std::sync::Arc<std::sync::Mutex<Vec<u64>>>;
+/// successful poll; completers and the pending panel read it without a
+/// server round-trip.
+pub type PendingIds = std::sync::Arc<std::sync::Mutex<Vec<PendingAccessInfo>>>;
+
+/// Test/constructor helper: a pending request with the given id.
+pub fn pending_info(id: u64) -> PendingAccessInfo {
+    PendingAccessInfo {
+        id,
+        secret_name: "s.yaml".into(),
+        process_name: None,
+        pid: id as u32,
+        pid_hash: None,
+        reason: "read request".into(),
+        expires_at: 0,
+    }
+}
 
 pub fn client_protocols() -> Vec<Protocol> {
     client_protocols_with_pending(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())))
@@ -167,7 +181,8 @@ pub fn client_protocols_with_pending(pending: PendingIds) -> Vec<Protocol> {
             .complete({
                 let ids = pending.clone();
                 move |s| {
-                    let snapshot = ids.lock().unwrap().clone();
+                    let snapshot: Vec<u64> =
+                        ids.lock().unwrap().iter().map(|p| p.id).collect();
                     pending_completions(&snapshot, s)
                 }
             }),
@@ -182,7 +197,8 @@ pub fn client_protocols_with_pending(pending: PendingIds) -> Vec<Protocol> {
             .complete({
                 let ids = pending.clone();
                 move |s| {
-                    let snapshot = ids.lock().unwrap().clone();
+                    let snapshot: Vec<u64> =
+                        ids.lock().unwrap().iter().map(|p| p.id).collect();
                     pending_completions(&snapshot, s)
                 }
             }),
@@ -259,29 +275,37 @@ pub(crate) fn pending_completions(ids: &[u64], confirmed: &str) -> Vec<String> {
         .collect()
 }
 
-/// Extract the pending request IDs from a `ListPending` response.
-pub(crate) fn pending_ids(resp: &crate::Response) -> Vec<u64> {
-    match resp {
-        crate::Response::PendingList { pending } => pending.iter().map(|p| p.id).collect(),
-        _ => Vec::new(),
+/// One full request/response exchange with the running server, speaking
+/// the standard wire sequence (protocol name, payload, response, closing
+/// sentinel) — the same conversation `run_cli_command` has.
+pub fn run_command_once(
+    socket: &std::path::Path,
+    name: &str,
+    cmd: &Command,
+) -> Result<crate::Response, String> {
+    use servyi_servatui::TypedConnection;
+    let mut conn = servyi_servatui::SocketConnection::connect(socket)?;
+    conn.send_typed(&name.to_string())?;
+    conn.send_typed(cmd)?;
+    let resp: crate::Response = conn.recv_typed()?;
+    conn.send_typed(&())?;
+    Ok(resp)
+}
+
+/// One poll cycle returning the FULL pending request list.
+pub fn poll_pending_info(socket: &std::path::Path) -> Result<Vec<PendingAccessInfo>, String> {
+    match run_command_once(socket, "pending", &Command::ListPending)? {
+        crate::Response::PendingList { pending } => Ok(pending),
+        other => Err(format!("unexpected response to list_pending: {other:?}")),
     }
 }
 
-/// One poll cycle: ask the running server for its pending access requests.
-/// The caller keeps the previous snapshot when this errors (server down,
-/// stale socket, ...). Connect failures already carry actionable messages
-/// from the transport layer.
+/// One poll cycle: ask the running server for its pending access request
+/// IDs. The caller keeps the previous snapshot when this errors (server
+/// down, stale socket, ...). Connect failures already carry actionable
+/// messages from the transport layer.
 pub fn poll_pending_once(socket: &std::path::Path) -> Result<Vec<u64>, String> {
-    use servyi_servatui::TypedConnection;
-    let mut conn = servyi_servatui::SocketConnection::connect(socket)?;
-    // The server dispatches on the FIRST wire message (the protocol name);
-    // the command payload is the client step's output. Mirrors the wire
-    // sequence of run_cli_command("pending", ...), closed by the sentinel.
-    conn.send_typed(&"pending".to_string())?;
-    conn.send_typed(&Command::ListPending)?;
-    let resp: crate::Response = conn.recv_typed()?;
-    conn.send_typed(&())?;
-    Ok(pending_ids(&resp))
+    Ok(poll_pending_info(socket)?.into_iter().map(|p| p.id).collect())
 }
 
 #[cfg(test)]
@@ -398,44 +422,23 @@ mod tests {
         assert!(pending_completions(&ids, "grant 4 x").is_empty());
     }
 
-    #[test]
-    fn pending_ids_extracted_from_response() {
-        let resp = crate::Response::PendingList {
-            pending: vec![
-                crate::PendingAccessInfo {
-                    id: 11,
-                    secret_name: "s".into(),
-                    pid: 1,
-                    pid_hash: None,
-                    reason: "r".into(),
-                    expires_at: 0,
-                },
-                crate::PendingAccessInfo {
-                    id: 22,
-                    secret_name: "s".into(),
-                    pid: 2,
-                    pid_hash: None,
-                    reason: "r".into(),
-                    expires_at: 0,
-                },
-            ],
-        };
-        assert_eq!(pending_ids(&resp), vec![11, 22]);
-    }
 
     #[test]
     fn grant_deny_complete_from_live_snapshot() {
-        let shared: PendingIds = std::sync::Arc::new(std::sync::Mutex::new(vec![5u64, 51]));
+        let shared: PendingIds = std::sync::Arc::new(std::sync::Mutex::new(vec![
+            pending_info(5),
+            pending_info(51),
+        ]));
         let protocols = client_protocols_with_pending(shared.clone());
         for name in ["grant", "deny"] {
             // Fresh snapshot per command: the loop's last step mutates it.
-            *shared.lock().unwrap() = vec![5u64, 51];
+            *shared.lock().unwrap() = vec![pending_info(5), pending_info(51)];
             let p = protocols.iter().find(|p| p.name == name).unwrap();
             let completer = p.completer().expect("completer registered");
             assert_eq!(completer("grant 5"), vec!["grant 5".to_string(), "grant 51".to_string()]);
 
             // The poller updates the snapshot — the completer sees new IDs.
-            *shared.lock().unwrap() = vec![9u64];
+            *shared.lock().unwrap() = vec![pending_info(9)];
             assert_eq!(completer("deny 9"), vec!["deny 9".to_string()]);
             assert!(completer("deny 5").is_empty(), "stale ID must be gone");
         }
@@ -472,6 +475,7 @@ mod tests {
                 pending: vec![crate::PendingAccessInfo {
                     id: 77,
                     secret_name: "s".into(),
+                    process_name: None,
                     pid: 1,
                     pid_hash: None,
                     reason: "r".into(),

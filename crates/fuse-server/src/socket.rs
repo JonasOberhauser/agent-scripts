@@ -122,8 +122,9 @@ mod tests {
         let sock = dir.path().join("poll.sock");
         let state = Arc::new(ServerState::new());
         state.add("s.yaml", b"DATA".to_vec(), "h1");
-        let id_a = state.create_pending("s.yaml", 42, Some("h42"), "read request");
-        let id_b = state.create_pending("s.yaml", 43, None, "read request");
+        let id_a =
+            state.create_pending("s.yaml", 42, Some("h42"), "read request", Some("checker"));
+        let id_b = state.create_pending("s.yaml", 43, None, "read request", None);
 
         let sock2 = sock.clone();
         let state2 = Arc::clone(&state);
@@ -138,6 +139,13 @@ mod tests {
         want.sort_unstable();
         got.sort_unstable();
         assert_eq!(got, want);
+
+        // The full poll carries the requesting process's name when known.
+        let list = fuse_protocol::poll_pending_info(&sock).unwrap();
+        let a = list.iter().find(|p| p.id == id_a).unwrap();
+        assert_eq!(a.process_name.as_deref(), Some("checker"), "got: {a:?}");
+        let b = list.iter().find(|p| p.id == id_b).unwrap();
+        assert_eq!(b.process_name, None);
 
         // Grant: the entry STAYS listed (granted=true) until the FUSE
         // reader consumes it — the badge disappearing on grant alone
