@@ -230,17 +230,11 @@ pub fn all_button_rect(row: Rect, grant: bool) -> Rect {
     Rect { x, y: row.y, width: w, height: 1 }
 }
 
-/// The panel title on the DEFAULT background (bold, underlined) — the
-/// layer-color backdrop would make it hard to read. The line repaints
-/// the full panel width so no backdrop color bleeds through.
-pub fn title_line(width: u16, shown: usize, total: usize) -> Line<'static> {
-    let text = format!(" pending requests: {shown}/{total} ");
-    let pad = (width as usize).saturating_sub(text.chars().count());
-    let style = Style::default().bg(Color::Reset).add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
-    Line::from(vec![
-        Span::styled(text, style),
-        Span::styled(" ".repeat(pad), Style::default().bg(Color::Reset)),
-    ])
+/// The panel title: completely unstyled text — no modifiers, no
+/// colors, no background override. It sits directly on the layer's
+/// servatui-assigned backdrop like every other row.
+pub fn title_line(shown: usize, total: usize) -> Line<'static> {
+    Line::raw(format!(" pending requests: {shown}/{total} "))
 }
 
 /// Identifying text for the requesting process: its name, or `#pid`.
@@ -347,7 +341,6 @@ impl DisplayLayer for PendingPanelLayer {
         widgets.push(WidgetEntry {
             name: PANEL_NAME,
             widget: Box::new(Paragraph::new(title_line(
-                panel.width,
                 occupied(&self.slots).len(),
                 total,
             ))),
@@ -686,15 +679,15 @@ mod tests {
         );
     }
 
-    /// The title must live on the default background (readable) and
-    /// cover the full width so no layer color bleeds through.
+    /// The title carries no styling at all: no fg/bg, no modifiers —
+    /// plain text on the layer backdrop, like the body rows.
     #[test]
-    fn title_is_default_bg_full_width() {
-        let line = title_line(PANEL_WIDTH, 5, 6);
-        let len: usize = line.spans.iter().map(|s| s.content.len()).sum();
-        assert_eq!(len, PANEL_WIDTH as usize);
+    fn title_is_completely_unstyled() {
+        let line = title_line(5, 6);
         for span in &line.spans {
-            assert_eq!(span.style.bg, Some(Color::Reset));
+            assert!(span.style.fg.is_none(), "no fg: {:?}", span.style);
+            assert!(span.style.bg.is_none(), "no bg: {:?}", span.style);
+            assert!(span.style.add_modifier.is_empty(), "no modifiers: {:?}", span.style);
         }
     }
 
