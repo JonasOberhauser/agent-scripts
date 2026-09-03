@@ -69,30 +69,16 @@ fn main() {
             let protocols = fuse_protocol::client_protocols_with_pending(pending.clone());
             // One pending layer, registered for the whole session: it
             // polls on its own (rate-limited inside on_overlay) and hides
-            // itself while idle, so its identity — and look — never
-            // changes. The display runs with an empty palette: no
-            // colored layer background, only the button brackets are
-            // colored. Main-thread only (the Display's layers are not
-            // Send).
-            let display: std::rc::Rc<
-                std::cell::RefCell<servatui_display::Display>,
-            > = std::rc::Rc::new(std::cell::RefCell::new(
-                servatui_display::Display::new(),
-            ));
-            display
-                .borrow_mut()
-                .add_layer(Box::new(pending_layer::PendingPanelLayer::new(
-                    pending,
-                    cli.socket.clone(),
-                )));
-            let frame_display = display.clone();
-            let event_display = display.clone();
-            if let Err(e) = servyi_servatui::run_tui_with_events(
-                &cli.socket,
-                &protocols,
-                move |widgets| frame_display.borrow_mut().frame(widgets),
-                move |ev| event_display.borrow_mut().route_event(ev),
-            ) {
+            // itself while idle. Display::run creates the shared
+            // BuiltinTui and attaches it as an ordinary layer, so the
+            // builtin input line and the panel are peers with
+            // activation-based keyboard focus (taskbar, Shift+Tab).
+            let mut display = servatui_display::Display::new();
+            display.add_layer(Box::new(pending_layer::PendingPanelLayer::new(
+                pending,
+                cli.socket.clone(),
+            )));
+            if let Err(e) = display.run(&cli.socket, &protocols) {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
             }
