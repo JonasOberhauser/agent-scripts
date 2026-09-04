@@ -1,10 +1,53 @@
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use fuse_protocol::SystemIo;
 use tracing::{info, warn};
 
-use crate::config::{build_create_args, build_exec_args, AgentConfig};
+use crate::config::{
+    build_create_args, build_exec_args, AgentConfig, NESTED_SECCOMP_PROFILE,
+};
+
+/// The agentbox Dockerfile, embedded into the binary at compile time
+/// (`include_str!`).  It is the single source for rebuilding the image:
+/// no runtime discovery of repo checkouts (the binary may be installed
+/// anywhere) — the file is materialized into a temp path on demand.
+/// The Dockerfile must stay COPY/ADD-free so any build context works.
+const EMBEDDED_DOCKERFILE: &str = include_str!("../../../Dockerfile");
+
+/// The Dockerfile content used for image builds.  Debug builds honor
+/// `RUN_AGENT_TEST_DOCKERFILE` (path) so tests can substitute a trivial
+/// image; release builds always use the embedded copy.
+fn dockerfile_content() -> Result<String, String> {
+    #[cfg(debug_assertions)]
+    if let Some(p) = std::env::var_os("RUN_AGENT_TEST_DOCKERFILE") {
+        return std::fs::read_to_string(p)
+            .map_err(|e| format!("RUN_AGENT_TEST_DOCKERFILE: {e}"));
+    }
+    Ok(EMBEDDED_DOCKERFILE.to_string())
+}
+
+/// Run a runtime command with **inherited stdio** so long-running work
+/// (image builds/pulls) streams its progress to the user live.
+fn run_streamed<S: SystemIo>(
+    io: &S,
+    wrapper: Option<&str>,
+    container_bin: &str,
+    args: &[&str],
+) -> Result<i32, String> {
+    match wrapper {
+        Some(w) => {
+            let parts: Vec<&str> = w.split_whitespace().collect();
+            let mut full: Vec<&str> = parts[1..].to_vec();
+            full.push(container_bin);
+            full.extend(args.iter());
+            io.run_interactive(parts[0], &full)
+        }
+        None => io.run_interactive(container_bin, args),
+    }
+    .map_err(|e| format!("spawn {container_bin}: {e}"))
+}
 
 /// Result of a completed agent session.
 #[derive(Debug)]
@@ -320,6 +363,26 @@ where
         setup_rootless_docker();
     }
 
+    // ── 5.5 Materialize the seccomp profile referenced by
+    // `--security-opt` in the create args.  Must exist on the host
+    // before `podman/docker run` reads it.
+    io.write_file(&config.seccomp_profile, NESTED_SECCOMP_PROFILE.as_bytes())
+        .map_err(|e| {
+            format!(
+                "cannot write seccomp profile {}: {e}",
+                config.seccomp_profile.display()
+            )
+        })?;
+
+    // Pass through the char devices nested rootless podman needs, when
+    // the host has them: /dev/fuse for fuse-overlayfs storage (and FUSE
+    // work generally), /dev/net/tun for pasta/slirp networking.
+    let passthrough_devices: Vec<String> = ["/dev/fuse", "/dev/net/tun"]
+        .into_iter()
+        .filter(|d| io.file_exists(std::path::Path::new(d)))
+        .map(str::to_string)
+        .collect();
+
     // ── 6. Ensure persistent container is running ────────────────
     let container_name = config.container_name();
 
@@ -360,9 +423,13 @@ where
                 }
             }
         }
-        None => {
+         None => {
+            // ── 6.4 Fail fast on a missing image (issue #1) ─────────
+            // A missing image must never reach headless `podman run`.
+            ensure_image_available(io, wrapper, container_bin, config)?;
+
             info!("Creating persistent container {container_name}...");
-            let create_args = build_create_args(config);
+            let create_args = build_create_args(config, &passthrough_devices);
             let create_refs: Vec<&str> = create_args.iter().map(|s| s.as_str()).collect();
             match run_with_wrapper(io, wrapper, container_bin, &create_refs) {
                 Ok(o) if o.success() => {
@@ -550,8 +617,122 @@ fn run_with_wrapper<S: SystemIo>(
 /// Check whether a named container is currently running.
 /// Inspect a container's running state.
 /// `Some(is_running)` when the container exists; `None` when it does not.
-fn check_container_running<S: SystemIo>(
+/// Ask an interactive user `prompt` (y/N) with a 10s countdown.  No TTY,
+/// timeout, or anything but an affirmative answer counts as No.
+fn prompt_yes_no(prompt: &str) -> bool {
+    if unsafe { libc::isatty(libc::STDIN_FILENO) } != 1 {
+        return false;
+    }
+    eprint!("{prompt} [y/N] (default N in 10s): ");
+    let _ = std::io::stderr().flush();
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let _ = std::io::stdin().read_line(&mut line);
+        let _ = tx.send(line);
+    });
+    match rx.recv_timeout(Duration::from_secs(10)) {
+        Ok(line) => matches!(line.trim(), "y" | "Y" | "yes"),
+        Err(_) => {
+            eprintln!("(timeout — defaulting to No)");
+            false
+        }
+    }
+}
+
+/// How to create a missing image.
+enum Remedy {
+    /// Build from the embedded Dockerfile, materialized into a temp path.
+    Build { dockerfile: PathBuf },
+    /// Pull a fully-qualified reference from its registry.
+    Pull,
+}
+
+/// Fail fast on a missing image instead of delegating to headless
+/// `podman run` (which dies with a config-dependent registry error —
+/// issue #1).  Prints the exact remediation command and, for interactive
+/// users (or `--yes`), creates the image right away.
+fn ensure_image_available<S: SystemIo>(
     io: &S,
+    wrapper: Option<&str>,
+    container_bin: &str,
+    config: &AgentConfig,
+) -> Result<(), String> {
+    let image = &config.image_name;
+    // `image exists` is podman-native; docker only has `image inspect`
+    // (exit != 0 when missing).
+    let probe = |io: &S| {
+        let args: Vec<&str> = if container_bin == "docker" {
+            vec!["image", "inspect", "-f", "{{.Id}}", image]
+        } else {
+            vec!["image", "exists", image]
+        };
+        run_with_wrapper(io, wrapper, container_bin, &args)
+            .map(|o| o.success())
+            .unwrap_or(false)
+    };
+    if probe(io) {
+        return Ok(());
+    }
+
+    // A fully-qualified reference comes from a registry → pull it.
+    // A local-only short name (the `agentbox` default) → build from the
+    // embedded Dockerfile in a temp location.
+    let tmp_ctx = std::env::temp_dir();
+    let (manual_cmd, verb, remedy) = if image.contains('/') {
+        (
+            format!("{container_bin} pull {image}"),
+            "Pull",
+            Remedy::Pull,
+        )
+    } else {
+        let dockerfile = tmp_ctx.join(format!("agentbox-{}.Dockerfile", std::process::id()));
+        (
+            format!(
+                "{container_bin} build -t {image} -f {} {}",
+                dockerfile.display(),
+                tmp_ctx.display()
+            ),
+            "Build",
+            Remedy::Build { dockerfile },
+        )
+    };
+
+    eprintln!("Image `{image}` not found locally. To create it, run:\n  {manual_cmd}");
+    if !(config.auto_confirm || prompt_yes_no(&format!("{verb} it now?"))) {
+        return Err(format!(
+            "image `{image}` is missing — create it first:\n  {manual_cmd}"
+        ));
+    }
+
+    eprintln!("{verb}ing image `{image}` — output follows (this can take a few minutes)…");
+    let streamed = |args: Vec<&str>| run_streamed(io, wrapper, container_bin, &args);
+    let code = match &remedy {
+        Remedy::Build { dockerfile } => {
+            if let Err(e) = std::fs::write(dockerfile, dockerfile_content()?) {
+                return Err(format!("cannot write {}: {e}", dockerfile.display()));
+            }
+            let df = dockerfile.to_string_lossy().to_string();
+            let ctx_s = tmp_ctx.to_string_lossy().to_string();
+            streamed(vec!["build", "-t", image, "-f", &df, &ctx_s])
+        }
+        Remedy::Pull => streamed(vec!["pull", image]),
+    }?;
+    if code != 0 {
+        return Err(format!("{verb} of image `{image}` failed with exit {code}"));
+    }
+
+    if probe(io) {
+        info!("Image {image} is now available.");
+        Ok(())
+    } else {
+        Err(format!(
+            "image `{image}` is still missing after {verb} — try manually:\n  {manual_cmd}"
+        ))
+    }
+}
+
+fn check_container_running<S: SystemIo>(    io: &S,
     wrapper: Option<&str>,
     runtime: &str,
     name: &str,
@@ -717,10 +898,10 @@ fn write_state_file<S: SystemIo>(
         }
     };
 
-    let state_path = std::path::Path::new(fuse_protocol::STATE_FILE);
-    if let Err(e) = io.write_file(state_path, json.as_bytes()) {
+    let state_path = fuse_protocol::state_file();
+    if let Err(e) = io.write_file(&state_path, json.as_bytes()) {
         warn!("Failed to write state file: {e}");
-    } else if let Err(e) = io.set_file_mode(state_path, 0o600) {
+    } else if let Err(e) = io.set_file_mode(&state_path, 0o600) {
         warn!("Failed to set state file permissions: {e}");
     }
 }
@@ -744,8 +925,10 @@ mod tests {
             agent_path: PathBuf::from("/work/agent1"),
             fuse_server_path: "fuse-server".into(),
             image_name: "agentbox".into(),
+            seccomp_profile: PathBuf::from("/tmp/agentbox-seccomp.json"),
             memory: "16G".into(),
             cpus: "4".into(),
+            auto_confirm: false,
             socket_path: PathBuf::from("/tmp/fgk.sock"),
             mount_point: PathBuf::from("/tmp/fgk-mnt"),
             use_sudo: false,
@@ -837,6 +1020,84 @@ mod tests {
     }
 
     // ── run_agent integration ────────────────────────────────────
+
+    #[test]
+    fn missing_image_fails_fast_with_remediation() {
+        // Issue #1: a missing image must never be delegated to headless
+        // `podman run`.  The error must name the image and the exact
+        // build command, and no container may be created.
+        let mut mock = base_mock()
+            .with_file("/home/user/secrets.yaml", b"DATA")
+            .with_command_result_when("podman", "inspect", Some(1))
+            .with_command_result_when("podman", "exists", Some(1));
+        let cfg = test_config();
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()), false);
+        let err = result.expect_err("missing image must fail run_agent");
+        assert!(
+            err.contains("agentbox"),
+            "error must name the image: {err}"
+        );
+        assert!(
+            err.contains("podman build"),
+            "error must contain the build command: {err}"
+        );
+        assert!(
+            !err.contains("Failed to create container"),
+            "must fail before podman run: {err}"
+        );
+    }
+
+    #[test]
+    fn missing_image_declined_prompt_is_error_not_crash() {
+        // Same as above but through the user-decline path: headless
+        // (no TTY) prompts default to No and yield the remediation error.
+        let mut mock = base_mock()
+            .with_file("/home/user/secrets.yaml", b"DATA")
+            .with_command_result_when("podman", "inspect", Some(1))
+            .with_command_result_when("podman", "exists", Some(1))
+            .with_command_result_when("podman", "build", Some(0));
+        let mut cfg = test_config();
+        cfg.image_name = "agentbox".into();
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()), false);
+        let err = result.expect_err("declined build must fail run_agent");
+        assert!(err.contains("create it first"), "got: {err}");
+        // The build command must NOT have run: the image probe would
+        // still report missing and the flow must stop before `run`.
+        assert!(!err.contains("Failed to create container"), "got: {err}");
+    }
+
+    #[test]
+    fn missing_image_auto_confirm_builds_and_proceeds() {
+        // With auto_confirm the remediation runs without a prompt: the
+        // first `image exists` probe fails, the build succeeds, the
+        // re-probe passes (rule expires after one use), and the flow
+        // continues to container creation.
+        let mut mock = base_mock()
+            .with_file("/home/user/secrets.yaml", b"DATA")
+            .with_command_result_when("podman", "inspect", Some(1))
+            .with_command_result_when_n("podman", "exists", Some(1), 1);
+        let mut cfg = test_config();
+        cfg.auto_confirm = true;
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()), false);
+        assert!(result.is_ok(), "got: {:?}", result.err());
+        // The build must STREAM (run_interactive: inherited stdio) so the
+        // user sees podman/apt progress instead of a silent multi-minute
+        // hang, and it must not go through the captured run_command path.
+        let interactive = mock.interactive_calls.borrow();
+        assert!(
+            interactive
+                .iter()
+                .any(|(bin, args)| bin == "podman"
+                    && args.first().map(String::as_str) == Some("build")),
+            "podman build must stream via run_interactive: {interactive:?}"
+        );
+        let calls = mock.command_calls.borrow();
+        assert!(
+            !calls.iter().any(|(bin, args)| bin == "podman"
+                && args.first().map(String::as_str) == Some("build")),
+            "podman build must NOT use the captured path: {calls:?}"
+        );
+    }
 
     #[test]
     fn missing_workspace_folders_are_created() {

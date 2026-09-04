@@ -145,6 +145,22 @@ impl SecretMapping {
 }
 
 /// All parameters needed to launch an agent session.
+/// Seccomp profile applied to every container run-agent creates.
+///
+/// Vendored from containers-common's `/usr/share/containers/seccomp.json`
+/// (podman's own shipped profile).  Unlike moby-style defaults it allows
+/// the namespace/mount syscall group (`clone`, `clone3`, `unshare`,
+/// `setns`, `mount`, `umount2`, the new mount API) so the agent box can
+/// run nested *rootless* podman/docker — no capabilities are granted;
+/// the kernel still limits mounts to user-namespace-scoped filesystems.
+pub const NESTED_SECCOMP_PROFILE: &str = include_str!("seccomp_profile.json");
+
+/// Host-side location the profile is written to before container
+/// creation.  Fixed path is fine: content is identical every run.
+pub fn seccomp_profile_path() -> PathBuf {
+    std::env::temp_dir().join("agentbox-seccomp.json")
+}
+
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
     /// SHA-256 of the binary allowed to read the secret.
@@ -161,10 +177,16 @@ pub struct AgentConfig {
     pub fuse_server_path: PathBuf,
     /// Docker/Podman image name.
     pub image_name: String,
+    /// Host-side path of the seccomp profile passed via
+    /// `--security-opt seccomp=…` at container creation.
+    pub seccomp_profile: PathBuf,
     /// Container memory limit.
     pub memory: String,
     /// Container CPU limit.
     pub cpus: String,
+    /// Non-interactively accept remediation prompts (e.g. building the
+    /// missing agentbox image) — for scripts and tests.
+    pub auto_confirm: bool,
     /// Unix socket path for the shared fuse-server.
     pub socket_path: PathBuf,
     /// FUSE mount point (shared across projects).
@@ -210,8 +232,10 @@ impl AgentConfig {
             agent_path: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             fuse_server_path: PathBuf::from("fuse-server"),
             image_name: "agentbox".to_string(),
+            seccomp_profile: seccomp_profile_path(),
             memory: "224G".to_string(),
             cpus: "90".to_string(),
+            auto_confirm: false,
             socket_path: PathBuf::from(DEFAULT_SOCKET),
             mount_point: PathBuf::from(DEFAULT_MOUNT_POINT),
             use_sudo: false,
@@ -259,8 +283,9 @@ impl AgentConfig {
 }
 
 /// Build `docker run -d` args to create the persistent container.
-/// The container runs `sleep infinity` and stays alive between sessions.
-pub fn build_create_args(config: &AgentConfig) -> Vec<String> {
+/// `devices` are host device paths to pass through (e.g. `/dev/fuse`,
+/// `/dev/net/tun`) — the caller passes only those that exist.
+pub fn build_create_args(config: &AgentConfig, devices: &[String]) -> Vec<String> {
     let mut args = vec![
         "run".into(),
         "-d".into(),
@@ -290,6 +315,11 @@ pub fn build_create_args(config: &AgentConfig) -> Vec<String> {
         args.push(format!("{}:/workspace/plans:Z", plans.display()));
     }
 
+    for d in devices {
+        args.push("--device".into());
+        args.push(d.clone());
+    }
+
     args.extend_from_slice(&[
         "-v".into(),
         format!("{}_home:/root:z", config.agent_name()),
@@ -297,6 +327,8 @@ pub fn build_create_args(config: &AgentConfig) -> Vec<String> {
         format!("{}:/fuse:ro,z,slave", config.host_fuse().display()),
         "--workdir".into(),
         "/workspace".into(),
+        "--security-opt".into(),
+        format!("seccomp={}", config.seccomp_profile.display()),
     ]);
 
     if config.pidns_host {
@@ -401,8 +433,10 @@ mod tests {
             agent_path: PathBuf::from("/work/myagent"),
             fuse_server_path: "fuse-server".into(),
             image_name: "myimg".into(),
+            seccomp_profile: PathBuf::from("/tmp/agentbox-seccomp.json"),
             memory: "16G".into(),
             cpus: "4".into(),
+            auto_confirm: false,
             socket_path: PathBuf::from(fuse_protocol::DEFAULT_SOCKET),
             mount_point: PathBuf::from(fuse_protocol::DEFAULT_MOUNT_POINT),
             use_sudo: false,
@@ -413,13 +447,32 @@ mod tests {
             log_level: "info".to_string(),
             plans_path: None,
         };
-        let args = build_create_args(&cfg);
+        let args = build_create_args(
+            &cfg,
+            &["/dev/fuse".to_string(), "/dev/net/tun".to_string()],
+        );
         assert!(args.contains(&"run".to_string()));
+        // Device passthrough enables nested rootless podman.
+        let di = args
+            .iter()
+            .position(|a| a == "--device")
+            .expect("--device present");
+        assert_eq!(args[di + 1], "/dev/fuse");
         assert!(args.contains(&"-d".to_string()));
         assert!(!args.contains(&"--rm".to_string()), "persistent container should NOT use --rm");
         assert!(args.contains(&"sleep".into()));
         assert!(args.contains(&"infinity".into()));
         assert!(args.contains(&"myimg".into()));
+        // Nested rootless podman: widened seccomp profile must be applied.
+        let i = args
+            .iter()
+            .position(|a| a == "--security-opt")
+            .expect("--security-opt present");
+        assert!(
+            args[i + 1].starts_with("seccomp="),
+            "must reference a seccomp profile: {:?}",
+            args[i + 1]
+        );
         // No pidns by default
         assert!(!args.iter().any(|a| a == "--pid"));
     }
@@ -434,8 +487,10 @@ mod tests {
             agent_path: PathBuf::from("/work/myagent"),
             fuse_server_path: "fuse-server".into(),
             image_name: "myimg".into(),
+            seccomp_profile: PathBuf::from("/tmp/agentbox-seccomp.json"),
             memory: "16G".into(),
             cpus: "4".into(),
+            auto_confirm: false,
             socket_path: PathBuf::from(fuse_protocol::DEFAULT_SOCKET),
             mount_point: PathBuf::from(fuse_protocol::DEFAULT_MOUNT_POINT),
             use_sudo: false,
@@ -446,10 +501,14 @@ mod tests {
             log_level: "info".to_string(),
             plans_path: None,
         };
-        let args = build_create_args(&cfg);
+        let args = build_create_args(&cfg, &[]);
         assert!(
             args.iter().any(|a| a == "--pid") && args.iter().any(|a| a == "host"),
             "should include --pid host when pidns_host is true"
+        );
+        assert!(
+            !args.iter().any(|a| a == "--device"),
+            "no --device flags when the host lacks the devices"
         );
     }
 
@@ -463,8 +522,10 @@ mod tests {
             agent_path: PathBuf::from("/work/myagent"),
             fuse_server_path: "fuse-server".into(),
             image_name: "myimg".into(),
+            seccomp_profile: PathBuf::from("/tmp/agentbox-seccomp.json"),
             memory: "16G".into(),
             cpus: "4".into(),
+            auto_confirm: false,
             socket_path: PathBuf::from(fuse_protocol::DEFAULT_SOCKET),
             mount_point: PathBuf::from(fuse_protocol::DEFAULT_MOUNT_POINT),
             use_sudo: false,
