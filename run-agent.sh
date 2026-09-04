@@ -32,15 +32,10 @@ CONT_WORKSPACE="/workspace"
 echo "$HOST_CONFIG -> $CONT_CONFIG"
 echo "$HOST_WORKSPACE -> $CONT_WORKSPACE"
 
-# 3. Validation
-for dir in "$HOST_CONFIG" "$HOST_WORKSPACE"; do
-    if [ ! -d "$dir" ]; then
-        echo -e "\e[31mError: Directory $dir not found. Is this really a Goose agent workspace?\033[0m"
-        exit 1
-    fi
-done
-
-mkdir -p "$HOST_FUSE"
+# 3. Generate missing workspace folders (a fresh agent path just works;
+#    the fuse bind source especially must exist before the container is
+#    created, or docker/podman would create it root-owned).
+mkdir -p "$HOST_HOME" "$HOST_CONFIG" "$HOST_WORKSPACE" "$HOST_FUSE"
 
 # 4. Find the EXACT Python executable
 PYTHON_EXEC=$(command -v python || command -v python3)

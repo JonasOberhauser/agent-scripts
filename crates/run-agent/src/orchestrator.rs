@@ -41,19 +41,23 @@ where
     S: SystemIo,
     F: Fn(&str, &str) -> Result<(), String>,
 {
-    // ── 1. Validate ──────────────────────────────────────────────
+    // ── 1. Generate missing workspace folders ────────────────────
+    // The agent's structure (config/, workspace/, fuse_mnt/) is created
+    // when missing — a fresh agent path just works. The fuse bind source
+    // especially must exist BEFORE the container is created: docker/
+    // podman would generate it root-owned, breaking later host access.
     let host_config = config.host_config_dir();
     let host_workspace = config.host_workspace();
-
-    for dir in [&host_config, &host_workspace] {
-        if !io.file_exists(dir) {
-            return Err(format!(
-                "Directory {} not found. Is this really an agent workspace?",
+    for dir in [&host_config, &host_workspace, &config.host_fuse()] {
+        io.create_dir_all(dir).map_err(|e| {
+            format!(
+                "cannot create {}: {e}.\n\
+                 Is the agent path writable (or does a file block the name)?",
                 dir.display()
-            ));
-        }
+            )
+        })?;
     }
-    info!("Workspace validated.");
+    info!("Workspace folders ready.");
 
     // ── 2. Probe for existing server ─────────────────────────────
     let socket = &config.socket_path;
@@ -835,12 +839,21 @@ mod tests {
     // ── run_agent integration ────────────────────────────────────
 
     #[test]
-    fn missing_workspace_dirs_errors() {
-        let mut mock = MockSystemIo::new();
+    fn missing_workspace_folders_are_created() {
+        // A fresh agent path with none of the structure present: run-agent
+        // generates the missing folders instead of refusing to run.
+        let mut mock = MockSystemIo::new().with_file("/home/user/secrets.yaml", b"DATA");
         let cfg = test_config();
         let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()), false);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("not found"));
+        assert!(result.is_ok(), "got: {:?}", result.err());
+        let created = mock.created_dirs.borrow();
+        let fuse = cfg.host_fuse().to_string_lossy().to_string();
+        for dir in ["/work/agent1/config", "/work/agent1/workspace", fuse.as_str()] {
+            assert!(
+                created.iter().any(|c| c == dir),
+                "folder {dir} must be generated (created: {created:?})"
+            );
+        }
     }
 
     #[test]

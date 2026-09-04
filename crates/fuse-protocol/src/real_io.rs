@@ -269,6 +269,7 @@ pub struct MockSystemIo {
     pub interactive_calls: std::cell::RefCell<Vec<(String, Vec<String>)>>,
     pub command_calls: std::cell::RefCell<Vec<(String, Vec<String>)>>,
     pub sleeps: std::cell::RefCell<Vec<u64>>,
+    pub created_dirs: std::cell::RefCell<Vec<String>>,
     pub heal_terminal_calls: std::cell::Cell<usize>,
     pub spawned: Vec<(String, Vec<String>)>,
     pub spawn_error_msg: Option<String>,
@@ -400,12 +401,15 @@ impl SystemIo for MockSystemIo {
 
     fn file_exists(&self, path: &Path) -> bool {
         let key = path.to_string_lossy().to_string();
-        self.files.contains_key(&key) || self.dirs.contains(&key)
+        self.files.contains_key(&key)
+            || self.dirs.contains(&key)
+            || self.created_dirs.borrow().contains(&key)
     }
 
-    fn create_dir_all(&self, _path: &Path) -> Result<(), IoError> {
-        // In the mock, we don't need to actually create directories —
-        // but we record the path so file_exists works.
+    fn create_dir_all(&self, path: &Path) -> Result<(), IoError> {
+        // Record the creation so tests can assert which folders the
+        // orchestrator generates; file_exists then answers true.
+        self.created_dirs.borrow_mut().push(path.to_string_lossy().to_string());
         Ok(())
     }
 
