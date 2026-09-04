@@ -3,7 +3,7 @@
 //!
 //! While access requests are pending, a multi-line panel floats top-right
 //! of the terminal: one line per request (id + requesting process name,
-//! falling back to `#pid`) with `[deny] [grant]` buttons, up to
+//! falling back to `#pid`) with `[grant] [deny]` buttons, up to
 //! [`MAX_SHOWN`] lines, and a `[deny all] [grant all]` row at the bottom.
 //!
 //! Layout is a button grid: [`MAX_SHOWN`] request rows plus the all-row,
@@ -269,20 +269,21 @@ fn all_row_rect(panel: Rect) -> Rect {
     }
 }
 
-/// A row's two button children, right-aligned as a deny|grant pair.
-/// Shared by request rows and the all-row (only the labels differ).
+/// A row's two button children, right-aligned as a grant|deny pair
+/// (grant on the left, deny on the right). Shared by request rows and
+/// the all-row (only the labels differ).
 fn button_pair(row: Rect, all: bool) -> (Rect, Rect) {
     let (deny_l, grant_l) = if all { ("[deny all]", "[grant all]") } else { ("[deny]", "[grant]") };
-    let grant = Rect {
-        x: row.x + row.width.saturating_sub(grant_l.len() as u16),
-        y: row.y,
-        width: grant_l.len() as u16,
-        height: 1,
-    };
     let deny = Rect {
-        x: grant.x.saturating_sub(deny_l.len() as u16 + 1),
+        x: row.x + row.width.saturating_sub(deny_l.len() as u16),
         y: row.y,
         width: deny_l.len() as u16,
+        height: 1,
+    };
+    let grant = Rect {
+        x: deny.x.saturating_sub(grant_l.len() as u16 + 1),
+        y: row.y,
+        width: grant_l.len() as u16,
         height: 1,
     };
     (deny, grant)
@@ -359,9 +360,9 @@ enum GridRow<'a> {
     All,
 }
 
-/// Render one grid row: content left, the deny|grant button pair right.
-/// Request rows show `id name`; the all-row is buttons only. The cursor
-/// selection reverses the highlighted button.
+/// Render one grid row: content left, the grant|deny button pair right
+/// (grant left, deny right). Request rows show `id name`; the all-row is
+/// buttons only. The cursor selection reverses the highlighted button.
 fn grid_row_line(row: GridRow, width: u16, cursor_here: bool, grant_selected: bool) -> Line<'static> {
     let all = matches!(row, GridRow::All);
     let (deny_l, grant_l) = if all { ("[deny all]", "[grant all]") } else { ("[deny]", "[grant]") };
@@ -384,9 +385,9 @@ fn grid_row_line(row: GridRow, width: u16, cursor_here: bool, grant_selected: bo
     )));
     let deny = if all { Button::DenyAll } else { Button::Deny { id: 0 } };
     let grant = if all { Button::GrantAll } else { Button::Grant { id: 0 } };
-    spans.extend(button_spans(deny, cursor_here && !grant_selected));
-    spans.push(Span::raw(" "));
     spans.extend(button_spans(grant, cursor_here && grant_selected));
+    spans.push(Span::raw(" "));
+    spans.extend(button_spans(deny, cursor_here && !grant_selected));
     Line::from(spans)
 }
 
@@ -681,7 +682,9 @@ impl DisplayLayer for PendingPanelLayer {
                         EventResult::Swallow
                     }
                     KeyCode::Left | KeyCode::Right => {
-                        let grant = matches!(k.code, KeyCode::Right);
+                        // Spatial: Left selects the left button (grant),
+                        // Right the right one (deny).
+                        let grant = matches!(k.code, KeyCode::Left);
                         self.cursor = match self.cursor {
                             Cursor::Request { slot, .. } => Cursor::Request { slot, grant },
                             Cursor::All { .. } => Cursor::All { grant },
@@ -929,12 +932,13 @@ mod tests {
     fn button_rects_sit_inside_their_rows() {
         let row = Rect::new(38, 1, 42, 1);
         let (deny, grant) = button_pair(row, false);
-        assert_eq!((grant.x, grant.width), (38 + 42 - 7, 7), "\"[grant]\" is 7 cells");
-        assert_eq!((deny.x, deny.width), (grant.x - 7, 6), "\"[deny]\" is 6 cells");
+        // Grant on the LEFT, deny on the RIGHT.
+        assert_eq!((deny.x, deny.width), (38 + 42 - 6, 6), "\"[deny]\" is 6 cells");
+        assert_eq!((grant.x, grant.width), (deny.x - 8, 7), "\"[grant]\" is 7 cells, left of deny");
         assert_eq!(deny.y, row.y);
         let (deny, grant) = button_pair(row, true);
-        assert_eq!((grant.x, grant.width), (38 + 42 - 11, 11));
-        assert_eq!((deny.x, deny.width), (grant.x - 11, 10));
+        assert_eq!((deny.x, deny.width), (38 + 42 - 10, 10));
+        assert_eq!((grant.x, grant.width), (deny.x - 12, 11));
     }
 
     /// All-buttons expand over the snapshot; single buttons carry their
@@ -1198,8 +1202,9 @@ mod tests {
         display.add_layer(Box::new(layer(pending, &sock)));
         frame_with_pending(&mut display);
 
-        // Cursor starts on the all-row's grant button; Left selects deny.
-        assert!(display.route_event(&key(KeyCode::Left)), "Left swallowed");
+        // Cursor starts on the all-row's grant (left) button; Right
+        // selects deny.
+        assert!(display.route_event(&key(KeyCode::Right)), "Right swallowed");
         assert!(display.route_event(&key(KeyCode::Enter)), "Enter swallowed");
 
         let conversations = seen.lock().unwrap().clone();
