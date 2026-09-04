@@ -134,7 +134,7 @@ fn check_version_or_restart(app: &App) {
         }
     };
 
-    if server_version == CLIENT_VERSION {
+    if fuse_protocol::protocol_compatible(&server_version, CLIENT_VERSION) {
         return;
     }
 
