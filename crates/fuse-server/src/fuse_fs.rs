@@ -21,6 +21,30 @@ fn process_name(pid: u32) -> Option<String> {
         .map(|s| s.trim().to_string())
 }
 
+/// The shared denial-to-pending transition: with a pending timeout
+/// configured, record a pending access request (with the requesting
+/// process's name) and log it; without one, deny outright. One code
+/// path for both the synchronous and asynchronous read handlers.
+fn open_pending_or_deny(
+    state: &ServerState,
+    name: &str,
+    pid: u32,
+    pid_hash: Option<&str>,
+    reason: &str,
+) -> Option<(u64, Duration)> {
+    let timeout = *state.pending_timeout.lock().unwrap();
+    if timeout.is_zero() {
+        warn!("Denied read of '{name}' by pid {pid}: {reason}");
+        return None;
+    }
+    let id = state.create_pending(name, pid, pid_hash, reason, process_name(pid).as_deref());
+    warn!(
+        "Access pending for '{name}' by pid {pid}: {reason} (id={id}). Waiting up to {}s for grant...",
+        timeout.as_secs()
+    );
+    Some((id, timeout))
+}
+
 const ROOT_INO: u64 = 1;
 
 /// TTL for kernel cache entries.  Set to zero so the kernel always
@@ -239,32 +263,12 @@ impl<S: SystemIo> GatekeeperFs<S> {
             }
             ReadOutcome::NotFound => ReadResult::Error(libc::ENOENT),
             ReadOutcome::AlreadyAccessed | ReadOutcome::HashMismatch { .. } => {
-                let reason = match &outcome {
-                    ReadOutcome::AlreadyAccessed => "exceeded access limit".to_string(),
-                    ReadOutcome::HashMismatch { got, expected } => {
-                        format!("hash mismatch: got {got}, expected {expected}")
-                    }
-                    _ => unreachable!(),
-                };
-
-                if self.state.pending_timeout.lock().unwrap().is_zero() {
-                    warn!("Denied read of '{name}' by pid {pid}: {reason}");
+                let reason = outcome.denial_reason().expect("narrowed above");
+                let Some((id, timeout)) =
+                    open_pending_or_deny(&self.state, &name, pid, pid_hash, &reason)
+                else {
                     return ReadResult::Error(libc::EACCES);
-                }
-                let id = self.state.create_pending(
-                    &name,
-                    pid,
-                    pid_hash,
-                    &reason,
-                    process_name(pid).as_deref(),
-                );
-                let timeout = *self.state.pending_timeout.lock().unwrap();
-
-                warn!(
-                    "Access pending for '{name}' by pid {pid}: {reason} \
-                     (id={id}). Waiting up to {}s for grant...",
-                    timeout.as_secs()
-                );
+                };
 
                 ReadResult::Pending {
                     pending_id: id,
@@ -393,28 +397,12 @@ fn read_worker(
         }
         ReadOutcome::NotFound => Err(libc::ENOENT),
         ReadOutcome::AlreadyAccessed | ReadOutcome::HashMismatch { .. } => {
-            let reason = match &outcome {
-                ReadOutcome::AlreadyAccessed => "exceeded access limit".to_string(),
-                ReadOutcome::HashMismatch { got, expected } => {
-                    format!("hash mismatch: got {got}, expected {expected}")
-                }
-                _ => unreachable!(),
-            };
-
-            if state.pending_timeout.lock().unwrap().is_zero() {
-                warn!("Denied read of '{name}' by pid {pid}: {reason}");
+            let reason = outcome.denial_reason().expect("narrowed above");
+            let Some((pending_id, timeout)) =
+                open_pending_or_deny(state, name, pid, pid_hash.as_deref(), &reason)
+            else {
                 return Err(libc::EACCES);
-            }
-            let pending_id = state.create_pending(
-                name,
-                pid,
-                pid_hash.as_deref(),
-                &reason,
-                process_name(pid).as_deref(),
-            );
-            let timeout = *state.pending_timeout.lock().unwrap();
-
-            warn!("Access pending for '{name}' by pid {pid}: {reason} (id={pending_id})");
+            };
 
             let deadline = std::time::Instant::now() + timeout;
             loop {

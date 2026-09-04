@@ -36,6 +36,21 @@ pub enum ReadOutcome {
     NotFound,
 }
 
+impl ReadOutcome {
+    /// Human-readable reason for the outcomes that create a pending
+    /// request; `None` for Granted and NotFound (handled before any
+    /// pending flow, without a reason string).
+    pub fn denial_reason(&self) -> Option<String> {
+        match self {
+            ReadOutcome::AlreadyAccessed => Some("exceeded access limit".to_string()),
+            ReadOutcome::HashMismatch { got, expected } => {
+                Some(format!("hash mismatch: got {got}, expected {expected}"))
+            }
+            ReadOutcome::Granted(_) | ReadOutcome::NotFound => None,
+        }
+    }
+}
+
 /// Lock a per-secret Mutex. On poisoning, reset to deny-all state:
 /// access_count=1, reading_pid=None, read_progress=0.
 /// This makes the secret permanently inaccessible until explicit `reset`.

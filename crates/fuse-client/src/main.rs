@@ -68,15 +68,17 @@ fn main() {
                 std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
             let protocols = fuse_protocol::client_protocols_with_pending(pending.clone());
             // One pending layer, registered for the whole session: it
-            // polls on its own (rate-limited inside on_overlay) and hides
-            // itself while idle. Display::run creates the shared
-            // BuiltinTui and attaches it as an ordinary layer, so the
-            // builtin input line and the panel are peers with
-            // activation-based keyboard focus (taskbar, Shift+Tab).
+            // polls on its own (rate-limited, non-blocking — all server
+            // I/O goes through a worker thread, so a wedged server can
+            // never freeze the render loop) and hides itself while idle.
+            // Display::run creates the shared BuiltinTui and attaches it
+            // as an ordinary layer, so the builtin input line and the
+            // panel are peers with activation-based keyboard focus.
+            let talk = pending_layer::spawn_worker(cli.socket.clone(), pending.clone());
             let mut display = servatui_display::Display::new();
             display.add_layer(Box::new(pending_layer::PendingPanelLayer::new(
                 pending,
-                cli.socket.clone(),
+                Box::new(talk),
             )));
             if let Err(e) = display.run(&cli.socket, &protocols) {
                 eprintln!("Error: {e}");

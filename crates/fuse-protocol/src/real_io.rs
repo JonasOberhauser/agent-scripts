@@ -4,12 +4,6 @@ use std::path::{Path, PathBuf};
 use crate::io::{CommandOutput, SystemIo};
 use crate::IoError;
 
-/// Disable sequences for everything a foreground TUI may have enabled on
-/// our tty: mouse capture (1000/1002/1003/1015/1006 — SGR mouse is the
-/// dead-scroll-wheel culprit), alternate screen (1049), hidden cursor
-/// (25h). Mirrors servatui's terminal_restore; keep in sync.
-const TERMINAL_RESTORE_BYTES: &[u8] =
-    b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1015l\x1b[?1006l\x1b[?1049l\x1b[?25h";
 
 fn hex_sha256(data: &[u8]) -> String {
     use sha2::{Digest, Sha256};
@@ -156,7 +150,7 @@ impl SystemIo for RealSystemIo {
         // alternate screen, hidden cursor. Mirrors servatui's restore
         // sequence; keep in sync with its terminal_restore module.
         let mut out = std::io::stdout();
-        let _ = out.write_all(TERMINAL_RESTORE_BYTES);
+        let _ = out.write_all(servyi_servatui::TERMINAL_RESTORE_BYTES);
         let _ = out.flush();
     }
 

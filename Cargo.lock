@@ -367,6 +367,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tui-input",
+ "unicode-width 0.2.2",
 ]
 
 [[package]]
@@ -892,7 +893,7 @@ dependencies = [
 [[package]]
 name = "servatui-display"
 version = "0.3.0"
-source = "git+https://github.com/servyi/servatui.git#3f7896c5a7eaae1a99cd0db0ad9f958dba5a0bf6"
+source = "git+https://github.com/servyi/servatui.git#b9c90f1123468cb91edccd4ef302a3f0a33460fd"
 dependencies = [
  "crossterm",
  "ratatui",
@@ -902,8 +903,8 @@ dependencies = [
 
 [[package]]
 name = "servyi-servatui"
-version = "0.8.0"
-source = "git+https://github.com/servyi/servatui.git#3f7896c5a7eaae1a99cd0db0ad9f958dba5a0bf6"
+version = "0.8.1"
+source = "git+https://github.com/servyi/servatui.git#b9c90f1123468cb91edccd4ef302a3f0a33460fd"
 dependencies = [
  "base64",
  "crossterm",

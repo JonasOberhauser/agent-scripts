@@ -178,14 +178,7 @@ pub fn client_protocols_with_pending(pending: PendingIds) -> Vec<Protocol> {
                     Err(_) => Err("Usage: grant ID (ID must be a number)".into()),
                 }
             })
-            .complete({
-                let ids = pending.clone();
-                move |s| {
-                    let snapshot: Vec<u64> =
-                        ids.lock().unwrap().iter().map(|p| p.id).collect();
-                    pending_completions(&snapshot, s)
-                }
-            }),
+            .complete(pending_completer(pending.clone())),
 
         cmd_protocol("deny", "Deny a pending access request",
             |args| {
@@ -194,14 +187,7 @@ pub fn client_protocols_with_pending(pending: PendingIds) -> Vec<Protocol> {
                     Err(_) => Err("Usage: deny ID (ID must be a number)".into()),
                 }
             })
-            .complete({
-                let ids = pending.clone();
-                move |s| {
-                    let snapshot: Vec<u64> =
-                        ids.lock().unwrap().iter().map(|p| p.id).collect();
-                    pending_completions(&snapshot, s)
-                }
-            }),
+            .complete(pending_completer(pending.clone())),
 
         cmd_protocol("version", "Show server version",
             |_| Ok(Command::GetVersion))
@@ -252,6 +238,18 @@ pub(crate) fn complete_first_secret(
         .filter(|n| n.starts_with(arg))
         .map(|n| format!("{cmd} {n}"))
         .collect()
+}
+
+/// A completer closure over the shared pending snapshot: completes the
+/// numeric request-ID argument of `grant`/`deny` from whatever the poller
+/// last saw, without a server round-trip.
+fn pending_completer(
+    pending: PendingIds,
+) -> impl Fn(&str) -> Vec<String> + Send + Sync + 'static {
+    move |s| {
+        let ids: Vec<u64> = pending.lock().unwrap().iter().map(|p| p.id).collect();
+        pending_completions(&ids, s)
+    }
 }
 
 /// Complete the numeric request-ID argument of `grant`/`deny` from the
