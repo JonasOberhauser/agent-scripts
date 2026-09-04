@@ -15,6 +15,17 @@ RUN apt-get update && apt-get install -y \
     git-lfs \
     && rm -rf /var/lib/apt/lists/*
 
+# Nested rootless podman support: the container must be able to run
+# podman (the seccomp widening is applied by run-agent's create args).
+RUN apt-get update && apt-get install -y \
+    podman \
+    uidmap \
+    passt \
+    fuse3 \
+    && rm -rf /var/lib/apt/lists/* \
+    && echo 'root:1:65536' > /etc/subuid \
+    && echo 'root:1:65536' > /etc/subgid
+
 ## 2 steps for ark compiliation
 # 1. Install system dependencies
 # 2. Comprehensive Toolchain Installation
@@ -99,4 +110,6 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 ENV PATH="/root/.cargo/bin:${PATH}"
 
 WORKDIR /workspace
-#ENTRYPOINT ["goose"]
+
+# Default entrypoint: an interactive shell for ad-hoc `podman run -it agentbox`.
+CMD ["/bin/bash"]
