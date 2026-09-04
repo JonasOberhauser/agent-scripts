@@ -66,7 +66,14 @@ fn main() {
         None => {
             let pending: fuse_protocol::PendingIds =
                 std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-            let protocols = fuse_protocol::client_protocols_with_pending(pending.clone());
+            let secrets: fuse_protocol::SecretNames =
+                std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            // The worker's 1s poll refreshes BOTH live completion
+            // sources: pending request ids (grant/deny) and the server's
+            // secret names (reset/remove/rotate) — the old state-file
+            // source went stale the moment a secret changed.
+            let protocols =
+                fuse_protocol::client_protocols_with_snapshots(pending.clone(), secrets.clone());
             // One pending layer, registered for the whole session: it
             // polls on its own (rate-limited, non-blocking — all server
             // I/O goes through a worker thread, so a wedged server can
@@ -74,7 +81,8 @@ fn main() {
             // Display::run creates the shared BuiltinTui and attaches it
             // as an ordinary layer, so the builtin input line and the
             // panel are peers with activation-based keyboard focus.
-            let talk = pending_layer::spawn_worker(cli.socket.clone(), pending.clone());
+            let talk =
+                pending_layer::spawn_worker(cli.socket.clone(), pending.clone(), secrets);
             let mut display = servatui_display::Display::new();
             display.add_layer(Box::new(pending_layer::PendingPanelLayer::new(
                 pending,

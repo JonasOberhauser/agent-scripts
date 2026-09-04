@@ -93,6 +93,13 @@ fn cmd_protocol(
 /// server round-trip.
 pub type PendingIds = std::sync::Arc<std::sync::Mutex<Vec<PendingAccessInfo>>>;
 
+/// Shared, polled snapshot of the server's secret names — the live
+/// source for `reset`/`remove`/`rotate` argument completion. (The old
+/// source, the orchestrator's startup-time state file, goes stale the
+/// moment a secret is added or removed and is missing entirely when the
+/// client runs standalone.)
+pub type SecretNames = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+
 /// Test/constructor helper: a pending request with the given id.
 pub fn pending_info(id: u64) -> PendingAccessInfo {
     PendingAccessInfo {
@@ -107,12 +114,17 @@ pub fn pending_info(id: u64) -> PendingAccessInfo {
 }
 
 pub fn client_protocols() -> Vec<Protocol> {
-    client_protocols_with_pending(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())))
+    client_protocols_with_snapshots(
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+    )
 }
 
-/// Like [`client_protocols`], but `grant`/`deny` complete the request ID
-/// from `pending` (see [`PendingIds`]).
-pub fn client_protocols_with_pending(pending: PendingIds) -> Vec<Protocol> {
+/// Like [`client_protocols`], with live completion sources: `grant`/
+/// `deny` complete the request ID from `pending` (see [`PendingIds`]);
+/// `reset`/`remove`/`rotate` complete the secret name from `secrets`
+/// (see [`SecretNames`]). Both are refreshed by the client's poller.
+pub fn client_protocols_with_snapshots(pending: PendingIds, secrets: SecretNames) -> Vec<Protocol> {
     vec![
         cmd_protocol("status", "Show all secrets and access counts",
             |_| Ok(Command::Status)),
@@ -125,7 +137,7 @@ pub fn client_protocols_with_pending(pending: PendingIds) -> Vec<Protocol> {
                 let name = args.split_whitespace().next().map(|s| s.to_string());
                 Ok(Command::Reset { name })
             })
-            .complete(|s| complete_first_secret(std::path::Path::new(crate::STATE_FILE), s, true)),
+            .complete(name_completer(secrets.clone(), true)),
 
         cmd_protocol("reset-all", "Reset all access counters",
             |_| Ok(Command::Reset { name: None })),
@@ -153,7 +165,7 @@ pub fn client_protocols_with_pending(pending: PendingIds) -> Vec<Protocol> {
                 }
                 Ok(Command::RemoveSecret { name: name.to_string() })
             })
-            .complete(|s| complete_first_secret(std::path::Path::new(crate::STATE_FILE), s, true)),
+            .complete(name_completer(secrets.clone(), true)),
 
         cmd_protocol("rotate", "Change the allowed binary hash",
             |args| {
@@ -166,7 +178,7 @@ pub fn client_protocols_with_pending(pending: PendingIds) -> Vec<Protocol> {
                     new_hash: parts[1].to_string(),
                 })
             })
-            .complete(|s| complete_first_secret(std::path::Path::new(crate::STATE_FILE), s, false)),
+            .complete(name_completer(secrets.clone(), false)),
 
         cmd_protocol("pending", "Show pending access requests",
             |_| Ok(Command::ListPending)),
@@ -209,7 +221,7 @@ pub fn client_protocols_with_pending(pending: PendingIds) -> Vec<Protocol> {
 /// `rotate NAME HASH` must NOT complete once the name is finished and the
 /// hash has started — a trailing space means the hash is being typed.
 pub(crate) fn complete_first_secret(
-    state_path: &std::path::Path,
+    candidates: &[String],
     confirmed: &str,
     complete_after_space: bool,
 ) -> Vec<String> {
@@ -228,16 +240,24 @@ pub(crate) fn complete_first_secret(
     if !complete_after_space && confirmed.ends_with(char::is_whitespace) {
         return Vec::new(); // e.g. `rotate NAME `: the hash is being typed
     }
-    let names: Vec<String> = std::fs::read(state_path)
-        .ok()
-        .and_then(|data| serde_json::from_slice::<crate::ServerStateFile>(&data).ok())
-        .map(|state| state.secrets.iter().map(|s| s.fuse_name.clone()).collect())
-        .unwrap_or_default();
-    names
-        .into_iter()
+    candidates
+        .iter()
         .filter(|n| n.starts_with(arg))
         .map(|n| format!("{cmd} {n}"))
         .collect()
+}
+
+/// A completer closure over the shared secret-name snapshot: completes
+/// the NAME argument of `reset`/`remove`/`rotate` from whatever the
+/// poller last saw, without a server round-trip.
+fn name_completer(
+    secrets: SecretNames,
+    complete_after_space: bool,
+) -> impl Fn(&str) -> Vec<String> + Send + Sync + 'static {
+    move |s| {
+        let names = secrets.lock().unwrap().clone();
+        complete_first_secret(&names, s, complete_after_space)
+    }
 }
 
 /// A completer closure over the shared pending snapshot: completes the
@@ -298,6 +318,17 @@ pub fn poll_pending_info(socket: &std::path::Path) -> Result<Vec<PendingAccessIn
     }
 }
 
+/// One poll cycle returning the server's secret NAMES (from `status`),
+/// the live source for reset/remove/rotate completion.
+pub fn poll_secret_names(socket: &std::path::Path) -> Result<Vec<String>, String> {
+    match run_command_once(socket, "status", &Command::Status)? {
+        crate::Response::Status { secrets } => {
+            Ok(secrets.into_iter().map(|s| s.name).collect())
+        }
+        other => Err(format!("unexpected response to status: {other:?}")),
+    }
+}
+
 /// One poll cycle: ask the running server for its pending access request
 /// IDs. The caller keeps the previous snapshot when this errors (server
 /// down, stale socket, ...). Connect failures already carry actionable
@@ -310,34 +341,13 @@ pub fn poll_pending_once(socket: &std::path::Path) -> Result<Vec<u64>, String> {
 mod tests {
     use super::*;
 
-    fn state_file(names: &[&str]) -> std::path::PathBuf {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        static SEQ: AtomicU32 = AtomicU32::new(0);
-        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-        // Unique per call: parallel tests must not share (and race on) one
-        // file, and fs::write is not atomic.
-        let dir = std::env::temp_dir().join(format!(
-            "fuse-comp-test-{}-{seq}-{:?}",
-            std::process::id(),
-            names
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("state.json");
-        let json = format!(
-            r#"{{"version":"0.20.0","server_pid":1,"server_binary":"","mount_point":"","socket":"","allow_other":false,"log_level":"info","pending_timeout":0,"runtime_wrapper":null,"secrets":[{}]}}"#,
-            names
-                .iter()
-                .map(|n| format!(r#"{{"fuse_name":"{n}","host_path":"/x","hash":"h"}}"#))
-                .collect::<Vec<_>>()
-                .join(",")
-        );
-        std::fs::write(&path, json).unwrap();
-        path
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
     }
 
     #[test]
     fn reset_completes_filtered_secret_names() {
-        let p = state_file(&["p1_s0", "p2_s1"]);
+        let p = names(&["p1_s0", "p2_s1"]);
         assert_eq!(
             complete_first_secret(&p, "reset p1", true),
             vec!["reset p1_s0".to_string()]
@@ -352,7 +362,7 @@ mod tests {
 
     #[test]
     fn remove_completes_all_names_on_empty_prefix() {
-        let p = state_file(&["p1_s0", "p2_s1"]);
+        let p = names(&["p1_s0", "p2_s1"]);
         assert_eq!(
             complete_first_secret(&p, "remove ", true).len(),
             2
@@ -361,7 +371,7 @@ mod tests {
 
     #[test]
     fn rotate_stops_after_the_name() {
-        let p = state_file(&["p1_s0"]);
+        let p = names(&["p1_s0"]);
         assert_eq!(
             complete_first_secret(&p, "rotate p", false),
             vec!["rotate p1_s0".to_string()]
@@ -372,18 +382,48 @@ mod tests {
 
     #[test]
     fn third_token_never_completes() {
-        let p = state_file(&["p1_s0"]);
+        let p = names(&["p1_s0"]);
         assert!(complete_first_secret(&p, "reset p1_s0 x", true).is_empty());
     }
 
     #[test]
-    fn missing_state_file_means_no_suggestions() {
-        assert!(complete_first_secret(
-            std::path::Path::new("/nonexistent-fuse-state.json"),
-            "reset ",
-            true
-        )
-        .is_empty());
+    fn empty_candidate_list_means_no_suggestions() {
+        let p: Vec<String> = Vec::new();
+        assert!(complete_first_secret(&p, "reset ", true).is_empty());
+    }
+
+    /// reset/remove/rotate complete their NAME argument from the LIVE
+    /// snapshot the poller refreshes — the old state-file source went
+    /// stale the moment a secret was added or removed after startup
+    /// (and was missing entirely in standalone client runs).
+    #[test]
+    fn name_commands_complete_from_live_snapshot() {
+        let secrets: SecretNames =
+            std::sync::Arc::new(std::sync::Mutex::new(vec!["p1_s0".to_string()]));
+        let protocols = client_protocols_with_snapshots(
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            secrets.clone(),
+        );
+        for name in ["reset", "remove", "rotate"] {
+            let p = protocols.iter().find(|p| p.name == name).unwrap();
+            let completer = p.completer().expect("completer registered");
+            assert_eq!(
+                completer(&format!("{name} p1")),
+                vec![format!("{name} p1_s0")]
+            );
+            assert!(completer(&format!("{name} zz")).is_empty(), "prefix filters");
+        }
+        // rotate's NAME argument completes, but `rotate NAME ` (hash
+        // being typed) does not.
+        let p = protocols.iter().find(|p| p.name == "rotate").unwrap();
+        let completer = p.completer().unwrap();
+        assert!(completer("rotate p1_s0 ").is_empty(), "no completion for the hash");
+
+        // The poller adds a secret: completion sees it immediately.
+        *secrets.lock().unwrap() = vec!["p1_s0".to_string(), "p9_s8".to_string()];
+        let p = protocols.iter().find(|p| p.name == "remove").unwrap();
+        let completer = p.completer().unwrap();
+        assert_eq!(completer("remove ").len(), 2, "live updates flow through");
     }
 
     #[test]
@@ -427,7 +467,8 @@ mod tests {
             pending_info(5),
             pending_info(51),
         ]));
-        let protocols = client_protocols_with_pending(shared.clone());
+        let secrets: SecretNames = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let protocols = client_protocols_with_snapshots(shared.clone(), secrets.clone());
         for name in ["grant", "deny"] {
             // Fresh snapshot per command: the loop's last step mutates it.
             *shared.lock().unwrap() = vec![pending_info(5), pending_info(51)];

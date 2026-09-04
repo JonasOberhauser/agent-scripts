@@ -32,6 +32,7 @@ pub use io::{CommandOutput, IoProvider, SystemIo, Transport};
 pub use protocol::{Command, MountEntry, PendingAccessInfo, Response, SecretStatus, ServerStateFile, StateSecretEntry};
 pub use real_io::{MockSystemIo, RealSystemIo};
 pub use servatui_protocols::{
-    client_protocols, client_protocols_with_pending, pending_info, poll_pending_info,
-    poll_pending_once, print_response, run_command_once, PendingIds,
+    client_protocols, client_protocols_with_snapshots, pending_info, poll_pending_info,
+    poll_pending_once, poll_secret_names, print_response, run_command_once, PendingIds,
+    SecretNames,
 };

@@ -19,7 +19,10 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crossterm::event::{Event, KeyCode, KeyEventKind, MouseEventKind};
-use fuse_protocol::{poll_pending_info, run_command_once, Command, PendingAccessInfo, PendingIds};
+use fuse_protocol::{
+    poll_pending_info, poll_secret_names, run_command_once, Command, PendingAccessInfo, PendingIds,
+    SecretNames,
+};
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -402,15 +405,23 @@ pub(crate) trait ServerTalk {
     fn request(&self, snapshot: &PendingIds, req: PanelRequest);
 }
 
-/// Service one request against the server, updating the shared snapshot.
-/// Failures warn and leave the snapshot as-is — the next poll
-/// reconciles.
-fn service(socket: &Path, snapshot: &PendingIds, req: PanelRequest) {
+/// Service one request against the server, updating the shared
+/// snapshots. Failures warn and leave the snapshots as-is — the next
+/// poll reconciles.
+fn service(socket: &Path, pending: &PendingIds, secrets: &SecretNames, req: PanelRequest) {
     match req {
-        PanelRequest::Poll => match poll_pending_info(socket) {
-            Ok(list) => *snapshot.lock().unwrap() = list,
-            Err(e) => tracing::warn!("pending poll failed: {e}"),
-        },
+        PanelRequest::Poll => {
+            match poll_pending_info(socket) {
+                Ok(list) => *pending.lock().unwrap() = list,
+                Err(e) => tracing::warn!("pending poll failed: {e}"),
+            }
+            // The same tick refreshes the secret-name snapshot that
+            // feeds reset/remove/rotate completion.
+            match poll_secret_names(socket) {
+                Ok(names) => *secrets.lock().unwrap() = names,
+                Err(e) => tracing::warn!("secret-name poll failed: {e}"),
+            }
+        }
         PanelRequest::Action { name, command } => {
             if let Err(e) = run_command_once(socket, &name, &command) {
                 tracing::warn!("pending action '{name}' failed: {e}");
@@ -423,19 +434,20 @@ fn service(socket: &Path, snapshot: &PendingIds, req: PanelRequest) {
 #[cfg(test)]
 pub(crate) struct DirectTalk {
     socket: PathBuf,
+    secrets: SecretNames,
 }
 
 #[cfg(test)]
 impl DirectTalk {
-    pub(crate) fn new(socket: impl Into<PathBuf>) -> Self {
-        Self { socket: socket.into() }
+    pub(crate) fn new(socket: impl Into<PathBuf>, secrets: SecretNames) -> Self {
+        Self { socket: socket.into(), secrets }
     }
 }
 
 #[cfg(test)]
 impl ServerTalk for DirectTalk {
     fn request(&self, snapshot: &PendingIds, req: PanelRequest) {
-        service(&self.socket, snapshot, req);
+        service(&self.socket, snapshot, &self.secrets, req);
     }
 }
 
@@ -448,14 +460,18 @@ pub(crate) struct WorkerTalk {
 /// Spawn the worker thread serving panel requests. Every action is
 /// followed by a poll, so the snapshot reflects the outcome without
 /// waiting for the next 1s tick.
-pub(crate) fn spawn_worker(socket: PathBuf, snapshot: PendingIds) -> WorkerTalk {
+pub(crate) fn spawn_worker(
+    socket: PathBuf,
+    snapshot: PendingIds,
+    secrets: SecretNames,
+) -> WorkerTalk {
     let (tx, rx) = std::sync::mpsc::channel::<PanelRequest>();
     std::thread::spawn(move || {
         for req in rx {
             let follow_up = matches!(req, PanelRequest::Action { .. });
-            service(&socket, &snapshot, req);
+            service(&socket, &snapshot, &secrets, req);
             if follow_up {
-                service(&socket, &snapshot, PanelRequest::Poll);
+                service(&socket, &snapshot, &secrets, PanelRequest::Poll);
             }
         }
     });
@@ -724,7 +740,8 @@ mod tests {
     }
 
     fn layer(pending: PendingIds, sock: &Path) -> PendingPanelLayer {
-        PendingPanelLayer::new(pending, Box::new(DirectTalk::new(sock)))
+        let secrets: SecretNames = Arc::new(Mutex::new(Vec::new()));
+        PendingPanelLayer::new(pending, Box::new(DirectTalk::new(sock, secrets)))
     }
 
     fn key(code: KeyCode) -> Event {
@@ -1226,7 +1243,8 @@ mod tests {
         let seen = fake_server(&sock, vec![31]);
 
         let pending: PendingIds = Arc::new(Mutex::new(Vec::new()));
-        let talk = spawn_worker(sock.clone(), pending.clone());
+        let secrets: SecretNames = Arc::new(Mutex::new(Vec::new()));
+        let talk = spawn_worker(sock.clone(), pending.clone(), secrets.clone());
         talk.request(
             &pending,
             PanelRequest::Action {
