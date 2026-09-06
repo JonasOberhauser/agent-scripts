@@ -16,6 +16,9 @@ pub struct SecretRecord {
     /// Permission bits snapshotted from the source file when the secret
     /// was loaded; the FUSE view presents them (masked read-only).
     pub mode: u32,
+    /// Set by `grant-forever`: the allowed package may read without
+    /// per-read approval.
+    pub unlimited_reads: bool,
 }
 
 /// A pending access request waiting for manual approval.
@@ -121,6 +124,7 @@ impl ServerState {
                 reading_pid: None,
                 read_progress: 0,
                 mode: mode & 0o777,
+                unlimited_reads: false,
             })),
         );
     }
@@ -144,7 +148,9 @@ impl ServerState {
         let mut rec = lock_secret(&rec_arc, name);
 
         if rec.reading_pid == Some(pid) {
-            if offset < rec.read_progress {
+            // Forward-only within one streaming read — but an unlimited
+            // (grant-forever) secret may re-read from the start.
+            if offset < rec.read_progress && !rec.unlimited_reads {
                 return ReadOutcome::AlreadyAccessed;
             }
             let end = offset.saturating_add(size).min(rec.content.len());
@@ -152,7 +158,7 @@ impl ServerState {
             return ReadOutcome::Granted(rec.content[offset..end].to_vec());
         }
 
-        if rec.access_count > 0 {
+        if rec.access_count > 0 && !rec.unlimited_reads {
             return ReadOutcome::AlreadyAccessed;
         }
 
@@ -252,6 +258,42 @@ impl ServerState {
         false
     }
 
+    /// Grant a pending access permanently: the observed package hash
+    /// becomes the secret's allowed hash and the read limit is lifted.
+    /// The waiting reader is served like a normal grant.
+    pub fn grant_pending_forever(&self, id: u64) -> Result<(), String> {
+        let (secret_name, package_hash) = {
+            let entry = self
+                .pending
+                .get(&id)
+                .ok_or_else(|| format!("pending access {id} not found"))?;
+            if entry.expires_at <= std::time::Instant::now() {
+                return Err(format!("pending access {id} expired"));
+            }
+            let hash = entry
+                .pid_hash
+                .clone()
+                .ok_or_else(|| format!("pending access {id} has no package hash"))?;
+            (entry.secret_name.clone(), hash)
+        };
+        if let Some(rec_arc) = self.secrets.get(&secret_name).map(|e| Arc::clone(e.value())) {
+            let mut rec = lock_secret(&rec_arc, &secret_name);
+            tracing::info!(
+                "grant-forever {id}: whitelisting package {} for '{secret_name}' (unlimited reads)",
+                &package_hash[..package_hash.len().min(12)]
+            );
+            rec.allowed_hash = package_hash;
+            rec.unlimited_reads = true;
+        } else {
+            return Err(format!("secret {secret_name} no longer exists"));
+        }
+        // Serve the waiting reader.
+        if !self.grant_pending(id) {
+            return Err(format!("pending access {id} not found or expired"));
+        }
+        Ok(())
+    }
+
     pub fn deny_pending(&self, id: u64) -> bool {
         self.pending.remove(&id).is_some()
     }
@@ -328,6 +370,7 @@ impl ServerState {
                 access_count: rec.access_count,
                 allowed_hash: rec.allowed_hash.clone(),
                 size: rec.content.len(),
+                unlimited: rec.unlimited_reads,
             }
         }).collect()
     }
@@ -394,6 +437,71 @@ mod tests {
         let s = sample_state();
         let out = s.attempt_read("secrets.yaml", 100, None, 0, 1024);
         assert!(matches!(out, ReadOutcome::HashMismatch { .. }));
+    }
+
+    #[test]
+    fn grant_forever_whitelists_package_hash_unlimited() {
+        // Issue #11: after grant-forever, the observed package hash is
+        // the allowed hash and reads are unlimited; other hashes still
+        // pend/deny.
+        let s = ServerState::new();
+        s.add("k", b"V".to_vec(), "old_hash");
+        s.create_pending("k", 7, Some("pkg_hash_abc"), "hash mismatch", None);
+        let id = s.pending.iter().next().unwrap().id;
+        assert!(s.grant_pending_forever(id).is_ok());
+
+        for n in 0..5 {
+            match s.attempt_read("k", 100 + n, Some("pkg_hash_abc"), 0, 1) {
+                ReadOutcome::Granted(d) => assert_eq!(d, b"V"),
+                other => panic!("read {n} not granted: {other:?}"),
+            }
+        }
+        assert!(matches!(
+            s.attempt_read("k", 200, Some("tampered"), 0, 1),
+            ReadOutcome::HashMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn grant_forever_allows_fresh_rereads_same_pid() {
+        // After grant-forever, a NEW open() by the same package starts
+        // at offset 0 even though a previous read advanced the progress
+        // — the forward-only gate applies to streaming reads, not to
+        // unlimited secrets.
+        let s = ServerState::new();
+        s.add("k", b"VAL".to_vec(), "h");
+        s.create_pending("k", 7, Some("pkg"), "mismatch", None);
+        let id = s.pending.iter().next().unwrap().id;
+        s.grant_pending_forever(id).unwrap();
+
+        match s.attempt_read("k", 7, Some("pkg"), 0, 3) {
+            ReadOutcome::Granted(d) => assert_eq!(d, b"VAL"),
+            other => panic!("first read: {other:?}"),
+        }
+        match s.attempt_read("k", 7, Some("pkg"), 0, 3) {
+            ReadOutcome::Granted(d) => assert_eq!(d, b"VAL"),
+            other => panic!("fresh re-read from offset 0: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn grant_forever_without_package_hash_errors() {
+        let s = ServerState::new();
+        s.add("k", b"V".to_vec(), "h");
+        s.create_pending("k", 7, None, "hash unknown", None);
+        let id = s.pending.iter().next().unwrap().id;
+        let err = s.grant_pending_forever(id).unwrap_err();
+        assert!(err.contains("no package hash"), "got: {err}");
+        assert!(matches!(
+            s.attempt_read("k", 9, Some("h2"), 0, 1),
+            ReadOutcome::HashMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn grant_forever_unknown_id_errors() {
+        let s = ServerState::new();
+        assert!(s.grant_pending_forever(9999).is_err());
     }
 
     #[test]

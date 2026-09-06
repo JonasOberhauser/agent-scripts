@@ -39,6 +39,15 @@ mod tests {
     }
 
     #[test]
+    fn grant_forever_round_trip() {
+        let cmd = Command::GrantForever { id: 42 };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"grant_forever\""));
+        let back: Command = serde_json::from_str(&json).unwrap();
+        assert_eq!(cmd, back);
+    }
+
+    #[test]
     fn response_status_round_trip() {
         let resp = Response::Status {
             secrets: vec![SecretStatus {
@@ -46,6 +55,7 @@ mod tests {
                 access_count: 2,
                 allowed_hash: "deadbeef".into(),
                 size: 42,
+                unlimited: false,
             }],
         };
         let json = serde_json::to_string(&resp).unwrap();

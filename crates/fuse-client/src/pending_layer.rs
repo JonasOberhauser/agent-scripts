@@ -16,6 +16,7 @@
 //! thread ([`spawn_worker`]), tests run them inline ([`DirectTalk`]).
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crossterm::event::{Event, KeyCode, KeyEventKind, MouseEventKind};
@@ -53,6 +54,8 @@ const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 pub(crate) enum Button {
     Deny { id: u64 },
     Grant { id: u64 },
+    /// Permanent grant (issue #11): whitelist the observed package hash.
+    GrantForever { id: u64 },
     DenyAll,
     GrantAll,
 }
@@ -60,15 +63,18 @@ pub(crate) enum Button {
 impl Button {
     /// Whether this button grants (green) or denies (red).
     fn is_grant(&self) -> bool {
-        matches!(self, Button::Grant { .. } | Button::GrantAll)
+        matches!(
+            self,
+            Button::Grant { .. } | Button::GrantAll | Button::GrantForever { .. }
+        )
     }
 
     /// The wire protocol this button speaks.
     fn protocol_name(&self) -> &'static str {
-        if self.is_grant() {
-            "grant"
-        } else {
-            "deny"
+        match self {
+            Button::GrantForever { .. } => "grant-forever",
+            _ if self.is_grant() => "grant",
+            _ => "deny",
         }
     }
 
@@ -77,6 +83,7 @@ impl Button {
         match self {
             Button::Deny { .. } => "[deny]",
             Button::Grant { .. } => "[grant]",
+            Button::GrantForever { .. } => "[forever]",
             Button::DenyAll => "[deny all]",
             Button::GrantAll => "[grant all]",
         }
@@ -95,15 +102,17 @@ impl Button {
     /// command; all-buttons expand to one per pending request.
     fn commands(&self, snapshot: &[PendingAccessInfo]) -> Vec<(String, Command)> {
         let one = |id: u64| {
-            let command = if self.is_grant() {
-                Command::Grant { id }
-            } else {
-                Command::Deny { id }
+            let command = match self {
+                Button::GrantForever { .. } => Command::GrantForever { id },
+                _ if self.is_grant() => Command::Grant { id },
+                _ => Command::Deny { id },
             };
             (self.protocol_name().to_string(), command)
         };
         match self {
-            Button::Deny { id } | Button::Grant { id } => vec![one(*id)],
+            Button::Deny { id } | Button::Grant { id } | Button::GrantForever { id } => {
+                vec![one(*id)]
+            }
             Button::DenyAll | Button::GrantAll => {
                 snapshot.iter().map(|p| one(p.id)).collect()
             }
@@ -112,14 +121,14 @@ impl Button {
 
     /// The button a cursor on `row` (a request slot index or the all-row)
     /// selects; `None` on a freed row.
-    fn at_cursor(button_row: Option<&PendingAccessInfo>, all: bool, grant: bool) -> Option<Button> {
+    fn at_cursor(button_row: Option<&PendingAccessInfo>, all: bool, sel: Sel) -> Option<Button> {
         match button_row {
-            Some(req) if !all => Some(if grant {
-                Button::Grant { id: req.id }
-            } else {
-                Button::Deny { id: req.id }
+            Some(req) if !all => Some(match sel {
+                Sel::Forever => Button::GrantForever { id: req.id },
+                Sel::Grant => Button::Grant { id: req.id },
+                Sel::Deny => Button::Deny { id: req.id },
             }),
-            None if all => Some(if grant {
+            None if all => Some(if sel == Sel::Grant {
                 Button::GrantAll
             } else {
                 Button::DenyAll
@@ -131,11 +140,34 @@ impl Button {
 
 // ── Slots + cursor model ─────────────────────────────────────────
 
+/// Which of a request row's three buttons is selected (left to right).
+/// The all-row keeps the plain grant/deny pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Sel {
+    Forever,
+    Grant,
+    Deny,
+}
+
+impl Sel {
+    /// Step one button to the left (true) or right (false), clamped at
+    /// the edges.
+    fn step(self, left: bool) -> Sel {
+        match (self, left) {
+            (Sel::Deny, true) => Sel::Grant,
+            (Sel::Grant, true) => Sel::Forever,
+            (Sel::Forever, false) => Sel::Grant,
+            (Sel::Grant, false) => Sel::Deny,
+            other => other.0,
+        }
+    }
+}
+
 /// The keyboard cursor: which request slot (or the all-row) and which of
-/// its two buttons is selected.
+/// its buttons is selected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Cursor {
-    Request { slot: usize, grant: bool },
+    Request { slot: usize, sel: Sel },
     All { grant: bool },
 }
 
@@ -189,7 +221,7 @@ pub(crate) fn cursor_after_action(slots: &Slots, slot: usize) -> Cursor {
         .copied()
         .or_else(|| occ.first().copied());
     match next {
-        Some(i) => Cursor::Request { slot: i, grant: true },
+        Some(i) => Cursor::Request { slot: i, sel: Sel::Grant },
         None => Cursor::All { grant: true },
     }
 }
@@ -202,15 +234,18 @@ pub(crate) fn cursor_up(slots: &Slots, cur: Cursor) -> Cursor {
         return Cursor::All { grant: cur_is_grant(cur) };
     }
     match cur {
-        Cursor::Request { slot, grant } => {
+        Cursor::Request { slot, sel } => {
             let idx = occ.iter().position(|&i| i == slot);
             match idx {
-                Some(0) => Cursor::All { grant },
-                Some(i) => Cursor::Request { slot: occ[i - 1], grant },
-                None => Cursor::Request { slot: occ[0], grant },
+                Some(0) => Cursor::All { grant: sel != Sel::Deny },
+                Some(i) => Cursor::Request { slot: occ[i - 1], sel },
+                None => Cursor::Request { slot: occ[0], sel },
             }
         }
-        Cursor::All { grant } => Cursor::Request { slot: *occ.last().unwrap(), grant },
+        Cursor::All { grant } => Cursor::Request {
+            slot: *occ.last().unwrap(),
+            sel: if grant { Sel::Grant } else { Sel::Deny },
+        },
     }
 }
 
@@ -222,21 +257,25 @@ pub(crate) fn cursor_down(slots: &Slots, cur: Cursor) -> Cursor {
         return Cursor::All { grant: cur_is_grant(cur) };
     }
     match cur {
-        Cursor::Request { slot, grant } => {
+        Cursor::Request { slot, sel } => {
             let idx = occ.iter().position(|&i| i == slot);
             match idx {
-                Some(i) if i + 1 < occ.len() => Cursor::Request { slot: occ[i + 1], grant },
-                Some(_) => Cursor::All { grant },
-                None => Cursor::Request { slot: occ[0], grant },
+                Some(i) if i + 1 < occ.len() => Cursor::Request { slot: occ[i + 1], sel },
+                Some(_) => Cursor::All { grant: sel != Sel::Deny },
+                None => Cursor::Request { slot: occ[0], sel },
             }
         }
-        Cursor::All { grant } => Cursor::Request { slot: occ[0], grant },
+        Cursor::All { grant } => Cursor::Request {
+            slot: occ[0],
+            sel: if grant { Sel::Grant } else { Sel::Deny },
+        },
     }
 }
 
 fn cur_is_grant(cur: Cursor) -> bool {
     match cur {
-        Cursor::Request { grant, .. } | Cursor::All { grant } => grant,
+        Cursor::Request { sel, .. } => sel != Sel::Deny,
+        Cursor::All { grant } => grant,
     }
 }
 
@@ -289,13 +328,31 @@ fn button_pair(row: Rect, all: bool) -> (Rect, Rect) {
     (deny, grant)
 }
 
+/// The per-request `[forever]` button sits one cell left of `[grant]`.
+fn forever_rect(row: Rect) -> Rect {
+    let (_, grant) = button_pair(row, false);
+    Rect {
+        x: grant.x.saturating_sub("[forever]".len() as u16 + 1),
+        y: row.y,
+        width: "[forever]".len() as u16,
+        height: 1,
+    }
+}
+
 // ── Rendering ─────────────────────────────────────────────────────
 
 /// The panel title: completely unstyled text — no modifiers, no
 /// colors, no background override. It sits directly on the layer's
 /// servatui-assigned backdrop like every other row.
-fn title_line(shown: usize, total: usize) -> Line<'static> {
-    Line::raw(format!(" pending requests: {shown}/{total} "))
+fn title_line(shown: usize, total: usize, error: Option<&str>, width: u16) -> Line<'static> {
+    let prefix = format!(" pending requests: {shown}/{total} ");
+    let mut t = prefix.clone();
+    if let Some(e) = error {
+        // Use whatever width the panel actually has, not a fixed cap.
+        let room = (width as usize).saturating_sub(prefix.width() + 4);
+        t.push_str(&format!("! {} ", truncate_pad(e, room).trim_end()));
+    }
+    Line::raw(t)
 }
 
 /// Identifying text for the requesting process: its name, or `#pid`.
@@ -363,10 +420,11 @@ enum GridRow<'a> {
 /// Render one grid row: content left, the grant|deny button pair right
 /// (grant left, deny right). Request rows show `id name`; the all-row is
 /// buttons only. The cursor selection reverses the highlighted button.
-fn grid_row_line(row: GridRow, width: u16, cursor_here: bool, grant_selected: bool) -> Line<'static> {
+fn grid_row_line(row: GridRow, width: u16, sel_here: Option<Sel>) -> Line<'static> {
     let all = matches!(row, GridRow::All);
     let (deny_l, grant_l) = if all { ("[deny all]", "[grant all]") } else { ("[deny]", "[grant]") };
-    let buttons_w = deny_l.len() + 1 + grant_l.len();
+    let forever_w = if all { 0 } else { "[forever]".len() + 1 };
+    let buttons_w = deny_l.len() + 1 + grant_l.len() + forever_w;
     let mut spans: Vec<Span<'static>> = Vec::new();
     match row {
         GridRow::Request(req) => {
@@ -385,9 +443,14 @@ fn grid_row_line(row: GridRow, width: u16, cursor_here: bool, grant_selected: bo
     )));
     let deny = if all { Button::DenyAll } else { Button::Deny { id: 0 } };
     let grant = if all { Button::GrantAll } else { Button::Grant { id: 0 } };
-    spans.extend(button_spans(grant, cursor_here && grant_selected));
+    let sel = sel_here;
+    if let GridRow::Request(_) = row {
+        spans.extend(button_spans(Button::GrantForever { id: 0 }, sel == Some(Sel::Forever)));
+        spans.push(Span::raw(" "));
+    }
+    spans.extend(button_spans(grant, sel == Some(Sel::Grant)));
     spans.push(Span::raw(" "));
-    spans.extend(button_spans(deny, cursor_here && !grant_selected));
+    spans.extend(button_spans(deny, sel == Some(Sel::Deny)));
     Line::from(spans)
 }
 
@@ -409,7 +472,21 @@ pub(crate) trait ServerTalk {
 /// Service one request against the server, updating the shared
 /// snapshots. Failures warn and leave the snapshots as-is — the next
 /// poll reconciles.
-fn service(socket: &Path, pending: &PendingIds, secrets: &SecretNames, req: PanelRequest) {
+/// Last action error, surfaced in the panel title until a successful
+/// action replaces it (never silently swallowed).
+pub(crate) type LastError = Arc<Mutex<Option<String>>>;
+
+pub(crate) fn no_error() -> LastError {
+    Arc::new(Mutex::new(None))
+}
+
+fn service(
+    socket: &Path,
+    pending: &PendingIds,
+    secrets: &SecretNames,
+    error: &LastError,
+    req: PanelRequest,
+) {
     match req {
         PanelRequest::Poll => {
             match poll_pending_info(socket) {
@@ -424,8 +501,23 @@ fn service(socket: &Path, pending: &PendingIds, secrets: &SecretNames, req: Pane
             }
         }
         PanelRequest::Action { name, command } => {
-            if let Err(e) = run_command_once(socket, &name, &command) {
-                tracing::warn!("pending action '{name}' failed: {e}");
+            tracing::info!("panel action '{name}' dispatched");
+            let failure = match run_command_once(socket, &name, &command) {
+                Err(e) => Some(e),
+                // The transport succeeded but the server rejected the
+                // command (e.g. unknown pending id, stale server).
+                Ok(fuse_protocol::Response::Error { message }) => Some(message),
+                Ok(_) => None,
+            };
+            match failure {
+                Some(e) => {
+                    tracing::warn!("pending action '{name}' failed: {e}");
+                    *error.lock().unwrap() = Some(format!("{name}: {e}"));
+                }
+                None => {
+                    tracing::info!("pending action '{name}' ok");
+                    *error.lock().unwrap() = None;
+                }
             }
         }
     }
@@ -436,19 +528,24 @@ fn service(socket: &Path, pending: &PendingIds, secrets: &SecretNames, req: Pane
 pub(crate) struct DirectTalk {
     socket: PathBuf,
     secrets: SecretNames,
+    error: LastError,
 }
 
 #[cfg(test)]
 impl DirectTalk {
-    pub(crate) fn new(socket: impl Into<PathBuf>, secrets: SecretNames) -> Self {
-        Self { socket: socket.into(), secrets }
+    pub(crate) fn new(
+        socket: impl Into<PathBuf>,
+        secrets: SecretNames,
+        error: LastError,
+    ) -> Self {
+        Self { socket: socket.into(), secrets, error }
     }
 }
 
 #[cfg(test)]
 impl ServerTalk for DirectTalk {
     fn request(&self, snapshot: &PendingIds, req: PanelRequest) {
-        service(&self.socket, snapshot, &self.secrets, req);
+        service(&self.socket, snapshot, &self.secrets, &self.error, req);
     }
 }
 
@@ -465,14 +562,15 @@ pub(crate) fn spawn_worker(
     socket: PathBuf,
     snapshot: PendingIds,
     secrets: SecretNames,
+    error: LastError,
 ) -> WorkerTalk {
     let (tx, rx) = std::sync::mpsc::channel::<PanelRequest>();
     std::thread::spawn(move || {
         for req in rx {
             let follow_up = matches!(req, PanelRequest::Action { .. });
-            service(&socket, &snapshot, &secrets, req);
+            service(&socket, &snapshot, &secrets, &error, req);
             if follow_up {
-                service(&socket, &snapshot, &secrets, PanelRequest::Poll);
+                service(&socket, &snapshot, &secrets, &error, PanelRequest::Poll);
             }
         }
     });
@@ -521,6 +619,7 @@ impl ButtonGrid {
 /// The pending-request panel as a display layer.
 pub(crate) struct PendingPanelLayer {
     pending: PendingIds,
+    error: LastError,
     talk: Box<dyn ServerTalk>,
     slots: Slots,
     cursor: Cursor,
@@ -532,8 +631,9 @@ pub(crate) struct PendingPanelLayer {
 }
 
 impl PendingPanelLayer {
-    pub(crate) fn new(pending: PendingIds, talk: Box<dyn ServerTalk>) -> Self {
+    pub(crate) fn new(pending: PendingIds, talk: Box<dyn ServerTalk>, error: LastError) -> Self {
         Self {
+            error,
             pending,
             talk,
             slots: empty_slots(),
@@ -597,6 +697,8 @@ impl DisplayLayer for PendingPanelLayer {
             widget: Box::new(Paragraph::new(title_line(
                 occupied(&self.slots).len(),
                 snapshot.len(),
+                self.error.lock().unwrap().as_deref(),
+                panel.width,
             ))),
             area: panel,
         });
@@ -607,8 +709,6 @@ impl DisplayLayer for PendingPanelLayer {
             let line = match &self.slots[i] {
                 None => Line::raw(" ".repeat(row.width as usize)),
                 Some(req) => {
-                    let cursor_here = matches!(self.cursor, Cursor::Request { slot, .. } if slot == i);
-                    let grant_sel = self.cursor == Cursor::Request { slot: i, grant: true };
                     let (deny, grant) = button_pair(row, false);
                     self.grid.children.push(GridChild {
                         row: i,
@@ -620,7 +720,16 @@ impl DisplayLayer for PendingPanelLayer {
                         button: Button::Grant { id: req.id },
                         rect: grant,
                     });
-                    grid_row_line(GridRow::Request(req), row.width, cursor_here, grant_sel)
+                    self.grid.children.push(GridChild {
+                        row: i,
+                        button: Button::GrantForever { id: req.id },
+                        rect: forever_rect(row),
+                    });
+                    let sel_here = match self.cursor {
+                        Cursor::Request { slot, sel } if slot == i => Some(sel),
+                        _ => None,
+                    };
+                    grid_row_line(GridRow::Request(req), row.width, sel_here)
                 }
             };
             widgets.push(WidgetEntry {
@@ -632,8 +741,10 @@ impl DisplayLayer for PendingPanelLayer {
 
         let all_row = all_row_rect(panel);
         self.grid.rows.push(all_row);
-        let cursor_here = matches!(self.cursor, Cursor::All { .. });
-        let grant_sel = self.cursor == Cursor::All { grant: true };
+        let sel_here = match self.cursor {
+            Cursor::All { grant } => Some(if grant { Sel::Grant } else { Sel::Deny }),
+            _ => None,
+        };
         let (deny, grant) = button_pair(all_row, true);
         self.grid.children.push(GridChild { row: MAX_SHOWN, button: Button::DenyAll, rect: deny });
         self.grid.children.push(GridChild { row: MAX_SHOWN, button: Button::GrantAll, rect: grant });
@@ -642,8 +753,7 @@ impl DisplayLayer for PendingPanelLayer {
             widget: Box::new(Paragraph::new(grid_row_line(
                 GridRow::All,
                 all_row.width,
-                cursor_here,
-                grant_sel,
+                sel_here,
             ))),
             area: all_row,
         });
@@ -682,21 +792,34 @@ impl DisplayLayer for PendingPanelLayer {
                         EventResult::Swallow
                     }
                     KeyCode::Left | KeyCode::Right => {
-                        // Spatial: Left selects the left button (grant),
-                        // Right the right one (deny).
-                        let grant = matches!(k.code, KeyCode::Left);
+                        // Spatial stepping: request rows walk
+                        // forever -> grant -> deny (clamped); the
+                        // all-row toggles its grant/deny pair.
+                        let left = matches!(k.code, KeyCode::Left);
                         self.cursor = match self.cursor {
-                            Cursor::Request { slot, .. } => Cursor::Request { slot, grant },
-                            Cursor::All { .. } => Cursor::All { grant },
+                            Cursor::Request { slot, sel } => Cursor::Request { slot, sel: sel.step(left) },
+                            Cursor::All { .. } => Cursor::All { grant: left },
                         };
+                        EventResult::Swallow
+                    }
+                    KeyCode::Char('f') => {
+                        // Grant-forever is a direct action on the
+                        // cursor row (issue #11): no cursor mode needed.
+                        if let Cursor::Request { slot, .. } = self.cursor {
+                            if let Some(req) = self.slots.get(slot).and_then(|s| s.as_ref()) {
+                                self.press(slot, Button::GrantForever { id: req.id });
+                            }
+                        }
                         EventResult::Swallow
                     }
                     KeyCode::Enter => {
                         let button = match self.cursor {
-                            Cursor::Request { slot, grant } => {
-                                Button::at_cursor(self.slots.get(slot).and_then(|s| s.as_ref()), false, grant)
+                            Cursor::Request { slot, sel } => {
+                                Button::at_cursor(self.slots.get(slot).and_then(|s| s.as_ref()), false, sel)
                             }
-                            Cursor::All { grant } => Button::at_cursor(None, true, grant),
+                            Cursor::All { grant } => {
+                                Button::at_cursor(None, true, if grant { Sel::Grant } else { Sel::Deny })
+                            }
                         };
                         if let Some(button) = button {
                             let row = match self.cursor {
@@ -744,7 +867,12 @@ mod tests {
 
     fn layer(pending: PendingIds, sock: &Path) -> PendingPanelLayer {
         let secrets: SecretNames = Arc::new(Mutex::new(Vec::new()));
-        PendingPanelLayer::new(pending, Box::new(DirectTalk::new(sock, secrets)))
+        let error: LastError = no_error();
+        PendingPanelLayer::new(
+            pending,
+            Box::new(DirectTalk::new(sock, secrets, error.clone())),
+            error,
+        )
     }
 
     fn key(code: KeyCode) -> Event {
@@ -805,12 +933,12 @@ mod tests {
     fn cursor_advances_to_next_and_wraps_to_all() {
         let mut slots = empty_slots();
         sync_slots(&mut slots, &ids(&[1, 2, 3]));
-        assert_eq!(cursor_after_action(&slots, 0), Cursor::Request { slot: 1, grant: true });
+        assert_eq!(cursor_after_action(&slots, 0), Cursor::Request { slot: 1, sel: Sel::Grant });
         // Acting on the last request wraps cyclically to the first.
-        assert_eq!(cursor_after_action(&slots, 2), Cursor::Request { slot: 0, grant: true });
+        assert_eq!(cursor_after_action(&slots, 2), Cursor::Request { slot: 0, sel: Sel::Grant });
         // Only request 2 left (slot 1): handling it wraps to itself.
         sync_slots(&mut slots, &ids(&[2]));
-        assert_eq!(cursor_after_action(&slots, 1), Cursor::Request { slot: 1, grant: true });
+        assert_eq!(cursor_after_action(&slots, 1), Cursor::Request { slot: 1, sel: Sel::Grant });
         // None left: the all-row.
         sync_slots(&mut slots, &ids(&[]));
         assert_eq!(cursor_after_action(&slots, 1), Cursor::All { grant: true });
@@ -820,14 +948,14 @@ mod tests {
     fn cursor_stays_on_request_when_new_ones_appear_above() {
         let mut slots = empty_slots();
         sync_slots(&mut slots, &ids(&[5, 6]));
-        let cursor = Cursor::Request { slot: 1, grant: true }; // on request 6
+        let cursor = Cursor::Request { slot: 1, sel: Sel::Grant }; // on request 6
         sync_slots(&mut slots, &ids(&[4, 5, 6]));
         // 4 took the topmost FREE slot (2): positions of 5 and 6 are
         // unchanged, so the cursor still points at request 6.
         let shown: Vec<Option<u64>> =
             slots.iter().map(|s| s.as_ref().map(|r| r.id)).collect();
         assert_eq!(shown, vec![Some(5), Some(6), Some(4), None, None]);
-        assert_eq!(cursor_up(&slots, cursor), Cursor::Request { slot: 0, grant: true });
+        assert_eq!(cursor_up(&slots, cursor), Cursor::Request { slot: 0, sel: Sel::Grant });
     }
 
     #[test]
@@ -836,13 +964,13 @@ mod tests {
         let mut slots = empty_slots();
         sync_slots(&mut slots, &ids(&[1, 2, 3]));
         sync_slots(&mut slots, &ids(&[1, 3]));
-        let c = Cursor::Request { slot: 0, grant: true };
+        let c = Cursor::Request { slot: 0, sel: Sel::Grant };
         let c = cursor_down(&slots, c);
-        assert_eq!(c, Cursor::Request { slot: 2, grant: true }, "empty slot 1 is skipped");
+        assert_eq!(c, Cursor::Request { slot: 2, sel: Sel::Grant }, "empty slot 1 is skipped");
         let c = cursor_down(&slots, c);
         assert_eq!(c, Cursor::All { grant: true });
         let c = cursor_down(&slots, c);
-        assert_eq!(c, Cursor::Request { slot: 0, grant: true }, "wraps to the top");
+        assert_eq!(c, Cursor::Request { slot: 0, sel: Sel::Grant }, "wraps to the top");
         assert_eq!(
             cursor_up(&slots, c),
             Cursor::All { grant: true },
@@ -864,7 +992,7 @@ mod tests {
     /// plain text on the layer backdrop, like the body rows.
     #[test]
     fn title_is_completely_unstyled() {
-        let line = title_line(5, 6);
+        let line = title_line(5, 6, None, 80);
         for span in &line.spans {
             assert!(span.style.fg.is_none(), "no fg: {:?}", span.style);
             assert!(span.style.bg.is_none(), "no bg: {:?}", span.style);
@@ -877,10 +1005,10 @@ mod tests {
     /// carry no color; only the brackets (and the reversed selection) do.
     #[test]
     fn rows_keep_the_layer_backdrop() {
-        for &grant_sel in &[false, true] {
+        for sel in [Sel::Forever, Sel::Grant, Sel::Deny] {
             for line in [
-                grid_row_line(GridRow::Request(&pending_info(31)), PANEL_WIDTH, true, grant_sel),
-                grid_row_line(GridRow::All, PANEL_WIDTH, true, grant_sel),
+                grid_row_line(GridRow::Request(&pending_info(31)), PANEL_WIDTH, Some(sel)),
+                grid_row_line(GridRow::All, PANEL_WIDTH, Some(sel)),
             ] {
                 for span in &line.spans {
                     assert!(
@@ -891,7 +1019,7 @@ mod tests {
                 }
             }
         }
-        let line = grid_row_line(GridRow::Request(&pending_info(31)), PANEL_WIDTH, false, false);
+        let line = grid_row_line(GridRow::Request(&pending_info(31)), PANEL_WIDTH, None);
         let colors: Vec<Option<Color>> = line.spans.iter().map(|s| s.style.fg).collect();
         assert!(colors.contains(&Some(Color::Red),), "deny brackets red: {colors:?}");
         assert!(colors.contains(&Some(Color::Green)), "grant brackets green: {colors:?}");
@@ -905,7 +1033,7 @@ mod tests {
     /// rest of the row (black on dark themes is invisible).
     #[test]
     fn request_line_id_is_uncolored() {
-        let line = grid_row_line(GridRow::Request(&pending_info(31)), PANEL_WIDTH, false, false);
+        let line = grid_row_line(GridRow::Request(&pending_info(31)), PANEL_WIDTH, None);
         let id_span = &line.spans[0];
         assert!(id_span.style.fg.is_none(), "id must be normal-colored: {:?}", id_span.style);
         assert_eq!(id_span.content.trim(), "31", "first span is the id");
@@ -1095,7 +1223,54 @@ mod tests {
                 let mut payload = String::new();
                 reader.read_line(&mut payload).unwrap();
                 seen2.lock().unwrap().push((name.clone(), payload.trim().to_string()));
-                let resp = if name == "grant" || name == "deny" {
+                let resp = if name == "grant" || name == "deny" || name == "grant-forever" {
+                    serde_json::json!({"type": "ok"})
+                } else {
+                    serde_json::json!({
+                        "type": "pending_list",
+                        "pending": answer
+                            .iter()
+                            .map(|&id| serde_json::json!({
+                                "id": id, "secret_name": "s", "process_name": "goose",
+                                "pid": id, "pid_hash": null, "reason": "r",
+                                "expires_at": 9999999999u64,
+                            }))
+                            .collect::<Vec<_>>(),
+                    })
+                };
+                writeln!(w, "{}", resp).unwrap();
+                let mut sentinel = String::new();
+                reader.read_line(&mut sentinel).unwrap();
+            }
+        });
+        seen
+    }
+
+    /// A fake server that rejects grant-forever like a stale server
+    /// would: answers it with the framework's REAL error envelope
+    /// ({"__error__": ...} — servatui protocol.rs), which the typed
+    /// client must surface, not choke on.
+    fn fake_server_stale(sock: &Path, answer: Vec<u64>) -> Arc<Mutex<Vec<(String, String)>>> {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::os::unix::net::UnixListener::bind(sock).unwrap();
+        let seen: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen2 = seen.clone();
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(stream) = conn else { break };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut w = stream;
+                let mut name = String::new();
+                if reader.read_line(&mut name).unwrap() == 0 {
+                    continue;
+                }
+                let name = serde_json::from_str::<String>(name.trim()).unwrap();
+                let mut payload = String::new();
+                reader.read_line(&mut payload).unwrap();
+                seen2.lock().unwrap().push((name.clone(), payload.trim().to_string()));
+                let resp = if name == "grant-forever" {
+                    serde_json::json!({"__error__": "Unknown command: grant-forever"})
+                } else if name == "grant" || name == "deny" {
                     serde_json::json!({"type": "ok"})
                 } else {
                     serde_json::json!({
@@ -1219,7 +1394,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel::<PanelRequest>();
         let talk = WorkerTalk { tx };
         let pending: PendingIds = Arc::new(Mutex::new(ids(&[31])));
-        let mut layer = PendingPanelLayer::new(pending, Box::new(talk));
+        let mut layer = PendingPanelLayer::new(pending, Box::new(talk), no_error());
 
         let mut ctx = servatui_display::LayerCtx {
             id: servatui_display::LayerId::BUILTIN,
@@ -1249,7 +1424,7 @@ mod tests {
 
         let pending: PendingIds = Arc::new(Mutex::new(Vec::new()));
         let secrets: SecretNames = Arc::new(Mutex::new(Vec::new()));
-        let talk = spawn_worker(sock.clone(), pending.clone(), secrets.clone());
+        let talk = spawn_worker(sock.clone(), pending.clone(), secrets.clone(), no_error());
         talk.request(
             &pending,
             PanelRequest::Action {
@@ -1270,5 +1445,156 @@ mod tests {
             wait_until(5_000, || !pending.lock().unwrap().is_empty()),
             "the follow-up poll must fill the snapshot"
         );
+    }
+
+    // ── grant-forever panel tests (#11) ───────────────────────────
+
+    /// Left/Right step through forever -> grant -> deny, clamped.
+    #[test]
+    fn left_right_step_through_forever() {
+        assert_eq!(Sel::Forever.step(false), Sel::Grant);
+        assert_eq!(Sel::Grant.step(false), Sel::Deny);
+        assert_eq!(Sel::Deny.step(false), Sel::Deny, "clamped at the right edge");
+        assert_eq!(Sel::Deny.step(true), Sel::Grant);
+        assert_eq!(Sel::Grant.step(true), Sel::Forever);
+        assert_eq!(Sel::Forever.step(true), Sel::Forever, "clamped at the left edge");
+    }
+
+    /// Pressing `f` grants the cursor-selected request permanently.
+    #[test]
+    fn f_grants_forever_selected_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("panel.sock");
+        let seen = fake_server(&sock, vec![31, 37]);
+
+        let pending: PendingIds = Arc::new(Mutex::new(ids(&[31, 37])));
+        let mut display = servatui_display::Display::with_palette(Vec::new());
+        display.add_layer(Box::new(layer(pending.clone(), &sock)));
+        frame_with_pending(&mut display);
+
+        assert!(display.route_event(&key(KeyCode::Down)), "panel has focus: swallowed");
+        assert!(display.route_event(&key(KeyCode::Char('f'))), "f swallowed");
+
+        let conversations = seen.lock().unwrap().clone();
+        assert!(
+            conversations
+                .iter()
+                .any(|(name, payload)| name == "grant-forever" && payload.contains("\"id\":31")),
+            "grant-forever for request 31 must hit the wire: {conversations:?}"
+        );
+    }
+
+    /// Enter on the forever selection (Down + Left + Enter) dispatches
+    /// grant-forever.
+    #[test]
+    fn enter_on_forever_selection_grants_forever() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("panel.sock");
+        let seen = fake_server(&sock, vec![31]);
+
+        let pending: PendingIds = Arc::new(Mutex::new(ids(&[31])));
+        let mut display = servatui_display::Display::with_palette(Vec::new());
+        display.add_layer(Box::new(layer(pending, &sock)));
+        frame_with_pending(&mut display);
+
+        assert!(display.route_event(&key(KeyCode::Down)), "swallowed");
+        assert!(display.route_event(&key(KeyCode::Left)), "swallowed");
+        assert!(display.route_event(&key(KeyCode::Enter)), "swallowed");
+
+        let conversations = seen.lock().unwrap().clone();
+        assert!(
+            conversations
+                .iter()
+                .any(|(name, payload)| name == "grant-forever" && payload.contains("\"id\":31")),
+            "grant-forever for request 31 must hit the wire: {conversations:?}"
+        );
+    }
+
+    /// Clicking the [forever] button grants that request permanently.
+    #[test]
+    fn click_forever_button_grants_forever() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("panel2.sock");
+        let seen = fake_server(&sock, vec![31, 37]);
+
+        let pending: PendingIds = Arc::new(Mutex::new(ids(&[31, 37])));
+        let mut display = servatui_display::Display::with_palette(Vec::new());
+        display.add_layer(Box::new(layer(pending, &sock)));
+        frame_with_pending(&mut display);
+
+        let row = row_rect(panel_rect(Rect::new(0, 0, 80, 24)), 1);
+        let forever = forever_rect(row);
+        assert!(
+            display.route_event(&click(forever.x, forever.y)),
+            "click on the forever button is swallowed"
+        );
+
+        let conversations = seen.lock().unwrap().clone();
+        assert!(
+            conversations
+                .iter()
+                .any(|(name, payload)| name == "grant-forever" && payload.contains("\"id\":37")),
+            "grant-forever for request 37 must hit the wire: {conversations:?}"
+        );
+    }
+
+    /// A failing action must surface in the panel title, never vanish:
+    /// a stale server rejecting grant-forever via the framework's error
+    /// envelope becomes a visible message instead of a dead button.
+    #[test]
+    fn failing_action_surfaces_in_the_title() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("stale.sock");
+        fake_server_stale(&sock, vec![31]);
+
+        let pending: PendingIds = Arc::new(Mutex::new(ids(&[31])));
+        let error: LastError = no_error();
+        let mut display = servatui_display::Display::with_palette(Vec::new());
+        display.add_layer(Box::new(PendingPanelLayer::new(
+            pending,
+            Box::new(DirectTalk::new(&sock, Arc::new(Mutex::new(Vec::new())), error.clone())),
+            error.clone(),
+        )));
+        frame_with_pending(&mut display);
+
+        assert!(display.route_event(&key(KeyCode::Down)), "swallowed");
+        assert!(display.route_event(&key(KeyCode::Char('f'))), "swallowed");
+
+        let err = error.lock().unwrap().clone();
+        assert!(
+            err.as_deref().unwrap_or("").contains("Unknown command"),
+            "error must be surfaced, got: {err:?}"
+        );
+    }
+
+    /// A failed action's error must SURVIVE the worker's follow-up poll
+    /// (which used to clear it within milliseconds, hiding the message).
+    #[test]
+    fn worker_error_survives_follow_up_poll() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("stale-worker.sock");
+        fake_server_stale(&sock, vec![31]);
+
+        let pending: PendingIds = Arc::new(Mutex::new(Vec::new()));
+        let secrets: SecretNames = Arc::new(Mutex::new(Vec::new()));
+        let error: LastError = no_error();
+        let talk = spawn_worker(sock.clone(), pending.clone(), secrets.clone(), error.clone());
+        talk.request(
+            &pending,
+            PanelRequest::Action {
+                name: "grant-forever".into(),
+                command: Command::GrantForever { id: 31 },
+            },
+        );
+        assert!(
+            wait_until(5_000, || error.lock().unwrap().is_some()),
+            "error must be surfaced"
+        );
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            error.lock().unwrap().is_some(),
+            "follow-up poll must not erase the surfaced error"
+        );
+        let _ = talk;
     }
 }

@@ -199,6 +199,10 @@ fn parse_grant(args: &str) -> Result<Command, String> {
     args.trim().parse::<u64>().map(|id| Command::Grant { id })
         .map_err(|_| "Usage: grant ID (ID must be a number)".into())
 }
+fn parse_grant_forever(args: &str) -> Result<Command, String> {
+    args.trim().parse::<u64>().map(|id| Command::GrantForever { id })
+        .map_err(|_| "Usage: grant-forever ID (ID must be a number)".into())
+}
 fn parse_deny(args: &str) -> Result<Command, String> {
     args.trim().parse::<u64>().map(|id| Command::Deny { id })
         .map_err(|_| "Usage: deny ID (ID must be a number)".into())
@@ -222,6 +226,7 @@ pub const COMMAND_TABLE: &[CommandSpec] = &[
     CommandSpec { name: "rotate", help: "Change the allowed binary hash", parse: parse_rotate, complete: Completer::SecretNames { after_space: false }, offline: None },
     CommandSpec { name: "pending", help: "Show pending access requests", parse: parse_pending, complete: NO_COMPLETE, offline: None },
     CommandSpec { name: "grant", help: "Grant a pending access request", parse: parse_grant, complete: Completer::PendingIds, offline: None },
+    CommandSpec { name: "grant-forever", help: "Grant a pending access permanently (whitelists the observed package hash)", parse: parse_grant_forever, complete: Completer::PendingIds, offline: None },
     CommandSpec { name: "deny", help: "Deny a pending access request", parse: parse_deny, complete: Completer::PendingIds, offline: None },
     CommandSpec { name: "version", help: "Show server version", parse: parse_version, complete: NO_COMPLETE, offline: Some(offline_version) },
     CommandSpec { name: "logpath", help: "Show server log file path", parse: parse_logpath, complete: NO_COMPLETE, offline: None },
