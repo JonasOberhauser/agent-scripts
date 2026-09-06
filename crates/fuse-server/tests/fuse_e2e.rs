@@ -631,3 +631,46 @@ fn e2e_grant_forever_full_flow() {
     let status = state.status();
     assert!(status.iter().any(|s| s.unlimited), "status must show unlimited: {status:?}");
 }
+
+// ── package hashing survives deleted-but-mapped libraries ───────
+
+#[test]
+fn e2e_package_hash_works_with_deleted_mapped_library() {
+    if !fuse_available() {
+        return;
+    }
+    let _serial = serial();
+    let art = tempfile::tempdir().unwrap();
+
+    // A dummy library, LD_PRELOADed into a live cat, then deleted from
+    // disk: the mapping survives, the on-disk path is gone.  This is
+    // the exact shape that made the whole package hash fail (None) on
+    // a real host, leaving grant-forever with nothing to whitelist.
+    let so = art.path().join("gone.so");
+    let src = art.path().join("gone.c");
+    std::fs::write(&src, "int agent_gone = 1;\n").unwrap();
+    let out = std::process::Command::new("cc")
+        .args(["-shared", "-fPIC", "-o"])
+        .arg(&so)
+        .arg(&src)
+        .output()
+        .expect("compile gone.so");
+    assert!(out.status.success());
+
+    let mut child = std::process::Command::new("cat")
+        .stdin(std::process::Stdio::piped())
+        .env("LD_PRELOAD", &so)
+        .spawn()
+        .expect("spawn preloaded cat");
+    std::fs::remove_file(&so).expect("delete the mapped library");
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
+    let io = RealSystemIo::new();
+    let h = io
+        .sha256_process_package(child.id())
+        .expect("package hash must succeed despite the deleted mapping");
+    assert_eq!(h.len(), 64, "a real SHA-256 hex digest");
+
+    child.kill().unwrap();
+    let _ = child.wait();
+}

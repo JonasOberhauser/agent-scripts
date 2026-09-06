@@ -273,7 +273,11 @@ impl ServerState {
             let hash = entry
                 .pid_hash
                 .clone()
-                .ok_or_else(|| format!("pending access {id} has no package hash"))?;
+                .ok_or_else(|| format!(
+                    "pending access {id} has no package hash — the reading process's \
+                     package could not be inspected (different PID namespace or unreadable \
+                     mappings), so there is nothing to whitelist"
+                ))?;
             (entry.secret_name.clone(), hash)
         };
         if let Some(rec_arc) = self.secrets.get(&secret_name).map(|e| Arc::clone(e.value())) {

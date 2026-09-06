@@ -163,31 +163,53 @@ impl SystemIo for RealSystemIo {
         use sha2::{Digest, Sha256};
         let exe = std::fs::read_link(format!("/proc/{pid}/exe"))
             .map_err(|e| IoError(format!(
-                "read /proc/{pid}/exe: {e}. \
-                 The process may be in a different PID namespace — \
-                 use --pidns=host on the container, or '*' as the hash to skip verification"
+                "read /proc/{pid}/exe: {e}. The process may be in a different PID \
+                 namespace — use --pidns=host on the container, or '*' as the \
+                 hash to skip verification"
             )))?;
-        // Union of the executable and every mapped file, sorted by path
-        // for a deterministic digest.
-        let mut paths: Vec<PathBuf> = vec![exe];
+        // Collect (mapping-range, path) pairs.  The range addresses the
+        // exact mapped inode via /proc/<pid>/map_files/, which works
+        // even when the on-disk path was replaced or unlinked
+        // (deleted-but-mapped libraries are common after updates).
+        let mut entries: Vec<(String, PathBuf)> = vec![(String::new(), exe)];
         let maps = std::fs::read_to_string(format!("/proc/{pid}/maps"))
             .map_err(|e| IoError(format!("read /proc/{pid}/maps: {e}")))?;
         for line in maps.lines() {
-            if let Some(path) = line.rsplit_once(' ').map(|(_, p)| p) {
-                if path.starts_with('/') && !paths.iter().any(|p| p == path) {
-                    paths.push(PathBuf::from(path));
+            // maps format: "start-end perms offset dev inode [path..]"
+            let mut fields = line.splitn(6, ' ');
+            let range = fields.next().unwrap_or_default();
+            if !range.contains('-') {
+                continue;
+            }
+            for _ in 0..4 {
+                fields.next();
+            }
+            if let Some(path) = fields.next().map(str::trim) {
+                if path.starts_with('/') && !entries.iter().any(|(_, p)| p == path) {
+                    entries.push((range.to_string(), PathBuf::from(path)));
                 }
             }
         }
-        paths.sort();
+        entries.sort_by(|a, b| a.1.cmp(&b.1));
         let mut hasher = Sha256::new();
-        for path in &paths {
+        for (range, path) in &entries {
             hasher.update(path.to_string_lossy().as_bytes());
             hasher.update(b"\0");
-            let data = std::fs::read(path)
-                .map_err(|e| IoError(format!("read {}: {e}", path.display())))?;
-            hasher.update((data.len() as u64).to_le_bytes());
-            hasher.update(&data);
+            // Read the actually-mapped inode when possible; fall back to
+            // the on-disk path; an unreadable file contributes a
+            // deterministic marker instead of aborting the whole
+            // package hash (one bad file must not blind the gatekeeper).
+            let content = std::fs::read(format!("/proc/{pid}/map_files/{range}"))
+                .or_else(|_| std::fs::read(path));
+            match content {
+                Ok(data) => {
+                    hasher.update((data.len() as u64).to_le_bytes());
+                    hasher.update(&data);
+                }
+                Err(_) => {
+                    hasher.update(b"unreadable");
+                }
+            }
         }
         Ok(format!("{:x}", hasher.finalize()))
     }
