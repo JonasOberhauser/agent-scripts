@@ -17,8 +17,8 @@ pub fn handle_command(cmd: Command, state: &ServerState) -> Response {
             Response::Status { secrets: state.status() }
         }
 
-        Command::AddSecret { name, content, hash } => {
-            state.add(&name, content, hash);
+        Command::AddSecret { name, content, hash, mode } => {
+            state.add_with_mode(&name, content, hash, mode);
             Response::Ok
         }
 
@@ -129,7 +129,7 @@ mod tests {
     fn add_then_remove() {
         let s = ServerState::new();
         let resp = handle_command(
-            Command::AddSecret { name: "new".into(), content: vec![9], hash: "h".into() },
+            Command::AddSecret { name: "new".into(), content: vec![9], hash: "h".into(), mode: 0o600 },
             &s,
         );
         assert_eq!(resp, Response::Ok);

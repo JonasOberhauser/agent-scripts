@@ -13,6 +13,9 @@ pub struct SecretRecord {
     pub access_count: u64,
     pub reading_pid: Option<u32>,
     pub read_progress: usize,
+    /// Permission bits snapshotted from the source file when the secret
+    /// was loaded; the FUSE view presents them (masked read-only).
+    pub mode: u32,
 }
 
 /// A pending access request waiting for manual approval.
@@ -96,7 +99,19 @@ impl ServerState {
         Self::default()
     }
 
+    /// Add with the conservative default presentation (owner-read-only).
     pub fn add(&self, name: impl Into<String>, content: Vec<u8>, allowed_hash: impl Into<String>) {
+        self.add_with_mode(name, content, allowed_hash, 0o400);
+    }
+
+    /// Add with permission bits snapshotted from the source file.
+    pub fn add_with_mode(
+        &self,
+        name: impl Into<String>,
+        content: Vec<u8>,
+        allowed_hash: impl Into<String>,
+        mode: u32,
+    ) {
         self.secrets.insert(
             name.into(),
             Arc::new(Mutex::new(SecretRecord {
@@ -105,6 +120,7 @@ impl ServerState {
                 access_count: 0,
                 reading_pid: None,
                 read_progress: 0,
+                mode: mode & 0o777,
             })),
         );
     }
