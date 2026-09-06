@@ -30,8 +30,7 @@ versions differ, the client offers to restart the server:
 ```sh
 cargo build                              # build all crates
 cargo test                               # run all tests
-cargo test -p fuse-server                # fuse-server only (unit + e2e)
-cargo test -p fuse-server --test fuse_e2e -- --include-ignored  # e2e (needs /dev/fuse)
+cargo test -p fuse-server                # fuse-server only (unit)
 cargo clippy --workspace                 # zero warnings required
 ```
 

@@ -9,15 +9,32 @@
 //! cargo test -p fuse-server --test fuse_e2e -- --include-ignored
 //! ```
 //!
-//! On a system with `/dev/fuse`, all tests should run and pass.
+//! Two constraints discovered while validating on a real /dev/fuse
+//! system (2026-09):
+//! * Tests run **serially** (see `SERIAL`): parallel mounts in one
+//!   process corrupt each other's fusermount3 fd passing.
+//! * Unauthorized reads (wrong hash, second read) **pend** awaiting an
+//!   interactive grant; denial arrives as EACCES only when the pending
+//!   timeout expires.  Tests set a 1s timeout instead of the 300s
+//!   default.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use fuse_protocol::{RealSystemIo, SystemIo};
 use fuse_server::{GatekeeperFs, ServerState};
 use fuser::{BackgroundSession, MountOption};
 
 // ── helpers ────────────────────────────────────────────────────
+
+/// FUSE sessions must not mount/unmount in parallel within one process:
+/// concurrent fusermount3 fd-passing corrupts sessions (observed as
+/// "file descriptor N is not a socket" plus cross-test failures).
+/// Every test holds this guard from before mount until after unmount.
+static SERIAL: Mutex<()> = Mutex::new(());
+
+fn serial() -> MutexGuard<'static, ()> {
+    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 fn fuse_available() -> bool {
     std::path::Path::new("/dev/fuse").exists()
@@ -56,6 +73,7 @@ fn e2e_read_secret() {
     if !fuse_available() {
         return;
     }
+    let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
     let hash = current_exe_hash();
     let state = make_state(&[("secret", b"TOPSECRET", &hash)]);
@@ -72,6 +90,7 @@ fn e2e_statfs_works() {
     if !fuse_available() {
         return;
     }
+    let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
     let hash = current_exe_hash();
     let state = make_state(&[("s", b"data", &hash)]);
@@ -103,6 +122,7 @@ fn e2e_multi_chunk_read_succeeds() {
     if !fuse_available() {
         return;
     }
+    let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
     let hash = current_exe_hash();
     let secret = b"THIS_IS_A_LONGER_SECRET_VALUE_FOR_MULTI_CHUNK_READ_TEST!!!";
@@ -130,12 +150,17 @@ fn e2e_multi_chunk_read_succeeds() {
 
 #[test]
 fn e2e_different_binary_denied() {
+    // `cat`'s read pends (wrong binary); with a 1s pending timeout it is
+    // denied and cat exits nonzero shortly after.
+
     if !fuse_available() {
         return;
     }
+    let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
     let hash = current_exe_hash();
     let state = make_state(&[("s", b"DATA", &hash)]);
+    *state.pending_timeout.lock().unwrap() = std::time::Duration::from_secs(1);
     let _session = mount_fs(state, dir.path());
 
     // `cat` has a different SHA-256 than the test binary, so the
@@ -155,11 +180,17 @@ fn e2e_different_binary_denied() {
 
 #[test]
 fn e2e_hash_mismatch_denied() {
+    // Wrong hash no longer fails instantly: the read pends awaiting an
+    // interactive grant and turns into EACCES when the (short, for
+    // tests) timeout expires.
+
     if !fuse_available() {
         return;
     }
+    let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
     let state = make_state(&[("s", b"DATA", "wrong_hash_value")]);
+    *state.pending_timeout.lock().unwrap() = std::time::Duration::from_secs(1);
     let _session = mount_fs(state, dir.path());
 
     let result = std::fs::read(dir.path().join("s"));
@@ -179,6 +210,7 @@ fn e2e_readdir_lists_secrets() {
     if !fuse_available() {
         return;
     }
+    let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
     let hash = current_exe_hash();
     let state = make_state(&[
@@ -203,6 +235,7 @@ fn e2e_getattr_reports_size() {
     if !fuse_available() {
         return;
     }
+    let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
     let hash = current_exe_hash();
     let state = make_state(&[("s", b"1234567890", &hash)]);
@@ -220,6 +253,7 @@ fn e2e_nonexistent_file_enoent() {
     if !fuse_available() {
         return;
     }
+    let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
     let state = make_state(&[]);
     let _session = mount_fs(state, dir.path());
@@ -241,6 +275,7 @@ fn e2e_dynamic_add_visible() {
     if !fuse_available() {
         return;
     }
+    let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
     let hash = current_exe_hash();
     let state = make_state(&[]);
@@ -263,16 +298,18 @@ fn e2e_reset_allows_reread() {
     if !fuse_available() {
         return;
     }
+    let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
     let hash = current_exe_hash();
     let state = make_state(&[("s", b"DATA", &hash)]);
+    *state.pending_timeout.lock().unwrap() = std::time::Duration::from_secs(1);
     let state_handle = std::sync::Arc::clone(&state);
     let _session = mount_fs(state, dir.path());
 
     // First read succeeds.
     let _ = std::fs::read(dir.path().join("s")).unwrap();
 
-    // Second read denied.
+    // Second read pends, then is denied when the timeout expires.
     let err = std::fs::read(dir.path().join("s")).unwrap_err();
     assert_eq!(err.raw_os_error(), Some(libc::EACCES));
 
@@ -291,6 +328,7 @@ fn e2e_multiple_secrets_independent() {
     if !fuse_available() {
         return;
     }
+    let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
     let hash = current_exe_hash();
     let state = make_state(&[
@@ -314,6 +352,7 @@ fn e2e_symlink_to_fuse_file() {
     if !fuse_available() {
         return;
     }
+    let _serial = serial();
     let mount = tempfile::tempdir().unwrap();
     let staging = tempfile::tempdir().unwrap();
     let hash = current_exe_hash();
@@ -335,6 +374,7 @@ fn e2e_root_is_directory() {
     if !fuse_available() {
         return;
     }
+    let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
     let hash = current_exe_hash();
     let state = make_state(&[("s", b"x", &hash)]);
@@ -351,6 +391,7 @@ fn e2e_pending_does_not_block_other_reads() {
     if !fuse_available() {
         return;
     }
+    let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
     let _hash = current_exe_hash();
     let state = make_state(&[
@@ -359,7 +400,7 @@ fn e2e_pending_does_not_block_other_reads() {
         // "open" has wildcard hash → read succeeds immediately
         ("open", b"OPEN_DATA", "*"),
     ]);
-    *state.pending_timeout.lock().unwrap() = std::time::Duration::from_secs(30);
+    *state.pending_timeout.lock().unwrap() = std::time::Duration::from_secs(10);
     let _session = mount_fs(state.clone(), dir.path());
 
     // Spawn a thread that reads "blocked" — this will be pending (hash mismatch).
@@ -370,8 +411,17 @@ fn e2e_pending_does_not_block_other_reads() {
         std::fs::read(&blocked_path)
     });
 
-    // Give the pending read time to trigger
-    std::thread::sleep(std::time::Duration::from_secs(1));
+    // Wait (bounded) until the blocked read actually registers a pending
+    // request.  Registration is load-dependent: the server's read worker
+    // hashes the reader's /proc/<pid>/exe first, so a fixed sleep races.
+    let reg_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while state.pending.is_empty() && std::time::Instant::now() < reg_deadline {
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    assert!(
+        !state.pending.is_empty(),
+        "the blocked read must have registered a pending request"
+    );
 
     // While "blocked" is pending, read "open" — this should succeed
     // immediately, proving the FUSE session is still responsive.
