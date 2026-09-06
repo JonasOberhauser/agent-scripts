@@ -40,12 +40,13 @@ fn fuse_available() -> bool {
     std::path::Path::new("/dev/fuse").exists()
 }
 
-/// SHA-256 of the test binary itself — this is what the FUSE daemon will
-/// compute for `req.pid()` when the test process reads a file.
-fn current_exe_hash() -> String {
+/// SHA-256 of the test binary's whole loaded package (exe + libraries) —
+/// this is what the FUSE daemon computes for `req.pid()` when the test
+/// process reads a file (issue #11: trust the whole package).
+fn current_package_hash() -> String {
     let io = RealSystemIo::new();
-    io.sha256_process_exe(std::process::id())
-        .expect("failed to hash test binary")
+    io.sha256_process_package(std::process::id())
+        .expect("failed to hash test package")
 }
 
 fn make_state(secrets: &[(&str, &[u8], &str)]) -> Arc<ServerState> {
@@ -75,7 +76,7 @@ fn e2e_read_secret() {
     }
     let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
-    let hash = current_exe_hash();
+    let hash = current_package_hash();
     let state = make_state(&[("secret", b"TOPSECRET", &hash)]);
     let _session = mount_fs(state, dir.path());
 
@@ -92,7 +93,7 @@ fn e2e_statfs_works() {
     }
     let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
-    let hash = current_exe_hash();
+    let hash = current_package_hash();
     let state = make_state(&[("s", b"data", &hash)]);
     let _session = mount_fs(state, dir.path());
 
@@ -124,7 +125,7 @@ fn e2e_multi_chunk_read_succeeds() {
     }
     let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
-    let hash = current_exe_hash();
+    let hash = current_package_hash();
     let secret = b"THIS_IS_A_LONGER_SECRET_VALUE_FOR_MULTI_CHUNK_READ_TEST!!!";
     let state = make_state(&[("s", secret, &hash)]);
     let _session = mount_fs(state, dir.path());
@@ -158,7 +159,7 @@ fn e2e_different_binary_denied() {
     }
     let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
-    let hash = current_exe_hash();
+    let hash = current_package_hash();
     let state = make_state(&[("s", b"DATA", &hash)]);
     *state.pending_timeout.lock().unwrap() = std::time::Duration::from_secs(1);
     let _session = mount_fs(state, dir.path());
@@ -212,7 +213,7 @@ fn e2e_readdir_lists_secrets() {
     }
     let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
-    let hash = current_exe_hash();
+    let hash = current_package_hash();
     let state = make_state(&[
         ("alpha", b"A", &hash),
         ("beta", b"BB", &hash),
@@ -237,7 +238,7 @@ fn e2e_getattr_reports_size() {
     }
     let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
-    let hash = current_exe_hash();
+    let hash = current_package_hash();
     let state = make_state(&[("s", b"1234567890", &hash)]);
     let _session = mount_fs(state, dir.path());
 
@@ -277,7 +278,7 @@ fn e2e_dynamic_add_visible() {
     }
     let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
-    let hash = current_exe_hash();
+    let hash = current_package_hash();
     let state = make_state(&[]);
     let state_handle = std::sync::Arc::clone(&state);
     let _session = mount_fs(state, dir.path());
@@ -300,7 +301,7 @@ fn e2e_reset_allows_reread() {
     }
     let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
-    let hash = current_exe_hash();
+    let hash = current_package_hash();
     let state = make_state(&[("s", b"DATA", &hash)]);
     *state.pending_timeout.lock().unwrap() = std::time::Duration::from_secs(1);
     let state_handle = std::sync::Arc::clone(&state);
@@ -330,7 +331,7 @@ fn e2e_multiple_secrets_independent() {
     }
     let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
-    let hash = current_exe_hash();
+    let hash = current_package_hash();
     let state = make_state(&[
         ("a", b"AAA", &hash),
         ("b", b"BBB", &hash),
@@ -355,7 +356,7 @@ fn e2e_symlink_to_fuse_file() {
     let _serial = serial();
     let mount = tempfile::tempdir().unwrap();
     let staging = tempfile::tempdir().unwrap();
-    let hash = current_exe_hash();
+    let hash = current_package_hash();
     let state = make_state(&[("key", b"SECRET_KEY_DATA", &hash)]);
     let _session = mount_fs(state, mount.path());
 
@@ -376,7 +377,7 @@ fn e2e_root_is_directory() {
     }
     let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
-    let hash = current_exe_hash();
+    let hash = current_package_hash();
     let state = make_state(&[("s", b"x", &hash)]);
     let _session = mount_fs(state, dir.path());
 
@@ -393,7 +394,7 @@ fn e2e_pending_does_not_block_other_reads() {
     }
     let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
-    let _hash = current_exe_hash();
+    let _hash = current_package_hash();
     let state = make_state(&[
         // "blocked" has a wrong hash → read triggers pending
         ("blocked", b"BLOCKED_DATA", "wrong_hash"),
@@ -458,7 +459,7 @@ fn e2e_source_mode_is_passed_through() {
     }
     let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
-    let hash = current_exe_hash();
+    let hash = current_package_hash();
     let state = ServerState::new();
     // 0600 on the source → presented as 0400 (write bits masked).
     state.add_with_mode("key", b"MODEDATA".to_vec(), &hash, 0o600);
@@ -471,4 +472,79 @@ fn e2e_source_mode_is_passed_through() {
     assert_eq!(key.permissions().mode() & 0o777, 0o400);
     let pubm = std::fs::metadata(dir.path().join("pub")).unwrap();
     assert_eq!(pubm.permissions().mode() & 0o777, 0o444);
+}
+
+// ── whole-package trust: LD_PRELOAD changes the hash (issue #11) ──
+
+#[test]
+fn e2e_ld_preload_changes_package_hash_and_is_denied() {
+    if !fuse_available() {
+        return;
+    }
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    // Artifacts must live OUTSIDE the mount dir: mount_fs overlays it
+    // and would shadow anything compiled inside.
+    let art = tempfile::tempdir().unwrap();
+
+    // Compile a tiny dummy library to inject via LD_PRELOAD.
+    let so = art.path().join("dummy.so");
+    let src = art.path().join("dummy.c");
+    std::fs::write(&src, "int agent_dummy = 1;\n").unwrap();
+    let out = std::process::Command::new("cc")
+        .args(["-shared", "-fPIC", "-o"])
+        .arg(&so)
+        .arg(&src)
+        .output()
+        .expect("compile dummy .so");
+    assert!(out.status.success(), "dummy .so build failed");
+
+    // Measure the package hash of an unpolluted `cat` while it lives.
+    // Poll until stable: hashing while the dynamic loader is still
+    // mapping libraries would capture an incomplete package.
+    let mut plain = std::process::Command::new("cat")
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn cat");
+    let io = RealSystemIo::new();
+    let mut cat_hash = io
+        .sha256_process_package(plain.id())
+        .expect("hash cat package");
+    for _ in 0..20 {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let again = io
+            .sha256_process_package(plain.id())
+            .expect("re-hash cat package");
+        if again == cat_hash {
+            break;
+        }
+        cat_hash = again;
+    }
+    plain.kill().unwrap();
+    let _ = plain.wait();
+
+    let state = make_state(&[("s", b"CATSECRET", &cat_hash)]);
+    *state.pending_timeout.lock().unwrap() = std::time::Duration::from_secs(1);
+    let _session = mount_fs(state.clone(), dir.path());
+
+    // Positive control: a plain cat read is granted.
+    let ok = std::process::Command::new("cat")
+        .arg(dir.path().join("s"))
+        .output()
+        .expect("run plain cat");
+    assert!(ok.status.success(), "plain cat should read: {ok:?}");
+    assert_eq!(ok.stdout, b"CATSECRET");
+
+    // Reset the one-read budget, then read with the injected library:
+    // the package hash differs, so the read pends and is denied.
+    state.reset(Some("s"));
+    let bad = std::process::Command::new("cat")
+        .arg(dir.path().join("s"))
+        .env("LD_PRELOAD", &so)
+        .output()
+        .expect("run preloaded cat");
+    assert!(
+        !bad.status.success(),
+        "LD_PRELOAD-injected read must be denied: {bad:?}"
+    );
 }

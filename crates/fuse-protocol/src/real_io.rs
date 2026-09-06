@@ -159,15 +159,37 @@ impl SystemIo for RealSystemIo {
         Ok(hex_sha256(&data))
     }
 
-    fn sha256_process_exe(&self, pid: u32) -> Result<String, IoError> {
-        let exe_path = std::fs::read_link(format!("/proc/{pid}/exe"))
+    fn sha256_process_package(&self, pid: u32) -> Result<String, IoError> {
+        use sha2::{Digest, Sha256};
+        let exe = std::fs::read_link(format!("/proc/{pid}/exe"))
             .map_err(|e| IoError(format!(
                 "read /proc/{pid}/exe: {e}. \
                  The process may be in a different PID namespace — \
                  use --pidns=host on the container, or '*' as the hash to skip verification"
             )))?;
-        let data = std::fs::read(&exe_path)?;
-        Ok(hex_sha256(&data))
+        // Union of the executable and every mapped file, sorted by path
+        // for a deterministic digest.
+        let mut paths: Vec<PathBuf> = vec![exe];
+        let maps = std::fs::read_to_string(format!("/proc/{pid}/maps"))
+            .map_err(|e| IoError(format!("read /proc/{pid}/maps: {e}")))?;
+        for line in maps.lines() {
+            if let Some(path) = line.rsplit_once(' ').map(|(_, p)| p) {
+                if path.starts_with('/') && !paths.iter().any(|p| p == path) {
+                    paths.push(PathBuf::from(path));
+                }
+            }
+        }
+        paths.sort();
+        let mut hasher = Sha256::new();
+        for path in &paths {
+            hasher.update(path.to_string_lossy().as_bytes());
+            hasher.update(b"\0");
+            let data = std::fs::read(path)
+                .map_err(|e| IoError(format!("read {}: {e}", path.display())))?;
+            hasher.update((data.len() as u64).to_le_bytes());
+            hasher.update(&data);
+        }
+        Ok(format!("{:x}", hasher.finalize()))
     }
 
     fn is_symlink(&self, path: &Path) -> bool {
@@ -518,7 +540,7 @@ impl SystemIo for MockSystemIo {
             .ok_or_else(|| IoError("no hash".into()))
     }
 
-    fn sha256_process_exe(&self, pid: u32) -> Result<String, IoError> {
+    fn sha256_process_package(&self, pid: u32) -> Result<String, IoError> {
         self.process_hashes
             .get(&pid)
             .cloned()
@@ -612,7 +634,7 @@ mod tests {
             .with_file_hash("/x", "abc")
             .with_process_hash(42, "def");
         assert_eq!(mock.sha256_file(Path::new("/x")).unwrap(), "abc");
-        assert_eq!(mock.sha256_process_exe(42).unwrap(), "def");
+        assert_eq!(mock.sha256_process_package(42).unwrap(), "def");
     }
 
     #[test]
