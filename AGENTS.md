@@ -7,14 +7,16 @@ The workspace version in `Cargo.toml` (`[workspace.package] version`) is the
 crates use `version.workspace = true` and access it at runtime via
 `fuse_protocol::VERSION`.
 
-**Increment the minor version for every build** that changes either the client
-or the server. This ensures the client detects version mismatches and can offer
-to restart the server.
-
 The version follows semantic versioning:
 - **Major**: incompatible protocol changes (commands removed/renamed)
 - **Minor**: new features, new commands, behavior changes
 - **Patch**: bug fixes with no protocol impact
+
+Bump **minor** only when the protocol changes; other changes to
+client/server still bump the **patch** version so builds stay
+distinguishable. The version handshake ignores the patch component and
+compares only major & minor — patch releases never force a restart of
+the long-running shared server.
 
 On startup, `fuse-client` sends `GetVersion` to the running server. If the
 versions differ, the client offers to restart the server:
