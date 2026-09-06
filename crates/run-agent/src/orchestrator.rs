@@ -5,7 +5,9 @@ use std::time::{Duration, Instant};
 use fuse_protocol::SystemIo;
 use tracing::{info, warn};
 
-use crate::config::{build_create_args, build_exec_args, AgentConfig};
+use crate::config::{
+    build_create_args, build_exec_args, AgentConfig, NESTED_SECCOMP_PROFILE,
+};
 
 /// The agentbox Dockerfile, embedded into the binary at compile time
 /// (`include_str!`).  It is the single source for rebuilding the image:
@@ -361,6 +363,26 @@ where
         setup_rootless_docker();
     }
 
+    // ── 5.5 Materialize the seccomp profile referenced by
+    // `--security-opt` in the create args.  Must exist on the host
+    // before `podman/docker run` reads it.
+    io.write_file(&config.seccomp_profile, NESTED_SECCOMP_PROFILE.as_bytes())
+        .map_err(|e| {
+            format!(
+                "cannot write seccomp profile {}: {e}",
+                config.seccomp_profile.display()
+            )
+        })?;
+
+    // Pass through the char devices nested rootless podman needs, when
+    // the host has them: /dev/fuse for fuse-overlayfs storage (and FUSE
+    // work generally), /dev/net/tun for pasta/slirp networking.
+    let passthrough_devices: Vec<String> = ["/dev/fuse", "/dev/net/tun"]
+        .into_iter()
+        .filter(|d| io.file_exists(std::path::Path::new(d)))
+        .map(str::to_string)
+        .collect();
+
     // ── 6. Ensure persistent container is running ────────────────
     let container_name = config.container_name();
 
@@ -407,7 +429,7 @@ where
             ensure_image_available(io, wrapper, container_bin, config)?;
 
             info!("Creating persistent container {container_name}...");
-            let create_args = build_create_args(config);
+            let create_args = build_create_args(config, &passthrough_devices);
             let create_refs: Vec<&str> = create_args.iter().map(|s| s.as_str()).collect();
             match run_with_wrapper(io, wrapper, container_bin, &create_refs) {
                 Ok(o) if o.success() => {
@@ -903,6 +925,7 @@ mod tests {
             agent_path: PathBuf::from("/work/agent1"),
             fuse_server_path: "fuse-server".into(),
             image_name: "agentbox".into(),
+            seccomp_profile: PathBuf::from("/tmp/agentbox-seccomp.json"),
             memory: "16G".into(),
             cpus: "4".into(),
             auto_confirm: false,
