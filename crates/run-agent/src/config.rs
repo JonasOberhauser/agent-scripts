@@ -165,6 +165,9 @@ pub struct AgentConfig {
     pub memory: String,
     /// Container CPU limit.
     pub cpus: String,
+    /// Non-interactively accept remediation prompts (e.g. building the
+    /// missing agentbox image) — for scripts and tests.
+    pub auto_confirm: bool,
     /// Unix socket path for the shared fuse-server.
     pub socket_path: PathBuf,
     /// FUSE mount point (shared across projects).
@@ -212,6 +215,7 @@ impl AgentConfig {
             image_name: "agentbox".to_string(),
             memory: "224G".to_string(),
             cpus: "90".to_string(),
+            auto_confirm: false,
             socket_path: PathBuf::from(DEFAULT_SOCKET),
             mount_point: PathBuf::from(DEFAULT_MOUNT_POINT),
             use_sudo: false,
@@ -259,7 +263,6 @@ impl AgentConfig {
 }
 
 /// Build `docker run -d` args to create the persistent container.
-/// The container runs `sleep infinity` and stays alive between sessions.
 pub fn build_create_args(config: &AgentConfig) -> Vec<String> {
     let mut args = vec![
         "run".into(),
@@ -403,6 +406,7 @@ mod tests {
             image_name: "myimg".into(),
             memory: "16G".into(),
             cpus: "4".into(),
+            auto_confirm: false,
             socket_path: PathBuf::from(fuse_protocol::DEFAULT_SOCKET),
             mount_point: PathBuf::from(fuse_protocol::DEFAULT_MOUNT_POINT),
             use_sudo: false,
@@ -436,6 +440,7 @@ mod tests {
             image_name: "myimg".into(),
             memory: "16G".into(),
             cpus: "4".into(),
+            auto_confirm: false,
             socket_path: PathBuf::from(fuse_protocol::DEFAULT_SOCKET),
             mount_point: PathBuf::from(fuse_protocol::DEFAULT_MOUNT_POINT),
             use_sudo: false,
@@ -465,6 +470,7 @@ mod tests {
             image_name: "myimg".into(),
             memory: "16G".into(),
             cpus: "4".into(),
+            auto_confirm: false,
             socket_path: PathBuf::from(fuse_protocol::DEFAULT_SOCKET),
             mount_point: PathBuf::from(fuse_protocol::DEFAULT_MOUNT_POINT),
             use_sudo: false,

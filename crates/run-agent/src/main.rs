@@ -82,6 +82,11 @@ struct Cli {
     #[arg(long, default_value = "90")]
     cpus: String,
 
+    /// Non-interactively accept remediation prompts (e.g. building the
+    /// missing agentbox image).
+    #[arg(long, short = 'y')]
+    yes: bool,
+
     /// Log level for the fuse-server (e.g. "info", "debug", "warn").
     #[arg(long, default_value = "info")]
     log_level: String,
@@ -133,6 +138,7 @@ fn main() -> ExitCode {
     config.image_name = cli.image;
     config.memory = cli.memory;
     config.cpus = cli.cpus;
+    config.auto_confirm = cli.yes;
     config.log_level = cli.log_level;
 
     let plans_candidate = std::path::Path::new("./plans/shared");
