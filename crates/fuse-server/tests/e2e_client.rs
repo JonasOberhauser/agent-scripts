@@ -61,7 +61,16 @@ fn e2e_client_binary_against_server() {
 
     // ── 1. Status: should see existing.yaml ──
     let (stdout, stderr, code) = run_client(&socket, &["status"]);
-    assert_eq!(code, 0, "status failed: {stderr}");
+    assert_eq!(
+        code, 0,
+        "status failed: {stderr}{}",
+        if stderr.contains("Version mismatch") {
+            "\n\nHINT: `target/debug/fuse-client` is stale (cargo test does not rebuild \
+             other crates' binaries). Run `cargo build -p fuse-client` and re-run."
+        } else {
+            ""
+        }
+    );
     assert!(stdout.contains("existing.yaml"), "status should list existing.yaml: {stdout}");
     assert!(stdout.contains("hash1"), "status should show hash: {stdout}");
 
