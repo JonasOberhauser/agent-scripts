@@ -124,7 +124,7 @@ impl<S: SystemIo> GatekeeperFs<S> {
         self.inodes.lock().unwrap_or_else(|e| e.into_inner()).get(&ino).cloned()
     }
 
-    fn file_attr(&self, ino: u64, size: u64, uid: u32, gid: u32) -> FileAttr {
+    fn file_attr(&self, ino: u64, size: u64, uid: u32, gid: u32, mode: u32) -> FileAttr {
         FileAttr {
             ino,
             size,
@@ -134,7 +134,9 @@ impl<S: SystemIo> GatekeeperFs<S> {
             ctime: SystemTime::now(),
             crtime: SystemTime::now(),
             kind: FileType::RegularFile,
-            perm: 0o444,
+            // Present the source file's snapshotted bits, but never the
+            // write bits: the mount is read-only and has no setattr.
+            perm: (mode & 0o777 & !0o222) as u16,
             nlink: 1,
             uid,
             gid,
@@ -206,7 +208,7 @@ impl<S: SystemIo> GatekeeperFs<S> {
         if let Some(entry) = self.state.secrets.get(name) {
             let rec = lock_secret(entry.value(), name);
             let ino = self.assign_inode(name);
-            let attr = self.file_attr(ino, rec.content.len() as u64, uid, gid);
+            let attr = self.file_attr(ino, rec.content.len() as u64, uid, gid, rec.mode);
             Ok((ino, attr))
         } else {
             Err(libc::ENOENT)
@@ -224,7 +226,7 @@ impl<S: SystemIo> GatekeeperFs<S> {
         };
         if let Some(entry) = self.state.secrets.get(&name) {
             let rec = lock_secret(entry.value(), &name);
-            Ok(self.file_attr(ino, rec.content.len() as u64, uid, gid))
+            Ok(self.file_attr(ino, rec.content.len() as u64, uid, gid, rec.mode))
         } else {
             Err(libc::ENOENT)
         }
@@ -559,7 +561,22 @@ mod tests {
         assert!(ino >= 2);
         assert_eq!(attr.size, 11);
         assert_eq!(attr.kind, FileType::RegularFile);
-        assert_eq!(attr.perm, 0o444);
+        // Default presentation: owner-read-only.
+        assert_eq!(attr.perm, 0o400);
+    }
+
+    #[test]
+    fn lookup_passes_through_source_mode_without_write_bits() {
+        // Mode snapshotted from the source file is presented verbatim,
+        // except write bits (the mount is read-only, no setattr).
+        let state = ServerState::new();
+        state.add_with_mode("priv", b"x".to_vec(), "h", 0o600);
+        state.add_with_mode("open", b"y".to_vec(), "h", 0o644);
+        state.add_with_mode("exec", b"z".to_vec(), "h", 0o755);
+        let fs = GatekeeperFs::new(state.into(), MockSystemIo::new());
+        assert_eq!(fs.do_lookup(0, 0, ROOT_INO, "priv").unwrap().1.perm, 0o400);
+        assert_eq!(fs.do_lookup(0, 0, ROOT_INO, "open").unwrap().1.perm, 0o444);
+        assert_eq!(fs.do_lookup(0, 0, ROOT_INO, "exec").unwrap().1.perm, 0o555);
     }
 
     #[test]

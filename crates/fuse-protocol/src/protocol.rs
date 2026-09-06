@@ -57,6 +57,10 @@ pub struct StateSecretEntry {
 
 // ── Commands (client → server) ─────────────────────────────────
 
+fn default_secret_mode() -> u32 {
+    0o400
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Command {
@@ -70,11 +74,15 @@ pub enum Command {
     // enumerate and restore secrets.  Changing it breaks cross-version
     // compatibility.
     Status,
-    /// Add a new secret to the mount.
+    /// Add a new secret to the mount.  `mode` is the permission bits of
+    /// the source file (masked read-only by the server); older clients
+    /// that do not send it get the conservative 0400 default.
     AddSecret {
         name: String,
         content: Vec<u8>,
         hash: String,
+        #[serde(default = "default_secret_mode")]
+        mode: u32,
     },
     /// Remove a secret from the mount.
     RemoveSecret { name: String },

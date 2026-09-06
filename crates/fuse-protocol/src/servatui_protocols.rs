@@ -150,10 +150,20 @@ pub fn client_protocols_with_snapshots(pending: PendingIds, secrets: SecretNames
                 }
                 let content = std::fs::read(parts[1])
                     .map_err(|e| format!("Error reading file: {e}"))?;
+                // Snapshot the source file's permission bits so the FUSE
+                // view can present them (masked read-only server-side).
+                // Un-stat-able files fall back to the conservative 0400.
+                let mode = std::fs::metadata(parts[1])
+                    .map(|m| {
+                        use std::os::unix::fs::PermissionsExt;
+                        m.permissions().mode() & 0o777
+                    })
+                    .unwrap_or(0o400);
                 Ok(Command::AddSecret {
                     name: parts[0].to_string(),
                     content,
                     hash: parts[2].to_string(),
+                    mode,
                 })
             }),
 

@@ -448,3 +448,27 @@ fn e2e_pending_does_not_block_other_reads() {
     // — either way, the important thing is that "open" succeeded while it was pending.
     let _ = blocked_result;
 }
+
+// ── mode passthrough: source file bits appear (write-masked) ────
+
+#[test]
+fn e2e_source_mode_is_passed_through() {
+    if !fuse_available() {
+        return;
+    }
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let hash = current_exe_hash();
+    let state = ServerState::new();
+    // 0600 on the source → presented as 0400 (write bits masked).
+    state.add_with_mode("key", b"MODEDATA".to_vec(), &hash, 0o600);
+    // 0644 on the source → presented as 0444.
+    state.add_with_mode("pub", b"MODEDATA2".to_vec(), &hash, 0o644);
+    let _session = mount_fs(Arc::new(state), dir.path());
+
+    use std::os::unix::fs::PermissionsExt;
+    let key = std::fs::metadata(dir.path().join("key")).unwrap();
+    assert_eq!(key.permissions().mode() & 0o777, 0o400);
+    let pubm = std::fs::metadata(dir.path().join("pub")).unwrap();
+    assert_eq!(pubm.permissions().mode() & 0o777, 0o444);
+}
