@@ -1,11 +1,16 @@
 use servyi_servatui::{Plugin, Protocol, ShellAction};
-use fuse_protocol::{Command, Response};
+use fuse_protocol::{Command, CommandSpec, COMMAND_TABLE, Response};
 
 use crate::handler::handle_command;
 use crate::state::ServerState;
 
-fn server_protocol(name: &'static str, help: &'static str) -> Protocol {
-    Plugin::new(name, help)
+/// Derive the server-side Protocol for one table row.  All rows share
+/// the same body: `handle_command` is the exhaustive typed dispatcher,
+/// so a Command variant without server logic does not compile.  There
+/// is deliberately no per-command list here to drift out of sync with
+/// the client registry.
+fn server_protocol(spec: &CommandSpec) -> Protocol {
+    Plugin::new(spec.name, spec.help)
         .parse(|_| -> Result<Command, String> { unreachable!("parse is never called on server") })
         .client(|cmd: Command, _out, _input| Ok(cmd))
         .server_ctx(|cmd: Command, ctx: &ServerState| {
@@ -22,19 +27,7 @@ fn server_protocol(name: &'static str, help: &'static str) -> Protocol {
         .finalize(|| Ok(ShellAction::Continue))
 }
 
+/// The server registry, derived from the single command table.
 pub fn server_protocols() -> Vec<Protocol> {
-    vec![
-        server_protocol("status", "Show all secrets and access counts"),
-        server_protocol("mounts", "List mounted secret files"),
-        server_protocol("reset", "Reset access counter for one or all secrets"),
-        server_protocol("reset-all", "Reset all access counters"),
-        server_protocol("add", "Add a new secret from a file"),
-        server_protocol("remove", "Remove a secret"),
-        server_protocol("rotate", "Change the allowed binary hash"),
-        server_protocol("pending", "Show pending access requests"),
-        server_protocol("grant", "Grant a pending access request"),
-        server_protocol("deny", "Deny a pending access request"),
-        server_protocol("version", "Show server version"),
-        server_protocol("logpath", "Show server log file path"),
-    ]
+    COMMAND_TABLE.iter().map(server_protocol).collect()
 }

@@ -113,6 +113,120 @@ pub fn pending_info(id: u64) -> PendingAccessInfo {
     }
 }
 
+
+// ═══════════════════════════════════════════════════════════════
+// Single command table — the one source of truth
+// ═══════════════════════════════════════════════════════════════
+
+/// Which live snapshot feeds first-argument completion (client TUI
+/// nicety; never relevant on the wire).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Completer {
+    None,
+    /// `grant`/`deny`/`grant-forever` complete the pending request id.
+    PendingIds,
+    /// `reset`/`remove`/`rotate` complete the secret name.
+    SecretNames {
+        /// `reset NAME`/`remove NAME` suggest on empty prefix;
+        /// `rotate NAME HASH` must not complete into the hash.
+        after_space: bool,
+    },
+}
+
+/// Offline (server-not-running) fallback renderer for CLI use.
+pub type OfflineFn = fn(&str, &mut dyn Console) -> Result<(), String>;
+
+/// ONE definition per wire command.  The client registry derives
+/// parse/completion from here, the server registry derives its name
+/// dispatch from here, and `handle_command`'s exhaustive match makes
+/// the compiler enforce server logic for every variant.  Registry
+/// drift between the two sides is structurally unrepresentable.
+pub struct CommandSpec {
+    pub name: &'static str,
+    pub help: &'static str,
+    pub parse: fn(&str) -> Result<Command, String>,
+    pub complete: Completer,
+    pub offline: Option<OfflineFn>,
+}
+
+const NO_COMPLETE: Completer = Completer::None;
+
+fn parse_status(_: &str) -> Result<Command, String> { Ok(Command::Status) }
+fn parse_mounts(_: &str) -> Result<Command, String> { Ok(Command::ListMounts) }
+fn parse_reset(args: &str) -> Result<Command, String> {
+    Ok(Command::Reset { name: args.split_whitespace().next().map(|s| s.to_string()) })
+}
+fn parse_reset_all(_: &str) -> Result<Command, String> { Ok(Command::Reset { name: None }) }
+fn parse_add(args: &str) -> Result<Command, String> {
+    let parts: Vec<&str> = args.split_whitespace().collect();
+    if parts.len() < 3 {
+        return Err("Usage: add NAME FILE HASH".into());
+    }
+    let content = std::fs::read(parts[1])
+        .map_err(|e| format!("Error reading file: {e}"))?;
+    // Snapshot the source file's permission bits so the FUSE view can
+    // present them (masked read-only server-side).  Un-stat-able files
+    // fall back to the conservative 0400.
+    let mode = std::fs::metadata(parts[1])
+        .map(|m| {
+            use std::os::unix::fs::PermissionsExt;
+            m.permissions().mode() & 0o777
+        })
+        .unwrap_or(0o400);
+    Ok(Command::AddSecret {
+        name: parts[0].to_string(),
+        content,
+        hash: parts[2].to_string(),
+        mode,
+    })
+}
+fn parse_remove(args: &str) -> Result<Command, String> {
+    let name = args.trim();
+    if name.is_empty() {
+        return Err("Usage: remove NAME".into());
+    }
+    Ok(Command::RemoveSecret { name: name.to_string() })
+}
+fn parse_rotate(args: &str) -> Result<Command, String> {
+    let parts: Vec<&str> = args.split_whitespace().collect();
+    if parts.len() < 2 {
+        return Err("Usage: rotate NAME HASH".into());
+    }
+    Ok(Command::RotateHash { name: parts[0].to_string(), new_hash: parts[1].to_string() })
+}
+fn parse_pending(_: &str) -> Result<Command, String> { Ok(Command::ListPending) }
+fn parse_grant(args: &str) -> Result<Command, String> {
+    args.trim().parse::<u64>().map(|id| Command::Grant { id })
+        .map_err(|_| "Usage: grant ID (ID must be a number)".into())
+}
+fn parse_deny(args: &str) -> Result<Command, String> {
+    args.trim().parse::<u64>().map(|id| Command::Deny { id })
+        .map_err(|_| "Usage: deny ID (ID must be a number)".into())
+}
+fn parse_version(_: &str) -> Result<Command, String> { Ok(Command::GetVersion) }
+fn parse_logpath(_: &str) -> Result<Command, String> { Ok(Command::GetLogPath) }
+
+fn offline_version(_args: &str, out: &mut dyn Console) -> Result<(), String> {
+    out.print_line(&format!("Client version: {} (server not running)", crate::VERSION));
+    Ok(())
+}
+
+/// The complete wire command set, in protocol order.
+pub const COMMAND_TABLE: &[CommandSpec] = &[
+    CommandSpec { name: "status", help: "Show all secrets and access counts", parse: parse_status, complete: NO_COMPLETE, offline: None },
+    CommandSpec { name: "mounts", help: "List mounted secret files", parse: parse_mounts, complete: NO_COMPLETE, offline: None },
+    CommandSpec { name: "reset", help: "Reset access counter for one or all secrets", parse: parse_reset, complete: Completer::SecretNames { after_space: true }, offline: None },
+    CommandSpec { name: "reset-all", help: "Reset all access counters", parse: parse_reset_all, complete: NO_COMPLETE, offline: None },
+    CommandSpec { name: "add", help: "Add a new secret from a file", parse: parse_add, complete: NO_COMPLETE, offline: None },
+    CommandSpec { name: "remove", help: "Remove a secret", parse: parse_remove, complete: Completer::SecretNames { after_space: true }, offline: None },
+    CommandSpec { name: "rotate", help: "Change the allowed binary hash", parse: parse_rotate, complete: Completer::SecretNames { after_space: false }, offline: None },
+    CommandSpec { name: "pending", help: "Show pending access requests", parse: parse_pending, complete: NO_COMPLETE, offline: None },
+    CommandSpec { name: "grant", help: "Grant a pending access request", parse: parse_grant, complete: Completer::PendingIds, offline: None },
+    CommandSpec { name: "deny", help: "Deny a pending access request", parse: parse_deny, complete: Completer::PendingIds, offline: None },
+    CommandSpec { name: "version", help: "Show server version", parse: parse_version, complete: NO_COMPLETE, offline: Some(offline_version) },
+    CommandSpec { name: "logpath", help: "Show server log file path", parse: parse_logpath, complete: NO_COMPLETE, offline: None },
+];
+
 pub fn client_protocols() -> Vec<Protocol> {
     client_protocols_with_snapshots(
         std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -125,102 +239,23 @@ pub fn client_protocols() -> Vec<Protocol> {
 /// `reset`/`remove`/`rotate` complete the secret name from `secrets`
 /// (see [`SecretNames`]). Both are refreshed by the client's poller.
 pub fn client_protocols_with_snapshots(pending: PendingIds, secrets: SecretNames) -> Vec<Protocol> {
-    vec![
-        cmd_protocol("status", "Show all secrets and access counts",
-            |_| Ok(Command::Status)),
-
-        cmd_protocol("mounts", "List mounted secret files",
-            |_| Ok(Command::ListMounts)),
-
-        cmd_protocol("reset", "Reset access counter for one or all secrets",
-            |args| {
-                let name = args.split_whitespace().next().map(|s| s.to_string());
-                Ok(Command::Reset { name })
-            })
-            .complete(name_completer(secrets.clone(), true)),
-
-        cmd_protocol("reset-all", "Reset all access counters",
-            |_| Ok(Command::Reset { name: None })),
-
-        cmd_protocol("add", "Add a new secret from a file",
-            |args| {
-                let parts: Vec<&str> = args.split_whitespace().collect();
-                if parts.len() < 3 {
-                    return Err("Usage: add NAME FILE HASH".into());
+    COMMAND_TABLE
+        .iter()
+        .map(|spec| {
+            let proto = cmd_protocol(spec.name, spec.help, spec.parse);
+            let proto = match spec.complete {
+                Completer::None => proto,
+                Completer::PendingIds => proto.complete(pending_completer(pending.clone())),
+                Completer::SecretNames { after_space } => {
+                    proto.complete(name_completer(secrets.clone(), after_space))
                 }
-                let content = std::fs::read(parts[1])
-                    .map_err(|e| format!("Error reading file: {e}"))?;
-                // Snapshot the source file's permission bits so the FUSE
-                // view can present them (masked read-only server-side).
-                // Un-stat-able files fall back to the conservative 0400.
-                let mode = std::fs::metadata(parts[1])
-                    .map(|m| {
-                        use std::os::unix::fs::PermissionsExt;
-                        m.permissions().mode() & 0o777
-                    })
-                    .unwrap_or(0o400);
-                Ok(Command::AddSecret {
-                    name: parts[0].to_string(),
-                    content,
-                    hash: parts[2].to_string(),
-                    mode,
-                })
-            }),
-
-        cmd_protocol("remove", "Remove a secret",
-            |args| {
-                let name = args.trim();
-                if name.is_empty() {
-                    return Err("Usage: remove NAME".into());
-                }
-                Ok(Command::RemoveSecret { name: name.to_string() })
-            })
-            .complete(name_completer(secrets.clone(), true)),
-
-        cmd_protocol("rotate", "Change the allowed binary hash",
-            |args| {
-                let parts: Vec<&str> = args.split_whitespace().collect();
-                if parts.len() < 2 {
-                    return Err("Usage: rotate NAME HASH".into());
-                }
-                Ok(Command::RotateHash {
-                    name: parts[0].to_string(),
-                    new_hash: parts[1].to_string(),
-                })
-            })
-            .complete(name_completer(secrets.clone(), false)),
-
-        cmd_protocol("pending", "Show pending access requests",
-            |_| Ok(Command::ListPending)),
-
-        cmd_protocol("grant", "Grant a pending access request",
-            |args| {
-                match args.trim().parse::<u64>() {
-                    Ok(id) => Ok(Command::Grant { id }),
-                    Err(_) => Err("Usage: grant ID (ID must be a number)".into()),
-                }
-            })
-            .complete(pending_completer(pending.clone())),
-
-        cmd_protocol("deny", "Deny a pending access request",
-            |args| {
-                match args.trim().parse::<u64>() {
-                    Ok(id) => Ok(Command::Deny { id }),
-                    Err(_) => Err("Usage: deny ID (ID must be a number)".into()),
-                }
-            })
-            .complete(pending_completer(pending.clone())),
-
-        cmd_protocol("version", "Show server version",
-            |_| Ok(Command::GetVersion))
-            .offline(|_args, out| {
-                out.print_line(&format!("Client version: {} (server not running)", crate::VERSION));
-                Ok(())
-            }),
-
-        cmd_protocol("logpath", "Show server log file path",
-            |_| Ok(Command::GetLogPath)),
-    ]
+            };
+            match spec.offline {
+                Some(offline) => proto.offline(offline),
+                None => proto,
+            }
+        })
+        .collect()
 }
 
 /// Complete the FIRST secret-name argument of `reset`/`remove`/`rotate`
@@ -311,11 +346,21 @@ pub fn run_command_once(
     name: &str,
     cmd: &Command,
 ) -> Result<crate::Response, String> {
-    use servyi_servatui::TypedConnection;
+    use servyi_servatui::{RawConnection, TypedConnection};
     let mut conn = servyi_servatui::SocketConnection::connect(socket)?;
     conn.send_typed(&name.to_string())?;
     conn.send_typed(cmd)?;
-    let resp: crate::Response = conn.recv_typed()?;
+    let raw = conn.recv_bytes()?;
+    // Mirror the framework's client chain exactly (servatui protocol.rs):
+    // server-side failures travel as the {"__error__": msg} envelope and
+    // must surface as Err(msg) — not die in Response parsing.
+    if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&raw) {
+        if let Some(err) = val.get("__error__").and_then(|v| v.as_str()) {
+            return Err(err.to_string());
+        }
+    }
+    let resp: crate::Response =
+        serde_json::from_slice(&raw).map_err(|e| e.to_string())?;
     conn.send_typed(&())?;
     Ok(resp)
 }
