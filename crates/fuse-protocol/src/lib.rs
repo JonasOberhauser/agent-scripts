@@ -59,7 +59,7 @@ pub fn state_file() -> std::path::PathBuf {
 
 pub use error::IoError;
 pub use io::{CommandOutput, IoProvider, SystemIo, Transport};
-pub use protocol::{Command, MountEntry, PendingAccessInfo, Response, SecretStatus, ServerStateFile, StateSecretEntry};
+pub use protocol::{Command, PENDING_ONLY_HASH, MountEntry, PendingAccessInfo, Response, SecretStatus, ServerStateFile, StateSecretEntry};
 pub use real_io::{MockSystemIo, RealSystemIo};
 pub use servatui_protocols::{CommandSpec, Completer, COMMAND_TABLE,
     client_protocols, client_protocols_with_snapshots, pending_info, poll_pending_info,

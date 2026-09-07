@@ -16,9 +16,14 @@ pub fn print_response(resp: &Response, out: &mut dyn Console) {
             } else {
                 out.print_line(&format!("{:<24} {:>8} {:>8}  HASH", "NAME", "READS", "SIZE"));
                 for s in secrets {
+                    let hash = if s.allowed_hash == crate::PENDING_ONLY_HASH {
+                        "(manual approval only)"
+                    } else {
+                        &s.allowed_hash
+                    };
                     out.print_line(&format!(
                         "{:<24} {:>8} {:>8}  {}",
-                        s.name, s.access_count, s.size, s.allowed_hash
+                        s.name, s.access_count, s.size, hash
                     ));
                 }
             }

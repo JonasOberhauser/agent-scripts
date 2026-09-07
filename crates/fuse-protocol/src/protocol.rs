@@ -64,6 +64,12 @@ fn default_secret_mode() -> u32 {
     0o400
 }
 
+/// Allowed-hash sentinel for secrets hosted without a binary hash
+/// (issue #2): no real SHA-256 digest ever equals it, so every read
+/// becomes a pending request for manual approval.  grant-forever can
+/// still whitelist the observed package hash afterwards.
+pub const PENDING_ONLY_HASH: &str = "!pending-only";
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Command {
