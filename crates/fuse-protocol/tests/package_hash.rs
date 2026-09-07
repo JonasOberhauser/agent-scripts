@@ -126,9 +126,9 @@ fn curl(listener: &TcpListener) -> Option<(Fixture, TcpStream)> {
 /// no SSH banner ever arrives, so the client blocks in banner exchange
 /// with its full crypto library closure loaded.  stdin is a held-open
 /// pipe like curl's.
-fn ssh(listener: &TcpListener) -> Option<(Fixture, TcpStream)> {
+fn ssh_client(listener: &TcpListener) -> Option<(Fixture, TcpStream)> {
     if missing("ssh") {
-        eprintln!("skip: ssh not on PATH");
+        eprintln!("skip: ssh client not on PATH");
         return None;
     }
     let port = listener.local_addr().unwrap().port();
@@ -199,10 +199,10 @@ fn curl_package_hash_covers_libraries() {
 /// Unlike its hardened agent, the ssh client stays dumpable: its whole
 /// crypto closure (libcrypto, libc, ...) is hashable everywhere.
 #[test]
-fn ssh_package_hash_is_deterministic() {
+fn ssh_client_package_hash_is_deterministic() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let Some((ssh1, _conn1)) = ssh(&listener) else { return };
-    let Some((ssh2, _conn2)) = ssh(&listener) else { return };
+    let Some((ssh1, _conn1)) = ssh_client(&listener) else { return };
+    let Some((ssh2, _conn2)) = ssh_client(&listener) else { return };
     let io = RealSystemIo::new();
     let h1 = io
         .sha256_process_package(ssh1.pid())
@@ -214,9 +214,9 @@ fn ssh_package_hash_is_deterministic() {
 }
 
 #[test]
-fn ssh_package_hash_covers_libraries() {
+fn ssh_client_package_hash_covers_libraries() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let Some((s, _conn)) = ssh(&listener) else { return };
+    let Some((s, _conn)) = ssh_client(&listener) else { return };
     let io = RealSystemIo::new();
     let package = io
         .sha256_process_package(s.pid())
@@ -230,10 +230,10 @@ fn ssh_package_hash_covers_libraries() {
 
 /// Two different network clients are two different packages.
 #[test]
-fn ssh_and_curl_packages_differ() {
+fn ssh_client_and_curl_packages_differ() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let Some((c, _cconn)) = curl(&listener) else { return };
-    let Some((s, _sconn)) = ssh(&listener) else { return };
+    let Some((s, _sconn)) = ssh_client(&listener) else { return };
     let io = RealSystemIo::new();
     let curl_hash = io
         .sha256_process_package(c.pid())
@@ -397,7 +397,7 @@ fn ssh_agent_hash_inside_capability_sandbox() {
 
     // Cross-check against the dumpable ssh client, hashed normally.
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let Some((client, _conn)) = ssh(&listener) else { return };
+    let Some((client, _conn)) = ssh_client(&listener) else { return };
     let io = RealSystemIo::new();
     let client_hash = io
         .sha256_process_package(client.pid())
