@@ -1,0 +1,46 @@
+# Basic CI: build everything, run every test tier that works on a
+# headless runner, and keep clippy at zero warnings (AGENTS.md contract).
+#
+# Test tiers:
+#   always:  cargo build --all-targets, clippy -D warnings, all unit
+#            suites, protocol contract, e2e_client (real client binary
+#            against an in-process server — needs a fresh fuse-client
+#            build first, the classic cross-crate staleness trap)
+#   local:   kernel-FUSE e2e (fuse_e2e) skips itself without /dev/fuse;
+#            e2e_empty_os / e2e_stub_fuse intentionally FAIL without
+#            podman + /dev/fuse — they guard the no-silent-skips policy
+#            and belong on dev machines, not here.
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install native deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libfuse3-dev fuse3
+      - name: Build (all targets)
+        run: cargo build --workspace --all-targets
+      - name: Clippy (zero warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Unit tests
+        run: cargo test --workspace --lib
+      - name: Integration tests (headless tiers)
+        run: |
+          cargo test -p fuse-protocol
+          cargo test -p fuse-server --test protocol_contract
+          cargo test -p fuse-server --test e2e_client
+          cargo test -p fuse-server --test fuse_e2e -- --include-ignored
