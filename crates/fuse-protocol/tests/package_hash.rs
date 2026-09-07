@@ -274,8 +274,9 @@ fn ssh_agent_package_hash_properties() {
                 "unexpected failure hashing ssh-agent: {e}"
             );
             eprintln!(
-                "note: ssh-agent is non-dumpable and this environment lacks \
-CAP_SYS_PTRACE — package hash fails closed (as designed)"
+                "note: DIRECT ssh-agent hashing fails closed here by design \
+(non-dumpable, no CAP_SYS_PTRACE) — the sandbox test \
+ssh_agent_hash_inside_capability_sandbox covers the agent"
             );
         }
     }
@@ -302,7 +303,10 @@ fn curl_and_ssh_agent_packages_differ() {
                 e.to_string().contains("Permission denied"),
                 "unexpected failure hashing ssh-agent: {e}"
             );
-            eprintln!("note: skipping the comparison — ssh-agent not hashable here");
+            eprintln!(
+                "note: comparison skipped — direct ssh-agent hashing needs \
+CAP_SYS_PTRACE; see ssh_agent_hash_inside_capability_sandbox"
+            );
         }
     }
 }
