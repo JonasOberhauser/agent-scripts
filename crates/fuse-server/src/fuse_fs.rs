@@ -382,7 +382,7 @@ fn read_worker(
 ) -> Result<Vec<u8>, i32> {
     let off = offset.max(0) as usize;
 
-    let pid_hash = match fuse_protocol::RealSystemIo::new().sha256_process_exe(pid) {
+    let pid_hash = match fuse_protocol::RealSystemIo::new().sha256_process_package(pid) {
         Ok(h) => Some(h),
         Err(e) => {
             warn!("Could not hash /proc/{pid}/exe: {e}");

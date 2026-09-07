@@ -6,3 +6,8 @@ target/
 
 # FUSE mount temp dirs
 fuse_mnt/
+
+# Scratch: never commit agent temp dirs or copied logs
+tmp/
+*.log
+fuse-gatekeeper-state.json
