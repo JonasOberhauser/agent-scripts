@@ -420,6 +420,12 @@ enum GridRow<'a> {
 /// Render one grid row: content left, the grant|deny button pair right
 /// (grant left, deny right). Request rows show `id name`; the all-row is
 /// buttons only. The cursor selection reverses the highlighted button.
+/// Who is requesting WHAT: the process plus the secret it wants
+/// (issue #19 — the panel used to show only the requester).
+fn requester_and_secret(req: &PendingAccessInfo) -> String {
+    format!("{} → {}", requester(req), req.secret_name)
+}
+
 fn grid_row_line(row: GridRow, width: u16, sel_here: Option<Sel>) -> Line<'static> {
     let all = matches!(row, GridRow::All);
     let (deny_l, grant_l) = if all { ("[deny all]", "[grant all]") } else { ("[deny]", "[grant]") };
@@ -433,7 +439,10 @@ fn grid_row_line(row: GridRow, width: u16, sel_here: Option<Sel>) -> Line<'stati
                 Style::default().add_modifier(Modifier::BOLD),
             ));
             let name_max = (width as usize).saturating_sub(4 + 1 + buttons_w);
-            spans.push(Span::raw(format!("{} ", truncate_pad(&requester(req), name_max))));
+            spans.push(Span::raw(format!(
+                "{} ",
+                truncate_pad(&requester_and_secret(req), name_max)
+            )));
         }
         GridRow::All => {}
     }
@@ -976,6 +985,18 @@ mod tests {
             Cursor::All { grant: true },
             "up from the top wraps to the all-row"
         );
+    }
+
+    #[test]
+    fn row_shows_the_requested_secret() {
+        // Issue #19: the panel must show what is requested, not just who.
+        let mut req = pending_info(7);
+        req.secret_name = "p4242_s0_auth.json".into();
+        req.process_name = Some("goose".into());
+        let line = grid_row_line(GridRow::Request(&req), 80, None);
+        let text: String = line.spans.iter().map(|s| s.content.to_string()).collect();
+        assert!(text.contains("goose"), "requester: {text:?}");
+        assert!(text.contains("auth.json"), "secret name: {text:?}");
     }
 
     #[test]
