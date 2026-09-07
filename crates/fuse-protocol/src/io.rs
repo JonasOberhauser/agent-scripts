@@ -50,7 +50,11 @@ pub trait SystemIo {
     /// without restoring it itself.
     fn heal_terminal(&self);
     fn sha256_file(&self, path: &Path) -> Result<String, IoError>;
-    fn sha256_process_exe(&self, pid: u32) -> Result<String, IoError>;
+    /// SHA-256 over the process's whole loaded package: the executable
+    /// plus every mapped library (sorted, path-labeled).  This is the
+    /// trust anchor for read grants — a changed library version or an
+    /// injected LD_PRELOAD library changes the hash.
+    fn sha256_process_package(&self, pid: u32) -> Result<String, IoError>;
     fn is_symlink(&self, path: &Path) -> bool;
 
     /// Whether the path is a directory.

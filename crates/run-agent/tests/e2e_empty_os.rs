@@ -264,7 +264,7 @@ fn e2e_short_image_name_survives_headless_on_empty_os() {
         "run-agent crashed headless on a short image name (issue #1):\n{text}"
     );
     assert!(
-        !(!out.status.success() && text.contains("Failed to create container: exit 125")),
+        out.status.success() || !text.contains("Failed to create container: exit 125"),
         "run-agent failed to create the container with a raw podman exit 125 \
          and no actionable diagnostic:\n{text}"
     );

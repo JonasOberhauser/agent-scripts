@@ -5,6 +5,42 @@ use crate::io::{CommandOutput, SystemIo};
 use crate::IoError;
 
 
+/// One parsed /proc/<pid>/maps line: `Ok(Some((range, path)))` for a
+/// file-backed mapping, `Ok(None)` for a pathless segment, `Err` when
+/// the line does not match the documented 5-mandatory-field format
+/// ("start-end perms offset dev inode [path..]").
+///
+/// Fields are positional by kernel contract — procfs has no headers to
+/// name them by — but every mandatory field is validated to exist, and
+/// the pathname is taken as the whole remainder of the line so paths
+/// containing spaces survive intact.
+fn parse_maps_line(line: &str) -> Result<Option<(String, PathBuf)>, String> {
+    const BAD: fn(&str) -> String = |l| format!("malformed maps line: {l:?}");
+    let mut fields = line.splitn(6, ' ');
+    let range = fields.next().ok_or_else(|| BAD(line))?;
+    let (start, end) = range.split_once('-').ok_or_else(|| BAD(line))?;
+    if start.is_empty() || end.is_empty() {
+        return Err(BAD(line));
+    }
+    // perms, offset, device, inode — all mandatory.
+    let perms = fields.next().ok_or_else(|| BAD(line))?;
+    if perms.len() != 4 {
+        return Err(BAD(line));
+    }
+    fields.next().ok_or_else(|| BAD(line))?; // offset
+    fields.next().ok_or_else(|| BAD(line))?; // dev:major:minor
+    let inode = fields.next().ok_or_else(|| BAD(line))?;
+    if inode.is_empty() || !inode.chars().all(|c| c.is_ascii_digit()) {
+        return Err(BAD(line));
+    }
+    // Path is optional ([heap], [stack], [vvar]… have none); when
+    // present it is the remainder — spaces included.
+    match fields.next().map(str::trim) {
+        Some(p) if p.starts_with('/') => Ok(Some((range.to_string(), PathBuf::from(p)))),
+        Some(_) | None => Ok(None),
+    }
+}
+
 fn hex_sha256(data: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(data);
@@ -159,15 +195,61 @@ impl SystemIo for RealSystemIo {
         Ok(hex_sha256(&data))
     }
 
-    fn sha256_process_exe(&self, pid: u32) -> Result<String, IoError> {
-        let exe_path = std::fs::read_link(format!("/proc/{pid}/exe"))
+    fn sha256_process_package(&self, pid: u32) -> Result<String, IoError> {
+        use sha2::{Digest, Sha256};
+        let exe = std::fs::read_link(format!("/proc/{pid}/exe"))
             .map_err(|e| IoError(format!(
-                "read /proc/{pid}/exe: {e}. \
-                 The process may be in a different PID namespace — \
-                 use --pidns=host on the container, or '*' as the hash to skip verification"
+                "read /proc/{pid}/exe: {e}. The process may be in a different PID \
+                 namespace — use --pidns=host on the container, or '*' as the \
+                 hash to skip verification"
             )))?;
-        let data = std::fs::read(&exe_path)?;
-        Ok(hex_sha256(&data))
+        // Collect (mapping-range, path) pairs.  The range addresses the
+        // exact mapped inode via /proc/<pid>/map_files/, which works
+        // even when the on-disk path was replaced or unlinked
+        // (deleted-but-mapped libraries are common after updates).
+        let mut entries: Vec<(String, PathBuf)> = vec![(String::new(), exe)];
+        let maps = std::fs::read_to_string(format!("/proc/{pid}/maps"))
+            .map_err(|e| IoError(format!("read /proc/{pid}/maps: {e}")))?;
+        for line in maps.lines() {
+            match parse_maps_line(line) {
+                // Pathless segments ([heap], [stack], [vvar], …) are
+                // legitimate — they carry no file content.
+                Ok(None) => {}
+                Ok(Some((range, path))) => {
+                    if !entries.iter().any(|(_, p)| p == &path) {
+                        entries.push((range, path));
+                    }
+                }
+                // A malformed maps line is never silently skipped: the
+                // format is load-bearing for the trust decision.
+                Err(e) => return Err(IoError(format!("/proc/{pid}/maps: {e}"))),
+            }
+        }
+        entries.sort_by(|a, b| a.1.cmp(&b.1));
+        let mut hasher = Sha256::new();
+        for (range, path) in &entries {
+            hasher.update(path.to_string_lossy().as_bytes());
+            hasher.update(b"\0");
+            // Read the actually-mapped inode (works after the on-disk
+            // path was replaced or unlinked); fall back to the path.
+            // FAIL CLOSED on unreadable mappings: a marker would make
+            // any two unreadable libraries at the same path hash
+            // identically — a library-swap attack vector.  A failed
+            // hash leaves the pending without a package hash: one-shot
+            // grants still work, grant-forever refuses to whitelist.
+            let content = std::fs::read(format!("/proc/{pid}/map_files/{range}"))
+                .or_else(|_| std::fs::read(path))
+                .map_err(|e| {
+                    IoError(format!(
+                        "read mapped {}: {e} — refusing to hash a package \
+                         with unreadable mappings",
+                        path.display()
+                    ))
+                })?;
+            hasher.update((content.len() as u64).to_le_bytes());
+            hasher.update(&content);
+        }
+        Ok(format!("{:x}", hasher.finalize()))
     }
 
     fn is_symlink(&self, path: &Path) -> bool {
@@ -518,7 +600,7 @@ impl SystemIo for MockSystemIo {
             .ok_or_else(|| IoError("no hash".into()))
     }
 
-    fn sha256_process_exe(&self, pid: u32) -> Result<String, IoError> {
+    fn sha256_process_package(&self, pid: u32) -> Result<String, IoError> {
         self.process_hashes
             .get(&pid)
             .cloned()
@@ -595,6 +677,56 @@ impl SystemIo for MockSystemIo {
 
 #[cfg(test)]
 mod tests {
+    use super::parse_maps_line;
+
+    #[test]
+    fn parses_file_backed_mapping_with_spaced_path() {
+        let (range, path) = parse_maps_line(
+            "7f2a:1-7f2a:2 r--p 00000000 fd:01 123456 /opt/my libs/lib x.so",
+        )
+        .expect("valid line")
+        .expect("file-backed");
+        assert_eq!(range, "7f2a:1-7f2a:2");
+        assert_eq!(path, std::path::PathBuf::from("/opt/my libs/lib x.so"));
+    }
+
+    #[test]
+    fn parses_deleted_mapped_file() {
+        let line = "7f0000000000-7f0000001000 r--p 00000000 fd:01 99 /usr/lib/x.so (deleted)";
+        let (_, path) = parse_maps_line(line).unwrap().unwrap();
+        assert_eq!(path, std::path::PathBuf::from("/usr/lib/x.so (deleted)"));
+    }
+
+    #[test]
+    fn pathless_segments_are_none_not_errors() {
+        for line in [
+            "7ffd-7ffe rw-p 00000000 00:00 0 [heap]",
+            "7ffd-7ffe rw-p 00000000 00:00 0 [stack]",
+            "7ffd-7ffe r--p 00000000 00:00 0 [vvar]",
+            "7ffd-7ffe rw-p 00000000 00:00 0",
+        ] {
+            assert!(parse_maps_line(line).unwrap().is_none(), "{line}");
+        }
+    }
+
+    #[test]
+    fn malformed_lines_fail_closed() {
+        for line in [
+            "",
+            "noperms fd:01 1 /x",
+            "7f00-7f01",
+            "7f00-7f01 r--p",
+            "7f00-7f01 r--p 0000",
+            "7f00-7f01 r--p 0000 fd:01",
+            "7f00-7f01 badlen! 0000 fd:01 1 /x",
+            "-7f01 r--p 0000 fd:01 1 /x",
+            "7f00- r--p 0000 fd:01 1 /x",
+            "7f00-7f01 r--p 0000 fd:01 notanumber /x",
+        ] {
+            assert!(parse_maps_line(line).is_err(), "must fail closed: {line:?}");
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -612,7 +744,7 @@ mod tests {
             .with_file_hash("/x", "abc")
             .with_process_hash(42, "def");
         assert_eq!(mock.sha256_file(Path::new("/x")).unwrap(), "abc");
-        assert_eq!(mock.sha256_process_exe(42).unwrap(), "def");
+        assert_eq!(mock.sha256_process_package(42).unwrap(), "def");
     }
 
     #[test]
