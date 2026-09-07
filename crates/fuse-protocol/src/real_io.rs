@@ -230,21 +230,24 @@ impl SystemIo for RealSystemIo {
         for (range, path) in &entries {
             hasher.update(path.to_string_lossy().as_bytes());
             hasher.update(b"\0");
-            // Read the actually-mapped inode when possible; fall back to
-            // the on-disk path; an unreadable file contributes a
-            // deterministic marker instead of aborting the whole
-            // package hash (one bad file must not blind the gatekeeper).
+            // Read the actually-mapped inode (works after the on-disk
+            // path was replaced or unlinked); fall back to the path.
+            // FAIL CLOSED on unreadable mappings: a marker would make
+            // any two unreadable libraries at the same path hash
+            // identically — a library-swap attack vector.  A failed
+            // hash leaves the pending without a package hash: one-shot
+            // grants still work, grant-forever refuses to whitelist.
             let content = std::fs::read(format!("/proc/{pid}/map_files/{range}"))
-                .or_else(|_| std::fs::read(path));
-            match content {
-                Ok(data) => {
-                    hasher.update((data.len() as u64).to_le_bytes());
-                    hasher.update(&data);
-                }
-                Err(_) => {
-                    hasher.update(b"unreadable");
-                }
-            }
+                .or_else(|_| std::fs::read(path))
+                .map_err(|e| {
+                    IoError(format!(
+                        "read mapped {}: {e} — refusing to hash a package \
+                         with unreadable mappings",
+                        path.display()
+                    ))
+                })?;
+            hasher.update((content.len() as u64).to_le_bytes());
+            hasher.update(&content);
         }
         Ok(format!("{:x}", hasher.finalize()))
     }
