@@ -307,6 +307,103 @@ fn curl_and_ssh_agent_packages_differ() {
     }
 }
 
+// ── ssh-agent inside a capability sandbox ─────────────────────────
+//
+// Why ssh-agent resists hashing: it sets PR_SET_DUMPABLE=0 (it holds
+// private keys), so /proc/<pid>/{exe,maps,map_files} demand
+// CAP_SYS_PTRACE in the TARGET's user namespace.  No unprivileged
+// context has that — a toolbox, a plain host as a normal user, this
+// container.  A user namespace changes that: `unshare --user
+// --map-root-user` is a rootless subcontainer whose mapped root holds
+// every capability INSIDE it, and an ssh-agent spawned in that same
+// namespace is hashable.  The test re-execs itself under unshare.
+
+const INNER_MARKER_ENV: &str = "FUSE_PACKAGE_HASH_INNER";
+
+/// Inner half (re-exec'd under unshare): hash ssh-agent from inside the
+/// capability sandbox and print the result for the outer half.  A
+/// no-op during normal suite runs.
+#[test]
+fn inner_ssh_agent_package_hash() {
+    if std::env::var(INNER_MARKER_ENV).as_deref() != Ok("1") {
+        return;
+    }
+    let agent = ssh_agent().expect("inner: spawn ssh-agent");
+    let io = RealSystemIo::new();
+    let hash = io
+        .sha256_process_package(agent.pid())
+        .expect("inner: hash ssh-agent inside the sandbox");
+    println!("INNER_AGENT_HASH: {hash}");
+}
+
+fn user_namespace_sandboxes_work() -> bool {
+    Command::new("unshare")
+        .args(["--user", "--map-root-user", "true"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+fn hash_ssh_agent_in_sandbox() -> Option<String> {
+    let out = Command::new("unshare")
+        .args(["--user", "--map-root-user"])
+        .arg(std::env::current_exe().expect("current exe"))
+        .args(["--exact", "inner_ssh_agent_package_hash", "--nocapture", "--test-threads=1"])
+        .env(INNER_MARKER_ENV, "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run unshare");
+    if !out.status.success() {
+        eprintln!(
+            "inner sandbox run failed:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        return None;
+    }
+    // libtest prints "test NAME ... " without a newline, so the marker
+    // lands mid-line — match it anywhere within a line.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    stdout
+        .lines()
+        .find_map(|l| l.split_once("INNER_AGENT_HASH: "))
+        .map(|(_, hash)| hash.trim().to_string())
+        .filter(|h| h.len() == 64 && h.chars().all(|c| c.is_ascii_hexdigit()))
+}
+
+/// A rootless subcontainer (user namespace) CAN hash the hardened
+/// ssh-agent — the capability lives inside the namespace, where the
+/// agent also lives.  Deterministic across two fresh sandboxes, and a
+/// different package from the (outer, dumpable) ssh client.
+#[test]
+fn ssh_agent_hash_inside_capability_sandbox() {
+    if !user_namespace_sandboxes_work() {
+        eprintln!(
+            "skip: user namespaces unavailable here (unshare -Ur) — \
+             the sandbox needs unprivileged userns creation"
+        );
+        return;
+    }
+    let hash1 = hash_ssh_agent_in_sandbox().expect("sandbox run #1 produces a hash");
+    let hash2 = hash_ssh_agent_in_sandbox().expect("sandbox run #2 produces a hash");
+    assert_eq!(hash1, hash2, "same binary, same library set, same hash");
+
+    // Cross-check against the dumpable ssh client, hashed normally.
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let Some((client, _conn)) = ssh(&listener) else { return };
+    let io = RealSystemIo::new();
+    let client_hash = io
+        .sha256_process_package(client.pid())
+        .unwrap_or_else(|e| panic!("hash ssh client: {e}"));
+    assert_ne!(
+        hash1, client_hash,
+        "ssh-agent and ssh are different packages"
+    );
+}
+
 // ── failure modes ─────────────────────────────────────────────────
 
 /// A dead pid must fail closed, never hash an empty package.
