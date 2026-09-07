@@ -122,6 +122,42 @@ fn curl(listener: &TcpListener) -> Option<(Fixture, TcpStream)> {
     Some((fixture, conn))
 }
 
+/// `ssh -N` against a silent listener: the connection is accepted but
+/// no SSH banner ever arrives, so the client blocks in banner exchange
+/// with its full crypto library closure loaded.  stdin is a held-open
+/// pipe like curl's.
+fn ssh(listener: &TcpListener) -> Option<(Fixture, TcpStream)> {
+    if missing("ssh") {
+        eprintln!("skip: ssh not on PATH");
+        return None;
+    }
+    let port = listener.local_addr().unwrap().port();
+    let mut child = Command::new("ssh")
+        .args([
+            "-N",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "UserKnownHostsFile=/dev/null",
+            "-p",
+            &port.to_string(),
+            "127.0.0.1",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn ssh");
+    let exe = exe_path("ssh", child.id());
+    let _stdin = child.stdin.take();
+    let fixture = Fixture { child, _stdin, exe };
+    let (conn, _) = listener.accept().expect("accept ssh");
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    Some((fixture, conn))
+}
+
 // ── curl ──────────────────────────────────────────────────────────
 
 /// The same binary's package hash is deterministic across independent
@@ -156,6 +192,56 @@ fn curl_package_hash_covers_libraries() {
         package, binary,
         "the package hash must not collapse to the bare binary hash"
     );
+}
+
+// ── ssh client ────────────────────────────────────────────────────
+
+/// Unlike its hardened agent, the ssh client stays dumpable: its whole
+/// crypto closure (libcrypto, libc, ...) is hashable everywhere.
+#[test]
+fn ssh_package_hash_is_deterministic() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let Some((ssh1, _conn1)) = ssh(&listener) else { return };
+    let Some((ssh2, _conn2)) = ssh(&listener) else { return };
+    let io = RealSystemIo::new();
+    let h1 = io
+        .sha256_process_package(ssh1.pid())
+        .unwrap_or_else(|e| panic!("hash ssh #1: {e}"));
+    let h2 = io
+        .sha256_process_package(ssh2.pid())
+        .unwrap_or_else(|e| panic!("hash ssh #2: {e}"));
+    assert_eq!(h1, h2, "same binary, same library set, same hash");
+}
+
+#[test]
+fn ssh_package_hash_covers_libraries() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let Some((s, _conn)) = ssh(&listener) else { return };
+    let io = RealSystemIo::new();
+    let package = io
+        .sha256_process_package(s.pid())
+        .unwrap_or_else(|e| panic!("hash ssh: {e}"));
+    let binary = io.sha256_file(s.exe()).expect("hash the ssh binary file");
+    assert_ne!(
+        package, binary,
+        "the package hash must not collapse to the bare binary hash"
+    );
+}
+
+/// Two different network clients are two different packages.
+#[test]
+fn ssh_and_curl_packages_differ() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let Some((c, _cconn)) = curl(&listener) else { return };
+    let Some((s, _sconn)) = ssh(&listener) else { return };
+    let io = RealSystemIo::new();
+    let curl_hash = io
+        .sha256_process_package(c.pid())
+        .unwrap_or_else(|e| panic!("hash curl: {e}"));
+    let ssh_hash = io
+        .sha256_process_package(s.pid())
+        .unwrap_or_else(|e| panic!("hash ssh: {e}"));
+    assert_ne!(curl_hash, ssh_hash, "ssh and curl are different packages");
 }
 
 // ── ssh-agent ─────────────────────────────────────────────────────
