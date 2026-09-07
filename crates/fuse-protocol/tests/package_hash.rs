@@ -6,25 +6,35 @@
 //! programs deployments actually grant — `curl` and `ssh-agent` — with
 //! their full real-world library closures (libcurl, libssl, libcrypto,
 //! zlib, ...).  Pure userspace: no FUSE, no podman, so they run in
-//! every default `cargo test`.
+//! every default `cargo test`; each property is its own test, so a
+//! failure names exactly what broke.
 //!
-//! Fixtures, not SUT: if a binary is missing from PATH the test skips
-//! with a message (unlike the podman suites, where skipping would hide
+//! Fixtures, not SUT: a binary missing from PATH skips that test with
+//! a message (unlike the podman suites, where skipping would hide
 //! regressions of the system under test itself).
 
-use std::net::TcpListener;
-use std::process::{Child, Command, Stdio};
+use std::io::Write;
+use std::net::{TcpListener, TcpStream};
+use std::path::PathBuf;
+use std::process::{Child, ChildStdin, Command, Stdio};
 
 use fuse_protocol::{RealSystemIo, SystemIo};
 
-/// A live fixture process, killed on drop.
+/// A live fixture process: kept alive (stdin pipe held open so no EOF
+/// ever reaches it), cleaned up on drop.
 struct Fixture {
     child: Child,
+    _stdin: Option<ChildStdin>,
+    exe: PathBuf,
 }
 
 impl Fixture {
     fn pid(&self) -> u32 {
         self.child.id()
+    }
+
+    fn exe(&self) -> &PathBuf {
+        &self.exe
     }
 }
 
@@ -35,104 +45,142 @@ impl Drop for Fixture {
     }
 }
 
-fn spawn_quiet(bin: &str, args: &[&str]) -> std::io::Result<Child> {
-    Command::new(bin)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
+/// Where `bin` lives on PATH (fixtures are spawned by name).
+fn on_path(bin: &str) -> Option<PathBuf> {
+    let out = Command::new("sh")
+        .arg("-c")
+        .arg(format!("command -v {bin}"))
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if path.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(path))
+    }
+}
+
+/// The executable path of a freshly spawned, still-live child; falls
+/// back to the PATH location when /proc denies the readlink (hardened
+/// binaries like ssh-agent are non-dumpable).
+fn exe_path(bin: &str, pid: u32) -> PathBuf {
+    std::fs::read_link(format!("/proc/{pid}/exe"))
+        .unwrap_or_else(|_| on_path(bin).expect("fixture is on PATH"))
+}
+
+fn missing(bin: &str) -> bool {
+    on_path(bin).is_none()
 }
 
 /// `ssh-agent -D`: a foreground daemon — stays loaded until killed.
 fn ssh_agent() -> Option<Fixture> {
-    match spawn_quiet("ssh-agent", &["-D"]) {
-        Ok(child) => Some(Fixture { child }),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            eprintln!("skip: ssh-agent not on PATH");
-            None
-        }
-        Err(e) => panic!("spawn ssh-agent: {e}"),
+    if missing("ssh-agent") {
+        eprintln!("skip: ssh-agent not on PATH");
+        return None;
     }
+    let mut child = Command::new("ssh-agent")
+        .arg("-D")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn ssh-agent");
+    let exe = exe_path("ssh-agent", child.id());
+    let _stdin = child.stdin.take();
+    Some(Fixture { child, _stdin, exe })
 }
 
 /// `curl -s telnet://<stalled-listener>`: connects and blocks on the
-/// silent peer — a live curl with its full library closure mapped.
-fn curl(listener: &TcpListener) -> Option<(Fixture, std::net::TcpStream)> {
+/// silent peer.  stdin is a HELD-OPEN pipe — with /dev/null curl would
+/// see EOF, end its half of the telnet session and exit mid-test.
+fn curl(listener: &TcpListener) -> Option<(Fixture, TcpStream)> {
+    if missing("curl") {
+        eprintln!("skip: curl not on PATH");
+        return None;
+    }
     let addr = listener.local_addr().unwrap();
-    let child = match spawn_quiet("curl", &["-s", &format!("telnet://{addr}")]) {
-        Ok(child) => child,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            eprintln!("skip: curl not on PATH");
-            return None;
-        }
-        Err(e) => panic!("spawn curl: {e}"),
-    };
-    let fixture = Fixture { child };
-    // Accept and stay silent; the stream stays open (in the returned
-    // value) so curl keeps blocking until the test is done.
+    let mut child = Command::new("curl")
+        .args(["-s", &format!("telnet://{addr}")])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn curl");
+    let exe = exe_path("curl", child.id());
+    let mut stdin = child.stdin.take();
+    // Belt and braces: never write, never close, never flush EOF.
+    let _ = stdin.as_mut().map(|s| s.flush());
+    let fixture = Fixture { child, _stdin: stdin, exe };
+    // Accept and stay silent; the stream stays open (returned to the
+    // caller) so curl keeps blocking until the test is done.
     let (conn, _) = listener.accept().expect("accept curl");
     // Settle: give lazy binders a moment so the mapped set is complete.
     std::thread::sleep(std::time::Duration::from_millis(300));
     Some((fixture, conn))
 }
 
+// ── curl ──────────────────────────────────────────────────────────
+
+/// The same binary's package hash is deterministic across independent
+/// instances.
 #[test]
-fn package_hash_of_curl_and_ssh_agent() {
-    let io = RealSystemIo::new();
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind stalled listener");
-
-    // ── curl: dumpable, full library closure ──────────────────────
+fn curl_package_hash_is_deterministic() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let Some((curl1, _conn1)) = curl(&listener) else { return };
-    let curl_hash = io
-        .sha256_process_package(curl1.pid())
-        .unwrap_or_else(|e| panic!("hash curl (pid {}): {e}", curl1.pid()));
-
-    // Deterministic: an independently spawned instance maps the same
-    // package and must hash identically.
     let Some((curl2, _conn2)) = curl(&listener) else { return };
-    let curl_hash2 = io
+    let io = RealSystemIo::new();
+    let h1 = io
+        .sha256_process_package(curl1.pid())
+        .unwrap_or_else(|e| panic!("hash curl #1: {e}"));
+    let h2 = io
         .sha256_process_package(curl2.pid())
-        .expect("hash curl #2");
-    assert_eq!(
-        curl_hash, curl_hash2,
-        "the same binary's package hash must be deterministic"
+        .unwrap_or_else(|e| panic!("hash curl #2: {e}"));
+    assert_eq!(h1, h2, "same binary, same library set, same hash");
+}
+
+/// The package hash covers the library closure: it must differ from
+/// the bare executable's sha256 (the old, pre-package hash).
+#[test]
+fn curl_package_hash_covers_libraries() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let Some((c, _conn)) = curl(&listener) else { return };
+    let io = RealSystemIo::new();
+    let package = io
+        .sha256_process_package(c.pid())
+        .unwrap_or_else(|e| panic!("hash curl: {e}"));
+    let binary = io.sha256_file(c.exe()).expect("hash the curl binary file");
+    assert_ne!(
+        package, binary,
+        "the package hash must not collapse to the bare binary hash"
     );
+}
 
-    // The package hash covers more than the bare executable: it must
-    // differ from the old single-file hash (libraries are included).
-    let curl_exe =
-        std::fs::read_link(format!("/proc/{}/exe", curl1.pid())).expect("exe link");
-    let curl_binary_hash = io.sha256_file(&curl_exe).expect("hash the curl binary file");
-    assert_ne!(curl_hash, curl_binary_hash, "curl's libs must be included");
+// ── ssh-agent ─────────────────────────────────────────────────────
 
-    // ── ssh-agent: hardened (PR_SET_DUMPABLE=0) ──────────────────
-    // ssh-agent drops dumpability, so reading its /proc maps requires
-    // CAP_SYS_PTRACE.  Both outcomes assert real behavior:
-    //  - with the capability: the full package-hash properties;
-    //  - without: fail closed with the documented, actionable error
-    //    (never a vacuous hash).
+/// ssh-agent hardens itself (PR_SET_DUMPABLE=0): reading its /proc
+/// maps needs CAP_SYS_PTRACE (or an equally permissive setup).  Both
+/// outcomes assert real behavior — with the capability the full
+/// property set, without it a clean fail-closed error.  Never a
+/// vacuous hash.
+#[test]
+fn ssh_agent_package_hash_properties() {
     let Some(agent) = ssh_agent() else { return };
+    let io = RealSystemIo::new();
     match io.sha256_process_package(agent.pid()) {
-        Ok(agent_hash) => {
-            let agent_exe =
-                std::fs::read_link(format!("/proc/{}/exe", agent.pid())).expect("exe link");
-            let agent_binary_hash =
-                io.sha256_file(&agent_exe).expect("hash the ssh-agent binary file");
+        Ok(hash) => {
+            let binary = io.sha256_file(agent.exe()).expect("hash the binary file");
             assert_ne!(
-                agent_hash, agent_binary_hash,
-                "package hash must not collapse to the bare binary hash"
+                hash, binary,
+                "the package hash must not collapse to the bare binary hash"
             );
-            assert_ne!(
-                agent_hash, curl_hash,
-                "curl and ssh-agent are different packages"
-            );
-            let agent2 = ssh_agent().expect("second ssh-agent");
-            assert_eq!(
-                agent_hash,
-                io.sha256_process_package(agent2.pid()).expect("hash ssh-agent #2"),
-                "the same binary's package hash must be deterministic"
-            );
+            let Some(agent2) = ssh_agent() else { return };
+            let hash2 = io
+                .sha256_process_package(agent2.pid())
+                .expect("hash ssh-agent #2");
+            assert_eq!(hash, hash2, "same binary, same library set, same hash");
         }
         Err(e) => {
             assert!(
@@ -141,21 +189,49 @@ fn package_hash_of_curl_and_ssh_agent() {
             );
             eprintln!(
                 "note: ssh-agent is non-dumpable and this environment lacks \
-                 CAP_SYS_PTRACE — package hash fails closed (as designed)"
+CAP_SYS_PTRACE — package hash fails closed (as designed)"
             );
         }
     }
 }
 
+/// When the environment CAN hash ssh-agent, its package must differ
+/// from curl's (a distinct program is a distinct package).
 #[test]
-fn dead_pid_errors_rather_than_hashing() {
+fn curl_and_ssh_agent_packages_differ() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let Some((c, _conn)) = curl(&listener) else { return };
+    let Some(agent) = ssh_agent() else { return };
     let io = RealSystemIo::new();
-    // Spawn and fully reap `true`, then hash the dead pid: fail closed.
+    let curl_hash = io
+        .sha256_process_package(c.pid())
+        .unwrap_or_else(|e| panic!("hash curl: {e}"));
+    match io.sha256_process_package(agent.pid()) {
+        Ok(agent_hash) => assert_ne!(
+            curl_hash, agent_hash,
+            "curl and ssh-agent are different packages"
+        ),
+        Err(e) => {
+            assert!(
+                e.to_string().contains("Permission denied"),
+                "unexpected failure hashing ssh-agent: {e}"
+            );
+            eprintln!("note: skipping the comparison — ssh-agent not hashable here");
+        }
+    }
+}
+
+// ── failure modes ─────────────────────────────────────────────────
+
+/// A dead pid must fail closed, never hash an empty package.
+#[test]
+fn dead_pid_fails_closed() {
+    let io = RealSystemIo::new();
     let mut child = Command::new("true").spawn().expect("spawn true");
     let pid = child.id();
     child.wait().unwrap();
     assert!(
         io.sha256_process_package(pid).is_err(),
-        "a reaped pid must fail closed, not hash an empty package"
+        "a reaped pid must fail closed"
     );
 }
