@@ -39,7 +39,10 @@ const PANEL_NAME: &str = "fuse.pending_panel";
 const MAX_SHOWN: usize = 5;
 
 /// Total panel width in terminal columns.
-const PANEL_WIDTH: u16 = 42;
+// Wide enough for `id requester → p{pid}_s{n}_{file}` plus the three
+// buttons on one row (issue #19/#18: at 42 columns the combined text
+// truncated to ~12 display columns and the secret name vanished).
+const PANEL_WIDTH: u16 = 56;
 
 /// How often the panel polls the server for pending requests.
 const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
@@ -984,6 +987,23 @@ mod tests {
             cursor_up(&slots, c),
             Cursor::All { grant: true },
             "up from the top wraps to the all-row"
+        );
+    }
+
+    /// At the real panel width, the combined requester → secret text of
+    /// typical length is fully visible (not truncated to noise).
+    #[test]
+    fn typical_request_line_fits_the_panel() {
+        let panel = panel_rect(Rect::new(0, 0, 80, 24));
+        let mut req = pending_info(31);
+        req.process_name = Some("goose".into());
+        req.secret_name = "p42_s0_auth.json".into();
+        let line = grid_row_line(GridRow::Request(&req), panel.width, None);
+        let text: String = line.spans.iter().map(|s| s.content.to_string()).collect();
+        assert!(
+            text.contains("goose → p42_s0_auth.json"),
+            "typical combo must be fully visible at width {}: {text:?}",
+            panel.width
         );
     }
 
