@@ -54,6 +54,14 @@ pub fn handle_command(cmd: Command, state: &ServerState) -> Response {
             }
         }
 
+        Command::GrantForever { id } => match state.grant_pending_forever(id) {
+            Ok(()) => Response::Ok,
+            Err(e) => {
+                tracing::warn!("grant-forever {id} rejected: {e}");
+                Response::Error { message: e }
+            }
+        },
+
         Command::Deny { id } => {
             if state.deny_pending(id) {
                 Response::Ok
@@ -132,6 +140,16 @@ mod tests {
             Command::AddSecret { name: "new".into(), content: vec![9], hash: "h".into(), mode: 0o600 },
             &s,
         );
+        assert_eq!(resp, Response::Ok);
+
+        // grant-forever round trip on a pending with a package hash
+        s.add("k", b"V".to_vec(), "h");
+        let _ = handle_command(Command::GrantForever { id: 1 }, &s); // unknown id -> error, no panic
+        let id = {
+            s.create_pending("k", 7, Some("pkg"), "mismatch", None);
+            s.pending.iter().next().unwrap().id
+        };
+        let resp = handle_command(Command::GrantForever { id }, &s);
         assert_eq!(resp, Response::Ok);
 
         let resp = handle_command(Command::RemoveSecret { name: "new".into() }, &s);

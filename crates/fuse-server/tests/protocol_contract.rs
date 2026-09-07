@@ -95,5 +95,10 @@ fn typed_client_round_trips_every_command() {
         "not found",
     );
     rejected("grant", Command::Grant { id: 999 }, "not found");
+    rejected(
+        "grant-forever",
+        Command::GrantForever { id: 999 },
+        "not found",
+    );
     rejected("deny", Command::Deny { id: 999 }, "not found");
 }

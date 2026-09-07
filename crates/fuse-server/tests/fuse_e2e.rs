@@ -21,7 +21,7 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use fuse_protocol::{RealSystemIo, SystemIo};
-use fuse_server::{GatekeeperFs, ServerState};
+use fuse_server::{run_socket_server, GatekeeperFs, ServerState};
 use fuser::{BackgroundSession, MountOption};
 
 // ── helpers ────────────────────────────────────────────────────
@@ -547,6 +547,89 @@ fn e2e_ld_preload_changes_package_hash_and_is_denied() {
         !bad.status.success(),
         "LD_PRELOAD-injected read must be denied: {bad:?}"
     );
+}
+
+// ── grant-forever, full stack: FUSE + socket + real client (#11) ──
+
+#[test]
+fn e2e_grant_forever_full_flow() {
+    if !fuse_available() {
+        return;
+    }
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    // The socket must live OUTSIDE the mount dir: the FUSE mount
+    // shadows everything beneath it, and connect-by-path would ENOENT
+    // even with a perfectly healthy listener.
+    let aux = tempfile::tempdir().unwrap();
+    let socket = aux.path().join("gf.sock");
+
+    // The secret's allowed hash deliberately does not match the test
+    // binary: every read pends until grant-forever whitelists it.
+    let state = Arc::new(ServerState::new());
+    state.add("s", b"FOREVER_SECRET".to_vec(), "not_our_hash");
+    *state.pending_timeout.lock().unwrap() = std::time::Duration::from_secs(30);
+
+    // Real socket server sharing the same state.
+    let st = Arc::clone(&state);
+    let sock = socket.clone();
+    let _server = std::thread::spawn(move || {
+        let _ = run_socket_server(&sock, st);
+    });
+    // Readiness probe speaks the real protocol: a bare connect+EOF
+    // leaves the acceptor wedged on the half-open conversation.
+    let mut ready = false;
+    for _ in 0..300 {
+        if fuse_protocol::run_command_once(&socket, "version", &fuse_protocol::Command::GetVersion).is_ok() {
+            ready = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(ready, "socket server never became ready");
+
+    let _session = mount_fs(Arc::clone(&state), dir.path());
+
+    // A reader blocks in pending (wrong hash).
+    let path = dir.path().join("s");
+    let reader = std::thread::spawn(move || std::fs::read(&path));
+
+    // Wait (bounded) for the pending registration.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while state.pending.is_empty() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    assert!(!state.pending.is_empty(), "read must pend");
+
+    // Grant forever through the REAL fuse-client binary.
+    let id = state.pending.iter().next().unwrap().id;
+    let out = std::process::Command::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/debug/fuse-client"))
+        .arg("--socket").arg(&socket)
+        .args(["grant-forever", &id.to_string()])
+        .output()
+        .expect("run fuse-client");
+    assert!(
+        out.status.success(),
+        "grant-forever failed: {}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    // The blocked reader is served by the grant.
+    let data = reader.join().unwrap().expect("blocked read served after grant-forever");
+    assert_eq!(data, b"FOREVER_SECRET");
+
+    // Unlimited: repeated reads by the SAME package need no further
+    // approval and no resets.
+    for _ in 0..3 {
+        let again = std::fs::read(dir.path().join("s"))
+            .expect("re-read must be granted without approval");
+        assert_eq!(again, b"FOREVER_SECRET");
+    }
+
+    // And the secret reports the whitelisted hash + unlimited.
+    let status = state.status();
+    assert!(status.iter().any(|s| s.unlimited), "status must show unlimited: {status:?}");
 }
 
 // ── package hashing survives deleted-but-mapped libraries ───────
