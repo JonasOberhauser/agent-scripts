@@ -26,15 +26,40 @@ enum Commands {
     ListMounts,
     Pending,
     Grant { id: u64 },
+    /// Grant a pending access permanently (whitelists the package hash).
+    GrantForever { id: u64 },
     Deny { id: u64 },
     GetVersion,
     GetLogPath,
 }
 
 fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
+    // Panel actions log to a file next to the state file: the TUI's
+    // alternate screen hides stderr, and truncated title messages are
+    // not a debugging interface.
+    let log_path = std::env::var("FUSE_GATEKEEPER_STATE")
+        .ok()
+        .map(|p| {
+            std::path::Path::new(&p)
+                .with_file_name("fuse-gatekeeper-client.log")
+                .to_string_lossy()
+                .to_string()
+        })
+        .unwrap_or_else(|| "/tmp/fuse-gatekeeper-client.log".to_string());
+    // Default to info: an unset RUST_LOG must not silence the panel
+    // action log (that is the whole point of the file).
+    let filter = tracing_subscriber::EnvFilter::builder()
+        .with_default_directive(tracing_subscriber::filter::LevelFilter::INFO.into())
+        .from_env_lossy();
+    if let Ok(file) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(std::sync::Mutex::new(file))
+            .init();
+        tracing::info!("fuse-client starting (log: {log_path})");
+    } else {
+        tracing_subscriber::fmt().with_env_filter(filter).init();
+    }
 
     let cli = Cli::parse();
 
@@ -81,12 +106,14 @@ fn main() {
             // Display::run creates the shared BuiltinTui and attaches it
             // as an ordinary layer, so the builtin input line and the
             // panel are peers with activation-based keyboard focus.
+            let panel_error = pending_layer::no_error();
             let talk =
-                pending_layer::spawn_worker(cli.socket.clone(), pending.clone(), secrets);
+                pending_layer::spawn_worker(cli.socket.clone(), pending.clone(), secrets, panel_error.clone());
             let mut display = servatui_display::Display::new();
             display.add_layer(Box::new(pending_layer::PendingPanelLayer::new(
                 pending,
                 Box::new(talk),
+                panel_error,
             )));
             if let Err(e) = display.run(&cli.socket, &protocols) {
                 eprintln!("Error: {e}");
@@ -109,6 +136,7 @@ fn build_clap_command(cmd: &Commands) -> (String, String) {
         Commands::ListMounts => ("mounts".into(), "".into()),
         Commands::Pending => ("pending".into(), "".into()),
         Commands::Grant { id } => ("grant".into(), id.to_string()),
+        Commands::GrantForever { id } => ("grant-forever".into(), id.to_string()),
         Commands::Deny { id } => ("deny".into(), id.to_string()),
         Commands::GetVersion => ("version".into(), "".into()),
         Commands::GetLogPath => ("logpath".into(), "".into()),

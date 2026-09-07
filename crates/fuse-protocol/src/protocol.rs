@@ -7,6 +7,9 @@ pub struct SecretStatus {
     pub access_count: u64,
     pub allowed_hash: String,
     pub size: usize,
+    /// Set by `grant-forever`: the allowed package may read without
+    /// per-read approval.
+    pub unlimited: bool,
 }
 
 /// One entry in a `list-mounts` response.
@@ -94,6 +97,9 @@ pub enum Command {
     ListPending,
     /// Grant a pending access request by ID.
     Grant { id: u64 },
+    /// Grant a pending access request permanently: the observed package
+    /// hash becomes the secret's allowed hash with unlimited reads.
+    GrantForever { id: u64 },
     /// Deny a pending access request by ID (immediate rejection).
     Deny { id: u64 },
     /// Request the server's protocol version.

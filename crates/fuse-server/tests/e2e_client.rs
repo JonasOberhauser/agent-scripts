@@ -125,6 +125,20 @@ fn e2e_client_binary_against_server() {
     assert!(!stdout.contains("new.yaml"), "removed secret should not appear: {stdout}");
     assert!(stdout.contains("existing.yaml"), "existing should still be there: {stdout}");
 
+    // ── 7.5. grant-forever whitelists the observed package hash ──
+    state.create_pending("existing.yaml", 4242, Some("pkg_hash_x"), "hash mismatch", None);
+    let id = state.pending.iter().next().unwrap().id;
+    let (stdout, stderr, code) = run_client(&socket, &["grant-forever", &id.to_string()]);
+    assert_eq!(code, 0, "grant-forever failed: {stderr}");
+    assert!(stdout.contains("OK"), "grant-forever should print OK: {stdout}");
+    let probe = state.attempt_read("existing.yaml", 555, Some("pkg_hash_x"), 0, 5);
+    assert!(matches!(probe, fuse_server::ReadOutcome::Granted(_)), "got: {probe:?}");
+    let probe2 = state.attempt_read("existing.yaml", 556, Some("pkg_hash_x"), 0, 5);
+    assert!(matches!(probe2, fuse_server::ReadOutcome::Granted(_)), "unlimited reads: {probe2:?}");
+    // A granted pending lingers until its (absent) reader removes it or
+    // it expires — clean it up so the later pending assertions hold.
+    state.remove_pending(id);
+
     // ── 8. Pending: should be empty ──
     let (stdout, _, _) = run_client(&socket, &["pending"]);
     assert!(stdout.contains("No pending"), "should have no pending: {stdout}");
