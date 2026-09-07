@@ -41,5 +41,6 @@ jobs:
       - name: Integration tests (headless tiers)
         run: |
           cargo test -p fuse-protocol
+          cargo test -p fuse-server --test protocol_contract
           cargo test -p fuse-server --test e2e_client
           cargo test -p fuse-server --test fuse_e2e -- --include-ignored
