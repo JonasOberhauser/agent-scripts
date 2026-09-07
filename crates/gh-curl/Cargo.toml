@@ -1,0 +1,14 @@
+[package]
+name = "gh-curl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Gatekeeper-shaped curl for the GitHub API: in-process libcurl, netrc-derived Bearer auth, exact-host allowlist."
+
+[[bin]]
+name = "gh-curl"
+path = "src/main.rs"
+
+[dependencies]
+curl = "0.4"
+url = "2"

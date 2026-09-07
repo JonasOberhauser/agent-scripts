@@ -34,7 +34,8 @@ cargo test -p fuse-server                # fuse-server only (unit)
 cargo clippy --workspace                 # zero warnings required
 ```
 
-The workspace has four crates: `fuse-protocol`, `fuse-server`, `fuse-client`, `run-agent`.
+The workspace has five crates: `fuse-protocol`, `fuse-server`, `fuse-client`, `run-agent`,
+`gh-curl`.
 
 ## Architecture
 
@@ -48,6 +49,10 @@ The workspace has four crates: `fuse-protocol`, `fuse-server`, `fuse-client`, `r
   socket server.
 - **fuse-protocol**: Shared types, `SystemIo` trait, `RealSystemIo` /
   `MockSystemIo` implementations.
+- **gh-curl**: Single-purpose GitHub API HTTP client meant to be the gatekeeper-
+  whitelisted reader of the token netrc: in-process libcurl, Bearer auth from the
+  netrc, exact-host allowlist derived from its `machine` entries, fail-closed
+  parsing (no `default` entries), no file-reading vectors.
 
 ## Testing Philosophy
 

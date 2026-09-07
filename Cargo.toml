@@ -5,10 +5,11 @@ members = [
     "crates/fuse-server",
     "crates/fuse-client",
     "crates/run-agent",
+    "crates/gh-curl",
 ]
 
 [workspace.package]
-version = "0.26.0"
+version = "0.26.1"
 edition = "2021"
 license = "MIT"
 

@@ -32,6 +32,7 @@ the counter to allow the next agent.
 | `fuse-server` | `fuse-server` | FUSE gatekeeper filesystem + Unix socket CRUD server |
 | `fuse-client` | `fuse-client` | CLI that sends commands to the server (reset, status, ...) |
 | `run-agent` | `run-agent` | Orchestrator: starts server, launches container, auto-resets |
+| `gh-curl` | `gh-curl` | Gatekeeper-whitelisted GitHub API client (netrc → Bearer, exact-host allowlist) |
 
 ## Prerequisites
 
@@ -200,6 +201,29 @@ Options:
       --restart-container           Recreate the persistent container from scratch
 ```
 
+## gh-curl — token-scoped GitHub API access
+
+`gh-curl` is a single-purpose HTTP client designed to be the only binary the
+gatekeeper whitelists for the token netrc (`~/.netrc` → `/fuse/...`):
+
+```sh
+gh-curl [-X METHOD] [-H 'Header: value']... [-d DATA]... [-i] URL
+```
+
+- **In-process libcurl** (the `curl` crate): no child process, no curl-syntax
+  pass-through — the CLI's local-file vectors (`-d @file`, `-T`, `--config`)
+  structurally do not exist; `-d` values are literal strings.
+- **Bearer auth from the netrc**: the binary parses the netrc itself (the one
+  gatekeeper-authorized read) and sends `Authorization: Bearer …` (the API
+  rejects netrc's HTTP-Basic form).
+- **Exact-host allowlist**: mirroring libcurl's netrc rule, credentials go
+  only to a URL host that exactly matches a `machine` entry — subdomains
+  don't match, `default` entries fail closed. Scope = netrc content, which
+  you control through the gatekeeper.
+- **The token never appears** in output, files, error messages, or argv —
+  only inside the Authorization header of an HTTPS request to an allowlisted
+  host.
+
 ## Project layout
 
 ```
@@ -209,7 +233,8 @@ agents/
 │   ├── fuse-protocol/         # shared types + IoProvider<I,O> trait
 │   ├── fuse-server/           # FUSE filesystem + socket server
 │   ├── fuse-client/           # CLI client
-│   └── run-agent/             # orchestrator
+│   ├── run-agent/             # orchestrator
+│   └── gh-curl/               # gatekeeper-whitelisted GitHub API client
 ├── Dockerfile                 # agentbox container image
 └── run-agent.sh               # original bash version (kept for reference)
 ```
