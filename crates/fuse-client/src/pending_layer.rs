@@ -27,6 +27,7 @@ use fuse_protocol::{
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use ratatui::widgets::Wrap;
 use ratatui::widgets::Paragraph;
 use servatui_display::{DisplayLayer, EventResult, LayerCtx, StackIntent};
 use servyi_servatui::WidgetEntry;
@@ -440,7 +441,7 @@ fn small_shell_hint() -> String {
         .map(|n| format!("'{n}'"))
         .collect::<Vec<_>>()
         .join(", ");
-    format!("use {listed} commands\nto deal with pending requests")
+    format!("use {listed} commands to deal with pending requests")
 }
 
 /// Who is requesting WHAT: the process plus the secret it wants
@@ -649,10 +650,16 @@ impl ButtonGrid {
 }
 
 /// The pending-request panel as a display layer.
+/// Writer into the shell's log window.
+pub(crate) type LogWindow = Box<dyn Fn(&str)>;
+
 pub(crate) struct PendingPanelLayer {
     pending: PendingIds,
     error: LastError,
     talk: Box<dyn ServerTalk>,
+    /// Writes a line into the shell's log window (the builtin TUI's
+    /// log area).  Optional: absent in tests that only assert layout.
+    log_window: Option<LogWindow>,
     /// Latches when the shell first becomes too small; resets once it
     /// is big enough again so a later shrink re-warns.
     small_warned: std::cell::Cell<bool>,
@@ -671,6 +678,7 @@ impl PendingPanelLayer {
             error,
             pending,
             talk,
+            log_window: None,
             small_warned: std::cell::Cell::new(false),
             slots: empty_slots(),
             cursor: Cursor::All { grant: true },
@@ -678,6 +686,12 @@ impl PendingPanelLayer {
             last_poll: None,
             seen: std::collections::HashSet::new(),
         }
+    }
+
+    /// Attach a writer into the shell's log window.
+    pub(crate) fn with_log_window(mut self, log: LogWindow) -> Self {
+        self.log_window = Some(log);
+        self
     }
 
     /// Press a button: dispatch its commands through the (non-blocking)
@@ -730,22 +744,28 @@ impl DisplayLayer for PendingPanelLayer {
         let panel = panel_rect(ctx.terminal_area);
         if panel.width < PANEL_WIDTH {
             if !self.small_warned.replace(true) {
-                tracing::warn!(
-                    "the shell is too small to support smooth operation, \
-                     please resize to at least {PANEL_WIDTH} columns"
+                let warning = format!(
+                    "Warning: the shell is too small to support smooth \
+                     operation, please resize to at least {PANEL_WIDTH} columns"
                 );
+                tracing::warn!("{warning}");
+                if let Some(log) = &self.log_window {
+                    log(&warning);
+                }
             }
             // Minimal fallback: no rows, no buttons — just the hint that
             // the CLI commands (from the single command table) work.
+            // Paragraph Wrap does the line breaking at the CURRENT shell
+            // dimensions — no manual splitting.
             let hint = small_shell_hint();
-            let area = Rect { height: 2, ..panel };
-            for (i, line) in hint.lines().enumerate() {
-                widgets.push(WidgetEntry {
-                    name: PANEL_NAME,
-                    widget: Box::new(Paragraph::new(Line::raw(line.to_string()))),
-                    area: Rect { y: area.y + i as u16, ..area },
-                });
-            }
+            let area = panel;
+            widgets.push(WidgetEntry {
+                name: PANEL_NAME,
+                widget: Box::new(
+                    Paragraph::new(hint).wrap(Wrap { trim: true }),
+                ),
+                area,
+            });
             return intent;
         }
         self.small_warned.set(false);
@@ -1045,7 +1065,7 @@ mod tests {
         assert!(hint.starts_with("use 'pending'"), "hint: {hint}");
         assert!(hint.contains("'grant'"), "hint: {hint}");
         assert!(hint.contains("'deny'"), "hint: {hint}");
-        assert!(hint.contains("\nto deal with pending requests"), "hint: {hint}");
+        assert!(hint.ends_with("to deal with pending requests"), "hint: {hint}");
         for spec in fuse_protocol::COMMAND_TABLE {
             if matches!(spec.complete, fuse_protocol::Completer::PendingIds) {
                 assert!(
@@ -1054,6 +1074,43 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The too-small warning reaches the shell's LOG WINDOW via the
+    /// attached writer (and only on the big-to-small transition).
+    #[test]
+    fn small_shell_warning_writes_to_the_log_window() {
+        let logged: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = logged.clone();
+        let mut layer_obj = layer(Arc::new(Mutex::new(ids(&[31]))), Path::new("/x"))
+            .with_log_window(Box::new(move |line: &str| {
+                sink.lock().unwrap().push(line.to_string());
+            }));
+        let mut widgets = Vec::new();
+        let mut small = servatui_display::LayerCtx {
+            id: servatui_display::LayerId::BUILTIN,
+            color: Color::Reset,
+            terminal_area: Rect::new(0, 0, 40, 24),
+            my_widgets: &[],
+        };
+        layer_obj.on_overlay(&mut small, &mut widgets);
+        layer_obj.on_overlay(&mut small, &mut widgets);
+        assert_eq!(
+            logged.lock().unwrap().len(),
+            1,
+            "one-shot: re-arming only after a big frame"
+        );
+        assert!(logged.lock().unwrap()[0].contains("resize to at least"));
+        // Big frame re-arms; small frame warns again.
+        let mut big = servatui_display::LayerCtx {
+            id: servatui_display::LayerId::BUILTIN,
+            color: Color::Reset,
+            terminal_area: Rect::new(0, 0, 80, 24),
+            my_widgets: &[],
+        };
+        layer_obj.on_overlay(&mut big, &mut widgets);
+        layer_obj.on_overlay(&mut small, &mut widgets);
+        assert_eq!(logged.lock().unwrap().len(), 2, "re-warns after re-arm");
     }
 
     /// Below the minimum width the panel renders only the hint: no
