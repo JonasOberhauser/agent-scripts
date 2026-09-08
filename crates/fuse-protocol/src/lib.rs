@@ -1,4 +1,5 @@
 pub mod error;
+pub mod hashd;
 pub mod io;
 pub mod protocol;
 pub mod real_io;

@@ -5,6 +5,7 @@ members = [
     "crates/fuse-server",
     "crates/fuse-client",
     "crates/run-agent",
+    "crates/hashd",
 ]
 
 [workspace.package]

@@ -40,12 +40,44 @@ fn fuse_available() -> bool {
     std::path::Path::new("/dev/fuse").exists()
 }
 
+/// Can this context compute package hashes at all? Following
+/// /proc/<pid>/map_files (even of ITSELF) requires CAP_SYS_ADMIN or
+/// CAP_CHECKPOINT_RESTORE in the initial user namespace; without it,
+/// every hash-configured test degrades to a loud skip instead of a
+/// vacuous red.
+fn hashing_available() -> bool {
+    let range = std::fs::read_to_string("/proc/self/maps")
+        .ok()
+        .and_then(|maps| {
+            maps.lines()
+                .find(|l| l.contains('/'))
+                .and_then(|l| l.split_whitespace().next().map(str::to_string))
+        });
+    let Some(range) = range else {
+        return false;
+    };
+    let ok = std::fs::read(format!("/proc/self/map_files/{range}")).is_ok();
+    if !ok {
+        eprintln!(
+            "skip: this context cannot follow /proc/self/map_files \
+             (needs CAP_SYS_ADMIN/CAP_CHECKPOINT_RESTORE in the initial \
+             user namespace) — hash-configured FUSE e2e tests skip loudly"
+        );
+    }
+    ok
+}
+
 /// SHA-256 of the test binary's whole loaded package (exe + libraries) —
 /// this is what the FUSE daemon computes for `req.pid()` when the test
 /// process reads a file (issue #11: trust the whole package).
-fn current_package_hash() -> String {
+/// `None` = hashing unavailable here (loud skip by the caller).
+fn current_package_hash() -> Option<String> {
+    if !hashing_available() {
+        return None;
+    }
     let io = RealSystemIo::new();
     io.sha256_process_package(std::process::id())
+        .map(Some)
         .expect("failed to hash test package")
 }
 
@@ -76,7 +108,7 @@ fn e2e_read_secret() {
     }
     let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
-    let hash = current_package_hash();
+    let Some(hash) = current_package_hash() else { return };
     let state = make_state(&[("secret", b"TOPSECRET", &hash)]);
     let _session = mount_fs(state, dir.path());
 
@@ -93,7 +125,7 @@ fn e2e_statfs_works() {
     }
     let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
-    let hash = current_package_hash();
+    let Some(hash) = current_package_hash() else { return };
     let state = make_state(&[("s", b"data", &hash)]);
     let _session = mount_fs(state, dir.path());
 
@@ -125,7 +157,7 @@ fn e2e_multi_chunk_read_succeeds() {
     }
     let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
-    let hash = current_package_hash();
+    let Some(hash) = current_package_hash() else { return };
     let secret = b"THIS_IS_A_LONGER_SECRET_VALUE_FOR_MULTI_CHUNK_READ_TEST!!!";
     let state = make_state(&[("s", secret, &hash)]);
     let _session = mount_fs(state, dir.path());
@@ -159,7 +191,7 @@ fn e2e_different_binary_denied() {
     }
     let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
-    let hash = current_package_hash();
+    let Some(hash) = current_package_hash() else { return };
     let state = make_state(&[("s", b"DATA", &hash)]);
     *state.pending_timeout.lock().unwrap() = std::time::Duration::from_secs(1);
     let _session = mount_fs(state, dir.path());
@@ -213,7 +245,7 @@ fn e2e_readdir_lists_secrets() {
     }
     let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
-    let hash = current_package_hash();
+    let Some(hash) = current_package_hash() else { return };
     let state = make_state(&[
         ("alpha", b"A", &hash),
         ("beta", b"BB", &hash),
@@ -238,7 +270,7 @@ fn e2e_getattr_reports_size() {
     }
     let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
-    let hash = current_package_hash();
+    let Some(hash) = current_package_hash() else { return };
     let state = make_state(&[("s", b"1234567890", &hash)]);
     let _session = mount_fs(state, dir.path());
 
@@ -278,7 +310,7 @@ fn e2e_dynamic_add_visible() {
     }
     let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
-    let hash = current_package_hash();
+    let Some(hash) = current_package_hash() else { return };
     let state = make_state(&[]);
     let state_handle = std::sync::Arc::clone(&state);
     let _session = mount_fs(state, dir.path());
@@ -301,7 +333,7 @@ fn e2e_reset_allows_reread() {
     }
     let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
-    let hash = current_package_hash();
+    let Some(hash) = current_package_hash() else { return };
     let state = make_state(&[("s", b"DATA", &hash)]);
     *state.pending_timeout.lock().unwrap() = std::time::Duration::from_secs(1);
     let state_handle = std::sync::Arc::clone(&state);
@@ -331,7 +363,7 @@ fn e2e_multiple_secrets_independent() {
     }
     let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
-    let hash = current_package_hash();
+    let Some(hash) = current_package_hash() else { return };
     let state = make_state(&[
         ("a", b"AAA", &hash),
         ("b", b"BBB", &hash),
@@ -356,7 +388,7 @@ fn e2e_symlink_to_fuse_file() {
     let _serial = serial();
     let mount = tempfile::tempdir().unwrap();
     let staging = tempfile::tempdir().unwrap();
-    let hash = current_package_hash();
+    let Some(hash) = current_package_hash() else { return };
     let state = make_state(&[("key", b"SECRET_KEY_DATA", &hash)]);
     let _session = mount_fs(state, mount.path());
 
@@ -377,7 +409,7 @@ fn e2e_root_is_directory() {
     }
     let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
-    let hash = current_package_hash();
+    let Some(hash) = current_package_hash() else { return };
     let state = make_state(&[("s", b"x", &hash)]);
     let _session = mount_fs(state, dir.path());
 
@@ -394,7 +426,7 @@ fn e2e_pending_does_not_block_other_reads() {
     }
     let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
-    let _hash = current_package_hash();
+    let Some(_hash) = current_package_hash() else { return };
     let state = make_state(&[
         // "blocked" has a wrong hash → read triggers pending
         ("blocked", b"BLOCKED_DATA", "wrong_hash"),
@@ -459,7 +491,7 @@ fn e2e_source_mode_is_passed_through() {
     }
     let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
-    let hash = current_package_hash();
+    let Some(hash) = current_package_hash() else { return };
     let state = ServerState::new();
     // 0600 on the source → presented as 0400 (write bits masked).
     state.add_with_mode("key", b"MODEDATA".to_vec(), &hash, 0o600);
@@ -480,6 +512,9 @@ fn e2e_source_mode_is_passed_through() {
 fn e2e_ld_preload_changes_package_hash_and_is_denied() {
     if !fuse_available() {
         return;
+    }
+    if !hashing_available() {
+        return; // the whole point is computing package hashes
     }
     let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
@@ -555,6 +590,9 @@ fn e2e_ld_preload_changes_package_hash_and_is_denied() {
 fn e2e_grant_forever_full_flow() {
     if !fuse_available() {
         return;
+    }
+    if !hashing_available() {
+        return; // grant-forever needs an observable package hash
     }
     let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
@@ -638,6 +676,9 @@ fn e2e_grant_forever_full_flow() {
 fn e2e_package_hash_works_with_deleted_mapped_library() {
     if !fuse_available() {
         return;
+    }
+    if !hashing_available() {
+        return; // hashes a live child's deleted mapping
     }
     let _serial = serial();
     let art = tempfile::tempdir().unwrap();

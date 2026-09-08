@@ -84,6 +84,9 @@ fn main() {
                 }
                 Err(e) => {
                     eprintln!("Error: {e}");
+                    if fuse_protocol::hashd::is_unprivileged_error(&e) {
+                        eprintln!("{}", fuse_protocol::hashd::remediation());
+                    }
                     std::process::exit(1);
                 }
             }

@@ -545,6 +545,9 @@ fn service(
             match failure {
                 Some(e) => {
                     tracing::warn!("pending action '{name}' failed: {e}");
+                    if fuse_protocol::hashd::is_unprivileged_error(&e) {
+                        tracing::warn!("{}", fuse_protocol::hashd::remediation());
+                    }
                     *error.lock().unwrap() = Some(format!("{name}: {e}"));
                 }
                 None => {

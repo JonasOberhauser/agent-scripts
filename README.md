@@ -222,6 +222,31 @@ Options:
       --restart-container           Recreate the persistent container from scratch
 ```
 
+## hashd — privileged package-hash helper
+
+`hashd` answers one question over a unix socket — *the SHA-256 of a
+process's loaded package* — so the deliberately-unprivileged fuse-server
+can compute reader hashes for grant-forever. Following
+`/proc/<pid>/map_files` (the only TOCTOU-safe source) requires
+`CAP_SYS_ADMIN` or `CAP_CHECKPOINT_RESTORE` in the *initial* user
+namespace; the server escalates to hashd when it cannot hash locally,
+and pendings carry hashd's structured errors so the client can print
+remediation:
+
+```text
+fuse-client grant-forever 7
+Error: pending access 7 has no package hash — ... hashd: insufficient privileges ...
+hashd is running without the capability the kernel demands ...
+  sudo install -m 644 fuse-hashd.socket fuse-hashd.service /etc/systemd/system/
+  sudo systemctl daemon-reload && sudo systemctl enable --now fuse-hashd.socket
+Or run hashd privileged only until its next restart:
+  sudo systemd-run --unit=fuse-hashd <hashd-binary> --socket /run/fuse-hashd.sock
+```
+
+Permanent mode is socket activation: root once at install, systemd owns
+the socket, the service runs as an unprivileged user with exactly one
+capability. No polkit anywhere.
+
 ## Project layout
 
 ```

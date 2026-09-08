@@ -34,7 +34,7 @@ cargo test -p fuse-server                # fuse-server only (unit)
 cargo clippy --workspace                 # zero warnings required
 ```
 
-The workspace has four crates: `fuse-protocol`, `fuse-server`, `fuse-client`, `run-agent`.
+The workspace has five crates: `fuse-protocol`, `fuse-server`, `fuse-client`, `run-agent`, `hashd`.
 
 ## Architecture
 
@@ -48,6 +48,11 @@ The workspace has four crates: `fuse-protocol`, `fuse-server`, `fuse-client`, `r
   socket server.
 - **fuse-protocol**: Shared types, `SystemIo` trait, `RealSystemIo` /
   `MockSystemIo` implementations.
+- **hashd**: Tiny socket-activated helper (`pid → sha256 of its loaded
+  package`) so the unprivileged fuse-server can hash readers; needs
+  CAP_CHECKPOINT_RESTORE in the initial user namespace (kernel
+  `fs/proc/base.c` gate on `/proc/<pid>/map_files`). Protocol and
+  deployment modes: see `crates/hashd` docs and `fuse_protocol::hashd`.
 
 ## Testing Philosophy
 

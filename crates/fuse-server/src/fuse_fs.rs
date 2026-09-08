@@ -388,6 +388,42 @@ impl<S: SystemIo> GatekeeperFs<S> {
     }
 }
 
+/// Compute a reader's package hash, escalating to hashd when this
+/// (unprivileged) server cannot hash locally.
+///
+/// Order of attempts:
+/// 1. locally — works when the server itself holds the capability
+///    (privileged deployments; unchanged behavior);
+/// 2. hashd   — when the local attempt failed, ask the helper. Its
+///    `Unprivileged` answer (helper itself lacks the capability) and any
+///    other error are recorded verbatim as the pending's `hash_error`,
+///    which the client surfaces with remediation.
+fn compute_pid_hash(pid: u32) -> (Option<String>, Option<String>) {
+    match fuse_protocol::RealSystemIo::new().sha256_process_package(pid) {
+        Ok(h) => (Some(h), None),
+        Err(local_err) => {
+            let socket = std::env::var("FUSE_HASHD_SOCK")
+                .unwrap_or_else(|_| fuse_protocol::hashd::DEFAULT_SOCK.to_string());
+            match fuse_protocol::hashd::ask(&socket, pid) {
+                Ok(h) => (Some(h), None),
+                Err(hashd_err) => {
+                    let hash_error = match &hashd_err {
+                        fuse_protocol::hashd::HashdError::Unreachable(_) => {
+                            // No helper at all: report the LOCAL failure
+                            // (capability/path diagnosis), not the missing
+                            // helper — the server alone was asked first.
+                            local_err.to_string()
+                        }
+                        other => other.to_string(),
+                    };
+                    warn!("Could not hash /proc/{pid}/exe locally ({local_err}); hashd: {hashd_err}");
+                    (None, Some(hash_error))
+                }
+            }
+        }
+    }
+}
+
 /// Core read logic — runs in a spawned thread. Returns data or error.
 fn read_worker(
     state: &Arc<ServerState>,
@@ -398,15 +434,7 @@ fn read_worker(
 ) -> Result<Vec<u8>, i32> {
     let off = offset.max(0) as usize;
 
-    let (pid_hash, hash_error) = match fuse_protocol::RealSystemIo::new()
-        .sha256_process_package(pid)
-    {
-        Ok(h) => (Some(h), None),
-        Err(e) => {
-            warn!("Could not hash /proc/{pid}/exe: {e}");
-            (None, Some(e.to_string()))
-        }
-    };
+    let (pid_hash, hash_error) = compute_pid_hash(pid);
 
     let outcome = state.attempt_read(name, pid, pid_hash.as_deref(), off, size as usize);
 
