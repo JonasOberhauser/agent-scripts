@@ -29,6 +29,13 @@ pub struct PendingAccessInfo {
     pub process_name: Option<String>,
     pub pid: u32,
     pub pid_hash: Option<String>,
+    /// Why `pid_hash` is absent, when the server knows: the package-hash
+    /// inspection of the reading process failed with this error (e.g.
+    /// process invisible from the server's PID namespace, or /proc maps
+    /// unreadable due to ptrace/SELinux restrictions). Additive field:
+    /// servers that predate it simply omit it.
+    #[serde(default)]
+    pub pid_hash_error: Option<String>,
     pub reason: String,
     /// Unix timestamp (seconds) when this request expires.
     pub expires_at: u64,
@@ -132,4 +139,46 @@ pub enum Response {
     Version { version: String },
     /// Server's log file path.
     LogPath { path: String },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PendingAccessInfo;
+
+    /// Wire compatibility: the `pid_hash_error` field is additive — a
+    /// payload from a server that predates it (no field at all) must
+    /// deserialize with the field defaulting to None.
+    #[test]
+    fn pending_info_deserializes_without_the_hash_error_field() {
+        let old = r#"{
+            "id": 5,
+            "secret_name": "s",
+            "process_name": "gh-curl",
+            "pid": 42,
+            "pid_hash": null,
+            "reason": "read request",
+            "expires_at": 99
+        }"#;
+        let info: PendingAccessInfo = serde_json::from_str(old).expect("old payload parses");
+        assert_eq!(info.id, 5);
+        assert_eq!(info.pid_hash_error, None, "absent field defaults to None");
+    }
+
+    #[test]
+    fn pending_info_round_trips_the_hash_error() {
+        let info = PendingAccessInfo {
+            id: 6,
+            secret_name: "s".into(),
+            process_name: None,
+            pid: 7,
+            pid_hash: None,
+            pid_hash_error: Some("read /proc/7/maps: Permission denied".into()),
+            reason: "r".into(),
+            expires_at: 1,
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        let back: PendingAccessInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, info);
+        assert!(json.contains("pid_hash_error"));
+    }
 }
