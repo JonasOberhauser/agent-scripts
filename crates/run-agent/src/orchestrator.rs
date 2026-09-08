@@ -1145,6 +1145,29 @@ mod tests {
     }
 
     #[test]
+    fn pending_only_hash_flows_through_add() {
+        // The add command the orchestrator dispatches must carry the
+        // sentinel — no real digest can match it downstream.
+        let mut mock = base_mock().with_file("/home/user/secrets.yaml", b"DATA");
+        let mut cfg = test_config();
+        cfg.binary_hash = fuse_protocol::PENDING_ONLY_HASH.into();
+        let sent: std::cell::RefCell<Vec<String>> = Default::default();
+        let captured = &sent;
+        let _ = run_agent(&mut mock, &cfg, &|name, args| {
+            if name == "add" {
+                captured.borrow_mut().push(args.to_string());
+            }
+            Ok(())
+        }, false)
+        .unwrap();
+        let adds = sent.borrow();
+        assert!(
+            adds.iter().any(|a| a.contains(fuse_protocol::PENDING_ONLY_HASH)),
+            "sentinel must be sent to the server: {adds:?}"
+        );
+    }
+
+    #[test]
     fn no_secrets_works() {
         let mut cfg = test_config();
         cfg.secrets = vec![];

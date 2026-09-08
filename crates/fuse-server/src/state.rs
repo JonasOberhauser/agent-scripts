@@ -503,6 +503,27 @@ mod tests {
     }
 
     #[test]
+    fn pending_only_hash_never_grants_but_grant_forever_works() {
+        // Issue #2: secrets hosted without a binary hash have zero
+        // permitted accesses — every read pends — and grant-forever can
+        // still whitelist the observed package afterwards.
+        let s = ServerState::new();
+        s.add("k", b"V".to_vec(), fuse_protocol::PENDING_ONLY_HASH);
+
+        assert!(matches!(
+            s.attempt_read("k", 1, Some("any_package"), 0, 1),
+            ReadOutcome::HashMismatch { .. }
+        ));
+        s.create_pending("k", 1, Some("pkg"), "hash mismatch", None);
+        let id = s.pending.iter().next().unwrap().id;
+        s.grant_pending_forever(id).unwrap();
+        match s.attempt_read("k", 1, Some("pkg"), 0, 1) {
+            ReadOutcome::Granted(d) => assert_eq!(d, b"V"),
+            other => panic!("post-grant read: {other:?}"),
+        }
+    }
+
+    #[test]
     fn grant_forever_unknown_id_errors() {
         let s = ServerState::new();
         assert!(s.grant_pending_forever(9999).is_err());

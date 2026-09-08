@@ -16,11 +16,14 @@ use tracing_subscriber::EnvFilter;
     about = "Launch a secure agent session: FUSE gatekeeper + container"
 )]
 struct Cli {
-    /// SHA-256 of the allowed agent binary.
-    binary_checksum: String,
-
     /// Guest subfolder under ~/.config/ (e.g. `goose`).
     agent_subfolder: String,
+
+    /// SHA-256 of the allowed agent binary.  Optional (issue #2):
+    /// without it, secrets are hosted with zero permitted accesses and
+    /// every read pends for manual approval via fuse-client.
+    #[arg(long)]
+    hash: Option<String>,
 
     /// Secret to serve through FUSE: HOST:CONTAINER.
     /// HOST is the real file/dir on the host; CONTAINER is an absolute path
@@ -121,12 +124,21 @@ fn main() -> ExitCode {
             std::process::exit(2);
         });
 
+    let no_hash = cli.hash.is_none();
     let mut config = AgentConfig::from_args(
-        &cli.binary_checksum,
+        cli.hash.as_deref().unwrap_or(fuse_protocol::PENDING_ONLY_HASH),
         secrets,
         &cli.agent_subfolder,
         &cli.container_args,
     );
+    if no_hash && !config.secrets.is_empty() {
+        eprintln!(
+            "Hosting {} secret(s) with NO binary hash: every read requires \
+             manual approval via fuse-client (grant / grant-forever). \
+             Re-run with a sha256 checksum to pre-approve a binary.",
+            config.secrets.len()
+        );
+    }
     config.fuse_server_path = resolve_fuse_server(&cli.fuse_server);
     config.socket_path = cli.socket;
     config.mount_point = cli.mount_point;
