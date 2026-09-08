@@ -38,8 +38,13 @@ fn map_files_hint(e: &std::io::Error) -> &'static str {
     match e.kind() {
         NotFound => "Mapped file unreachable in this mount namespace — a guest \
                      path that does not exist where the server runs.",
-        PermissionDenied => "Permission denied reading the mapped inode \
-                             (ptrace/SELinux restrictions on map_files).",
+        PermissionDenied => "Following /proc/<pid>/map_files requires \
+                             CAP_SYS_ADMIN or CAP_CHECKPOINT_RESTORE in the \
+                             INITIAL user namespace (kernel fs/proc/base.c, \
+                             proc_map_files_get_link) — not ptrace of the \
+                             target, and not a rootless user namespace. Run \
+                             the hashing process with one of those \
+                             capabilities (e.g. setcap cap_checkpoint_restore+ep).",
         _ => "The mapped file could not be read.",
     }
 }
@@ -754,7 +759,8 @@ mod tests {
         assert!(inspect_hint(&other).contains("could not be inspected"));
 
         assert!(map_files_hint(&notfound).contains("mount namespace"));
-        assert!(map_files_hint(&denied).contains("map_files"));
+        assert!(map_files_hint(&denied).contains("CAP_CHECKPOINT_RESTORE"));
+        assert!(map_files_hint(&denied).contains("INITIAL user namespace"));
         assert!(map_files_hint(&other).contains("could not be read"));
     }
 

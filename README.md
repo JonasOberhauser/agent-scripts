@@ -157,6 +157,15 @@ SHA-256 and serves the content exactly **once**.
 
 ## How the gatekeeper works
 
+> **Package hashing (grant-forever) needs capabilities.** Following
+> `/proc/<pid>/map_files` — the only TOCTOU-safe source for a reader's
+> loaded package — requires `CAP_SYS_ADMIN` or `CAP_CHECKPOINT_RESTORE`
+> in the *initial* user namespace (kernel `fs/proc/base.c`). Neither
+> ptrace rights nor a rootless user namespace suffice. Run fuse-server
+> with one of those, e.g.
+> `sudo setcap cap_checkpoint_restore+ep ./fuse-server`, and grant-forever
+> can whitelist observed package hashes.
+
 1. **Binary hash check** — when a process reads the mounted file, the server
    hashes `/proc/<pid>/exe` and compares it to the allowed hash. Mismatch →
    `EACCES`.
