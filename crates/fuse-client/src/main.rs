@@ -111,52 +111,23 @@ fn main() {
                 pending_layer::spawn_worker(cli.socket.clone(), pending.clone(), secrets, panel_error.clone());
             let mut display = servatui_display::Display::new();
 
-            // Drive the loop directly (Display::run's six lines, made
-            // explicit) so the panel can hold a writer into the shell's
-            // log window: BuiltinTui owns the log, run() would create it
-            // privately.
-            let builtin = std::rc::Rc::new(std::cell::RefCell::new(
-                servyi_servatui::tui::BuiltinTui::new(&cli.socket, &protocols),
-            ));
-            // Layers write into this queue; the frame callback drains it
-            // into the log window.  Keeps the layer 'static (no
-            // BuiltinTui lifetime infections) and stays single-threaded.
-            let log_queue: std::rc::Rc<std::cell::RefCell<Vec<String>>> =
+            // Supported log-window path (servatui >= 0.8.3): the panel
+            // pushes into the sink; Display::run drains it into the
+            // builtin log at the start of every frame.
+            let log_sink: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
                 Default::default();
-            let panel_log = std::rc::Rc::clone(&log_queue);
+            let panel_sink = std::sync::Arc::clone(&log_sink);
             let panel = pending_layer::PendingPanelLayer::new(
                 pending,
                 Box::new(talk),
                 panel_error,
             )
             .with_log_window(Box::new(move |line: &str| {
-                panel_log.borrow_mut().push(line.to_string());
+                panel_sink.lock().unwrap().push(line.to_string());
             }));
             display.add_layer(Box::new(panel));
-            display.attach_builtin(std::rc::Rc::clone(&builtin));
-            let display = std::cell::RefCell::new(display);
-            let drain = {
-                let builtin = std::rc::Rc::clone(&builtin);
-                let log_queue = std::rc::Rc::clone(&log_queue);
-                move || {
-                    let mut q = log_queue.borrow_mut();
-                    if q.is_empty() {
-                        return;
-                    }
-                    let mut tui = builtin.borrow_mut();
-                    for line in q.drain(..) {
-                        tui.state.log_lines.push(line);
-                    }
-                }
-            };
-            if let Err(e) = servyi_servatui::tui::run_tui_managed(
-                builtin,
-                |widgets| {
-                    drain();
-                    display.borrow_mut().frame(widgets)
-                },
-                |ev| display.borrow_mut().route_event(ev),
-            ) {
+            display.set_log_sink(log_sink);
+            if let Err(e) = display.run(&cli.socket, &protocols) {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
             }
