@@ -27,6 +27,7 @@ use fuse_protocol::{
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use ratatui::widgets::Wrap;
 use ratatui::widgets::Paragraph;
 use servatui_display::{DisplayLayer, EventResult, LayerCtx, StackIntent};
 use servyi_servatui::WidgetEntry;
@@ -39,7 +40,10 @@ const PANEL_NAME: &str = "fuse.pending_panel";
 const MAX_SHOWN: usize = 5;
 
 /// Total panel width in terminal columns.
-const PANEL_WIDTH: u16 = 42;
+// Wide enough for `id requester → p{pid}_s{n}_{file}` plus the three
+// buttons on one row (issue #19/#18: at 42 columns the combined text
+// truncated to ~12 display columns and the secret name vanished).
+const PANEL_WIDTH: u16 = 56;
 
 /// How often the panel polls the server for pending requests.
 const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
@@ -420,6 +424,32 @@ enum GridRow<'a> {
 /// Render one grid row: content left, the grant|deny button pair right
 /// (grant left, deny right). Request rows show `id name`; the all-row is
 /// buttons only. The cursor selection reverses the highlighted button.
+/// The too-small fallback text, derived from the single command table
+/// (never a hardcoded duplicate): the pending list command plus every
+/// command that completes pending-request ids.
+fn small_shell_hint() -> String {
+    let mut names: Vec<&str> = Vec::new();
+    for spec in fuse_protocol::COMMAND_TABLE {
+        let relevant = spec.name == "pending"
+            || matches!(spec.complete, fuse_protocol::Completer::PendingIds);
+        if relevant && !names.contains(&spec.name) {
+            names.push(spec.name);
+        }
+    }
+    let listed = names
+        .iter()
+        .map(|n| format!("'{n}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("use {listed} commands to deal with pending requests")
+}
+
+/// Who is requesting WHAT: the process plus the secret it wants
+/// (issue #19 — the panel used to show only the requester).
+fn requester_and_secret(req: &PendingAccessInfo) -> String {
+    format!("{} → {}", requester(req), req.secret_name)
+}
+
 fn grid_row_line(row: GridRow, width: u16, sel_here: Option<Sel>) -> Line<'static> {
     let all = matches!(row, GridRow::All);
     let (deny_l, grant_l) = if all { ("[deny all]", "[grant all]") } else { ("[deny]", "[grant]") };
@@ -433,7 +463,10 @@ fn grid_row_line(row: GridRow, width: u16, sel_here: Option<Sel>) -> Line<'stati
                 Style::default().add_modifier(Modifier::BOLD),
             ));
             let name_max = (width as usize).saturating_sub(4 + 1 + buttons_w);
-            spans.push(Span::raw(format!("{} ", truncate_pad(&requester(req), name_max))));
+            spans.push(Span::raw(format!(
+                "{} ",
+                truncate_pad(&requester_and_secret(req), name_max)
+            )));
         }
         GridRow::All => {}
     }
@@ -617,10 +650,19 @@ impl ButtonGrid {
 }
 
 /// The pending-request panel as a display layer.
+/// Writer into the shell's log window.
+pub(crate) type LogWindow = Box<dyn Fn(&str)>;
+
 pub(crate) struct PendingPanelLayer {
     pending: PendingIds,
     error: LastError,
     talk: Box<dyn ServerTalk>,
+    /// Writes a line into the shell's log window (the builtin TUI's
+    /// log area).  Optional: absent in tests that only assert layout.
+    log_window: Option<LogWindow>,
+    /// Latches when the shell first becomes too small; resets once it
+    /// is big enough again so a later shrink re-warns.
+    small_warned: std::cell::Cell<bool>,
     slots: Slots,
     cursor: Cursor,
     grid: ButtonGrid,
@@ -636,12 +678,20 @@ impl PendingPanelLayer {
             error,
             pending,
             talk,
+            log_window: None,
+            small_warned: std::cell::Cell::new(false),
             slots: empty_slots(),
             cursor: Cursor::All { grant: true },
             grid: ButtonGrid::default(),
             last_poll: None,
             seen: std::collections::HashSet::new(),
         }
+    }
+
+    /// Attach a writer into the shell's log window.
+    pub(crate) fn with_log_window(mut self, log: LogWindow) -> Self {
+        self.log_window = Some(log);
+        self
     }
 
     /// Press a button: dispatch its commands through the (non-blocking)
@@ -692,6 +742,33 @@ impl DisplayLayer for PendingPanelLayer {
         }
 
         let panel = panel_rect(ctx.terminal_area);
+        if panel.width < PANEL_WIDTH {
+            if !self.small_warned.replace(true) {
+                let warning = format!(
+                    "Warning: the shell is too small to support smooth \
+                     operation, please resize to at least {PANEL_WIDTH} columns"
+                );
+                tracing::warn!("{warning}");
+                if let Some(log) = &self.log_window {
+                    log(&warning);
+                }
+            }
+            // Minimal fallback: no rows, no buttons — just the hint that
+            // the CLI commands (from the single command table) work.
+            // Paragraph Wrap does the line breaking at the CURRENT shell
+            // dimensions — no manual splitting.
+            let hint = small_shell_hint();
+            let area = panel;
+            widgets.push(WidgetEntry {
+                name: PANEL_NAME,
+                widget: Box::new(
+                    Paragraph::new(hint).wrap(Wrap { trim: true }),
+                ),
+                area,
+            });
+            return intent;
+        }
+        self.small_warned.set(false);
         widgets.push(WidgetEntry {
             name: PANEL_NAME,
             widget: Box::new(Paragraph::new(title_line(
@@ -976,6 +1053,139 @@ mod tests {
             Cursor::All { grant: true },
             "up from the top wraps to the all-row"
         );
+    }
+
+    /// At the real panel width, the combined requester → secret text of
+    /// typical length is fully visible (not truncated to noise).
+    /// The fallback hint derives from the command table — no hardcoded
+    /// command names — and survives table changes.
+    #[test]
+    fn small_shell_hint_lists_table_commands() {
+        let hint = small_shell_hint();
+        assert!(hint.starts_with("use 'pending'"), "hint: {hint}");
+        assert!(hint.contains("'grant'"), "hint: {hint}");
+        assert!(hint.contains("'deny'"), "hint: {hint}");
+        assert!(hint.ends_with("to deal with pending requests"), "hint: {hint}");
+        for spec in fuse_protocol::COMMAND_TABLE {
+            if matches!(spec.complete, fuse_protocol::Completer::PendingIds) {
+                assert!(
+                    hint.contains(&format!("'{}'", spec.name)),
+                    "every pending command must appear: {hint}"
+                );
+            }
+        }
+    }
+
+    /// The too-small warning reaches the shell's LOG WINDOW via the
+    /// attached writer (and only on the big-to-small transition).
+    #[test]
+    fn small_shell_warning_writes_to_the_log_window() {
+        let logged: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = logged.clone();
+        let mut layer_obj = layer(Arc::new(Mutex::new(ids(&[31]))), Path::new("/x"))
+            .with_log_window(Box::new(move |line: &str| {
+                sink.lock().unwrap().push(line.to_string());
+            }));
+        let mut widgets = Vec::new();
+        let mut small = servatui_display::LayerCtx {
+            id: servatui_display::LayerId::BUILTIN,
+            color: Color::Reset,
+            terminal_area: Rect::new(0, 0, 40, 24),
+            my_widgets: &[],
+        };
+        layer_obj.on_overlay(&mut small, &mut widgets);
+        layer_obj.on_overlay(&mut small, &mut widgets);
+        assert_eq!(
+            logged.lock().unwrap().len(),
+            1,
+            "one-shot: re-arming only after a big frame"
+        );
+        assert!(logged.lock().unwrap()[0].contains("resize to at least"));
+        // Big frame re-arms; small frame warns again.
+        let mut big = servatui_display::LayerCtx {
+            id: servatui_display::LayerId::BUILTIN,
+            color: Color::Reset,
+            terminal_area: Rect::new(0, 0, 80, 24),
+            my_widgets: &[],
+        };
+        layer_obj.on_overlay(&mut big, &mut widgets);
+        layer_obj.on_overlay(&mut small, &mut widgets);
+        assert_eq!(logged.lock().unwrap().len(), 2, "re-warns after re-arm");
+    }
+
+    /// Below the minimum width the panel renders only the hint: no
+    /// rows, no clickable buttons.
+    #[test]
+    fn too_small_shell_shows_hint_not_buttons() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("panel.sock");
+        fake_server(&sock, vec![31]);
+
+        let pending: PendingIds = Arc::new(Mutex::new(ids(&[31])));
+        let mut display = servatui_display::Display::with_palette(Vec::new());
+        display.add_layer(Box::new(layer(pending, &sock)));
+        // Terminal narrower than PANEL_WIDTH.
+        let _ = display; // frame below needs the real overlay path.
+        let mut layer_obj = layer(Arc::new(Mutex::new(ids(&[31]))), Path::new("/x"));
+        let mut widgets = Vec::new();
+        let mut ctx = servatui_display::LayerCtx {
+            id: servatui_display::LayerId::BUILTIN,
+            color: Color::Reset,
+            terminal_area: Rect::new(0, 0, 40, 24),
+            my_widgets: &[],
+        };
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            layer_obj.on_overlay(&mut ctx, &mut widgets)
+        }));
+        let text: String = widgets
+            .iter()
+            .map(|w| w.name.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let _ = text;
+        let mut layer2 = layer(Arc::new(Mutex::new(ids(&[31]))), Path::new("/x"));
+        let mut w2 = Vec::new();
+        // Direct: too small → hint widgets exist, grid has no buttons.
+        let mut ctx2 = servatui_display::LayerCtx {
+            id: servatui_display::LayerId::BUILTIN,
+            color: Color::Reset,
+            terminal_area: Rect::new(0, 0, 40, 24),
+            my_widgets: &[],
+        };
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            layer2.on_overlay(&mut ctx2, &mut w2)
+        }));
+        assert!(
+            layer2.grid.children.is_empty(),
+            "no clickable buttons in the small-shell fallback"
+        );
+    }
+
+    #[test]
+    fn typical_request_line_fits_the_panel() {
+        let panel = panel_rect(Rect::new(0, 0, 80, 24));
+        let mut req = pending_info(31);
+        req.process_name = Some("goose".into());
+        req.secret_name = "p42_s0_auth.json".into();
+        let line = grid_row_line(GridRow::Request(&req), panel.width, None);
+        let text: String = line.spans.iter().map(|s| s.content.to_string()).collect();
+        assert!(
+            text.contains("goose → p42_s0_auth.json"),
+            "typical combo must be fully visible at width {}: {text:?}",
+            panel.width
+        );
+    }
+
+    #[test]
+    fn row_shows_the_requested_secret() {
+        // Issue #19: the panel must show what is requested, not just who.
+        let mut req = pending_info(7);
+        req.secret_name = "p4242_s0_auth.json".into();
+        req.process_name = Some("goose".into());
+        let line = grid_row_line(GridRow::Request(&req), 80, None);
+        let text: String = line.spans.iter().map(|s| s.content.to_string()).collect();
+        assert!(text.contains("goose"), "requester: {text:?}");
+        assert!(text.contains("auth.json"), "secret name: {text:?}");
     }
 
     #[test]

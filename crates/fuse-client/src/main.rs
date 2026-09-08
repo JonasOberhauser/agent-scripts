@@ -110,11 +110,23 @@ fn main() {
             let talk =
                 pending_layer::spawn_worker(cli.socket.clone(), pending.clone(), secrets, panel_error.clone());
             let mut display = servatui_display::Display::new();
-            display.add_layer(Box::new(pending_layer::PendingPanelLayer::new(
+
+            // Supported log-window path (servatui >= 0.8.3): the panel
+            // pushes into the sink; Display::run drains it into the
+            // builtin log at the start of every frame.
+            let log_sink: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+                Default::default();
+            let panel_sink = std::sync::Arc::clone(&log_sink);
+            let panel = pending_layer::PendingPanelLayer::new(
                 pending,
                 Box::new(talk),
                 panel_error,
-            )));
+            )
+            .with_log_window(Box::new(move |line: &str| {
+                panel_sink.lock().unwrap().push(line.to_string());
+            }));
+            display.add_layer(Box::new(panel));
+            display.set_log_sink(log_sink);
             if let Err(e) = display.run(&cli.socket, &protocols) {
                 eprintln!("Error: {e}");
                 std::process::exit(1);

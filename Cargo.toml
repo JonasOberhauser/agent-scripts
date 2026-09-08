@@ -17,8 +17,8 @@ fuse-protocol = { path = "crates/fuse-protocol" }
 fuse-server = { path = "crates/fuse-server" }
 fuse-client = { path = "crates/fuse-client" }
 run-agent = { path = "crates/run-agent" }
-servyi-servatui = { git = "https://github.com/servyi/servatui.git", default-features = false }
-servatui-display = { git = "https://github.com/servyi/servatui.git" }
+servyi-servatui = { git = "https://github.com/servyi/servatui.git", rev = "be753e5", default-features = false }
+servatui-display = { git = "https://github.com/servyi/servatui.git", rev = "be753e5" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 clap = { version = "4", features = ["derive", "env"] }
