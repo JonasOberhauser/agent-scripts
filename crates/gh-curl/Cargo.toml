@@ -10,5 +10,8 @@ name = "gh-curl"
 path = "src/main.rs"
 
 [dependencies]
-curl = "0.4"
+# static-curl + static-ssl: bundle libcurl and OpenSSL into the binary.
+# Deterministic linkage (no system libcurl/libssl) — reproducible builds
+# and a stable gatekeeper package hash.
+curl = { version = "0.4", features = ["static-curl", "static-ssl"] }
 url = "2"
