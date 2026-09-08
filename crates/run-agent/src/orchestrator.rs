@@ -510,6 +510,31 @@ pub(crate) struct LoadedSecret {
 /// - File + `/dir/name` → file placed at exact path
 /// - Dir + `/dest` → directory contents mapped under `dest/`
 /// - Dir + `/dest/` → same (contents mapped under `dest/`)
+///
+/// FUSE-visible secret name carrying the sanitized host file name
+/// (issue #18): recognizable in /fuse listings and pending requests,
+/// while the pid/counter prefix keeps it collision-free.
+fn secret_name(host: &Path, pid: u32, counter: usize) -> String {
+    let safe: String = host
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if safe.is_empty() {
+        format!("p{pid}_s{counter}")
+    } else {
+        format!("p{pid}_s{counter}_{safe}")
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn load_secret_recursive<S, F>(
     io: &mut S,
@@ -545,7 +570,11 @@ where
     // cp semantics: if container ends with '/', it's a directory destination.
     let dest = resolve_dest(host, container);
 
-    let fuse_name = format!("p{pid}_s{counter}");
+    // Names carry the host file name (issue #18): p{pid}_s{n}_{file}
+    // so /fuse listings and pending requests are recognizable.  The
+    // pid/counter prefix keeps names collision-free even when two
+    // secrets share a file name.
+    let fuse_name = secret_name(host, pid, *counter);
     *counter += 1;
 
     let args = format!("{} {} {}", fuse_name, host.display(), config.binary_hash);
@@ -1017,6 +1046,25 @@ mod tests {
     fn setup_script_empty_when_no_secrets() {
         let script = build_setup_script(&[]);
         assert!(script.is_empty());
+    }
+
+    // ── secret naming (#18) ────────────────────────────────────────
+
+    #[test]
+    fn secret_name_carries_the_host_file_name() {
+        let n = secret_name(Path::new("/home/u/.config/goose/auth.json"), 42, 0);
+        assert_eq!(n, "p42_s0_auth.json");
+    }
+
+    #[test]
+    fn secret_name_sanitizes_unsafe_characters() {
+        let n = secret_name(Path::new("/x/my key! v2.bin"), 7, 3);
+        assert_eq!(n, "p7_s3_my_key__v2.bin");
+    }
+
+    #[test]
+    fn secret_name_falls_back_when_no_file_name() {
+        assert_eq!(secret_name(Path::new("/"), 9, 1), "p9_s1");
     }
 
     // ── run_agent integration ────────────────────────────────────
