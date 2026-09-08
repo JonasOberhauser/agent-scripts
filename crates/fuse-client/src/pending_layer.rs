@@ -17,7 +17,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{Event, KeyCode, KeyEventKind, MouseEventKind};
 use fuse_protocol::{
@@ -38,6 +38,11 @@ const PANEL_NAME: &str = "fuse.pending_panel";
 
 /// How many request lines the panel shows at once.
 const MAX_SHOWN: usize = 5;
+
+/// How long a dispatched decision stays in flight without the poll
+/// confirming its consumption (poll cadence is 1s; a few round-trips
+/// of headroom, then the row un-grays rather than sticking).
+const IN_FLIGHT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Total panel width in terminal columns.
 // Wide enough for `id requester → p{pid}_s{n}_{file}` plus the three
@@ -398,6 +403,18 @@ fn truncate_pad(s: &str, max: usize) -> String {
 /// A button as colored brackets around plain text; the selected button
 /// is reversed instead, so the cursor stays obvious.
 fn button_spans(button: Button, selected: bool) -> Vec<Span<'static>> {
+    button_spans_styled(button, selected, false)
+}
+
+/// `disabled`: the request's decision is in flight — gray the whole
+/// button, never reverse-highlight it (issue #24).
+fn button_spans_styled(button: Button, selected: bool, disabled: bool) -> Vec<Span<'static>> {
+    if disabled {
+        return vec![Span::styled(
+            button.label().to_string(),
+            Style::default().fg(Color::DarkGray),
+        )];
+    }
     if selected {
         return vec![Span::styled(
             button.label().to_string(),
@@ -451,6 +468,15 @@ fn requester_and_secret(req: &PendingAccessInfo) -> String {
 }
 
 fn grid_row_line(row: GridRow, width: u16, sel_here: Option<Sel>) -> Line<'static> {
+    grid_row_line_styled(row, width, sel_here, false)
+}
+
+fn grid_row_line_styled(
+    row: GridRow,
+    width: u16,
+    sel_here: Option<Sel>,
+    disabled: bool,
+) -> Line<'static> {
     let all = matches!(row, GridRow::All);
     let (deny_l, grant_l) = if all { ("[deny all]", "[grant all]") } else { ("[deny]", "[grant]") };
     let forever_w = if all { 0 } else { "[forever]".len() + 1 };
@@ -476,14 +502,14 @@ fn grid_row_line(row: GridRow, width: u16, sel_here: Option<Sel>) -> Line<'stati
     )));
     let deny = if all { Button::DenyAll } else { Button::Deny { id: 0 } };
     let grant = if all { Button::GrantAll } else { Button::Grant { id: 0 } };
-    let sel = sel_here;
+    let sel = if disabled { None } else { sel_here };
     if let GridRow::Request(_) = row {
         spans.extend(button_spans(Button::GrantForever { id: 0 }, sel == Some(Sel::Forever)));
         spans.push(Span::raw(" "));
     }
-    spans.extend(button_spans(grant, sel == Some(Sel::Grant)));
+    spans.extend(button_spans_styled(grant, sel == Some(Sel::Grant), disabled));
     spans.push(Span::raw(" "));
-    spans.extend(button_spans(deny, sel == Some(Sel::Deny)));
+    spans.extend(button_spans_styled(deny, sel == Some(Sel::Deny), disabled));
     Line::from(spans)
 }
 
@@ -686,6 +712,11 @@ pub(crate) struct PendingPanelLayer {
     /// Latches when the shell first becomes too small; resets once it
     /// is big enough again so a later shrink re-warns.
     small_warned: std::cell::Cell<bool>,
+    /// Decisions dispatched but not yet confirmed by the server
+    /// (issue #24): request id -> dispatch time.  Rows gray out while
+    /// present; cleared when the poll snapshot drops the id or the
+    /// in-flight timeout passes.
+    in_flight: std::cell::RefCell<std::collections::HashMap<u64, Instant>>,
     slots: Slots,
     cursor: Cursor,
     grid: ButtonGrid,
@@ -703,6 +734,7 @@ impl PendingPanelLayer {
             talk,
             log_window: None,
             small_warned: std::cell::Cell::new(false),
+            in_flight: Default::default(),
             slots: empty_slots(),
             cursor: Cursor::All { grant: true },
             grid: ButtonGrid::default(),
@@ -720,8 +752,33 @@ impl PendingPanelLayer {
     /// Press a button: dispatch its commands through the (non-blocking)
     /// talk, then advance the cursor to the next request.
     fn press(&mut self, row: usize, button: Button) {
+        // A decision already in flight must not be dispatched again
+        // (issue #24): the server has it; the row stays grayed until
+        // the poll confirms consumption.  All-row buttons expand over
+        // the snapshot, so the same guard filters their expansion.
+        let in_flight_ids: Vec<u64> = self.in_flight.borrow().keys().copied().collect();
+        let already_sent = |command: &Command| match command {
+            Command::Grant { id } | Command::GrantForever { id } | Command::Deny { id } => {
+                in_flight_ids.contains(id)
+            }
+            _ => false,
+        };
+
         let snapshot = self.pending.lock().unwrap().clone();
-        for (name, command) in button.commands(&snapshot) {
+        let dispatch: Vec<(String, Command)> = button
+            .commands(&snapshot)
+            .into_iter()
+            .filter(|(_, command)| !already_sent(command))
+            .collect();
+        if dispatch.is_empty() {
+            return;
+        }
+        for (name, command) in dispatch {
+            if let Command::Grant { id } | Command::GrantForever { id } | Command::Deny { id } =
+                &command
+            {
+                self.in_flight.borrow_mut().insert(*id, Instant::now());
+            }
             self.talk
                 .request(&self.pending, PanelRequest::Action { name, command });
         }
@@ -744,6 +801,12 @@ impl DisplayLayer for PendingPanelLayer {
         // reconcile, new-request detection and the title count.
         let snapshot = self.pending.lock().unwrap().clone();
         sync_slots(&mut self.slots, &snapshot);
+        // Confirm in-flight decisions: once the server consumed a
+        // decision the request leaves the snapshot.  A timeout guards
+        // against a lost reply keeping a row grayed forever.
+        self.in_flight.borrow_mut().retain(|id, since| {
+            snapshot.iter().any(|p| p.id == *id) && since.elapsed() < IN_FLIGHT_TIMEOUT
+        });
         if let Cursor::Request { slot, .. } = self.cursor {
             if self.slots.get(slot).is_none_or(|s| s.is_none()) {
                 self.cursor = cursor_after_action(&self.slots, slot);
@@ -829,7 +892,8 @@ impl DisplayLayer for PendingPanelLayer {
                         Cursor::Request { slot, sel } if slot == i => Some(sel),
                         _ => None,
                     };
-                    grid_row_line(GridRow::Request(req), row.width, sel_here)
+                    let disabled = self.in_flight.borrow().contains_key(&req.id);
+                    grid_row_line_styled(GridRow::Request(req), row.width, sel_here, disabled)
                 }
             };
             widgets.push(WidgetEntry {
@@ -1097,6 +1161,92 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A dispatched decision blocks duplicate dispatch (same button or
+    /// the all-row expansion) until the poll confirms consumption (#24).
+    #[test]
+    fn in_flight_decision_blocks_duplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("panel.sock");
+        let seen = fake_server(&sock, vec![31]);
+
+        let pending: PendingIds = Arc::new(Mutex::new(ids(&[31])));
+        let mut display = servatui_display::Display::with_palette(Vec::new());
+        display.add_layer(Box::new(layer(pending, &sock)));
+        frame_with_pending(&mut display);
+
+        // Press Enter (grant 31), then Down + Enter (all-row grant-all,
+        // which would also target 31): only ONE dispatch for id 31.
+        assert!(display.route_event(&key(KeyCode::Down)), "swallowed");
+        assert!(display.route_event(&key(KeyCode::Enter)), "swallowed");
+        assert!(display.route_event(&key(KeyCode::Enter)), "swallowed");
+        let conversations = seen.lock().unwrap().clone();
+        let grants = conversations.iter().filter(|(n, _)| n == "grant").count();
+        assert_eq!(grants, 1, "duplicate dispatch must be blocked: {conversations:?}");
+    }
+
+    /// The row renders gray while its decision is in flight, and the
+    /// keyboard selection does not reverse-highlight a grayed button.
+    #[test]
+    fn in_flight_row_renders_gray() {
+        let line = grid_row_line_styled(
+            GridRow::Request(&pending_info(31)),
+            PANEL_WIDTH,
+            Some(Sel::Grant),
+            true,
+        );
+        assert!(
+            line.spans.iter().any(|s| s.style.fg == Some(Color::DarkGray)),
+            "grayed buttons expected: {line:?}"
+        );
+        assert!(
+            !line.spans
+                .iter()
+                .any(|s| s.style.add_modifier.contains(Modifier::REVERSED)),
+            "no selection highlight on a grayed row"
+        );
+    }
+
+    /// In-flight clears when the poll snapshot drops the request.
+    #[test]
+    fn in_flight_clears_when_request_disappears() {
+        let mut layer_obj = layer(Arc::new(Mutex::new(ids(&[31]))), Path::new("/x"));
+        let mut widgets = Vec::new();
+        let mut ctx = servatui_display::LayerCtx {
+            id: servatui_display::LayerId::BUILTIN,
+            color: Color::Reset,
+            terminal_area: Rect::new(0, 0, 80, 24),
+            my_widgets: &[],
+        };
+        layer_obj.on_overlay(&mut ctx, &mut widgets);
+        layer_obj.in_flight.borrow_mut().insert(31, Instant::now());
+        *layer_obj.pending.lock().unwrap() = Vec::new();
+        layer_obj.on_overlay(&mut ctx, &mut widgets);
+        assert!(
+            layer_obj.in_flight.borrow().is_empty(),
+            "consumed decision must clear in-flight"
+        );
+    }
+
+    /// In-flight times out so a lost reply cannot gray a row forever.
+    #[test]
+    fn in_flight_times_out() {
+        let mut layer_obj = layer(Arc::new(Mutex::new(ids(&[31]))), Path::new("/x"));
+        let mut widgets = Vec::new();
+        let mut ctx = servatui_display::LayerCtx {
+            id: servatui_display::LayerId::BUILTIN,
+            color: Color::Reset,
+            terminal_area: Rect::new(0, 0, 80, 24),
+            my_widgets: &[],
+        };
+        layer_obj.on_overlay(&mut ctx, &mut widgets);
+        layer_obj
+            .in_flight
+            .borrow_mut()
+            .insert(31, Instant::now() - IN_FLIGHT_TIMEOUT - Duration::from_secs(1));
+        layer_obj.on_overlay(&mut ctx, &mut widgets);
+        assert!(layer_obj.in_flight.borrow().is_empty(), "stale in-flight must expire");
     }
 
     /// The too-small warning reaches the shell's LOG WINDOW via the
