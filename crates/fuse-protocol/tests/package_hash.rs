@@ -158,72 +158,175 @@ fn ssh_client(listener: &TcpListener) -> Option<(Fixture, TcpStream)> {
     Some((fixture, conn))
 }
 
+// ── capability-sandbox hashing for every fixture ─────────────────
+//
+// The kernel denies following /proc/<pid>/map_files magic links to
+// UNPRIVILEGED callers — even a direct parent gets EPERM (observed on
+// stock Ubuntu CI runners, toolbox/container shells, everywhere without
+// capabilities; reading the maps TEXT is allowed, the magic links are
+// not).  Package hashing therefore only succeeds where the reader holds
+// the ptrace capability over the target.  `unshare --user
+// --map-root-user` is a rootless subcontainer whose mapped root holds
+// every capability INSIDE it — fixtures spawned in that same namespace
+// are hashable.  Every test that computes a package hash runs inside
+// one; unprivileged environments without userns skip loudly instead of
+// pretending.
+
+const INNER_MARKER_ENV: &str = "FUSE_PACKAGE_HASH_INNER";
+
+/// Inner half (re-exec'd under unshare): spawn the fixtures named in
+/// the comma-separated marker (curl / ssh_client / ssh_agent) and print
+/// one `INNER_HASH <case> <sha256> <exe>` line per instance.  A no-op
+/// during normal suite runs and for the ssh-agent test's "1" marker.
+#[test]
+fn inner_package_hash_case() {
+    let spec = match std::env::var(INNER_MARKER_ENV).as_deref() {
+        Ok(s) if !s.is_empty() && s != "1" => s.to_string(),
+        _ => return,
+    };
+    for case in spec.split(',') {
+        let fixture = match case {
+            "curl" => {
+                let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+                curl(&listener).map(|(f, _)| (f.pid(), f.exe().display().to_string()))
+            }
+            "ssh_client" => {
+                let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+                ssh_client(&listener).map(|(f, _)| (f.pid(), f.exe().display().to_string()))
+            }
+            "ssh_agent" => {
+                ssh_agent().map(|f| (f.pid(), f.exe().display().to_string()))
+            }
+            other => panic!("inner: unknown case {other:?}"),
+        };
+        let Some((pid, exe)) = fixture else {
+            eprintln!("INNER_MISSING {case}");
+            continue;
+        };
+        let hash = RealSystemIo::new()
+            .sha256_process_package(pid)
+            .unwrap_or_else(|e| panic!("inner {case}: {e}"));
+        println!("INNER_HASH {case} {hash} {exe}");
+    }
+}
+
+fn user_namespace_sandboxes_work() -> bool {
+    Command::new("unshare")
+        .args(["--user", "--map-root-user", "true"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// Run the inner hash case under a rootless capability sandbox and
+/// return `(case, hash, exe)` per requested fixture, in order.
+fn package_hashes_in_sandbox(spec: &str) -> Option<Vec<(String, String, String)>> {
+    let out = Command::new("unshare")
+        .args(["--user", "--map-root-user"])
+        .arg(std::env::current_exe().expect("current exe"))
+        .args(["--exact", "inner_package_hash_case", "--nocapture", "--test-threads=1"])
+        .env(INNER_MARKER_ENV, spec)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run unshare");
+    if !out.status.success() {
+        eprintln!(
+            "inner sandbox run failed:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<(String, String, String)> = stdout
+        .lines()
+        .filter_map(|l| l.split_once("INNER_HASH "))
+        .map(|(_, rest)| rest.trim().splitn(3, ' '))
+        .filter_map(|mut it| {
+            Some((
+                it.next()?.to_string(),
+                it.next()?.to_string(),
+                it.next()?.to_string(),
+            ))
+        })
+        .collect();
+    Some(lines)
+}
+
+/// Loud skip when this environment cannot create the sandbox.
+fn sandbox_available() -> bool {
+    if user_namespace_sandboxes_work() {
+        return true;
+    }
+    eprintln!(
+        "skip: user namespaces unavailable here (unshare -Ur) — \
+         package-hash tests need the rootless capability sandbox"
+    );
+    false
+}
+
 // ── curl ──────────────────────────────────────────────────────────
 
 /// The same binary's package hash is deterministic across independent
 /// instances.
 #[test]
 fn curl_package_hash_is_deterministic() {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let Some((curl1, _conn1)) = curl(&listener) else { return };
-    let Some((curl2, _conn2)) = curl(&listener) else { return };
-    let io = RealSystemIo::new();
-    let h1 = io
-        .sha256_process_package(curl1.pid())
-        .unwrap_or_else(|e| panic!("hash curl #1: {e}"));
-    let h2 = io
-        .sha256_process_package(curl2.pid())
-        .unwrap_or_else(|e| panic!("hash curl #2: {e}"));
-    assert_eq!(h1, h2, "same binary, same library set, same hash");
+    if !sandbox_available() {
+        return;
+    }
+    let hashes = package_hashes_in_sandbox("curl,curl").expect("sandbox run produces hashes");
+    assert_eq!(hashes.len(), 2, "one line per requested instance");
+    assert_eq!(hashes[0].1, hashes[1].1, "same binary, same library set, same hash");
 }
 
 /// The package hash covers the library closure: it must differ from
 /// the bare executable's sha256 (the old, pre-package hash).
 #[test]
 fn curl_package_hash_covers_libraries() {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let Some((c, _conn)) = curl(&listener) else { return };
-    let io = RealSystemIo::new();
-    let package = io
-        .sha256_process_package(c.pid())
-        .unwrap_or_else(|e| panic!("hash curl: {e}"));
-    let binary = io.sha256_file(c.exe()).expect("hash the curl binary file");
+    if !sandbox_available() {
+        return;
+    }
+    let hashes = package_hashes_in_sandbox("curl").expect("sandbox run produces hashes");
+    let (_, package, exe) = &hashes[0];
+    let binary = RealSystemIo::new()
+        .sha256_file(std::path::Path::new(exe))
+        .expect("hash the curl binary file");
     assert_ne!(
-        package, binary,
+        package, &binary,
         "the package hash must not collapse to the bare binary hash"
     );
 }
 
 // ── ssh client ────────────────────────────────────────────────────
 
-/// Unlike its hardened agent, the ssh client stays dumpable: its whole
-/// crypto closure (libcrypto, libc, ...) is hashable everywhere.
+/// The ssh client's whole crypto closure (libcrypto, libc, ...) hashes
+/// deterministically inside the capability sandbox.
 #[test]
 fn ssh_client_package_hash_is_deterministic() {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let Some((ssh1, _conn1)) = ssh_client(&listener) else { return };
-    let Some((ssh2, _conn2)) = ssh_client(&listener) else { return };
-    let io = RealSystemIo::new();
-    let h1 = io
-        .sha256_process_package(ssh1.pid())
-        .unwrap_or_else(|e| panic!("hash ssh #1: {e}"));
-    let h2 = io
-        .sha256_process_package(ssh2.pid())
-        .unwrap_or_else(|e| panic!("hash ssh #2: {e}"));
-    assert_eq!(h1, h2, "same binary, same library set, same hash");
+    if !sandbox_available() {
+        return;
+    }
+    let hashes =
+        package_hashes_in_sandbox("ssh_client,ssh_client").expect("sandbox run produces hashes");
+    assert_eq!(hashes.len(), 2, "one line per requested instance");
+    assert_eq!(hashes[0].1, hashes[1].1, "same binary, same library set, same hash");
 }
 
 #[test]
 fn ssh_client_package_hash_covers_libraries() {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let Some((s, _conn)) = ssh_client(&listener) else { return };
-    let io = RealSystemIo::new();
-    let package = io
-        .sha256_process_package(s.pid())
-        .unwrap_or_else(|e| panic!("hash ssh: {e}"));
-    let binary = io.sha256_file(s.exe()).expect("hash the ssh binary file");
+    if !sandbox_available() {
+        return;
+    }
+    let hashes = package_hashes_in_sandbox("ssh_client").expect("sandbox run produces hashes");
+    let (_, package, exe) = &hashes[0];
+    let binary = RealSystemIo::new()
+        .sha256_file(std::path::Path::new(exe))
+        .expect("hash the ssh binary file");
     assert_ne!(
-        package, binary,
+        package, &binary,
         "the package hash must not collapse to the bare binary hash"
     );
 }
@@ -231,17 +334,12 @@ fn ssh_client_package_hash_covers_libraries() {
 /// Two different network clients are two different packages.
 #[test]
 fn ssh_client_and_curl_packages_differ() {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let Some((c, _cconn)) = curl(&listener) else { return };
-    let Some((s, _sconn)) = ssh_client(&listener) else { return };
-    let io = RealSystemIo::new();
-    let curl_hash = io
-        .sha256_process_package(c.pid())
-        .unwrap_or_else(|e| panic!("hash curl: {e}"));
-    let ssh_hash = io
-        .sha256_process_package(s.pid())
-        .unwrap_or_else(|e| panic!("hash ssh: {e}"));
-    assert_ne!(curl_hash, ssh_hash, "ssh and curl are different packages");
+    if !sandbox_available() {
+        return;
+    }
+    let hashes = package_hashes_in_sandbox("ssh_client,curl").expect("sandbox run produces hashes");
+    assert_eq!(hashes.len(), 2);
+    assert_ne!(hashes[0].1, hashes[1].1, "ssh and curl are different packages");
 }
 
 // ── ssh-agent ─────────────────────────────────────────────────────
@@ -286,29 +384,13 @@ ssh_agent_hash_inside_capability_sandbox covers the agent"
 /// from curl's (a distinct program is a distinct package).
 #[test]
 fn curl_and_ssh_agent_packages_differ() {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let Some((c, _conn)) = curl(&listener) else { return };
-    let Some(agent) = ssh_agent() else { return };
-    let io = RealSystemIo::new();
-    let curl_hash = io
-        .sha256_process_package(c.pid())
-        .unwrap_or_else(|e| panic!("hash curl: {e}"));
-    match io.sha256_process_package(agent.pid()) {
-        Ok(agent_hash) => assert_ne!(
-            curl_hash, agent_hash,
-            "curl and ssh-agent are different packages"
-        ),
-        Err(e) => {
-            assert!(
-                e.to_string().contains("Permission denied"),
-                "unexpected failure hashing ssh-agent: {e}"
-            );
-            eprintln!(
-                "note: comparison skipped — direct ssh-agent hashing needs \
-CAP_SYS_PTRACE; see ssh_agent_hash_inside_capability_sandbox"
-            );
-        }
+    if !sandbox_available() {
+        return;
     }
+    let hashes =
+        package_hashes_in_sandbox("curl,ssh_agent").expect("sandbox run produces hashes");
+    assert_eq!(hashes.len(), 2);
+    assert_ne!(hashes[0].1, hashes[1].1, "curl and ssh-agent are different packages");
 }
 
 // ── ssh-agent inside a capability sandbox ─────────────────────────
@@ -321,8 +403,6 @@ CAP_SYS_PTRACE; see ssh_agent_hash_inside_capability_sandbox"
 // --map-root-user` is a rootless subcontainer whose mapped root holds
 // every capability INSIDE it, and an ssh-agent spawned in that same
 // namespace is hashable.  The test re-execs itself under unshare.
-
-const INNER_MARKER_ENV: &str = "FUSE_PACKAGE_HASH_INNER";
 
 /// Inner half (re-exec'd under unshare): hash ssh-agent from inside the
 /// capability sandbox and print the result for the outer half.  A
@@ -338,16 +418,6 @@ fn inner_ssh_agent_package_hash() {
         .sha256_process_package(agent.pid())
         .expect("inner: hash ssh-agent inside the sandbox");
     println!("INNER_AGENT_HASH: {hash}");
-}
-
-fn user_namespace_sandboxes_work() -> bool {
-    Command::new("unshare")
-        .args(["--user", "--map-root-user", "true"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
 }
 
 fn hash_ssh_agent_in_sandbox() -> Option<String> {
