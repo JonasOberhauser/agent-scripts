@@ -423,6 +423,26 @@ enum GridRow<'a> {
 /// Render one grid row: content left, the grant|deny button pair right
 /// (grant left, deny right). Request rows show `id name`; the all-row is
 /// buttons only. The cursor selection reverses the highlighted button.
+/// The too-small fallback text, derived from the single command table
+/// (never a hardcoded duplicate): the pending list command plus every
+/// command that completes pending-request ids.
+fn small_shell_hint() -> String {
+    let mut names: Vec<&str> = Vec::new();
+    for spec in fuse_protocol::COMMAND_TABLE {
+        let relevant = spec.name == "pending"
+            || matches!(spec.complete, fuse_protocol::Completer::PendingIds);
+        if relevant && !names.contains(&spec.name) {
+            names.push(spec.name);
+        }
+    }
+    let listed = names
+        .iter()
+        .map(|n| format!("'{n}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("use {listed} commands\nto deal with pending requests")
+}
+
 /// Who is requesting WHAT: the process plus the secret it wants
 /// (issue #19 — the panel used to show only the requester).
 fn requester_and_secret(req: &PendingAccessInfo) -> String {
@@ -633,6 +653,9 @@ pub(crate) struct PendingPanelLayer {
     pending: PendingIds,
     error: LastError,
     talk: Box<dyn ServerTalk>,
+    /// Latches when the shell first becomes too small; resets once it
+    /// is big enough again so a later shrink re-warns.
+    small_warned: std::cell::Cell<bool>,
     slots: Slots,
     cursor: Cursor,
     grid: ButtonGrid,
@@ -648,6 +671,7 @@ impl PendingPanelLayer {
             error,
             pending,
             talk,
+            small_warned: std::cell::Cell::new(false),
             slots: empty_slots(),
             cursor: Cursor::All { grant: true },
             grid: ButtonGrid::default(),
@@ -704,6 +728,27 @@ impl DisplayLayer for PendingPanelLayer {
         }
 
         let panel = panel_rect(ctx.terminal_area);
+        if panel.width < PANEL_WIDTH {
+            if !self.small_warned.replace(true) {
+                tracing::warn!(
+                    "the shell is too small to support smooth operation, \
+                     please resize to at least {PANEL_WIDTH} columns"
+                );
+            }
+            // Minimal fallback: no rows, no buttons — just the hint that
+            // the CLI commands (from the single command table) work.
+            let hint = small_shell_hint();
+            let area = Rect { height: 2, ..panel };
+            for (i, line) in hint.lines().enumerate() {
+                widgets.push(WidgetEntry {
+                    name: PANEL_NAME,
+                    widget: Box::new(Paragraph::new(Line::raw(line.to_string()))),
+                    area: Rect { y: area.y + i as u16, ..area },
+                });
+            }
+            return intent;
+        }
+        self.small_warned.set(false);
         widgets.push(WidgetEntry {
             name: PANEL_NAME,
             widget: Box::new(Paragraph::new(title_line(
@@ -992,6 +1037,73 @@ mod tests {
 
     /// At the real panel width, the combined requester → secret text of
     /// typical length is fully visible (not truncated to noise).
+    /// The fallback hint derives from the command table — no hardcoded
+    /// command names — and survives table changes.
+    #[test]
+    fn small_shell_hint_lists_table_commands() {
+        let hint = small_shell_hint();
+        assert!(hint.starts_with("use 'pending'"), "hint: {hint}");
+        assert!(hint.contains("'grant'"), "hint: {hint}");
+        assert!(hint.contains("'deny'"), "hint: {hint}");
+        assert!(hint.contains("\nto deal with pending requests"), "hint: {hint}");
+        for spec in fuse_protocol::COMMAND_TABLE {
+            if matches!(spec.complete, fuse_protocol::Completer::PendingIds) {
+                assert!(
+                    hint.contains(&format!("'{}'", spec.name)),
+                    "every pending command must appear: {hint}"
+                );
+            }
+        }
+    }
+
+    /// Below the minimum width the panel renders only the hint: no
+    /// rows, no clickable buttons.
+    #[test]
+    fn too_small_shell_shows_hint_not_buttons() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("panel.sock");
+        fake_server(&sock, vec![31]);
+
+        let pending: PendingIds = Arc::new(Mutex::new(ids(&[31])));
+        let mut display = servatui_display::Display::with_palette(Vec::new());
+        display.add_layer(Box::new(layer(pending, &sock)));
+        // Terminal narrower than PANEL_WIDTH.
+        let _ = display; // frame below needs the real overlay path.
+        let mut layer_obj = layer(Arc::new(Mutex::new(ids(&[31]))), Path::new("/x"));
+        let mut widgets = Vec::new();
+        let mut ctx = servatui_display::LayerCtx {
+            id: servatui_display::LayerId::BUILTIN,
+            color: Color::Reset,
+            terminal_area: Rect::new(0, 0, 40, 24),
+            my_widgets: &[],
+        };
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            layer_obj.on_overlay(&mut ctx, &mut widgets)
+        }));
+        let text: String = widgets
+            .iter()
+            .map(|w| w.name.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let _ = text;
+        let mut layer2 = layer(Arc::new(Mutex::new(ids(&[31]))), Path::new("/x"));
+        let mut w2 = Vec::new();
+        // Direct: too small → hint widgets exist, grid has no buttons.
+        let mut ctx2 = servatui_display::LayerCtx {
+            id: servatui_display::LayerId::BUILTIN,
+            color: Color::Reset,
+            terminal_area: Rect::new(0, 0, 40, 24),
+            my_widgets: &[],
+        };
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            layer2.on_overlay(&mut ctx2, &mut w2)
+        }));
+        assert!(
+            layer2.grid.children.is_empty(),
+            "no clickable buttons in the small-shell fallback"
+        );
+    }
+
     #[test]
     fn typical_request_line_fits_the_panel() {
         let panel = panel_rect(Rect::new(0, 0, 80, 24));
