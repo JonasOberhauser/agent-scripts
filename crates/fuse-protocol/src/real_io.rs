@@ -30,9 +30,9 @@ fn inspect_hint(e: &std::io::Error) -> &'static str {
     }
 }
 
-/// The map_files read (and its on-disk path fallback) both failed: either
-/// the ptrace permission above, or the mapped path does not resolve in the
-/// server's mount namespace (paths from a container guest rootfs).
+/// The map_files read (and its fallbacks) both failed: either the ptrace
+/// permission above, or the mapped path does not resolve in the server's
+/// mount namespace (paths from a container guest rootfs).
 fn map_files_hint(e: &std::io::Error) -> &'static str {
     use std::io::ErrorKind::*;
     match e.kind() {
@@ -42,6 +42,31 @@ fn map_files_hint(e: &std::io::Error) -> &'static str {
                              (ptrace/SELinux restrictions on map_files).",
         _ => "The mapped file could not be read.",
     }
+}
+
+/// Read the content of one mapping — DIRECTLY from the mapped inode, via
+/// the procfs magic links. `/proc/<pid>/map_files/<range>` (and
+/// `/proc/<pid>/exe` for the main binary) resolve to the exact inode the
+/// process has mapped, even after the on-disk file was replaced or
+/// unlinked. On-disk paths are NEVER consulted: re-reading a path can
+/// race with a swap (TOCTOU) and hash content the process is not
+/// actually running. If the magic link is unreadable, hashing fails
+/// closed — one-shot grants still work; grant-forever refuses.
+fn read_mapped_inode(pid: u32, range: &str, path: &Path) -> Result<Vec<u8>, IoError> {
+    let src = if range.is_empty() {
+        format!("/proc/{pid}/exe")
+    } else {
+        format!("/proc/{pid}/map_files/{range}")
+    };
+    std::fs::read(&src).map_err(|e| {
+        IoError(format!(
+            "read mapped {} via {src}: {e} — refusing to hash a package \
+             with unreadable mappings (on-disk paths are never consulted: \
+             they race with file swaps). {}",
+            path.display(),
+            map_files_hint(&e)
+        ))
+    })
 }
 
 fn parse_maps_line(line: &str) -> Result<Option<(String, PathBuf)>, String> {
@@ -267,16 +292,7 @@ impl SystemIo for RealSystemIo {
             // identically — a library-swap attack vector.  A failed
             // hash leaves the pending without a package hash: one-shot
             // grants still work, grant-forever refuses to whitelist.
-            let content = std::fs::read(format!("/proc/{pid}/map_files/{range}"))
-                .or_else(|_| std::fs::read(path))
-                .map_err(|e| {
-                    IoError(format!(
-                        "read mapped {}: {e} — refusing to hash a package \
-                         with unreadable mappings. {}",
-                        path.display(),
-                        map_files_hint(&e)
-                    ))
-                })?;
+            let content = read_mapped_inode(pid, range, path)?;
             hasher.update((content.len() as u64).to_le_bytes());
             hasher.update(&content);
         }
@@ -710,6 +726,19 @@ impl SystemIo for MockSystemIo {
 mod tests {
     use super::{inspect_hint, map_files_hint, parse_maps_line};
 
+    /// A dead pid fails closed AND names the procfs source it tried —
+    /// no on-disk path is ever consulted (TOCTOU: paths race with swaps).
+    #[test]
+    fn dead_pid_error_names_the_procfs_source() {
+        let io = super::RealSystemIo::new();
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        let err = io.sha256_process_package(pid).unwrap_err();
+        assert!(err.0.contains(&format!("/proc/{pid}/exe")), "{}", err.0);
+        assert!(err.0.contains("PID namespace"), "{}", err.0);
+    }
+
     /// The hints are the disambiguation surface shown in the pending
     /// panel: each errno class must name its distinct remediation.
     #[test]
@@ -727,23 +756,6 @@ mod tests {
         assert!(map_files_hint(&notfound).contains("mount namespace"));
         assert!(map_files_hint(&denied).contains("map_files"));
         assert!(map_files_hint(&other).contains("could not be read"));
-    }
-
-    /// A dead pid produces the ENOENT path: the error text must carry the
-    /// PID-namespace hint (the common cross-container case).
-    #[test]
-    fn dead_pid_error_names_the_pid_namespace_hint() {
-        let io = super::RealSystemIo::new();
-        let mut child = std::process::Command::new("true").spawn().unwrap();
-        let pid = child.id();
-        child.wait().unwrap();
-        let err = io.sha256_process_package(pid).unwrap_err();
-        assert!(
-            err.0.contains(&format!("/proc/{pid}/exe")),
-            "names the probe: {}",
-            err.0
-        );
-        assert!(err.0.contains("PID namespace"), "hints the cause: {}", err.0);
     }
 
     #[test]
