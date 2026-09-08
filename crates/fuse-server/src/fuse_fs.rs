@@ -30,6 +30,7 @@ fn open_pending_or_deny(
     name: &str,
     pid: u32,
     pid_hash: Option<&str>,
+    hash_error: Option<&str>,
     reason: &str,
 ) -> Option<(u64, Duration)> {
     let timeout = *state.pending_timeout.lock().unwrap();
@@ -37,7 +38,14 @@ fn open_pending_or_deny(
         warn!("Denied read of '{name}' by pid {pid}: {reason}");
         return None;
     }
-    let id = state.create_pending(name, pid, pid_hash, reason, process_name(pid).as_deref());
+    let id = state.create_pending_with_hash_error(
+        name,
+        pid,
+        pid_hash,
+        hash_error,
+        reason,
+        process_name(pid).as_deref(),
+    );
     warn!(
         "Access pending for '{name}' by pid {pid}: {reason} (id={id}). Waiting up to {}s for grant...",
         timeout.as_secs()
@@ -266,8 +274,16 @@ impl<S: SystemIo> GatekeeperFs<S> {
             ReadOutcome::NotFound => ReadResult::Error(libc::ENOENT),
             ReadOutcome::AlreadyAccessed | ReadOutcome::HashMismatch { .. } => {
                 let reason = outcome.denial_reason().expect("narrowed above");
-                let Some((id, timeout)) =
-                    open_pending_or_deny(&self.state, &name, pid, pid_hash, &reason)
+                let Some((id, timeout)) = open_pending_or_deny(
+                    &self.state,
+                    &name,
+                    pid,
+                    pid_hash,
+                    // The synchronous test path computes no package hash;
+                    // tests that need one call create_pending directly.
+                    None,
+                    &reason,
+                )
                 else {
                     return ReadResult::Error(libc::EACCES);
                 };
@@ -382,11 +398,13 @@ fn read_worker(
 ) -> Result<Vec<u8>, i32> {
     let off = offset.max(0) as usize;
 
-    let pid_hash = match fuse_protocol::RealSystemIo::new().sha256_process_package(pid) {
-        Ok(h) => Some(h),
+    let (pid_hash, hash_error) = match fuse_protocol::RealSystemIo::new()
+        .sha256_process_package(pid)
+    {
+        Ok(h) => (Some(h), None),
         Err(e) => {
             warn!("Could not hash /proc/{pid}/exe: {e}");
-            None
+            (None, Some(e.to_string()))
         }
     };
 
@@ -400,8 +418,14 @@ fn read_worker(
         ReadOutcome::NotFound => Err(libc::ENOENT),
         ReadOutcome::AlreadyAccessed | ReadOutcome::HashMismatch { .. } => {
             let reason = outcome.denial_reason().expect("narrowed above");
-            let Some((pending_id, timeout)) =
-                open_pending_or_deny(state, name, pid, pid_hash.as_deref(), &reason)
+            let Some((pending_id, timeout)) = open_pending_or_deny(
+                state,
+                name,
+                pid,
+                pid_hash.as_deref(),
+                hash_error.as_deref(),
+                &reason,
+            )
             else {
                 return Err(libc::EACCES);
             };

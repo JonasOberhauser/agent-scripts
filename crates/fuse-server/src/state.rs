@@ -29,6 +29,10 @@ pub struct PendingAccess {
     pub process_name: Option<String>,
     pub pid: u32,
     pub pid_hash: Option<String>,
+    /// Why the package-hash inspection failed when `pid_hash` is None —
+    /// shown to the human deciding a grant-forever, so the remediation
+    /// (pidns visibility, CAP_SYS_PTRACE, …) is actionable.
+    pub hash_error: Option<String>,
     pub reason: String,
     pub expires_at: Instant,
     pub granted: bool,
@@ -234,6 +238,28 @@ impl ServerState {
         reason: &str,
         process_name: Option<&str>,
     ) -> u64 {
+        self.create_pending_with_hash_error(
+            secret_name,
+            pid,
+            pid_hash,
+            None,
+            reason,
+            process_name,
+        )
+    }
+
+    /// Like [`Self::create_pending`], recording why a failed package-hash
+    /// inspection left `pid_hash` empty (surfaced by grant-forever).
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_pending_with_hash_error(
+        &self,
+        secret_name: &str,
+        pid: u32,
+        pid_hash: Option<&str>,
+        hash_error: Option<&str>,
+        reason: &str,
+        process_name: Option<&str>,
+    ) -> u64 {
         let id = self.next_pending_id.fetch_add(1, Ordering::SeqCst);
         self.pending.insert(id, PendingAccess {
             id,
@@ -241,6 +267,7 @@ impl ServerState {
             process_name: process_name.map(|s| s.to_string()),
             pid,
             pid_hash: pid_hash.map(|s| s.to_string()),
+            hash_error: hash_error.map(|s| s.to_string()),
             reason: reason.to_string(),
             expires_at: Instant::now() + *self.pending_timeout.lock().unwrap(),
             granted: false,
@@ -273,11 +300,18 @@ impl ServerState {
             let hash = entry
                 .pid_hash
                 .clone()
-                .ok_or_else(|| format!(
-                    "pending access {id} has no package hash — the reading process's \
-                     package could not be inspected (different PID namespace or unreadable \
-                     mappings), so there is nothing to whitelist"
-                ))?;
+                .ok_or_else(|| match &entry.hash_error {
+                    Some(why) => format!(
+                        "pending access {id} has no package hash — the reading \
+                         process's package could not be inspected: {why}"
+                    ),
+                    None => format!(
+                        "pending access {id} has no package hash — the reading \
+                         process's package could not be inspected (different PID \
+                         namespace or unreadable mappings), so there is nothing to \
+                         whitelist"
+                    ),
+                })?;
             (entry.secret_name.clone(), hash)
         };
         if let Some(rec_arc) = self.secrets.get(&secret_name).map(|e| Arc::clone(e.value())) {
@@ -336,6 +370,7 @@ impl ServerState {
                     process_name: p.process_name.clone(),
                     pid: p.pid,
                     pid_hash: p.pid_hash.clone(),
+                    pid_hash_error: p.hash_error.clone(),
                     reason: p.reason.clone(),
                     expires_at: unix_now + remaining,
                 }
@@ -500,6 +535,60 @@ mod tests {
             s.attempt_read("k", 9, Some("h2"), 0, 1),
             ReadOutcome::HashMismatch { .. }
         ));
+    }
+
+    /// grant-forever must NAME the recorded inspection failure, not the
+    /// generic "could not be inspected" — the whole point of carrying
+    /// `hash_error` is an actionable refusal.
+    #[test]
+    fn grant_forever_names_the_recorded_inspection_failure() {
+        let s = ServerState::new();
+        s.add("k", b"V".to_vec(), "h");
+        s.create_pending_with_hash_error(
+            "k",
+            42,
+            None,
+            Some(
+                "read /proc/42/maps: Permission denied. Permission denied: /proc \
+                 ptrace checks failed (SELinux? daemon lacks CAP_SYS_PTRACE? ...)",
+            ),
+            "hash mismatch",
+            None,
+        );
+        let id = s.pending.iter().next().unwrap().id;
+        let err = s.grant_pending_forever(id).unwrap_err();
+        assert!(err.contains("no package hash"), "got: {err}");
+        assert!(
+            err.contains("Permission denied"),
+            "the recorded reason must be embedded verbatim: {err}"
+        );
+        assert!(
+            !err.contains("different PID namespace or unreadable mappings"),
+            "with a recorded reason the generic text must not appear: {err}"
+        );
+    }
+
+    /// The recorded failure reaches the wire: `pending` responses carry
+    /// pid_hash_error so the client panel can disambiguate.
+    #[test]
+    fn list_pending_carries_the_hash_error() {
+        let s = ServerState::new();
+        s.add("k", b"V".to_vec(), "h");
+        s.create_pending_with_hash_error(
+            "k",
+            42,
+            None,
+            Some("read /proc/42/maps: Permission denied"),
+            "hash mismatch",
+            None,
+        );
+        let list = s.list_pending();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].pid_hash, None);
+        assert_eq!(
+            list[0].pid_hash_error.as_deref(),
+            Some("read /proc/42/maps: Permission denied")
+        );
     }
 
     #[test]

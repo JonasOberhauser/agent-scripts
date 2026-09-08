@@ -14,6 +14,66 @@ use crate::IoError;
 /// name them by — but every mandatory field is validated to exist, and
 /// the pathname is taken as the whole remainder of the line so paths
 /// containing spaces survive intact.
+/// Disambiguate why a /proc/<pid> inspection step failed, from the errno:
+/// each cause has a different remediation, and the pending panel shows
+/// this text to the human deciding the grant.
+fn inspect_hint(e: &std::io::Error) -> &'static str {
+    use std::io::ErrorKind::*;
+    match e.kind() {
+        NotFound => "The process is invisible from this server's PID namespace \
+                     (container guest without --pidns=host?) or has already exited.",
+        PermissionDenied => "Permission denied: /proc ptrace checks failed \
+                             (SELinux? daemon lacks CAP_SYS_PTRACE? uid mismatch?). \
+                             On the host check `getenforce`, yama ptrace_scope, \
+                             and run the daemon with CAP_SYS_PTRACE.",
+        _ => "The process could not be inspected.",
+    }
+}
+
+/// The map_files read (and its fallbacks) both failed: either the ptrace
+/// permission above, or the mapped path does not resolve in the server's
+/// mount namespace (paths from a container guest rootfs).
+fn map_files_hint(e: &std::io::Error) -> &'static str {
+    use std::io::ErrorKind::*;
+    match e.kind() {
+        NotFound => "Mapped file unreachable in this mount namespace — a guest \
+                     path that does not exist where the server runs.",
+        PermissionDenied => "Following /proc/<pid>/map_files requires \
+                             CAP_SYS_ADMIN or CAP_CHECKPOINT_RESTORE in the \
+                             INITIAL user namespace (kernel fs/proc/base.c, \
+                             proc_map_files_get_link) — not ptrace of the \
+                             target, and not a rootless user namespace. Run \
+                             the hashing process with one of those \
+                             capabilities (e.g. setcap cap_checkpoint_restore+ep).",
+        _ => "The mapped file could not be read.",
+    }
+}
+
+/// Read the content of one mapping — DIRECTLY from the mapped inode, via
+/// the procfs magic links. `/proc/<pid>/map_files/<range>` (and
+/// `/proc/<pid>/exe` for the main binary) resolve to the exact inode the
+/// process has mapped, even after the on-disk file was replaced or
+/// unlinked. On-disk paths are NEVER consulted: re-reading a path can
+/// race with a swap (TOCTOU) and hash content the process is not
+/// actually running. If the magic link is unreadable, hashing fails
+/// closed — one-shot grants still work; grant-forever refuses.
+fn read_mapped_inode(pid: u32, range: &str, path: &Path) -> Result<Vec<u8>, IoError> {
+    let src = if range.is_empty() {
+        format!("/proc/{pid}/exe")
+    } else {
+        format!("/proc/{pid}/map_files/{range}")
+    };
+    std::fs::read(&src).map_err(|e| {
+        IoError(format!(
+            "read mapped {} via {src}: {e} — refusing to hash a package \
+             with unreadable mappings (on-disk paths are never consulted: \
+             they race with file swaps). {}",
+            path.display(),
+            map_files_hint(&e)
+        ))
+    })
+}
+
 fn parse_maps_line(line: &str) -> Result<Option<(String, PathBuf)>, String> {
     const BAD: fn(&str) -> String = |l| format!("malformed maps line: {l:?}");
     let mut fields = line.splitn(6, ' ');
@@ -199,9 +259,7 @@ impl SystemIo for RealSystemIo {
         use sha2::{Digest, Sha256};
         let exe = std::fs::read_link(format!("/proc/{pid}/exe"))
             .map_err(|e| IoError(format!(
-                "read /proc/{pid}/exe: {e}. The process may be in a different PID \
-                 namespace — use --pidns=host on the container, or '*' as the \
-                 hash to skip verification"
+                "read /proc/{pid}/exe: {e}. {}", inspect_hint(&e)
             )))?;
         // Collect (mapping-range, path) pairs.  The range addresses the
         // exact mapped inode via /proc/<pid>/map_files/, which works
@@ -209,7 +267,9 @@ impl SystemIo for RealSystemIo {
         // (deleted-but-mapped libraries are common after updates).
         let mut entries: Vec<(String, PathBuf)> = vec![(String::new(), exe)];
         let maps = std::fs::read_to_string(format!("/proc/{pid}/maps"))
-            .map_err(|e| IoError(format!("read /proc/{pid}/maps: {e}")))?;
+            .map_err(|e| IoError(format!(
+                "read /proc/{pid}/maps: {e}. {}", inspect_hint(&e)
+            )))?;
         for line in maps.lines() {
             match parse_maps_line(line) {
                 // Pathless segments ([heap], [stack], [vvar], …) are
@@ -237,15 +297,7 @@ impl SystemIo for RealSystemIo {
             // identically — a library-swap attack vector.  A failed
             // hash leaves the pending without a package hash: one-shot
             // grants still work, grant-forever refuses to whitelist.
-            let content = std::fs::read(format!("/proc/{pid}/map_files/{range}"))
-                .or_else(|_| std::fs::read(path))
-                .map_err(|e| {
-                    IoError(format!(
-                        "read mapped {}: {e} — refusing to hash a package \
-                         with unreadable mappings",
-                        path.display()
-                    ))
-                })?;
+            let content = read_mapped_inode(pid, range, path)?;
             hasher.update((content.len() as u64).to_le_bytes());
             hasher.update(&content);
         }
@@ -677,7 +729,40 @@ impl SystemIo for MockSystemIo {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_maps_line;
+    use super::{inspect_hint, map_files_hint, parse_maps_line};
+
+    /// A dead pid fails closed AND names the procfs source it tried —
+    /// no on-disk path is ever consulted (TOCTOU: paths race with swaps).
+    #[test]
+    fn dead_pid_error_names_the_procfs_source() {
+        let io = super::RealSystemIo::new();
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        let err = io.sha256_process_package(pid).unwrap_err();
+        assert!(err.0.contains(&format!("/proc/{pid}/exe")), "{}", err.0);
+        assert!(err.0.contains("PID namespace"), "{}", err.0);
+    }
+
+    /// The hints are the disambiguation surface shown in the pending
+    /// panel: each errno class must name its distinct remediation.
+    #[test]
+    fn inspect_hints_disambiguate_by_errno() {
+        let notfound = std::io::Error::from_raw_os_error(libc::ENOENT);
+        let denied = std::io::Error::from_raw_os_error(libc::EACCES);
+        let other = std::io::Error::from_raw_os_error(libc::EIO);
+
+        assert!(inspect_hint(&notfound).contains("PID namespace"));
+        assert!(inspect_hint(&notfound).contains("--pidns=host"));
+        assert!(inspect_hint(&denied).contains("CAP_SYS_PTRACE"));
+        assert!(inspect_hint(&denied).contains("SELinux"));
+        assert!(inspect_hint(&other).contains("could not be inspected"));
+
+        assert!(map_files_hint(&notfound).contains("mount namespace"));
+        assert!(map_files_hint(&denied).contains("CAP_CHECKPOINT_RESTORE"));
+        assert!(map_files_hint(&denied).contains("INITIAL user namespace"));
+        assert!(map_files_hint(&other).contains("could not be read"));
+    }
 
     #[test]
     fn parses_file_backed_mapping_with_spaced_path() {
