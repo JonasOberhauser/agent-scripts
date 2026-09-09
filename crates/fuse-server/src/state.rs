@@ -8,7 +8,9 @@ use tracing::error;
 /// One secret file tracked by the gatekeeper.
 #[derive(Debug, Clone)]
 pub struct SecretRecord {
-    pub content: Vec<u8>,
+    /// Content lives in the data daemon (`fused`); the policy daemon
+    /// tracks only the size it adjudicates offsets against.
+    pub size: usize,
     pub allowed_hash: String,
     pub access_count: u64,
     pub reading_pid: Option<u32>,
@@ -40,7 +42,7 @@ pub struct PendingAccess {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ReadOutcome {
-    Granted(Vec<u8>),
+    Granted,
     AlreadyAccessed,
     HashMismatch { got: String, expected: String },
     NotFound,
@@ -56,7 +58,7 @@ impl ReadOutcome {
             ReadOutcome::HashMismatch { got, expected } => {
                 Some(format!("hash mismatch: got {got}, expected {expected}"))
             }
-            ReadOutcome::Granted(_) | ReadOutcome::NotFound => None,
+            ReadOutcome::Granted | ReadOutcome::NotFound => None,
         }
     }
 }
@@ -122,7 +124,7 @@ impl ServerState {
         self.secrets.insert(
             name.into(),
             Arc::new(Mutex::new(SecretRecord {
-                content,
+                size: content.len(),
                 allowed_hash: allowed_hash.into(),
                 access_count: 0,
                 reading_pid: None,
@@ -157,9 +159,9 @@ impl ServerState {
             if offset < rec.read_progress && !rec.unlimited_reads {
                 return ReadOutcome::AlreadyAccessed;
             }
-            let end = offset.saturating_add(size).min(rec.content.len());
+            let end = offset.saturating_add(size).min(rec.size);
             rec.read_progress = rec.read_progress.max(end);
-            return ReadOutcome::Granted(rec.content[offset..end].to_vec());
+            return ReadOutcome::Granted;
         }
 
         if rec.access_count > 0 && !rec.unlimited_reads {
@@ -175,9 +177,9 @@ impl ServerState {
         if hash_ok {
             rec.access_count += 1;
             rec.reading_pid = Some(pid);
-            let end = offset.saturating_add(size).min(rec.content.len());
+            let end = offset.saturating_add(size).min(rec.size);
             rec.read_progress = end;
-            ReadOutcome::Granted(rec.content[offset..end].to_vec())
+            ReadOutcome::Granted
         } else {
             ReadOutcome::HashMismatch {
                 got: pid_hash.unwrap_or("<unknown>").to_string(),
@@ -378,22 +380,19 @@ impl ServerState {
             .collect()
     }
 
-    pub fn force_grant_read(
-        &self,
-        name: &str,
-        pid: u32,
-        offset: usize,
-        size: usize,
-    ) -> Option<Vec<u8>> {
-        let entry = self.secrets.get(name)?;
+    /// Post-grant adjudication: a pending that was just granted may be
+    /// served regardless of hash — record the access (forward-only
+    /// progress by offset/size) and confirm the secret still exists.
+    pub fn granted_read(&self, name: &str, pid: u32, offset: usize, size: usize) -> bool {
+        let Some(entry) = self.secrets.get(name) else { return false; };
         let rec_arc = Arc::clone(entry.value());
         drop(entry);
         let mut rec = lock_secret(&rec_arc, name);
         rec.access_count += 1;
         rec.reading_pid = Some(pid);
-        let end = offset.saturating_add(size).min(rec.content.len());
+        let end = offset.saturating_add(size).min(rec.size);
         rec.read_progress = rec.read_progress.max(end);
-        Some(rec.content[offset..end].to_vec())
+        true
     }
 
     pub fn status(&self) -> Vec<fuse_protocol::SecretStatus> {
@@ -408,7 +407,7 @@ impl ServerState {
                 name: name.clone(),
                 access_count: rec.access_count,
                 allowed_hash: rec.allowed_hash.clone(),
-                size: rec.content.len(),
+                size: rec.size,
                 unlimited: rec.unlimited_reads,
             }
         }).collect()
@@ -424,7 +423,7 @@ impl ServerState {
             let rec = lock_secret(rec_arc, name);
             fuse_protocol::MountEntry {
                 name: name.clone(),
-                size: rec.content.len(),
+                size: rec.size,
             }
         }).collect()
     }
@@ -450,7 +449,7 @@ mod tests {
     fn first_read_with_correct_hash_grants() {
         let s = sample_state();
         let out = s.attempt_read("secrets.yaml", 100, Some("abc123"), 0, 1024);
-        assert_eq!(out, ReadOutcome::Granted(b"TOPSECRET".to_vec()));
+        assert_eq!(out, ReadOutcome::Granted);
     }
 
     #[test]
@@ -491,7 +490,7 @@ mod tests {
 
         for n in 0..5 {
             match s.attempt_read("k", 100 + n, Some("pkg_hash_abc"), 0, 1) {
-                ReadOutcome::Granted(d) => assert_eq!(d, b"V"),
+                ReadOutcome::Granted => {}
                 other => panic!("read {n} not granted: {other:?}"),
             }
         }
@@ -514,11 +513,11 @@ mod tests {
         s.grant_pending_forever(id).unwrap();
 
         match s.attempt_read("k", 7, Some("pkg"), 0, 3) {
-            ReadOutcome::Granted(d) => assert_eq!(d, b"VAL"),
+            ReadOutcome::Granted => {}
             other => panic!("first read: {other:?}"),
         }
         match s.attempt_read("k", 7, Some("pkg"), 0, 3) {
-            ReadOutcome::Granted(d) => assert_eq!(d, b"VAL"),
+            ReadOutcome::Granted => {}
             other => panic!("fresh re-read from offset 0: {other:?}"),
         }
     }
@@ -607,7 +606,7 @@ mod tests {
         let id = s.pending.iter().next().unwrap().id;
         s.grant_pending_forever(id).unwrap();
         match s.attempt_read("k", 1, Some("pkg"), 0, 1) {
-            ReadOutcome::Granted(d) => assert_eq!(d, b"V"),
+            ReadOutcome::Granted => {}
             other => panic!("post-grant read: {other:?}"),
         }
     }
@@ -624,7 +623,7 @@ mod tests {
         s.attempt_read("secrets.yaml", 100, Some("abc123"), 0, 1024);
         s.reset(Some("secrets.yaml"));
         let out = s.attempt_read("secrets.yaml", 100, Some("abc123"), 0, 1024);
-        assert_eq!(out, ReadOutcome::Granted(b"TOPSECRET".to_vec()));
+        assert_eq!(out, ReadOutcome::Granted);
     }
 
     #[test]
@@ -642,7 +641,7 @@ mod tests {
         let out = s.attempt_read("secrets.yaml", 100, Some("abc123"), 0, 1024);
         assert!(matches!(out, ReadOutcome::HashMismatch { .. }));
         let out = s.attempt_read("secrets.yaml", 100, Some("newhash"), 0, 1024);
-        assert_eq!(out, ReadOutcome::Granted(b"TOPSECRET".to_vec()));
+        assert_eq!(out, ReadOutcome::Granted);
     }
 
     #[test]
@@ -655,11 +654,11 @@ mod tests {
     fn multi_chunk_forward_reads_allowed() {
         let s = sample_state();
         let out1 = s.attempt_read("secrets.yaml", 42, Some("abc123"), 0, 4);
-        assert!(matches!(out1, ReadOutcome::Granted(_)));
+        assert!(matches!(out1, ReadOutcome::Granted));
         let out2 = s.attempt_read("secrets.yaml", 42, Some("abc123"), 4, 4);
-        assert!(matches!(out2, ReadOutcome::Granted(_)));
+        assert!(matches!(out2, ReadOutcome::Granted));
         let out3 = s.attempt_read("secrets.yaml", 42, Some("abc123"), 8, 4);
-        assert!(matches!(out3, ReadOutcome::Granted(_)));
+        assert!(matches!(out3, ReadOutcome::Granted));
         let (count, _, progress) = get_rec(&s, "secrets.yaml");
         assert_eq!(count, 1);
         assert_eq!(progress, 9);
@@ -686,7 +685,7 @@ mod tests {
         let s = sample_state();
         s.attempt_read("secrets.yaml", 42, Some("abc123"), 0, 9);
         let out = s.attempt_read("secrets.yaml", 42, Some("abc123"), 9, 4);
-        assert!(matches!(out, ReadOutcome::Granted(_)));
+        assert!(matches!(out, ReadOutcome::Granted));
     }
 
     #[test]
@@ -694,7 +693,7 @@ mod tests {
         let s = sample_state();
         s.attempt_read("secrets.yaml", 42, Some("abc123"), 0, 4);
         let out = s.attempt_read("secrets.yaml", 42, Some("totally_wrong"), 4, 4);
-        assert!(matches!(out, ReadOutcome::Granted(_)));
+        assert!(matches!(out, ReadOutcome::Granted));
     }
 
     #[test]
@@ -715,7 +714,7 @@ mod tests {
         let (_, _, progress) = get_rec(&s, "secrets.yaml");
         assert_eq!(progress, 0);
         let out = s.attempt_read("secrets.yaml", 42, Some("abc123"), 0, 4);
-        assert!(matches!(out, ReadOutcome::Granted(_)));
+        assert!(matches!(out, ReadOutcome::Granted));
     }
 
     #[test]
@@ -723,7 +722,7 @@ mod tests {
         let s = sample_state();
         for i in 0..9 {
             let out = s.attempt_read("secrets.yaml", 7, Some("abc123"), i, 1);
-            assert!(matches!(out, ReadOutcome::Granted(_)), "failed at offset {i}");
+            assert!(matches!(out, ReadOutcome::Granted), "failed at offset {i}");
         }
         let (count, _, _) = get_rec(&s, "secrets.yaml");
         assert_eq!(count, 1);
@@ -734,7 +733,7 @@ mod tests {
         let s = ServerState::new();
         s.add("s", b"DATA".to_vec(), "*");
         let out = s.attempt_read("s", 100, Some("any_hash_value"), 0, 1024);
-        assert!(matches!(out, ReadOutcome::Granted(_)));
+        assert!(matches!(out, ReadOutcome::Granted));
     }
 
     #[test]
@@ -742,7 +741,7 @@ mod tests {
         let s = ServerState::new();
         s.add("s", b"DATA".to_vec(), "*");
         let out = s.attempt_read("s", 100, None, 0, 1024);
-        assert!(matches!(out, ReadOutcome::Granted(_)));
+        assert!(matches!(out, ReadOutcome::Granted));
     }
 
     #[test]
@@ -762,7 +761,7 @@ mod tests {
         let out = s.attempt_read("s", 42, None, 0, 4);
         assert_eq!(out, ReadOutcome::AlreadyAccessed);
         let out = s.attempt_read("s", 42, None, 4, 4);
-        assert!(matches!(out, ReadOutcome::Granted(_)));
+        assert!(matches!(out, ReadOutcome::Granted));
     }
 
     #[test]

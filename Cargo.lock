@@ -371,6 +371,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "fuse-mount"
+version = "0.27.0"
+dependencies = [
+ "clap",
+ "fuse-protocol",
+ "fuser",
+ "libc",
+ "serde_json",
+ "tempfile",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "fuse-protocol"
 version = "0.27.0"
 dependencies = [

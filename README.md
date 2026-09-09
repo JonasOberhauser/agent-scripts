@@ -29,7 +29,8 @@ the counter to allow the next agent.
 | Crate | Binary | Role |
 |-------|--------|------|
 | `fuse-protocol` | — | Shared types, `IoProvider<I,O>` trait, `SystemIo`, `Transport` |
-| `fuse-server` | `fuse-server` | FUSE gatekeeper filesystem + Unix socket CRUD server |
+| `fuse-server` | `fuse-server` | POLICY daemon: decisions, pendings, grants, servatui command socket |
+| `fuse-mount` | `fused` | DATA daemon: secret bytes + FUSE mount; asks the policy daemon per read |
 | `fuse-client` | `fuse-client` | CLI that sends commands to the server (reset, status, ...) |
 | `run-agent` | `run-agent` | Orchestrator: starts server, launches container, auto-resets |
 
