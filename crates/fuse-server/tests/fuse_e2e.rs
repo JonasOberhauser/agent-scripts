@@ -284,6 +284,35 @@ fn e2e_source_mode_is_passed_through() {
 }
 
 #[test]
+fn e2e_source_mode_passthrough_masks_write_bits() {
+    if !fuse_available() { return; }
+    let _g = serial();
+    let split = Split::new("mode2", &[("s", b"X", "*")]);
+    // Dynamically add a secret whose source file is 0644: the view must
+    // present the read bits and MASK every write bit (read-only fs).
+    let src = tempfile::tempdir().unwrap();
+    let f = src.path().join("mode.secret");
+    std::fs::write(&f, b"M").unwrap();
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let out = split.client(&["add-secret", "m", "--file", &f.display().to_string(), "--hash", "*"]);
+    assert!(out.status.success(), "add failed: {}", write_out(&out));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Ok(md) = std::fs::metadata(split.path("m")) {
+            let mode = std::os::unix::fs::MetadataExt::mode(&md) & 0o777;
+            assert_eq!(
+                mode, 0o444,
+                "source 0644 must surface as read-only 0444, got {mode:o}"
+            );
+            break;
+        }
+        assert!(Instant::now() < deadline, "added secret never appeared");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
 fn e2e_statfs_works() {
     if !fuse_available() { return; }
     let _g = serial();
