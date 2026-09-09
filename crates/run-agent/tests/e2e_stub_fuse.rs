@@ -280,6 +280,7 @@ fn missing_default_image_fails_fast_before_podman_run() {
 }
 
 #[test]
+#[ignore = "needs real podman with registry egress; run with --ignored on a capable host"]
 fn fully_qualified_missing_image_handled_diagnosably() {
     assert!(
         Command::new("podman")
@@ -327,6 +328,7 @@ fn fully_qualified_missing_image_handled_diagnosably() {
 // ("Failed to create container"), on capable ones the container exists.
 
 #[test]
+#[ignore = "needs real podman with registry egress; run with --ignored on a capable host"]
 fn auto_yes_builds_trivial_image_and_reaches_creation() {
     assert!(
         Command::new("podman")

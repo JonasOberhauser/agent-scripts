@@ -243,6 +243,7 @@ fn output_text(out: &std::process::Output) -> String {
 // ── naive user: short image name, no TTY (issue #1) ─────────────
 
 #[test]
+#[ignore = "needs real podman + /dev/fuse; run with --ignored on a capable host"]
 fn e2e_short_image_name_survives_headless_on_empty_os() {
     require_environment("e2e_short_image_name_survives_headless_on_empty_os");
     let os = EmptyOs::new("repro");
@@ -280,6 +281,7 @@ fn e2e_short_image_name_survives_headless_on_empty_os() {
 // for TTY use — so the assertion is on creation, not overall exit).
 
 #[test]
+#[ignore = "needs real podman + /dev/fuse; run with --ignored on a capable host"]
 fn e2e_fully_qualified_image_creates_container_on_empty_os() {
     require_environment("e2e_fully_qualified_image_creates_container_on_empty_os");
     assert!(
@@ -325,6 +327,7 @@ fn e2e_fully_qualified_image_creates_container_on_empty_os() {
 // container must have been created.
 
 #[test]
+#[ignore = "needs real podman + /dev/fuse; run with --ignored on a capable host"]
 fn e2e_auto_build_creates_image_and_container() {
     require_environment("e2e_auto_build_creates_image_and_container");
     assert!(
