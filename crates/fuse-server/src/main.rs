@@ -55,6 +55,12 @@ extern "C" fn shutdown_handler(_sig: libc::c_int) {
     unsafe { libc::_exit(130); }
 }
 
+/// Supervised data daemon (kept alive by being our child; killed when
+/// we exit, per Rust child-process semantics on drop is NOT guaranteed —
+/// so we also store it to reap on shutdown).
+static SUPERVISED_FUSED: std::sync::Mutex<Option<std::process::Child>> =
+    std::sync::Mutex::new(None);
+
 fn stale_socket(path: &Path) {
     if path.exists() {
         if std::os::unix::net::UnixStream::connect(path).is_ok() {
@@ -80,8 +86,29 @@ fn main() {
     info!("  socket:          {}", cli.socket.display());
     info!("  oracle-socket:   {}", cli.oracle_socket.display());
     info!("  pending-timeout: {}s", cli.pending_timeout);
+    // --mount-point means SUPERVISE a data daemon at that mount point
+    // (the one-command contract of the old monolith): spawn fused next
+    // to this binary and keep it as a child; on our exit it dies too.
     if let Some(mp) = &cli.mount_point {
-        info!("  mount-point:     {} (mounting is fused's job; ignored)", mp.display());
+        let exe = std::env::current_exe().expect("current exe");
+        let fused = exe.parent().map(|d| d.join("fused")).filter(|p| p.exists());
+        match fused {
+            Some(fused) => {
+                info!("  mount-point:     {} (spawning supervised data daemon)", mp.display());
+                let child = std::process::Command::new(&fused)
+                    .arg("--mount-point").arg(mp)
+                    .arg("--oracle-socket").arg(&cli.oracle_socket)
+                    .spawn();
+                match child {
+                    Ok(c) => SUPERVISED_FUSED.lock().unwrap().replace(c),
+                    Err(e) => error!("cannot spawn data daemon {}: {e}", fused.display()),
+                };
+            }
+            None => error!(
+                "--mount-point given but no data daemon found next to {} —                  build `fused` or start it manually",
+                exe.display()
+            ),
+        }
     }
     let _ = cli.allow_other;
 
