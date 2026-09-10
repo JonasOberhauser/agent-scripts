@@ -1,0 +1,22 @@
+# /etc/systemd/system/fuse-hashd.socket
+#
+# Socket activation for the package-hash helper: root installs this ONCE;
+# from then on systemd owns the socket and starts the service whenever
+# anything connects. No polkit, no manual starts, no ambient machinery
+# in user sessions.
+#
+# Install together with fuse-hashd.service:
+#   sudo install -m 644 fuse-hashd.socket fuse-hashd.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now fuse-hashd.socket
+
+[Unit]
+Description=FUSE gatekeeper package-hash helper socket
+
+[Socket]
+ListenStream=/run/fuse-hashd.sock
+SocketMode=0660
+SocketUser=root
+SocketGroup=jonas
+
+[Install]
+WantedBy=sockets.target

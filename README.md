@@ -223,18 +223,27 @@ Options:
       --restart-container           Recreate the persistent container from scratch
 ```
 
-## Package hashing — not supported in the current version
+## Package hashing — optional hashd helper
 
-Reader package hashes (the input to grant-forever) would require
-following `/proc/<pid>/map_files`, which demands `CAP_SYS_ADMIN` or
+Reader package hashes (the input to grant-forever) require following
+`/proc/<pid>/map_files`, which demands `CAP_SYS_ADMIN` or
 `CAP_CHECKPOINT_RESTORE` in the *initial* user namespace — more
 privilege than the deliberately-unprivileged fuse-server may hold.
-The server still performs the hashd socket lookup and lets it fail
-(no hashd is shipped), and the refusal is deliberately bare:
+The server delegates to the optional `hashd` helper over
+`/run/fuse-hashd.sock`; with no hashd deployed the lookup fails and
+grant-forever answers with a deliberately bare refusal:
 
 ```text
 fuse-client grant-forever 7
 Error: forever grant is not supported in the current version.
+```
+
+Deploying the helper (root once at install; systemd owns the socket,
+the service carries exactly one capability; no polkit):
+
+```sh
+sudo install -m 644 crates/hashd/fuse-hashd.socket crates/hashd/fuse-hashd.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now fuse-hashd.socket
 ```
 
 The technical reason for a missing hash only goes to the server log.
