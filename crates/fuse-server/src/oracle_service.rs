@@ -80,25 +80,36 @@ impl OracleHub {
 
 /// Package hash for the reader, ALWAYS via the hashd helper: this
 /// daemon is deliberately unprivileged and must never touch
-/// `/proc/<pid>/map_files` itself (that is hashd's one job). A missing
-/// hashd is not an error to remediate in the pending — the user-facing
-/// story is that grant-forever is simply not supported in the current
-/// version; the technical reason only goes to the log.
+/// `/proc/<pid>/map_files` itself (that is hashd's one job). Failures
+/// carry the commands that fix them, so a pending shown to a human
+/// says what to run.
 fn compute_pid_hash(pid: u32) -> (Option<String>, Option<String>) {
     let socket = std::env::var("FUSE_HASHD_SOCK")
         .unwrap_or_else(|_| fuse_protocol::hashd::DEFAULT_SOCK.to_string());
     match fuse_protocol::hashd::ask(&socket, pid) {
         Ok(h) => (Some(h), None),
         Err(hashd_err) => {
+            let hash_error = fuse_protocol::hashd::actionable_error(
+                &hashd_err,
+                &socket,
+                sibling_hashd_binary().as_deref(),
+            );
             warn!("hashd ({socket}) could not hash pid {pid}: {hashd_err}");
-            (None, Some(NOT_SUPPORTED.to_string()))
+            (None, Some(hash_error))
         }
     }
 }
 
-/// The one user-facing sentence when a forever-grant is impossible:
-/// no per-cause remediation, no deployment instructions.
-pub const NOT_SUPPORTED: &str = "forever grant is not supported in the current version.";
+/// Where a hashd binary lives next to this server, so remediation can
+/// name a runnable command instead of a placeholder: cargo builds every
+/// workspace binary into the same target dir.
+fn sibling_hashd_binary() -> Option<String> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join("hashd")))
+        .filter(|p| p.exists())
+        .map(|p| p.display().to_string())
+}
 
 fn process_name(pid: u32) -> Option<String> {
     std::fs::read_to_string(format!("/proc/{pid}/comm"))

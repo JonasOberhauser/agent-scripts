@@ -231,11 +231,15 @@ Reader package hashes (the input to grant-forever) require following
 privilege than the deliberately-unprivileged fuse-server may hold.
 The server delegates to the optional `hashd` helper over
 `/run/fuse-hashd.sock`; with no hashd deployed the lookup fails and
-grant-forever answers with a deliberately bare refusal:
+grant-forever names the fix:
 
 ```text
 fuse-client grant-forever 7
-Error: forever grant is not supported in the current version.
+Error: pending access 7 has no package hash — hashd unreachable — No such file or directory (os error 2). Start hashd now:
+  sudo systemd-run --unit=fuse-hashd <hashd-binary> --socket /run/fuse-hashd.sock
+Or install it permanently (one-time, root):
+  sudo install -m 644 fuse-hashd.socket fuse-hashd.service /etc/systemd/system/
+  sudo systemctl daemon-reload && sudo systemctl enable --now fuse-hashd.socket
 ```
 
 Deploying the helper (root once at install; systemd owns the socket,

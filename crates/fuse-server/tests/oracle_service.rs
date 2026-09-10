@@ -153,12 +153,16 @@ fn wrong_hash_pends_and_carries_the_hash_error() {
     };
     // Hashing goes through hashd only. Either a hashd answered (it is
     // installed and this context is hashable) — or the pending carries
-    // the bare not-supported sentence, never remediation commands.
+    // a runnable command that starts one.
     if pid_hash.is_none() {
-        assert_eq!(
-            hash_error.as_deref(),
-            Some(fuse_server::oracle_service::NOT_SUPPORTED),
-            "hash failure must carry the bare not-supported message"
+        let why = hash_error.as_deref().unwrap_or("");
+        assert!(
+            why.contains("Start hashd now"),
+            "hash failure must name the fix, got: {why:?}"
+        );
+        assert!(
+            why.contains("systemd-run"),
+            "hash failure must embed a runnable start command, got: {why:?}"
         );
     } else {
         assert!(hash_error.is_none(), "hash present: no error expected");
