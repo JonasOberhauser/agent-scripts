@@ -34,7 +34,7 @@ cargo test -p fuse-server                # fuse-server only (unit)
 cargo clippy --workspace                 # zero warnings required
 ```
 
-The workspace has six crates: `fuse-protocol`, `fuse-server`, `fuse-client`, `run-agent`, `hashd`, `fuse-mount`.
+The workspace has five crates: `fuse-protocol`, `fuse-server`, `fuse-client`, `run-agent`, `fuse-mount`.
 
 ## Architecture
 
@@ -49,11 +49,10 @@ The workspace has six crates: `fuse-protocol`, `fuse-server`, `fuse-client`, `ru
 - **fuse-protocol**: Shared types, `SystemIo` trait, `RealSystemIo` /
   `MockSystemIo` implementations.
 - **fuse-mount** (`fused`): DATA daemon — holds the secret bytes and the FUSE mount; every read asks the policy daemon over the oracle socket. Either half alone is useless; the mount survives policy restarts.
-- **hashd**: Tiny socket-activated helper (`pid → sha256 of its loaded
-  package`) so the unprivileged fuse-server can hash readers; needs
-  CAP_CHECKPOINT_RESTORE in the initial user namespace (kernel
-  `fs/proc/base.c` gate on `/proc/<pid>/map_files`). Protocol and
-  deployment modes: see `crates/hashd` docs and `fuse_protocol::hashd`.
+- **package hashing**: NOT SUPPORTED in the current version. The server
+  still performs the (unshipped) hashd lookup via `fuse_protocol::hashd`
+  and lets it fail; grant-forever answers with a bare not-supported
+  message and the reason only goes to the server log.
 
 ## Testing Philosophy
 

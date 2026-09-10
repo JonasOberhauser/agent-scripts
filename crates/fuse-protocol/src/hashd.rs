@@ -1,8 +1,8 @@
-//! Client side of the hashd helper: `pid → package hash` over a unix
-//! socket, with machine-readable failure kinds so consumers can branch
-//! into remediation instead of guessing from strings.
+//! Client side of the hashd lookup: `pid → package hash` over a unix
+//! socket, with machine-readable failure kinds.
 //!
-//! See the `hashd` binary crate for the protocol and deployment modes.
+//! No hashd is shipped: the lookup is expected to fail in every
+//! deployment, and callers answer with a bare "not supported".
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -16,8 +16,7 @@ pub const DEFAULT_SOCK: &str = "/run/fuse-hashd.sock";
 pub enum HashdError {
     /// hashd answered, but it is running without the capability the
     /// kernel demands (CAP_SYS_ADMIN/CAP_CHECKPOINT_RESTORE in the
-    /// initial user namespace). The actionable case: clients should
-    /// print their remediation commands.
+    /// initial user namespace).
     Unprivileged(String),
     /// The target process vanished (exited or invisible).
     Gone(String),
@@ -83,27 +82,6 @@ pub fn parse_reply(line: &str) -> Result<String, HashdError> {
     Err(HashdError::Other(format!("malformed reply: {line:?}")))
 }
 
-/// The remediation text a client should print when hashd answered
-/// [`HashdError::Unprivileged`]: one permanent option (install the
-/// socket-activated unit — root once, systemd owns the socket and the
-/// service carries exactly one capability) and one transient option
-/// (privileged until hashd's next restart). No polkit involved either way.
-pub fn remediation() -> String {
-    format!(
-        "hashd is running without the capability the kernel demands \
-         (CAP_SYS_ADMIN or CAP_CHECKPOINT_RESTORE in the initial user \
-         namespace). Fix it permanently:\n\
-         \x20 sudo install -m 644 fuse-hashd.socket fuse-hashd.service /etc/systemd/system/\n\
-         \x20 sudo systemctl daemon-reload && sudo systemctl enable --now fuse-hashd.socket\n\
-         Or run hashd privileged only until its next restart:\n\
-         \x20 sudo systemd-run --unit=fuse-hashd <hashd-binary> --socket {DEFAULT_SOCK}"
-    )
-}
-
-/// Does an error message carry the unprivileged-hashd signature?
-pub fn is_unprivileged_error(msg: &str) -> bool {
-    msg.contains("hashd: insufficient privileges")
-}
 
 #[cfg(test)]
 mod tests {

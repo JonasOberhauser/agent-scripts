@@ -223,30 +223,21 @@ Options:
       --restart-container           Recreate the persistent container from scratch
 ```
 
-## hashd — privileged package-hash helper
+## Package hashing — not supported in the current version
 
-`hashd` answers one question over a unix socket — *the SHA-256 of a
-process's loaded package* — so the deliberately-unprivileged fuse-server
-can compute reader hashes for grant-forever. Following
-`/proc/<pid>/map_files` (the only TOCTOU-safe source) requires
-`CAP_SYS_ADMIN` or `CAP_CHECKPOINT_RESTORE` in the *initial* user
-namespace; the server escalates to hashd when it cannot hash locally,
-and pendings carry hashd's structured errors so the client can print
-remediation:
+Reader package hashes (the input to grant-forever) would require
+following `/proc/<pid>/map_files`, which demands `CAP_SYS_ADMIN` or
+`CAP_CHECKPOINT_RESTORE` in the *initial* user namespace — more
+privilege than the deliberately-unprivileged fuse-server may hold.
+The server still performs the hashd socket lookup and lets it fail
+(no hashd is shipped), and the refusal is deliberately bare:
 
 ```text
 fuse-client grant-forever 7
-Error: pending access 7 has no package hash — ... hashd: insufficient privileges ...
-hashd is running without the capability the kernel demands ...
-  sudo install -m 644 fuse-hashd.socket fuse-hashd.service /etc/systemd/system/
-  sudo systemctl daemon-reload && sudo systemctl enable --now fuse-hashd.socket
-Or run hashd privileged only until its next restart:
-  sudo systemd-run --unit=fuse-hashd <hashd-binary> --socket /run/fuse-hashd.sock
+Error: forever grant is not supported in the current version.
 ```
 
-Permanent mode is socket activation: root once at install, systemd owns
-the socket, the service runs as an unprivileged user with exactly one
-capability. No polkit anywhere.
+The technical reason for a missing hash only goes to the server log.
 
 ## Project layout
 

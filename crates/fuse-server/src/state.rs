@@ -33,9 +33,9 @@ pub struct PendingAccess {
     pub process_name: Option<String>,
     pub pid: u32,
     pub pid_hash: Option<String>,
-    /// Why the package-hash inspection failed when `pid_hash` is None —
-    /// shown to the human deciding a grant-forever, so the remediation
-    /// (pidns visibility, CAP_SYS_PTRACE, …) is actionable.
+    /// Why the package-hash lookup failed when `pid_hash` is None —
+    /// carried to the pending panel; with no hashd shipped this is the
+    /// bare not-supported sentence.
     pub hash_error: Option<String>,
     pub reason: String,
     pub expires_at: Instant,

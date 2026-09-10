@@ -467,13 +467,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "hashd"
-version = "0.27.0"
-dependencies = [
- "fuse-protocol",
-]
-
-[[package]]
 name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
