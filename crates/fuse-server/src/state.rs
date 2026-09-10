@@ -5,6 +5,8 @@ use std::time::{Duration, Instant};
 use dashmap::DashMap;
 use tracing::error;
 
+use crate::oracle_service::NOT_SUPPORTED;
+
 /// One secret file tracked by the gatekeeper.
 #[derive(Debug, Clone)]
 pub struct SecretRecord {
@@ -302,18 +304,7 @@ impl ServerState {
             let hash = entry
                 .pid_hash
                 .clone()
-                .ok_or_else(|| match &entry.hash_error {
-                    Some(why) => format!(
-                        "pending access {id} has no package hash — the reading \
-                         process's package could not be inspected: {why}"
-                    ),
-                    None => format!(
-                        "pending access {id} has no package hash — the reading \
-                         process's package could not be inspected (different PID \
-                         namespace or unreadable mappings), so there is nothing to \
-                         whitelist"
-                    ),
-                })?;
+                .ok_or_else(|| NOT_SUPPORTED.to_string())?;
             (entry.secret_name.clone(), hash)
         };
         if let Some(rec_arc) = self.secrets.get(&secret_name).map(|e| Arc::clone(e.value())) {
@@ -529,18 +520,18 @@ mod tests {
         s.create_pending("k", 7, None, "hash unknown", None);
         let id = s.pending.iter().next().unwrap().id;
         let err = s.grant_pending_forever(id).unwrap_err();
-        assert!(err.contains("no package hash"), "got: {err}");
+        assert_eq!(err, NOT_SUPPORTED, "got: {err}");
         assert!(matches!(
             s.attempt_read("k", 9, Some("h2"), 0, 1),
             ReadOutcome::HashMismatch { .. }
         ));
     }
 
-    /// grant-forever must NAME the recorded inspection failure, not the
-    /// generic "could not be inspected" — the whole point of carrying
-    /// `hash_error` is an actionable refusal.
+    /// The refusal is deliberately bare: no recorded-inspection text,
+    /// no remediation commands — grant-forever is simply not supported
+    /// in the current version, whatever the technical reason.
     #[test]
-    fn grant_forever_names_the_recorded_inspection_failure() {
+    fn grant_forever_refusal_stays_bare_even_with_a_recorded_failure() {
         let s = ServerState::new();
         s.add("k", b"V".to_vec(), "h");
         s.create_pending_with_hash_error(
@@ -556,14 +547,10 @@ mod tests {
         );
         let id = s.pending.iter().next().unwrap().id;
         let err = s.grant_pending_forever(id).unwrap_err();
-        assert!(err.contains("no package hash"), "got: {err}");
+        assert_eq!(err, NOT_SUPPORTED, "got: {err}");
         assert!(
-            err.contains("Permission denied"),
-            "the recorded reason must be embedded verbatim: {err}"
-        );
-        assert!(
-            !err.contains("different PID namespace or unreadable mappings"),
-            "with a recorded reason the generic text must not appear: {err}"
+            !err.contains("Permission denied") && !err.contains("hashd"),
+            "no cause or remediation may leak into the refusal: {err}"
         );
     }
 

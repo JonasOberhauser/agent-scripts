@@ -102,16 +102,33 @@ fn pending_expiry_denies_with_eacces() {
 fn wrong_hash_pends_and_carries_the_hash_error() {
     let (path, state, _t) = oracle_env();
     state.add("s", b"X".to_vec(), "some_hash");
-    *state.pending_timeout.lock().unwrap() = Duration::from_millis(300);
-    match ask(&path, "s", 30, 0, 1) {
-        OracleReply::Deny { reason, .. } => {
-            // The test environment usually cannot hash (map_files gate);
-            // either way the pending was created and the deny names it.
-            let _ = reason;
-        }
-        other => panic!("expected deny for hash mismatch, got {other:?}"),
+    // The ask blocks while the pending waits: run it on a thread so the
+    // pending entry can be inspected before it expires.
+    let p = path.clone();
+    let asker = std::thread::spawn(move || ask(&p, "s", 30, 0, 1));
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let (pid_hash, hash_error) = loop {
+        let Some(entry) = state.pending.iter().next() else {
+            assert!(std::time::Instant::now() < deadline, "pending never appeared");
+            std::thread::sleep(Duration::from_millis(10));
+            continue;
+        };
+        break (entry.pid_hash.clone(), entry.hash_error.clone());
+    };
+    // Hashing goes through hashd only. Either a hashd answered (it is
+    // installed and this context is hashable) — or the pending carries
+    // the bare not-supported sentence, never remediation commands.
+    if pid_hash.is_none() {
+        assert_eq!(
+            hash_error.as_deref(),
+            Some(fuse_server::oracle_service::NOT_SUPPORTED),
+            "hash failure must carry the bare not-supported message"
+        );
+    } else {
+        assert!(hash_error.is_none(), "hash present: no error expected");
     }
     let _ = ReadOutcome::Granted; // import witness
+    let _ = asker.join().unwrap();
 }
 
 /// A fake data daemon: hello + receive commands; verifies snapshot

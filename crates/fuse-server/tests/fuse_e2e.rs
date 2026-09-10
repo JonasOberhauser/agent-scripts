@@ -10,7 +10,7 @@
 //!
 //! Run under a mount-capable context (e.g. the userns wrapper).
 
-use std::io::Write as _;
+use std::io::{BufRead as _, BufReader, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -49,6 +49,43 @@ fn hashing_available() -> bool {
     ok
 }
 
+/// A stand-in for the real hashd: answers `hash {pid}` with the
+/// locally-computed package hash. Legitimate here — the stub PLAYS the
+/// privileged helper (and these tests gate on `hashing_available`),
+/// letting them verify the production shape where the policy daemon
+/// never hashes by itself but always asks over the socket.
+fn hashd_stub() -> PathBuf {
+    let dir = tempfile::tempdir().unwrap().keep();
+    let sock = dir.join("hashd.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    std::thread::spawn(move || {
+        use fuse_protocol::io::SystemIo as _;
+        for conn in listener.incoming().flatten() {
+            let Ok(clone) = conn.try_clone() else { continue };
+            let mut reader = BufReader::new(clone);
+            let mut stream = conn;
+            let mut line = String::new();
+            if reader.read_line(&mut line).is_err() {
+                continue;
+            }
+            let reply = match line
+                .trim()
+                .strip_prefix("hash ")
+                .and_then(|p| p.parse::<u32>().ok())
+            {
+                Some(pid) => match fuse_protocol::RealSystemIo::new().sha256_process_package(pid) {
+                    Ok(h) => format!("ok {h}\n"),
+                    Err(e) => format!("error gone {e}\n"),
+                },
+                None => "error malformed request\n".to_string(),
+            };
+            let _ = stream.write_all(reply.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+    sock
+}
+
 /// The split stack: policy daemon + data daemon + mount point.
 struct Split {
     mount: PathBuf,
@@ -74,7 +111,18 @@ impl Drop for Split {
 
 impl Split {
     /// Start both daemons; `secrets` as (name, content, hash).
-    fn new(_tag: &str, secrets: &[(&str, &[u8], &str)]) -> Split {
+    fn new(tag: &str, secrets: &[(&str, &[u8], &str)]) -> Split {
+        Split::new_impl(tag, secrets, None)
+    }
+
+    /// Like [`Split::new`], but the policy daemon hashes readers via a
+    /// hashd at `hashd_sock` (see [`hashd_stub`]) — the production
+    /// shape: the server itself NEVER touches /proc/<pid>/map_files.
+    fn new_with_hashd(tag: &str, secrets: &[(&str, &[u8], &str)], hashd_sock: &Path) -> Split {
+        Split::new_impl(tag, secrets, Some(hashd_sock))
+    }
+
+    fn new_impl(_tag: &str, secrets: &[(&str, &[u8], &str)], hashd_sock: Option<&Path>) -> Split {
         let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
         let mount = dirs[0].path().join("mnt");
         std::fs::create_dir_all(&mount).unwrap();
@@ -89,6 +137,9 @@ impl Split {
             .arg("--oracle-socket").arg(&oracle)
             .arg("--pending-timeout").arg("5")
             .env("RUST_LOG", "error");
+        if let Some(sock) = hashd_sock {
+            policy.env("FUSE_HASHD_SOCK", sock);
+        }
         for (name, content, hash) in secrets {
             let f = secret_dir.path().join(name);
             std::fs::write(&f, content).unwrap();
@@ -401,12 +452,13 @@ fn e2e_hash_mismatch_denied() {
     if !hashing_available() { return; }
     let _g = serial();
     let pkg = package_hash_of_self();
-    let split = Split::new("hash", &[("s", b"H", "definitely_not_our_package")]);
+    let stub = hashd_stub();
+    let split = Split::new_with_hashd("hash", &[("s", b"H", "definitely_not_our_package")], &stub);
     let err = std::fs::read(split.path("s")).unwrap_err();
     assert_eq!(err.raw_os_error(), Some(libc::EACCES), "wrong hash must pend out to deny");
     // …and with the right hash it serves immediately.
     drop(split);
-    let split2 = Split::new("hash-ok", &[("s", b"H", &pkg)]);
+    let split2 = Split::new_with_hashd("hash-ok", &[("s", b"H", &pkg)], &stub);
     assert_eq!(std::fs::read(split2.path("s")).unwrap(), b"H");
     }
 
@@ -424,7 +476,8 @@ fn e2e_different_binary_denied() {
     let _g = serial();
     // Our package hash whitelisted; a DIFFERENT binary must be denied.
     let pkg = package_hash_of_self();
-    let split = Split::new("diff", &[("s", b"D", &pkg)]);
+    let stub = hashd_stub();
+    let split = Split::new_with_hashd("diff", &[("s", b"D", &pkg)], &stub);
     assert_eq!(std::fs::read(split.path("s")).unwrap(), b"D");
     // A distinct process (cat) has a different package hash: EACCES.
     let out = Command::new("cat").arg(split.path("s")).output().unwrap();
@@ -443,7 +496,8 @@ fn e2e_grant_forever_full_flow() {
     if !hashing_available() { return; }
     let _g = serial();
     let _pkg = package_hash_of_self();
-    let split = Split::new("gf", &[("s", b"FOREVER", "not_our_hash")]);
+    let stub = hashd_stub();
+    let split = Split::new_with_hashd("gf", &[("s", b"FOREVER", "not_our_hash")], &stub);
     // Budget unspent but hash wrong: the read pends.
     let p = split.path("s");
     let reader = std::thread::spawn(move || std::fs::read(p));

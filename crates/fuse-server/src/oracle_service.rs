@@ -10,8 +10,8 @@
 //! * `Ask {...}` — a short-lived (possibly long-blocked, while a
 //!   pending waits for a grant) adjudication request.
 //!
-//! Every Ask runs the full policy pipeline synchronously: local package
-//! hash → hashd escalation → one-read semantics → pending + wait until
+//! Every Ask runs the full policy pipeline synchronously: hashd
+//! package-hash lookup → one-read semantics → pending + wait until
 //! grant/expiry → Allow/Deny. The data daemon serves bytes only on
 //! Allow.
 
@@ -22,7 +22,6 @@ use std::time::{Duration, Instant};
 
 use tracing::{info, warn};
 
-use fuse_protocol::io::SystemIo as _;
 use fuse_protocol::oracle::{OracleCommand, OracleReply, OracleRequest};
 use fuse_protocol::PendingAccessInfo;
 
@@ -79,32 +78,27 @@ impl OracleHub {
     }
 }
 
-/// Package hash for the reader, escalating to hashd when this (deliber-
-/// ately unprivileged) daemon cannot hash locally.
+/// Package hash for the reader, ALWAYS via the hashd helper: this
+/// daemon is deliberately unprivileged and must never touch
+/// `/proc/<pid>/map_files` itself (that is hashd's one job). A missing
+/// hashd is not an error to remediate in the pending — the user-facing
+/// story is that grant-forever is simply not supported in the current
+/// version; the technical reason only goes to the log.
 fn compute_pid_hash(pid: u32) -> (Option<String>, Option<String>) {
-    match fuse_protocol::RealSystemIo::new()
-        .sha256_process_package(pid)
-    {
+    let socket = std::env::var("FUSE_HASHD_SOCK")
+        .unwrap_or_else(|_| fuse_protocol::hashd::DEFAULT_SOCK.to_string());
+    match fuse_protocol::hashd::ask(&socket, pid) {
         Ok(h) => (Some(h), None),
-        Err(local_err) => {
-            let socket = std::env::var("FUSE_HASHD_SOCK")
-                .unwrap_or_else(|_| fuse_protocol::hashd::DEFAULT_SOCK.to_string());
-            match fuse_protocol::hashd::ask(&socket, pid) {
-                Ok(h) => (Some(h), None),
-                Err(hashd_err) => {
-                    let hash_error = match &hashd_err {
-                        fuse_protocol::hashd::HashdError::Unreachable(_) => {
-                            local_err.to_string()
-                        }
-                        other => other.to_string(),
-                    };
-                    warn!("Could not hash /proc/{pid}/exe locally ({local_err}); hashd: {hashd_err}");
-                    (None, Some(hash_error))
-                }
-            }
+        Err(hashd_err) => {
+            warn!("hashd ({socket}) could not hash pid {pid}: {hashd_err}");
+            (None, Some(NOT_SUPPORTED.to_string()))
         }
     }
 }
+
+/// The one user-facing sentence when a forever-grant is impossible:
+/// no per-cause remediation, no deployment instructions.
+pub const NOT_SUPPORTED: &str = "forever grant is not supported in the current version.";
 
 fn process_name(pid: u32) -> Option<String> {
     std::fs::read_to_string(format!("/proc/{pid}/comm"))
