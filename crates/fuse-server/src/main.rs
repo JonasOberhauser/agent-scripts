@@ -1,18 +1,29 @@
+//! fuse-server: the POLICY daemon of the gatekeeper split.
+//!
+//! It owns the trust decisions (one-read semantics, package hashes via
+//! hashd, pendings, grants), the servatui command socket for
+//! fuse-client, and the oracle endpoint the data daemon (`fused`)
+//! connects to. It holds NO secret bytes in split mode: content goes to
+//! the data daemon through the oracle hub, metadata stays here.
+
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use clap::Parser;
-use fuser::MountOption;
-use fuse_protocol::{RealSystemIo, SystemIo};
-use fuse_server::{GatekeeperFs, ServerState};
+use fuse_protocol::io::SystemIo as _;
+use fuse_protocol::RealSystemIo;
 use tracing::{error, info, warn};
 
+use fuse_server::{OracleHub, ServerState};
+
 #[derive(Parser)]
-#[command(name = "fuse-server", about = "FUSE gatekeeper filesystem + CRUD socket server")]
+#[command(name = "fuse-server", about = "FUSE gatekeeper POLICY daemon (decisions + command socket; data lives in fused)")]
 struct Cli {
+    /// Accepted for backward compatibility with older orchestrators;
+    /// mounting is the data daemon's job now.
     #[arg(short, long)]
-    mount_point: PathBuf,
+    mount_point: Option<PathBuf>,
     #[arg(short, long, default_value = "/tmp/fuse-gatekeeper.sock")]
     socket: PathBuf,
     #[arg(long, value_name = "NAME:FILE:HASH")]
@@ -25,32 +36,39 @@ struct Cli {
     pending_timeout: u64,
     #[arg(long, default_value = "/tmp/fuse-gatekeeper.log")]
     log_path: PathBuf,
+    /// Socket where the data daemon (fused) connects for adjudication
+    /// and content updates.
+    #[arg(long, default_value = "/tmp/fuse-gatekeeper-oracle.sock")]
+    oracle_socket: PathBuf,
 }
 
-/// Pre-computed CString for async-signal-safe unlink in the signal handler.
-static CLEANUP_SOCKET: OnceLock<std::ffi::CString> = OnceLock::new();
+/// Pre-computed CStrings for async-signal-safe unlink in the handler.
+static CLEANUP_SOCKETS: OnceLock<(std::ffi::CString, std::ffi::CString)> = OnceLock::new();
 
-/// Signal handler: removes the socket file and exits.
-/// Only uses async-signal-safe functions (unlink, _exit).
 extern "C" fn shutdown_handler(_sig: libc::c_int) {
-    if let Some(path) = CLEANUP_SOCKET.get() {
-        unsafe { libc::unlink(path.as_ptr()); }
+    if let Some((cmd, oracle)) = CLEANUP_SOCKETS.get() {
+        unsafe {
+            libc::unlink(cmd.as_ptr());
+            libc::unlink(oracle.as_ptr());
+        }
     }
-    // _exit is async-signal-safe; std::process::exit is NOT (runs atexit handlers).
-    unsafe { libc::_exit(130); } // 128 + SIGINT(2)
+    unsafe { libc::_exit(130); }
 }
 
-/// Try to unmount a stale FUSE mount at `mount_point`.
-/// Tries fusermount, fusermount3, then umount -l.
-fn unmount_if_mounted(mount_point: &Path) {
-    for (cmd, flag) in [("fusermount", "-uz"), ("fusermount3", "-uz"), ("umount", "-l")] {
-        match std::process::Command::new(cmd).arg(flag).arg(mount_point).output() {
-            Ok(output) if output.status.success() => {
-                info!("Unmounted stale mount at {} via {} {}", mount_point.display(), cmd, flag);
-                return;
-            }
-            _ => {}
+/// Supervised data daemon (kept alive by being our child; killed when
+/// we exit, per Rust child-process semantics on drop is NOT guaranteed —
+/// so we also store it to reap on shutdown).
+static SUPERVISED_FUSED: std::sync::Mutex<Option<std::process::Child>> =
+    std::sync::Mutex::new(None);
+
+fn stale_socket(path: &Path) {
+    if path.exists() {
+        if std::os::unix::net::UnixStream::connect(path).is_ok() {
+            error!("Another server is running at {}. Kill it first.", path.display());
+            std::process::exit(1);
         }
+        warn!("Removing stale socket at {}", path.display());
+        let _ = std::fs::remove_file(path);
     }
 }
 
@@ -63,59 +81,65 @@ fn main() {
                 .parse_lossy(&cli.log_level),
         )
         .init();
-    let io = RealSystemIo::new();
 
-    info!("fuse-server v{} starting", fuse_protocol::VERSION);
-    info!("  mount-point:     {}", cli.mount_point.display());
+    info!("fuse-server (policy daemon) v{} starting", fuse_protocol::VERSION);
     info!("  socket:          {}", cli.socket.display());
-    info!("  allow-other:     {}", cli.allow_other);
+    info!("  oracle-socket:   {}", cli.oracle_socket.display());
     info!("  pending-timeout: {}s", cli.pending_timeout);
-    info!("  log-path:        {}", cli.log_path.display());
-
-    // ── Startup cleanup: take over from stale instance ───────────
-
-    // 1. If socket exists and is connectable, another server is running.
-    if cli.socket.exists() {
-        if std::os::unix::net::UnixStream::connect(&cli.socket).is_ok() {
-            error!("Server already running at {}. Use 'fuse-client' or kill the existing process.", cli.socket.display());
-            std::process::exit(1);
+    // --mount-point means SUPERVISE a data daemon at that mount point
+    // (the one-command contract of the old monolith): spawn fused next
+    // to this binary and keep it as a child; on our exit it dies too.
+    if let Some(mp) = &cli.mount_point {
+        let exe = std::env::current_exe().expect("current exe");
+        let fused = exe.parent().map(|d| d.join("fused")).filter(|p| p.exists());
+        match fused {
+            Some(fused) => {
+                info!("  mount-point:     {} (spawning supervised data daemon)", mp.display());
+                let child = std::process::Command::new(&fused)
+                    .arg("--mount-point").arg(mp)
+                    .arg("--oracle-socket").arg(&cli.oracle_socket)
+                    .spawn();
+                match child {
+                    Ok(c) => {
+                        SUPERVISED_FUSED.lock().unwrap().replace(c);
+                    }
+                    Err(e) => error!("cannot spawn data daemon {}: {e}", fused.display()),
+                }
+            }
+            None => error!(
+                "--mount-point given but no data daemon found next to {} —                  build `fused` or start it manually",
+                exe.display()
+            ),
         }
-        // Socket exists but not connectable — stale, remove it.
-        warn!("Removing stale socket at {}", cli.socket.display());
-        let _ = std::fs::remove_file(&cli.socket);
     }
+    let _ = cli.allow_other;
 
-    // 2. Unmount any stale FUSE mount before we try to mount.
-    unmount_if_mounted(&cli.mount_point);
+    stale_socket(&cli.socket);
+    stale_socket(&cli.oracle_socket);
 
-    // 3. Ensure mount point directory exists.
-    if !cli.mount_point.exists() {
-        if let Err(e) = std::fs::create_dir_all(&cli.mount_point) {
-            error!("Failed to create mount point {}: {e}", cli.mount_point.display());
-            std::process::exit(1);
-        }
-    }
-
-    // ── Install shutdown handler ─────────────────────────────────
-    // On SIGINT/SIGTERM: unlink socket, then _exit.
-    // The kernel automatically releases the FUSE mount when the process dies.
-    if let Ok(socket_cstr) = std::ffi::CString::new(cli.socket.to_string_lossy().as_bytes()) {
-        CLEANUP_SOCKET.set(socket_cstr).ok();
+    if let (Ok(a), Ok(b)) = (
+        std::ffi::CString::new(cli.socket.to_string_lossy().as_bytes()),
+        std::ffi::CString::new(cli.oracle_socket.to_string_lossy().as_bytes()),
+    ) {
+        CLEANUP_SOCKETS.set((a, b)).ok();
     }
     unsafe {
         libc::signal(libc::SIGINT, shutdown_handler as *const () as usize);
         libc::signal(libc::SIGTERM, shutdown_handler as *const () as usize);
     }
 
-    // ── Build state ──────────────────────────────────────────────
+    // ── State: metadata here, content pushed to the data daemon ──
     let mut state = ServerState::new();
     state.pending_timeout = std::sync::Mutex::new(Duration::from_secs(cli.pending_timeout));
     state.log_path = cli.log_path.to_string_lossy().to_string();
+    let hub = OracleHub::clone(&fuse_server::ORACLE_HUB);
+    let io = RealSystemIo::new();
     for spec in &cli.secret {
         match parse_secret(spec, &io) {
             Ok((name, content, hash)) => {
-                info!("Loaded secret '{name}' ({} bytes)", content.len());
-                state.add(&name, content, &hash);
+                info!("Registering secret '{name}' ({} bytes -> data daemon)", content.len());
+                state.add_with_mode(&name, content.clone(), &hash, 0o400);
+                hub.upsert(&name, &content, 0o400);
             }
             Err(e) => {
                 error!("Bad --secret '{spec}': {e}");
@@ -125,65 +149,23 @@ fn main() {
     }
     let state = Arc::new(state);
 
-    // ── Start socket server ──────────────────────────────────────
+    // ── Command socket (fuse-client / servatui) ──────────────────
     let socket_path = cli.socket.clone();
     let socket_state = Arc::clone(&state);
     std::thread::spawn(move || {
         if let Err(e) = fuse_server::run_socket_server(&socket_path, socket_state) {
             error!("Socket server error: {e}");
+            std::process::exit(1);
         }
     });
 
-    // Wait for socket to be connectable.
-    let mut socket_ready = false;
-    for _ in 0..200 {
-        if cli.socket.exists() {
-            info!("Socket file exists, probing connectability...");
-            match std::os::unix::net::UnixStream::connect(&cli.socket) {
-                Ok(_) => {
-                    info!("Socket probe succeeded — this connect+drop will trigger server-side 'connection closed'");
-                    socket_ready = true;
-                    break;
-                }
-                Err(_) => {
-                    // Not ready yet
-                }
-            }
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
+    // ── Oracle endpoint (fused: adjudication + content) ───────────
+    // Blocks the main thread for the daemon's lifetime.
+    if let Err(e) = fuse_server::run_oracle_server(&cli.oracle_socket, state, hub) {
+        error!("Oracle server error: {e}");
+        let _ = std::fs::remove_file(&cli.socket);
+        std::process::exit(1);
     }
-    if !socket_ready {
-        error!("Socket server did not start in time");
-        cleanup_and_exit(&cli.socket, &cli.mount_point, 1);
-    }
-    info!("Socket ready at {}", cli.socket.display());
-
-    // ── Mount FUSE (blocks until unmounted or signal) ────────────
-    let mut options = vec![MountOption::FSName("gatekeeper".into())];
-    if cli.allow_other {
-        options.push(MountOption::AllowOther);
-    }
-
-    info!("Mounting FUSE at {}", cli.mount_point.display());
-    let fs = GatekeeperFs::new(Arc::clone(&state), RealSystemIo::new());
-
-    match fuser::mount2(fs, &cli.mount_point, &options) {
-        Ok(()) => info!("FUSE unmounted cleanly."),
-        Err(e) => {
-            error!("FUSE mount error: {e}");
-            cleanup_and_exit(&cli.socket, &cli.mount_point, 1);
-        }
-    }
-
-    // ── Normal shutdown cleanup ──────────────────────────────────
-    cleanup_and_exit(&cli.socket, &cli.mount_point, 0);
-}
-
-/// Remove socket and unmount. Called on normal exit or error.
-fn cleanup_and_exit(socket: &Path, mount_point: &Path, code: i32) {
-    let _ = std::fs::remove_file(socket);
-    unmount_if_mounted(mount_point);
-    std::process::exit(code);
 }
 
 fn parse_secret(spec: &str, io: &RealSystemIo) -> Result<(String, Vec<u8>, String), String> {

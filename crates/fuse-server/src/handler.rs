@@ -2,7 +2,7 @@ use fuse_protocol::{Command, Response};
 
 use crate::state::ServerState;
 
-pub fn handle_command(cmd: Command, state: &ServerState) -> Response {
+pub fn handle_command(cmd: Command, state: &ServerState, hub: &crate::oracle_service::OracleHub) -> Response {
     match cmd {
         Command::Reset { name } => {
             let n = state.reset(name.as_deref());
@@ -18,12 +18,16 @@ pub fn handle_command(cmd: Command, state: &ServerState) -> Response {
         }
 
         Command::AddSecret { name, content, hash, mode } => {
-            state.add_with_mode(&name, content, hash, mode);
+            state.add_with_mode(&name, content.clone(), hash, mode);
+            // The data daemon serves the bytes; the policy daemon keeps
+            // only the metadata it adjudicates against.
+            hub.upsert(&name, &content, mode & 0o777);
             Response::Ok
         }
 
         Command::RemoveSecret { name } => {
             if state.remove(&name) {
+                hub.remove(&name);
                 Response::Ok
             } else {
                 Response::Error { message: "secret not found".into() }
@@ -83,6 +87,9 @@ pub fn handle_command(cmd: Command, state: &ServerState) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn hub() -> crate::oracle_service::OracleHub {
+        crate::oracle_service::OracleHub::new()
+    }
     use crate::state::ReadOutcome;
 
     fn seeded() -> ServerState {
@@ -96,16 +103,16 @@ mod tests {
     fn reset_specific() {
         let s = seeded();
         s.attempt_read("a.yaml", 1, Some("hash_a"), 0, 1024);
-        let resp = handle_command(Command::Reset { name: Some("a.yaml".into()) }, &s);
+        let resp = handle_command(Command::Reset { name: Some("a.yaml".into()) }, &s, &hub());
         assert_eq!(resp, Response::Ok);
         let out = s.attempt_read("a.yaml", 1, Some("hash_a"), 0, 1024);
-        assert!(matches!(out, ReadOutcome::Granted(_)));
+        assert!(matches!(out, ReadOutcome::Granted));
     }
 
     #[test]
     fn reset_nonexistent_errors() {
         let s = seeded();
-        let resp = handle_command(Command::Reset { name: Some("nope".into()) }, &s);
+        let resp = handle_command(Command::Reset { name: Some("nope".into()) }, &s, &hub());
         assert!(matches!(resp, Response::Error { .. }));
     }
 
@@ -113,7 +120,7 @@ mod tests {
     fn reset_all_ok() {
         let s = seeded();
         s.attempt_read("a.yaml", 1, Some("hash_a"), 0, 1024);
-        let resp = handle_command(Command::Reset { name: None }, &s);
+        let resp = handle_command(Command::Reset { name: None }, &s, &hub());
         assert_eq!(resp, Response::Ok);
     }
 
@@ -121,7 +128,7 @@ mod tests {
     fn status_reports_counts() {
         let s = seeded();
         s.attempt_read("a.yaml", 1, Some("hash_a"), 0, 1024);
-        let resp = handle_command(Command::Status, &s);
+        let resp = handle_command(Command::Status, &s, &hub());
         match resp {
             Response::Status { secrets } => {
                 let a = secrets.iter().find(|e| e.name == "a.yaml").unwrap();
@@ -139,20 +146,21 @@ mod tests {
         let resp = handle_command(
             Command::AddSecret { name: "new".into(), content: vec![9], hash: "h".into(), mode: 0o600 },
             &s,
+            &hub(),
         );
         assert_eq!(resp, Response::Ok);
 
         // grant-forever round trip on a pending with a package hash
         s.add("k", b"V".to_vec(), "h");
-        let _ = handle_command(Command::GrantForever { id: 1 }, &s); // unknown id -> error, no panic
+        let _ = handle_command(Command::GrantForever { id: 1 }, &s, &hub()); // unknown id -> error, no panic
         let id = {
             s.create_pending("k", 7, Some("pkg"), "mismatch", None);
             s.pending.iter().next().unwrap().id
         };
-        let resp = handle_command(Command::GrantForever { id }, &s);
+        let resp = handle_command(Command::GrantForever { id }, &s, &hub());
         assert_eq!(resp, Response::Ok);
 
-        let resp = handle_command(Command::RemoveSecret { name: "new".into() }, &s);
+        let resp = handle_command(Command::RemoveSecret { name: "new".into() }, &s, &hub());
         assert_eq!(resp, Response::Ok);
     }
 
@@ -162,16 +170,17 @@ mod tests {
         let resp = handle_command(
             Command::RotateHash { name: "a.yaml".into(), new_hash: "xyz".into() },
             &s,
+            &hub(),
         );
         assert_eq!(resp, Response::Ok);
         let out = s.attempt_read("a.yaml", 1, Some("xyz"), 0, 1024);
-        assert!(matches!(out, ReadOutcome::Granted(_)));
+        assert!(matches!(out, ReadOutcome::Granted));
     }
 
     #[test]
     fn list_mounts() {
         let s = seeded();
-        let resp = handle_command(Command::ListMounts, &s);
+        let resp = handle_command(Command::ListMounts, &s, &hub());
         match resp {
             Response::MountList { mounts } => assert_eq!(mounts.len(), 2),
             _ => panic!("expected MountList"),

@@ -34,11 +34,11 @@ cargo test -p fuse-server                # fuse-server only (unit)
 cargo clippy --workspace                 # zero warnings required
 ```
 
-The workspace has four crates: `fuse-protocol`, `fuse-server`, `fuse-client`, `run-agent`.
+The workspace has five crates: `fuse-protocol`, `fuse-server`, `fuse-client`, `run-agent`, `fuse-mount`.
 
 ## Architecture
 
-- **fuse-server**: FUSE gatekeeper filesystem + Unix socket CRUD server. Mounts
+- **fuse-server**: POLICY daemon — trust decisions (one-read, package hashes via hashd, pendings, grants), the servatui command socket, and the oracle endpoint the data daemon connects to. Holds NO secret bytes. Mounts
   at `/tmp/fuse-gatekeeper-mnt`, listens on `/tmp/fuse-gatekeeper.sock`. Enforces
   one-read-per-secret with binary-hash verification and forward-only multi-chunk
   reads.
@@ -48,6 +48,11 @@ The workspace has four crates: `fuse-protocol`, `fuse-server`, `fuse-client`, `r
   socket server.
 - **fuse-protocol**: Shared types, `SystemIo` trait, `RealSystemIo` /
   `MockSystemIo` implementations.
+- **fuse-mount** (`fused`): DATA daemon — holds the secret bytes and the FUSE mount; every read asks the policy daemon over the oracle socket. Either half alone is useless; the mount survives policy restarts.
+- **package hashing**: NOT SUPPORTED in the current version. The server
+  still performs the (unshipped) hashd lookup via `fuse_protocol::hashd`
+  and lets it fail; grant-forever answers with a bare not-supported
+  message and the reason only goes to the server log.
 
 ## Testing Philosophy
 

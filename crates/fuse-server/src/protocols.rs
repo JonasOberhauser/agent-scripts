@@ -14,7 +14,7 @@ fn server_protocol(spec: &CommandSpec) -> Protocol {
         .parse(|_| -> Result<Command, String> { unreachable!("parse is never called on server") })
         .client(|cmd: Command, _out, _input| Ok(cmd))
         .server_ctx(|cmd: Command, ctx: &ServerState| {
-            let resp = handle_command(cmd, ctx);
+            let resp = handle_command(cmd, ctx, &crate::oracle_service::ORACLE_HUB);
             match resp {
                 Response::Error { message } => Err(message),
                 other => Ok(other),

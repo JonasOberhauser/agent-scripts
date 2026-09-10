@@ -1,0 +1,22 @@
+[package]
+name = "fuse-mount"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The gatekeeper DATA daemon: holds the secret bytes and the FUSE mount; every read asks the policy daemon (fuse-server) for access."
+
+[[bin]]
+name = "fused"
+path = "src/main.rs"
+
+[dependencies]
+fuse-protocol = { workspace = true }
+serde_json = { workspace = true }
+fuser = "0.15"
+libc = "0.2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

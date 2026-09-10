@@ -108,9 +108,27 @@ struct RunOutcome {
     combined: String,
 }
 
+/// These suites drive real podman. Inside a toolbox that is NESTED
+/// rootless podman: it has no subordinate IDs of its own (the toolbox
+/// image carries no /etc/subuid entry for it), yet it shares
+/// `/run/user/<uid>` with the host session — a nested run writes
+/// libpod/pause state into the HOST's runtime dir and poisons the
+/// host's podman until the next reboot. Refuse instead: run from the
+/// host (compile artifacts from a toolbox `cargo build` are reused).
+fn refuse_inside_toolbox() {
+    if Path::new("/.toolboxenv").exists() {
+        panic!(
+            "refusing to run real-podman tests inside a toolbox: nested podman \
+             is subid-less and shares /run/user with the host session, which \
+             corrupts the host's podman runtime state until reboot"
+        );
+    }
+}
+
 /// The seam harness: temp workspace/socket/mount/state, compiled fuse
 /// stub, and an isolated naive-user podman environment (real podman,
-/// zero local images, distro-default config — nothing global touched).
+/// zero local images, distro-default config — nothing global touched,
+/// including the session-shared XDG_RUNTIME_DIR).
 struct Seam {
     ws: PathBuf,
     fuse_server: PathBuf,
@@ -118,11 +136,13 @@ struct Seam {
     mount_point: PathBuf,
     state: PathBuf,
     home: PathBuf,
+    xdg_runtime: PathBuf,
     storage_conf: PathBuf,
 }
 
 impl Seam {
     fn new(dir: &tempfile::TempDir, tag: &str) -> Seam {
+        refuse_inside_toolbox();
         let root = dir.path().join(tag);
         let ws = root.join("ws");
         std::fs::create_dir_all(&ws).expect("create ws");
@@ -130,6 +150,18 @@ impl Seam {
         std::fs::create_dir_all(&mount_point).expect("create mount point");
         let home = root.join("home");
         std::fs::create_dir_all(home.join(".config/containers")).expect("create home");
+        // Podman keeps its pause/infra and libpod state under
+        // XDG_RUNTIME_DIR, which the login session SHARES with the real
+        // podman — an unisolated run clobbers the host's pause.pid and
+        // poisons every later `podman unshare` until reboot. Point it at
+        // a private dir (0700, as podman demands).
+        let xdg_runtime = root.join("xdg-run");
+        std::fs::create_dir_all(&xdg_runtime).expect("create xdg runtime dir");
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&xdg_runtime, std::fs::Permissions::from_mode(0o700))
+                .expect("chmod xdg runtime dir");
+        }
         let storage_conf = root.join("storage.conf");
         std::fs::write(
             &storage_conf,
@@ -147,6 +179,7 @@ impl Seam {
             mount_point,
             state: root.join("state.json"),
             home,
+            xdg_runtime,
             storage_conf,
         }
     }
@@ -157,6 +190,7 @@ impl Seam {
             .env("XDG_CONFIG_HOME", self.home.join(".config"))
             .env("XDG_CACHE_HOME", self.home.join(".cache"))
             .env("XDG_DATA_HOME", self.home.join(".local/share"))
+            .env("XDG_RUNTIME_DIR", &self.xdg_runtime)
             .env("CONTAINERS_STORAGE_CONF", &self.storage_conf)
             .args(args)
             .stdin(Stdio::null())
@@ -201,6 +235,7 @@ impl Seam {
         .env("XDG_CONFIG_HOME", self.home.join(".config"))
         .env("XDG_CACHE_HOME", self.home.join(".cache"))
         .env("XDG_DATA_HOME", self.home.join(".local/share"))
+        .env("XDG_RUNTIME_DIR", &self.xdg_runtime)
         .env("CONTAINERS_STORAGE_CONF", &self.storage_conf)
         .env("FUSE_GATEKEEPER_STATE", &self.state)
         .env("RUST_LOG", "error")
@@ -280,6 +315,7 @@ fn missing_default_image_fails_fast_before_podman_run() {
 }
 
 #[test]
+#[ignore = "needs real podman with registry egress; run with --ignored on a capable host"]
 fn fully_qualified_missing_image_handled_diagnosably() {
     assert!(
         Command::new("podman")
@@ -327,6 +363,7 @@ fn fully_qualified_missing_image_handled_diagnosably() {
 // ("Failed to create container"), on capable ones the container exists.
 
 #[test]
+#[ignore = "needs real podman with registry egress; run with --ignored on a capable host"]
 fn auto_yes_builds_trivial_image_and_reaches_creation() {
     assert!(
         Command::new("podman")

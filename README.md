@@ -29,7 +29,8 @@ the counter to allow the next agent.
 | Crate | Binary | Role |
 |-------|--------|------|
 | `fuse-protocol` | — | Shared types, `IoProvider<I,O>` trait, `SystemIo`, `Transport` |
-| `fuse-server` | `fuse-server` | FUSE gatekeeper filesystem + Unix socket CRUD server |
+| `fuse-server` | `fuse-server` | POLICY daemon: decisions, pendings, grants, servatui command socket |
+| `fuse-mount` | `fused` | DATA daemon: secret bytes + FUSE mount; asks the policy daemon per read |
 | `fuse-client` | `fuse-client` | CLI that sends commands to the server (reset, status, ...) |
 | `run-agent` | `run-agent` | Orchestrator: starts server, launches container, auto-resets |
 
@@ -157,6 +158,28 @@ SHA-256 and serves the content exactly **once**.
 
 ## How the gatekeeper works
 
+> **Package hashing (grant-forever) needs capabilities.** Following
+> `/proc/<pid>/map_files` — the only TOCTOU-safe source for a reader's
+> loaded package — requires `CAP_SYS_ADMIN` or `CAP_CHECKPOINT_RESTORE`
+> in the *initial* user namespace (kernel `fs/proc/base.c`). Neither
+> ptrace rights nor a rootless user namespace suffice, and file
+> capabilities (`setcap`) only work where the launching session's
+> capability BOUNDING set contains the cap (many user sessions trim it).
+> The reliable least-privilege deployment is a system-level unit — the
+> bounding set descends full from PID 1:
+>
+> ```ini
+> [Service]
+> User=youruser
+> AmbientCapabilities=CAP_CHECKPOINT_RESTORE
+> CapabilityBoundingSet=CAP_CHECKPOINT_RESTORE
+> ExecStart=/path/to/fuse-server ...
+> ```
+>
+> (Launching under `sudo`/root also works — real root holds
+> `CAP_SYS_ADMIN`.) With the capability in place, grant-forever can
+> whitelist observed package hashes.
+
 1. **Binary hash check** — when a process reads the mounted file, the server
    hashes `/proc/<pid>/exe` and compares it to the allowed hash. Mismatch →
    `EACCES`.
@@ -199,6 +222,22 @@ Options:
       --stop                        Stop and remove the persistent container, then exit
       --restart-container           Recreate the persistent container from scratch
 ```
+
+## Package hashing — not supported in the current version
+
+Reader package hashes (the input to grant-forever) would require
+following `/proc/<pid>/map_files`, which demands `CAP_SYS_ADMIN` or
+`CAP_CHECKPOINT_RESTORE` in the *initial* user namespace — more
+privilege than the deliberately-unprivileged fuse-server may hold.
+The server still performs the hashd socket lookup and lets it fail
+(no hashd is shipped), and the refusal is deliberately bare:
+
+```text
+fuse-client grant-forever 7
+Error: forever grant is not supported in the current version.
+```
+
+The technical reason for a missing hash only goes to the server log.
 
 ## Project layout
 

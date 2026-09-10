@@ -132,9 +132,9 @@ fn e2e_client_binary_against_server() {
     assert_eq!(code, 0, "grant-forever failed: {stderr}");
     assert!(stdout.contains("OK"), "grant-forever should print OK: {stdout}");
     let probe = state.attempt_read("existing.yaml", 555, Some("pkg_hash_x"), 0, 5);
-    assert!(matches!(probe, fuse_server::ReadOutcome::Granted(_)), "got: {probe:?}");
+    assert!(matches!(probe, fuse_server::ReadOutcome::Granted), "got: {probe:?}");
     let probe2 = state.attempt_read("existing.yaml", 556, Some("pkg_hash_x"), 0, 5);
-    assert!(matches!(probe2, fuse_server::ReadOutcome::Granted(_)), "unlimited reads: {probe2:?}");
+    assert!(matches!(probe2, fuse_server::ReadOutcome::Granted), "unlimited reads: {probe2:?}");
     // A granted pending lingers until its (absent) reader removes it or
     // it expires — clean it up so the later pending assertions hold.
     state.remove_pending(id);

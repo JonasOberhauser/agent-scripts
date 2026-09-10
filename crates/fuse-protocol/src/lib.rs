@@ -1,5 +1,7 @@
 pub mod error;
+pub mod hashd;
 pub mod io;
+pub mod oracle;
 pub mod protocol;
 pub mod real_io;
 pub mod servatui_protocols;

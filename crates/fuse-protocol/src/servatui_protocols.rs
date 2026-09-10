@@ -113,6 +113,7 @@ pub fn pending_info(id: u64) -> PendingAccessInfo {
         process_name: None,
         pid: id as u32,
         pid_hash: None,
+        pid_hash_error: None,
         reason: "read request".into(),
         expires_at: 0,
     }
@@ -582,6 +583,7 @@ mod tests {
                     process_name: None,
                     pid: 1,
                     pid_hash: None,
+                    pid_hash_error: None,
                     reason: "r".into(),
                     expires_at: 0,
                 }],
