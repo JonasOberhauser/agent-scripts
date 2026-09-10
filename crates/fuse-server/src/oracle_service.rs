@@ -83,7 +83,7 @@ impl OracleHub {
 /// `/proc/<pid>/map_files` itself (that is hashd's one job). Failures
 /// carry the commands that fix them, so a pending shown to a human
 /// says what to run.
-fn compute_pid_hash(pid: u32) -> (Option<String>, Option<String>) {
+pub(crate) fn compute_pid_hash(pid: u32) -> (Option<String>, Option<String>) {
     let socket = std::env::var("FUSE_HASHD_SOCK")
         .unwrap_or_else(|_| fuse_protocol::hashd::DEFAULT_SOCK.to_string());
     match fuse_protocol::hashd::ask(&socket, pid) {

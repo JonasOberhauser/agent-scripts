@@ -58,13 +58,23 @@ pub fn handle_command(cmd: Command, state: &ServerState, hub: &crate::oracle_ser
             }
         }
 
-        Command::GrantForever { id } => match state.grant_pending_forever(id) {
-            Ok(()) => Response::Ok,
-            Err(e) => {
-                tracing::warn!("grant-forever {id} rejected: {e}");
-                Response::Error { message: e }
+        Command::GrantForever { id } => {
+            // A pending created while hashd was down carries no hash and
+            // a stale remediation snapshot. The operator has (hopefully)
+            // started hashd since — retry the lookup live before
+            // refusing, so following the printed fix actually works.
+            if let Some(pid) = state.pending_pid_needing_hash(id) {
+                let (pid_hash, hash_error) = crate::oracle_service::compute_pid_hash(pid);
+                state.refresh_pending_hash(id, pid_hash, hash_error);
             }
-        },
+            match state.grant_pending_forever(id) {
+                Ok(()) => Response::Ok,
+                Err(e) => {
+                    tracing::warn!("grant-forever {id} rejected: {e}");
+                    Response::Error { message: e }
+                }
+            }
+        }
 
         Command::Deny { id } => {
             if state.deny_pending(id) {

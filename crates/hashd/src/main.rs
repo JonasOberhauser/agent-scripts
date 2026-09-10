@@ -111,37 +111,39 @@ fn handle(conn: std::os::unix::net::UnixStream) {
     if reader.read_line(&mut line).is_err() {
         return;
     }
-    let reply = match line.trim().split_once(' ') {
-        Some(("hash", pid)) => match pid.parse::<u32>() {
-            Ok(pid) => match RealSystemIo::new().sha256_process_package(pid) {
-                Ok(hash) => format!("ok {hash}\n"),
-                Err(e) => {
-                    let msg = e.to_string();
-                    let kind = if msg.contains("Operation not permitted")
-                        || msg.contains("Permission denied")
-                    {
-                        if privileges_ok() {
-                            "error"
+    let trimmed = line.trim();
+    let reply = if trimmed == "status" {
+        let state = if privileges_ok() { "privileged" } else { "unprivileged" };
+        format!("status {state} follows /proc/<pid>/map_files\n")
+    } else {
+        match trimmed.split_once(' ') {
+            Some(("hash", pid)) => match pid.parse::<u32>() {
+                Ok(pid) => match RealSystemIo::new().sha256_process_package(pid) {
+                    Ok(hash) => format!("ok {hash}\n"),
+                    Err(e) => {
+                        let msg = e.to_string();
+                        let kind = if msg.contains("Operation not permitted")
+                            || msg.contains("Permission denied")
+                        {
+                            if privileges_ok() {
+                                "error"
+                            } else {
+                                // The helper itself lacks the init-ns capability:
+                                // the actionable case for client-side remediation.
+                                "error unprivileged"
+                            }
+                        } else if msg.contains("No such file") {
+                            "error gone"
                         } else {
-                            // The helper itself lacks the init-ns capability:
-                            // the actionable case for client-side remediation.
-                            "error unprivileged"
-                        }
-                    } else if msg.contains("No such file") {
-                        "error gone"
-                    } else {
-                        "error"
-                    };
-                    format!("{kind} {msg}\n")
-                }
+                            "error"
+                        };
+                        format!("{kind} {msg}\n")
+                    }
+                },
+                Err(_) => "error pid must be a number\n".to_string(),
             },
-            Err(_) => "error pid must be a number\n".to_string(),
-        },
-        Some(("status", "")) | Some(("status", _)) => {
-            let state = if privileges_ok() { "privileged" } else { "unprivileged" };
-            format!("status {state} follows /proc/<pid>/map_files\n")
+            _ => "error unknown request (use: hash <pid> | status)\n".to_string(),
         }
-        _ => "error unknown request (use: hash <pid> | status)\n".to_string(),
     };
     let _ = stream.write_all(reply.as_bytes());
     let _ = stream.flush();

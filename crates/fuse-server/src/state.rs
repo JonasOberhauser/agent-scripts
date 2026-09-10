@@ -293,6 +293,30 @@ impl ServerState {
         !self.pending.contains_key(&id)
     }
 
+    /// The reader pid of a live pending that still lacks a package
+    /// hash — grant-forever retries the hashd lookup at decision time,
+    /// so an operator who starts hashd in response to the pending's
+    /// remediation message can grant the SAME pending.
+    pub fn pending_pid_needing_hash(&self, id: u64) -> Option<u32> {
+        self.pending
+            .get(&id)
+            .filter(|e| e.pid_hash.is_none() && e.expires_at > Instant::now())
+            .map(|e| e.pid)
+    }
+
+    /// Overwrite a pending's hash fields with a live retry's outcome.
+    pub fn refresh_pending_hash(
+        &self,
+        id: u64,
+        pid_hash: Option<String>,
+        hash_error: Option<String>,
+    ) {
+        if let Some(mut entry) = self.pending.get_mut(&id) {
+            entry.pid_hash = pid_hash;
+            entry.hash_error = hash_error;
+        }
+    }
+
     /// Grant a pending access permanently: the observed package hash
     /// becomes the secret's allowed hash and the read limit is lifted.
     /// The waiting reader is served like a normal grant.
