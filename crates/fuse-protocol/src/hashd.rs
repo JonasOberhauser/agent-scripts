@@ -83,18 +83,37 @@ pub fn parse_reply(line: &str) -> Result<String, HashdError> {
     Err(HashdError::Other(format!("malformed reply: {line:?}")))
 }
 
-/// The transient start command (works until the next reboot) for a
-/// hashd at `socket`, naming a concrete binary when the caller knows
-/// one (the policy daemon looks for `hashd` next to its own binary —
-/// cargo builds every workspace binary into the same target dir).
-pub fn start_command(socket: &str, hashd_binary: &str) -> String {
-    format!("sudo systemd-run --unit=fuse-hashd {hashd_binary} --socket {socket}")
+/// Where the hashd binary belongs when a service runs it: a system
+/// path, NOT the build dir. On enforcing Fedora (and any SELinux
+/// default) a service may not execute binaries from user-writable
+/// locations — `systemd-run .../home/.../hashd` dies with 203/EXEC
+/// "Permission denied", so the remediation must install first.
+pub const SYSTEM_PATH: &str = "/usr/local/bin/hashd";
+
+/// The transient start commands (work until the next reboot): install
+/// the binary to a service-executable location, then run it under a
+/// transient unit. `hashd_binary` is the concrete build output when
+/// the caller knows one (the policy daemon looks for `hashd` next to
+/// its own binary — cargo builds every workspace binary into the same
+/// target dir).
+pub fn start_commands(socket: &str, hashd_binary: Option<&str>) -> String {
+    match hashd_binary {
+        Some(bin) if bin != SYSTEM_PATH => format!(
+            "sudo install -m 755 {bin} {SYSTEM_PATH}\n  \
+             sudo systemd-run --unit=fuse-hashd {SYSTEM_PATH} --socket {socket}"
+        ),
+        _ => format!(
+            "sudo systemd-run --unit=fuse-hashd {} --socket {socket}",
+            hashd_binary.unwrap_or("<hashd-binary>")
+        ),
+    }
 }
 
 /// The permanent install commands (one-time, root), run from the
 /// repository directory that contains the hashd crate.
 pub fn install_commands() -> String {
-    "sudo install -m 644 fuse-hashd.socket fuse-hashd.service /etc/systemd/system/\n  \
+    "sudo install -m 755 target/{debug,release}/hashd /usr/local/bin/hashd\n  \
+     sudo install -m 644 crates/hashd/fuse-hashd.socket crates/hashd/fuse-hashd.service /etc/systemd/system/\n  \
      sudo systemctl daemon-reload && sudo systemctl enable --now fuse-hashd.socket"
         .to_string()
 }
@@ -111,12 +130,11 @@ pub fn install_commands() -> String {
 /// * everything else (process gone, other failure) — pass through;
 ///   there is nothing to start or re-privilege.
 pub fn actionable_error(err: &HashdError, socket: &str, hashd_binary: Option<&str>) -> String {
-    let binary = hashd_binary.unwrap_or("<hashd-binary>");
     match err {
         HashdError::Unreachable(_) => {
             let mut text = format!(
                 "{err}. Start hashd now:\n  {}\n",
-                start_command(socket, binary)
+                start_commands(socket, hashd_binary)
             );
             if socket == DEFAULT_SOCK {
                 text.push_str(&format!(
@@ -131,7 +149,7 @@ pub fn actionable_error(err: &HashdError, socket: &str, hashd_binary: Option<&st
              capability (one-time, root):\n  {}\nOr restart it privileged only \
              until its next restart:\n  {}",
             install_commands(),
-            start_command(socket, binary)
+            start_commands(socket, hashd_binary)
         ),
         other => other.to_string(),
     }
@@ -188,20 +206,25 @@ mod tests {
     }
 
     #[test]
-    fn actionable_unreachable_names_a_runnable_start_command() {
+    fn actionable_unreachable_installs_to_a_system_path_before_running() {
         let e = HashdError::Unreachable("connect: No such file or directory".into());
         let text = actionable_error(
             &e,
             "/run/fuse-hashd.sock",
-            Some("/opt/agents/target/release/hashd"),
+            Some("/home/jonas/ws/agents/target/debug/hashd"),
         );
         assert!(
             text.contains("Start hashd now")
                 && text.contains(
-                    "sudo systemd-run --unit=fuse-hashd /opt/agents/target/release/hashd \
+                    "sudo install -m 755 /home/jonas/ws/agents/target/debug/hashd \
+                     /usr/local/bin/hashd"
+                )
+                && text.contains(
+                    "sudo systemd-run --unit=fuse-hashd /usr/local/bin/hashd \
                      --socket /run/fuse-hashd.sock"
                 ),
-            "must embed a copy-paste start command, got:\n{text}"
+            "a home-path binary must be installed first — services cannot exec \
+             from $HOME (systemd 203/EXEC); got:\n{text}"
         );
         assert!(
             text.contains("sudo systemctl enable --now fuse-hashd.socket"),
@@ -230,6 +253,17 @@ mod tests {
             text.contains("systemctl enable --now fuse-hashd.socket")
                 && text.contains("systemd-run --unit=fuse-hashd"),
             "must offer the reinstall and the transient restart:\n{text}"
+        );
+    }
+
+    #[test]
+    fn install_commands_reference_the_units_from_the_repo_root() {
+        let c = install_commands();
+        assert!(
+            c.contains("install -m 644 crates/hashd/fuse-hashd.socket")
+                && c.contains("/usr/local/bin/hashd"),
+            "permanent install must ship the binary to the system path and the \
+             units from the repo root:\n{c}"
         );
     }
 

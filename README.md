@@ -236,11 +236,16 @@ grant-forever names the fix:
 ```text
 fuse-client grant-forever 7
 Error: pending access 7 has no package hash — hashd unreachable — No such file or directory (os error 2). Start hashd now:
-  sudo systemd-run --unit=fuse-hashd <hashd-binary> --socket /run/fuse-hashd.sock
+  sudo install -m 755 <build-dir>/hashd /usr/local/bin/hashd
+  sudo systemd-run --unit=fuse-hashd /usr/local/bin/hashd --socket /run/fuse-hashd.sock
 Or install it permanently (one-time, root):
-  sudo install -m 644 fuse-hashd.socket fuse-hashd.service /etc/systemd/system/
+  sudo install -m 755 target/{debug,release}/hashd /usr/local/bin/hashd
+  sudo install -m 644 crates/hashd/fuse-hashd.socket crates/hashd/fuse-hashd.service /etc/systemd/system/
   sudo systemctl daemon-reload && sudo systemctl enable --now fuse-hashd.socket
 ```
+
+(Install before `systemd-run`: on SELinux-enforcing systems a service
+cannot execute binaries from `$HOME` — it fails with 203/EXEC.)
 
 Deploying the helper (root once at install; systemd owns the socket,
 the service carries exactly one capability; no polkit):
