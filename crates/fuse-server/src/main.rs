@@ -100,9 +100,11 @@ fn main() {
                     .arg("--oracle-socket").arg(&cli.oracle_socket)
                     .spawn();
                 match child {
-                    Ok(c) => SUPERVISED_FUSED.lock().unwrap().replace(c),
+                    Ok(c) => {
+                        SUPERVISED_FUSED.lock().unwrap().replace(c);
+                    }
                     Err(e) => error!("cannot spawn data daemon {}: {e}", fused.display()),
-                };
+                }
             }
             None => error!(
                 "--mount-point given but no data daemon found next to {} —                  build `fused` or start it manually",
