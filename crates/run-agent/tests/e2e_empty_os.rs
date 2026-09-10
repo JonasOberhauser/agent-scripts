@@ -44,6 +44,21 @@ use std::time::Duration;
 
 // ── availability probes ────────────────────────────────────────
 
+/// These suites drive real podman against the host's kernel. Inside a
+/// toolbox that is NESTED rootless podman: no subordinate IDs of its
+/// own (the toolbox image carries no /etc/subuid entry), while
+/// `/run/user/<uid>` is shared with the host session — a nested run
+/// poisons the host's podman runtime state until reboot. Refuse.
+fn refuse_inside_toolbox() {
+    if Path::new("/.toolboxenv").exists() {
+        panic!(
+            "refusing to run real-podman tests inside a toolbox: nested podman \
+             is subid-less and shares /run/user with the host session, which \
+             corrupts the host's podman runtime state until reboot"
+        );
+    }
+}
+
 fn podman_available() -> bool {
     Command::new("podman")
         .arg("--version")
@@ -89,18 +104,33 @@ struct EmptyOs {
     _dir: tempfile::TempDir,
     root: PathBuf,
     home: PathBuf,
+    xdg_runtime: PathBuf,
     socket: PathBuf,
     mount_point: PathBuf,
 }
 
 impl EmptyOs {
     fn new(tag: &str) -> EmptyOs {
+        refuse_inside_toolbox();
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path().join(tag);
         let home = root.join("home");
 
         let containers_cfg = home.join(".config/containers");
         std::fs::create_dir_all(&containers_cfg).expect("create config dir");
+
+        // Private XDG_RUNTIME_DIR: podman's pause/infra and libpod state
+        // live there, and the login session's real podman shares it — an
+        // unisolated run clobbers the host's pause state and poisons
+        // every later `podman unshare` until reboot. 0700, as podman
+        // demands of its runtime dir.
+        let xdg_runtime = root.join("xdg-run");
+        std::fs::create_dir_all(&xdg_runtime).expect("create xdg runtime dir");
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&xdg_runtime, std::fs::Permissions::from_mode(0o700))
+                .expect("chmod xdg runtime dir");
+        }
 
         // Isolated image store: a fresh machine has no local images (and the
         // developer running the test keeps their real store untouched).
@@ -125,6 +155,7 @@ impl EmptyOs {
             _dir: dir,
             root,
             home,
+            xdg_runtime,
             socket,
             mount_point,
         }
@@ -136,6 +167,7 @@ impl EmptyOs {
             .env("XDG_CONFIG_HOME", self.home.join(".config"))
             .env("XDG_CACHE_HOME", self.home.join(".cache"))
             .env("XDG_DATA_HOME", self.home.join(".local/share"))
+            .env("XDG_RUNTIME_DIR", &self.xdg_runtime)
             .env("CONTAINERS_STORAGE_CONF", self.root.join("storage.conf"))
             .env("FUSE_GATEKEEPER_STATE", self.root.join("state.json"))
             .env("RUST_LOG", "error")
