@@ -43,12 +43,14 @@ fn spawn_hashd(dir: &std::path::Path) -> Hashd {
         if socket.exists() && UnixStream::connect(&socket).is_ok() {
             return Hashd { child, socket };
         }
-        assert!(
-            child.try_wait().expect("poll hashd").is_none(),
-            "hashd exited before becoming connectable"
-        );
+        if child.try_wait().expect("poll hashd").is_some() {
+            let _ = child.wait();
+            panic!("hashd exited before becoming connectable");
+        }
         std::thread::sleep(Duration::from_millis(25));
     }
+    let _ = child.kill();
+    let _ = child.wait();
     panic!("hashd never came up at {}", socket.display());
 }
 
