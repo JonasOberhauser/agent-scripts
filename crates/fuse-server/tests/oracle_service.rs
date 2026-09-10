@@ -98,6 +98,42 @@ fn pending_expiry_denies_with_eacces() {
     }
 }
 
+/// A deny must unblock the waiting reader IMMEDIATELY with EPERM —
+/// regression test: the wait loop used to ignore the pending's removal
+/// and kept the reader stuck until the full pending timeout.
+#[test]
+fn deny_unblocks_the_reader_immediately_with_eperm() {
+    let (path, state, _t) = oracle_env();
+    state.add("s", b"X".to_vec(), "some_hash");
+    // Long enough that a non-short-circuiting loop fails the time bound.
+    *state.pending_timeout.lock().unwrap() = Duration::from_secs(15);
+    let p = path.clone();
+    let started = std::time::Instant::now();
+    let asker = std::thread::spawn(move || ask(&p, "s", 30, 0, 1));
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let id = loop {
+        let Some(entry) = state.pending.iter().next() else {
+            assert!(std::time::Instant::now() < deadline, "pending never appeared");
+            std::thread::sleep(Duration::from_millis(10));
+            continue;
+        };
+        break entry.id;
+    };
+    state.deny_pending(id);
+    match asker.join().unwrap() {
+        OracleReply::Deny { errno, reason } => {
+            assert_eq!(errno, libc::EPERM, "deny must EPERM, reason was: {reason}");
+            assert!(reason.contains("denied"), "{reason}");
+        }
+        other => panic!("expected EPERM deny after explicit deny, got {other:?}"),
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "deny must unblock immediately, waited {:.1}s",
+        started.elapsed().as_secs_f32()
+    );
+}
+
 #[test]
 fn wrong_hash_pends_and_carries_the_hash_error() {
     let (path, state, _t) = oracle_env();

@@ -289,6 +289,12 @@ impl ServerState {
         false
     }
 
+    /// A pending that vanished without a grant was denied: the blocked
+    /// reader must be released immediately, not wait out its timeout.
+    pub fn is_pending_denied(&self, id: u64) -> bool {
+        !self.pending.contains_key(&id)
+    }
+
     /// Grant a pending access permanently: the observed package hash
     /// becomes the secret's allowed hash and the read limit is lifted.
     /// The waiting reader is served like a normal grant.

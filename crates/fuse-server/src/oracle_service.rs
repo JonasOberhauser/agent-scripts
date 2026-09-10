@@ -151,6 +151,15 @@ fn adjudicate(state: &ServerState, name: &str, pid: u32, offset: usize, size: us
                         reason: "secret vanished while granted".into(),
                     };
                 }
+                if state.is_pending_denied(id) {
+                    // A deny releases the blocked reader AT ONCE — waiting
+                    // out the timeout would pin the reading process for
+                    // minutes after the decision was already made.
+                    return OracleReply::Deny {
+                        errno: libc::EPERM,
+                        reason: format!("pending {id} denied: {reason}"),
+                    };
+                }
                 if Instant::now() > deadline {
                     state.remove_pending(id);
                     warn!("Pending access {id} timed out");
