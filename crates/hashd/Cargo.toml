@@ -11,3 +11,6 @@ path = "src/main.rs"
 
 [dependencies]
 fuse-protocol = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

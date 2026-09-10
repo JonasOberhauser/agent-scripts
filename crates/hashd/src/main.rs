@@ -172,6 +172,19 @@ fn main() {
             std::process::exit(1);
         }
     };
+    // connect(2) on a unix socket needs WRITE permission on the socket
+    // file, and bind(2) applies the umask (0755 → srwxr-xr-x): without
+    // this, a root-started hashd is connectable by root only and every
+    // unprivileged fuse-server gets EACCES.
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if let Err(e) =
+            std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o666))
+        {
+            eprintln!("hashd: cannot open {socket} to unprivileged clients: {e}");
+            std::process::exit(1);
+        }
+    }
     eprintln!(
         "hashd: listening on {socket} ({})",
         if privileges_ok() { "privileged" } else { "unprivileged" }

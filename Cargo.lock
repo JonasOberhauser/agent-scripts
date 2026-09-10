@@ -471,6 +471,7 @@ name = "hashd"
 version = "0.27.0"
 dependencies = [
  "fuse-protocol",
+ "tempfile",
 ]
 
 [[package]]
