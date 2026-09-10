@@ -509,8 +509,19 @@ pub(crate) trait ServerTalk {
 /// action replaces it (never silently swallowed).
 pub(crate) type LastError = Arc<Mutex<Option<String>>>;
 
+/// The shell's log window contents (drained into the builtin TUI's log
+/// area at the start of every frame by `Display::run`): the worker
+/// pushes action failures here so a human sees them without opening the
+/// /tmp log file.
+pub(crate) type LogSink = Arc<Mutex<Vec<String>>>;
+
 pub(crate) fn no_error() -> LastError {
     Arc::new(Mutex::new(None))
+}
+
+#[cfg(test)]
+pub(crate) fn empty_sink() -> LogSink {
+    Arc::new(Mutex::new(Vec::new()))
 }
 
 fn service(
@@ -518,6 +529,7 @@ fn service(
     pending: &PendingIds,
     secrets: &SecretNames,
     error: &LastError,
+    log: &LogSink,
     req: PanelRequest,
 ) {
     match req {
@@ -545,9 +557,15 @@ fn service(
             match failure {
                 Some(e) => {
                     tracing::warn!("pending action '{name}' failed: {e}");
-                    if fuse_protocol::hashd::is_unprivileged_error(&e) {
-                        tracing::warn!("{}", fuse_protocol::hashd::remediation());
-                    }
+                    // The client's log area is the debugging surface a
+                    // human actually sees (stderr is hidden behind the
+                    // alternate screen): push every line, including any
+                    // remediation commands embedded by the server.
+                    log.lock().unwrap().extend(
+                        format!("pending action '{name}' failed: {e}")
+                            .lines()
+                            .map(str::to_string),
+                    );
                     *error.lock().unwrap() = Some(format!("{name}: {e}"));
                 }
                 None => {
@@ -565,6 +583,7 @@ pub(crate) struct DirectTalk {
     socket: PathBuf,
     secrets: SecretNames,
     error: LastError,
+    log: LogSink,
 }
 
 #[cfg(test)]
@@ -574,14 +593,14 @@ impl DirectTalk {
         secrets: SecretNames,
         error: LastError,
     ) -> Self {
-        Self { socket: socket.into(), secrets, error }
+        Self { socket: socket.into(), secrets, error, log: empty_sink() }
     }
 }
 
 #[cfg(test)]
 impl ServerTalk for DirectTalk {
     fn request(&self, snapshot: &PendingIds, req: PanelRequest) {
-        service(&self.socket, snapshot, &self.secrets, &self.error, req);
+        service(&self.socket, snapshot, &self.secrets, &self.error, &self.log, req);
     }
 }
 
@@ -599,14 +618,15 @@ pub(crate) fn spawn_worker(
     snapshot: PendingIds,
     secrets: SecretNames,
     error: LastError,
+    log: LogSink,
 ) -> WorkerTalk {
     let (tx, rx) = std::sync::mpsc::channel::<PanelRequest>();
     std::thread::spawn(move || {
         for req in rx {
             let follow_up = matches!(req, PanelRequest::Action { .. });
-            service(&socket, &snapshot, &secrets, &error, req);
+            service(&socket, &snapshot, &secrets, &error, &log, req);
             if follow_up {
-                service(&socket, &snapshot, &secrets, &error, PanelRequest::Poll);
+                service(&socket, &snapshot, &secrets, &error, &log, PanelRequest::Poll);
             }
         }
     });
@@ -1637,7 +1657,7 @@ mod tests {
 
         let pending: PendingIds = Arc::new(Mutex::new(Vec::new()));
         let secrets: SecretNames = Arc::new(Mutex::new(Vec::new()));
-        let talk = spawn_worker(sock.clone(), pending.clone(), secrets.clone(), no_error());
+        let talk = spawn_worker(sock.clone(), pending.clone(), secrets.clone(), no_error(), empty_sink());
         talk.request(
             &pending,
             PanelRequest::Action {
@@ -1781,9 +1801,12 @@ mod tests {
     }
 
     /// A failed action's error must SURVIVE the worker's follow-up poll
-    /// (which used to clear it within milliseconds, hiding the message).
+    /// (which used to clear it within milliseconds, hiding the message)
+    /// and must reach the shell's log area — stderr is hidden behind
+    /// the alternate screen, the log window is the surface a human
+    /// actually sees.
     #[test]
-    fn worker_error_survives_follow_up_poll() {
+    fn worker_error_survives_follow_up_poll_and_reaches_the_log() {
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("stale-worker.sock");
         fake_server_stale(&sock, vec![31]);
@@ -1791,7 +1814,8 @@ mod tests {
         let pending: PendingIds = Arc::new(Mutex::new(Vec::new()));
         let secrets: SecretNames = Arc::new(Mutex::new(Vec::new()));
         let error: LastError = no_error();
-        let talk = spawn_worker(sock.clone(), pending.clone(), secrets.clone(), error.clone());
+        let log: LogSink = empty_sink();
+        let talk = spawn_worker(sock.clone(), pending.clone(), secrets.clone(), error.clone(), log.clone());
         talk.request(
             &pending,
             PanelRequest::Action {
@@ -1802,6 +1826,16 @@ mod tests {
         assert!(
             wait_until(5_000, || error.lock().unwrap().is_some()),
             "error must be surfaced"
+        );
+        assert!(
+            wait_until(5_000, || !log.lock().unwrap().is_empty()),
+            "error must be pushed into the log window, got: {:?}",
+            log.lock().unwrap()
+        );
+        let lines = log.lock().unwrap().join("\n");
+        assert!(
+            lines.contains("grant-forever") && lines.contains("Unknown command"),
+            "log lines must name the action and the failure: {lines}"
         );
         std::thread::sleep(Duration::from_millis(300));
         assert!(

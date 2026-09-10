@@ -84,9 +84,6 @@ fn main() {
                 }
                 Err(e) => {
                     eprintln!("Error: {e}");
-                    if fuse_protocol::hashd::is_unprivileged_error(&e) {
-                        eprintln!("{}", fuse_protocol::hashd::remediation());
-                    }
                     std::process::exit(1);
                 }
             }
@@ -110,15 +107,22 @@ fn main() {
             // as an ordinary layer, so the builtin input line and the
             // panel are peers with activation-based keyboard focus.
             let panel_error = pending_layer::no_error();
-            let talk =
-                pending_layer::spawn_worker(cli.socket.clone(), pending.clone(), secrets, panel_error.clone());
-            let mut display = servatui_display::Display::new();
-
-            // Supported log-window path (servatui >= 0.8.3): the panel
-            // pushes into the sink; Display::run drains it into the
-            // builtin log at the start of every frame.
+            // Supported log-window path (servatui >= 0.8.3): both the
+            // panel and the worker push into the sink; Display::run
+            // drains it into the builtin log at the start of every
+            // frame — so action failures (with their remediation
+            // commands) are visible in the TUI, not only in the /tmp
+            // log file.
             let log_sink: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
                 Default::default();
+            let talk = pending_layer::spawn_worker(
+                cli.socket.clone(),
+                pending.clone(),
+                secrets,
+                panel_error.clone(),
+                log_sink.clone(),
+            );
+            let mut display = servatui_display::Display::new();
             let panel_sink = std::sync::Arc::clone(&log_sink);
             let panel = pending_layer::PendingPanelLayer::new(
                 pending,
