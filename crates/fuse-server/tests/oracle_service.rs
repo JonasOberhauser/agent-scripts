@@ -157,7 +157,7 @@ fn wrong_hash_pends_and_carries_the_hash_error() {
     if pid_hash.is_none() {
         let why = hash_error.as_deref().unwrap_or("");
         assert!(
-            why.contains("Start hashd now"),
+            why.contains("(Re)start hashd now"),
             "hash failure must name the fix, got: {why:?}"
         );
         assert!(
