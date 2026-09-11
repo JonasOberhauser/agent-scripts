@@ -260,6 +260,58 @@ sudo systemctl daemon-reload && sudo systemctl enable --now fuse-hashd.socket
 
 The technical reason for a missing hash only goes to the server log.
 
+## Threat model
+
+The gate's goal is **containment**: a confused, overly eager actor
+inside the agent container must not spread secrets to the outside
+world. It provides:
+
+- one-read-per-secret with binary-hash verification; every other
+  reader pends for manual approval
+- package identity — the executable plus every mapped library, read
+  through `/proc/<pid>/map_files` (the mapped inodes, never on-disk
+  paths, failing closed on anything unreadable)
+- two grant tiers: one-shot manual grants (strict) and
+  grant-forever (convenience)
+
+What it deliberately does **not** provide:
+
+- **instance authorization** — grant-forever whitelists a package
+  *class*, not the verified process: whoever can later execute the
+  same executable + libraries inherits the access
+- **defense against full container compromise** — an actor
+  controlling env, argv, DNS and the trust stores can coerce any
+  credentialed client; that tier is mitigated in the consuming
+  binary (below), not in the gate
+- **memory identity** — JIT-generated (anonymous executable) pages
+  are outside the hash by construction; the hash is a *package*
+  identity
+
+## Using a forever-granted secret securely
+
+A binary that gets grant-forever should be built to:
+
+1. **Be closed-mouth**: the secret never appears on stdout/stderr,
+   in logs, in verbose output, or in error paths.
+2. **Restrict its operations**: confine what it does *with* the
+   credential — otherwise the actor drives a confused deputy that
+   acts as you.
+3. **Harden its memory**: `prctl(PR_SET_DUMPABLE, 0)` at startup (as
+   ssh-agent does) — blocks core dumps and `/proc/<pid>/mem` even
+   for same-uid attackers. The flag resets on `execve`: set it
+   yourself, re-set after exec.
+4. **Pin the peer**: verify the destination's leaf public key
+   (compiled in), ignore environment-overridable CA paths
+   (`SSL_CERT_FILE` and friends), hard-fail on certificate change,
+   never fall back to plain HTTP. HTTPS alone is **not** sufficient —
+   with container control the actor owns the trust store, and a fake
+   endpoint receives the credentials as Basic auth after its own TLS
+   termination.
+5. **Strongest form**: keep the credentialed client outside the
+   compromisable container — a host-side proxy performing approved
+   actions on the container's behalf, so the secret never enters the
+   container at all.
+
 ## Project layout
 
 ```

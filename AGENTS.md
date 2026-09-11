@@ -57,6 +57,30 @@ The workspace has six crates: `fuse-protocol`, `fuse-server`, `fuse-client`, `ru
   answers with a bare not-supported message (the reason only goes to the
   server log). Protocol: `fuse_protocol::hashd`; units in `crates/hashd`.
 
+## Threat Model
+
+Goal: **containment** — a confused, overly eager actor inside the agent
+container must not spread secrets to the outside world. The gate
+provides one-read semantics, package identity (`map_files` inodes,
+fail-closed), pendings with manual grants, and grant-forever as a
+convenience tier.
+
+Limits every contributor must know:
+
+- grant-forever authorizes a package **class**, not the verified
+  instance: whoever can later execute the same executable + libraries
+  inherits the access.
+- Full container compromise (env/argv/DNS/trust-store control) is out
+  of scope; a credentialed client under that control can be coerced.
+  Mitigations belong in the consuming binary: closed-mouth,
+  operation-restricted, `PR_SET_DUMPABLE=0`, compiled-in leaf-key
+  pinning (HTTPS against an attacker-owned CA store is no protection),
+  or keeping the credentialed client outside the container entirely.
+- Package hashing is file-backed identity; anonymous executable pages
+  (JIT) are outside the hash by construction.
+
+Do not weaken these properties without updating this section.
+
 ## Testing Philosophy
 
 ### Mocks must simulate real-world scenarios, not just happy paths
