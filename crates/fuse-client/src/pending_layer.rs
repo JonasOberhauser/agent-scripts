@@ -450,6 +450,23 @@ fn requester_and_secret(req: &PendingAccessInfo) -> String {
     format!("{} → {}", requester(req), req.secret_name)
 }
 
+/// Hover (#25): the button under the mouse renders with the same
+/// reverse-video highlight as the keyboard selection.
+fn grid_row_line_hover(
+    row: GridRow,
+    width: u16,
+    sel_here: Option<Sel>,
+    hovered: Option<&Button>,
+) -> Line<'static> {
+    let sel_here = match hovered {
+        Some(Button::GrantForever { .. }) => Some(Sel::Forever),
+        Some(Button::Grant { .. }) | Some(Button::GrantAll) => Some(Sel::Grant),
+        Some(Button::Deny { .. }) | Some(Button::DenyAll) => Some(Sel::Deny),
+        None => sel_here,
+    };
+    grid_row_line(row, width, sel_here)
+}
+
 fn grid_row_line(row: GridRow, width: u16, sel_here: Option<Sel>) -> Line<'static> {
     let all = matches!(row, GridRow::All);
     let (deny_l, grant_l) = if all { ("[deny all]", "[grant all]") } else { ("[deny]", "[grant]") };
@@ -683,6 +700,9 @@ pub(crate) struct PendingPanelLayer {
     /// Writes a line into the shell's log window (the builtin TUI's
     /// log area).  Optional: absent in tests that only assert layout.
     log_window: Option<LogWindow>,
+    /// Last hovered cell (col, row); hover highlighting (#25) hit-tests
+    /// it against the button grid each frame.
+    hover: std::cell::Cell<Option<(u16, u16)>>,
     /// Latches when the shell first becomes too small; resets once it
     /// is big enough again so a later shrink re-warns.
     small_warned: std::cell::Cell<bool>,
@@ -702,6 +722,7 @@ impl PendingPanelLayer {
             pending,
             talk,
             log_window: None,
+            hover: std::cell::Cell::new(None),
             small_warned: std::cell::Cell::new(false),
             slots: empty_slots(),
             cursor: Cursor::All { grant: true },
@@ -829,7 +850,18 @@ impl DisplayLayer for PendingPanelLayer {
                         Cursor::Request { slot, sel } if slot == i => Some(sel),
                         _ => None,
                     };
-                    grid_row_line(GridRow::Request(req), row.width, sel_here)
+                    let hovered = self
+                        .hover
+                        .get()
+                        .and_then(|(c, r)| self.grid.hit(c, r))
+                        .filter(|h| h.row == i)
+                        .map(|h| h.button);
+                    grid_row_line_hover(
+                        GridRow::Request(req),
+                        row.width,
+                        sel_here,
+                        hovered.as_ref(),
+                    )
                 }
             };
             widgets.push(WidgetEntry {
@@ -845,15 +877,22 @@ impl DisplayLayer for PendingPanelLayer {
             Cursor::All { grant } => Some(if grant { Sel::Grant } else { Sel::Deny }),
             _ => None,
         };
+        let all_hovered = self
+            .hover
+            .get()
+            .and_then(|(c, r)| self.grid.hit(c, r))
+            .filter(|h| h.row == MAX_SHOWN)
+            .map(|h| h.button);
         let (deny, grant) = button_pair(all_row, true);
         self.grid.children.push(GridChild { row: MAX_SHOWN, button: Button::DenyAll, rect: deny });
         self.grid.children.push(GridChild { row: MAX_SHOWN, button: Button::GrantAll, rect: grant });
         widgets.push(WidgetEntry {
             name: PANEL_NAME,
-            widget: Box::new(Paragraph::new(grid_row_line(
+            widget: Box::new(Paragraph::new(grid_row_line_hover(
                 GridRow::All,
                 all_row.width,
                 sel_here,
+                all_hovered.as_ref(),
             ))),
             area: all_row,
         });
@@ -876,6 +915,10 @@ impl DisplayLayer for PendingPanelLayer {
                     EventResult::Pass
                 }
                 MouseEventKind::Drag(_) | MouseEventKind::Up(_) => EventResult::Swallow,
+                MouseEventKind::Moved => {
+                    self.hover.set(Some((m.column, m.row)));
+                    EventResult::Swallow
+                }
                 _ => EventResult::Pass,
             },
             Event::Key(k) if k.kind == KeyEventKind::Press => {
@@ -1683,6 +1726,87 @@ mod tests {
     // ── grant-forever panel tests (#11) ───────────────────────────
 
     /// Left/Right step through forever -> grant -> deny, clamped.
+    fn moved(x: u16, y: u16) -> Event {
+        Event::Mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: x,
+            row: y,
+            modifiers: KeyModifiers::NONE,
+        })
+    }
+
+    /// Hovering a button highlights it (reverse video) even without any
+    /// keyboard selection, on request rows and the all-row alike (#25).
+    #[test]
+    fn hovered_button_renders_highlighted() {
+        for (button, sel) in [
+            (Button::GrantForever { id: 31 }, Sel::Forever),
+            (Button::Grant { id: 31 }, Sel::Grant),
+            (Button::Deny { id: 31 }, Sel::Deny),
+        ] {
+            let line = grid_row_line_hover(
+                GridRow::Request(&pending_info(31)),
+                PANEL_WIDTH,
+                None,
+                Some(&button),
+            );
+            assert!(
+                line.spans
+                    .iter()
+                    .any(|s| s.style.add_modifier.contains(Modifier::REVERSED)),
+                "hover on {button:?} must reverse-highlight"
+            );
+            let _ = sel;
+        }
+        let line = grid_row_line_hover(GridRow::All, PANEL_WIDTH, None, Some(&Button::GrantAll));
+        assert!(
+            line.spans
+                .iter()
+                .any(|s| s.style.add_modifier.contains(Modifier::REVERSED)),
+            "hover on grant-all must reverse-highlight"
+        );
+    }
+
+    /// No hover -> no highlight change (pure renderer pass-through).
+    #[test]
+    fn hover_absent_leaves_selection_untouched() {
+        let line =
+            grid_row_line_hover(GridRow::Request(&pending_info(31)), PANEL_WIDTH, None, None);
+        assert!(
+            !line.spans
+                .iter()
+                .any(|s| s.style.add_modifier.contains(Modifier::REVERSED)),
+            "no hover and no selection: no highlight"
+        );
+    }
+
+    /// Moving the mouse over a [forever] button highlights it in the
+    /// NEXT frame, and moving off clears it.
+    #[test]
+    fn mouse_move_updates_hover_across_frames() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("panel.sock");
+        fake_server(&sock, vec![31, 37]);
+
+        let pending: PendingIds = Arc::new(Mutex::new(ids(&[31, 37])));
+        let mut display = servatui_display::Display::with_palette(Vec::new());
+        display.add_layer(Box::new(layer(pending, &sock)));
+        frame_with_pending(&mut display);
+
+        let row = row_rect(panel_rect(Rect::new(0, 0, 80, 24)), 1);
+        let forever = forever_rect(row);
+        assert!(
+            display.route_event(&moved(forever.x + 1, forever.y)),
+            "Moved swallowed"
+        );
+        frame_with_pending(&mut display);
+        assert!(
+            display.route_event(&moved(row.x, row.y)),
+            "Moved off (still inside the panel, over no button) swallowed"
+        );
+        frame_with_pending(&mut display);
+    }
+
     #[test]
     fn left_right_step_through_forever() {
         assert_eq!(Sel::Forever.step(false), Sel::Grant);
