@@ -185,7 +185,6 @@ impl EmptyOs {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_run-agent"));
         self.env(&mut cmd)
             .args([
-                "*",
                 "e2e-agent",
                 "--runtime",
                 "podman",
