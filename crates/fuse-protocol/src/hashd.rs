@@ -90,23 +90,23 @@ pub fn parse_reply(line: &str) -> Result<String, HashdError> {
 /// "Permission denied", so the remediation must install first.
 pub const SYSTEM_PATH: &str = "/usr/local/bin/hashd";
 
-/// The transient start commands (work until the next reboot): install
-/// the binary to a service-executable location, then run it under a
-/// transient unit. `hashd_binary` is the concrete build output when
-/// the caller knows one (the policy daemon looks for `hashd` next to
-/// its own binary — cargo builds every workspace binary into the same
-/// target dir).
+/// The transient (re)start commands, valid in EVERY state: down,
+/// running-but-unreachable, or a failed transient unit still occupying
+/// the name. Clear the unit first, ship the binary to a
+/// service-executable location (services cannot exec from $HOME on
+/// SELinux-enforcing hosts — 203/EXEC), then start it. `hashd_binary`
+/// is the concrete build output when the caller knows one.
 pub fn start_commands(socket: &str, hashd_binary: Option<&str>) -> String {
-    match hashd_binary {
-        Some(bin) if bin != SYSTEM_PATH => format!(
-            "sudo install -m 755 {bin} {SYSTEM_PATH}\n  \
-             sudo systemd-run --unit=fuse-hashd {SYSTEM_PATH} --socket {socket}"
-        ),
-        _ => format!(
-            "sudo systemd-run --unit=fuse-hashd {} --socket {socket}",
-            hashd_binary.unwrap_or("<hashd-binary>")
-        ),
-    }
+    let source = match hashd_binary {
+        Some(bin) if bin != SYSTEM_PATH => bin.to_string(),
+        _ => "<hashd-binary>".to_string(),
+    };
+    format!(
+        "sudo install -m 755 {source} {SYSTEM_PATH}\n  \
+         sudo systemctl stop fuse-hashd.service 2>/dev/null; \
+         sudo systemctl reset-failed fuse-hashd.service 2>/dev/null\n  \
+         sudo systemd-run --unit=fuse-hashd {SYSTEM_PATH} --socket {socket}"
+    )
 }
 
 /// The permanent install commands (one-time, root), run from the
@@ -133,7 +133,7 @@ pub fn actionable_error(err: &HashdError, socket: &str, hashd_binary: Option<&st
     match err {
         HashdError::Unreachable(_) => {
             let mut text = format!(
-                "{err}. Start hashd now:\n  {}\n",
+                "{err}. (Re)start hashd now:\n  {}\n",
                 start_commands(socket, hashd_binary)
             );
             if socket == DEFAULT_SOCK {
@@ -214,17 +214,22 @@ mod tests {
             Some("/home/jonas/ws/agents/target/debug/hashd"),
         );
         assert!(
-            text.contains("Start hashd now")
+            text.contains("(Re)start hashd now")
                 && text.contains(
                     "sudo install -m 755 /home/jonas/ws/agents/target/debug/hashd \
                      /usr/local/bin/hashd"
                 )
                 && text.contains(
+                    "sudo systemctl stop fuse-hashd.service 2>/dev/null; \
+                     sudo systemctl reset-failed fuse-hashd.service 2>/dev/null"
+                )
+                && text.contains(
                     "sudo systemd-run --unit=fuse-hashd /usr/local/bin/hashd \
                      --socket /run/fuse-hashd.sock"
                 ),
-            "a home-path binary must be installed first — services cannot exec \
-             from $HOME (systemd 203/EXEC); got:\n{text}"
+            "must install to a system path, clear a possibly-running/failed \
+             unit, then start — services cannot exec from $HOME (203/EXEC); \
+             got:\n{text}"
         );
         assert!(
             text.contains("sudo systemctl enable --now fuse-hashd.socket"),
@@ -236,7 +241,7 @@ mod tests {
     fn actionable_unreachable_custom_socket_skips_install_hint() {
         let e = HashdError::Unreachable("refused".into());
         let text = actionable_error(&e, "/tmp/custom-hashd.sock", None);
-        assert!(text.contains("<hashd-binary>"), "no known binary: placeholder, got:\n{text}");
+        assert!(text.contains("install -m 755 <hashd-binary> /usr/local/bin/hashd"), "no known binary: placeholder, got:\n{text}");
         assert!(
             !text.contains("systemctl enable"),
             "custom socket: the unit files hard-code the default socket, so the \

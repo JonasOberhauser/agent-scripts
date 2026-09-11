@@ -235,8 +235,9 @@ grant-forever names the fix:
 
 ```text
 fuse-client grant-forever 7
-Error: pending access 7 has no package hash — hashd unreachable — No such file or directory (os error 2). Start hashd now:
+Error: pending access 7 has no package hash — hashd unreachable — No such file or directory (os error 2). (Re)start hashd now:
   sudo install -m 755 <build-dir>/hashd /usr/local/bin/hashd
+  sudo systemctl stop fuse-hashd.service 2>/dev/null; sudo systemctl reset-failed fuse-hashd.service 2>/dev/null
   sudo systemd-run --unit=fuse-hashd /usr/local/bin/hashd --socket /run/fuse-hashd.sock
 Or install it permanently (one-time, root):
   sudo install -m 755 target/{debug,release}/hashd /usr/local/bin/hashd
@@ -244,8 +245,10 @@ Or install it permanently (one-time, root):
   sudo systemctl daemon-reload && sudo systemctl enable --now fuse-hashd.socket
 ```
 
-(Install before `systemd-run`: on SELinux-enforcing systems a service
-cannot execute binaries from `$HOME` — it fails with 203/EXEC.)
+(The commands work in every state — hashd down, running but
+unreachable, or a failed unit still occupying the name. Install before
+`systemd-run`: on SELinux-enforcing systems a service cannot execute
+binaries from `$HOME` — it fails with 203/EXEC.)
 
 Deploying the helper (root once at install; systemd owns the socket,
 the service carries exactly one capability; no polkit):
