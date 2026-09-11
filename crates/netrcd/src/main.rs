@@ -62,6 +62,7 @@ fn main() {
         grants_dir: cli.grants_dir.clone(),
         netrc_texts,
         executor: Arc::new(RealExecutor { ca_path: None }),
+        install_signal_handler: true,
     };
 
     let daemon = match Daemon::start(config) {

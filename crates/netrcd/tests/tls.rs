@@ -12,18 +12,31 @@ use netrcd::policy::Method;
 
 /// Serve one HTTPS request: read whatever the client sends, answer
 /// with a minimal 200. Blocks until one request is served.
-fn serve_one(listener: std::net::TcpListener, config: Arc<rustls::ServerConfig>) {
+fn serve_one(
+    listener: std::net::TcpListener,
+    config: Arc<rustls::ServerConfig>,
+    body: std::sync::Arc<std::sync::Mutex<Option<Vec<u8>>>>,
+    status_line: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+) {
     let (stream, _) = listener.accept().expect("accept");
     let mut conn = rustls::ServerConnection::new(config).expect("server conn");
     let mut stream = stream;
     let _ = conn.complete_io(&mut stream);
-    // Drain until the request looks finished (curl sends one request).
     let mut tls = conn;
     let _ = tls.read_tls(&mut stream);
     let _ = tls.write_tls(&mut stream);
     let _ = tls.process_new_packets();
-    let response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
-    let _ = tls.writer().write_all(response);
+    let body = body.lock().unwrap().clone().unwrap_or_else(|| b"ok".to_vec());
+    let status = status_line
+        .lock()
+        .unwrap()
+        .clone()
+        .unwrap_or_else(|| "HTTP/1.1 200 OK\r\nConnection: close\r\n".into());
+    let head = format!("{status}Content-Length: {}\r\n", body.len());
+    let mut response = head.into_bytes();
+    response.extend_from_slice(b"\r\n");
+    response.extend_from_slice(&body);
+    let _ = tls.writer().write_all(&response);
     let _ = tls.write_tls(&mut stream);
 }
 
@@ -31,6 +44,8 @@ struct TestPeer {
     cert_pem: String,
     port: u16,
     _dir: tempfile::TempDir,
+    body_override: std::sync::Arc<std::sync::Mutex<Option<Vec<u8>>>>,
+    status_override: std::sync::Arc<std::sync::Mutex<Option<String>>>,
 }
 
 /// Stand up a loopback TLS listener with a fresh self-signed cert for
@@ -54,11 +69,14 @@ fn spawn_peer() -> TestPeer {
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let port = listener.local_addr().unwrap().port();
-    std::thread::spawn(move || serve_one(listener, Arc::new(config)));
+    let body: std::sync::Arc<std::sync::Mutex<Option<Vec<u8>>>> = Default::default();
+    let status: std::sync::Arc<std::sync::Mutex<Option<String>>> = Default::default();
+    let (b2, s2) = (Arc::clone(&body), Arc::clone(&status));
+    std::thread::spawn(move || serve_one(listener, Arc::new(config), b2, s2));
 
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("ca.pem"), &cert_pem).unwrap();
-    TestPeer { cert_pem, port, _dir: dir }
+    TestPeer { cert_pem, port, _dir: dir, body_override: body, status_override: status }
 }
 
 fn outbound(port: u16, pins: Vec<String>) -> OutboundRequest {
@@ -110,4 +128,34 @@ fn untrusted_ca_without_pins_fails_closed() {
         "{err:?}"
     );
     let _ = &peer.cert_pem; // keep the peer alive through the request
+}
+
+
+#[test]
+fn response_truncation_flags_and_caps() {
+    let peer = spawn_peer();
+    *peer.body_override.lock().unwrap() = Some(vec![b'x'; 4096]);
+    let exec = RealExecutor {
+        ca_path: Some(peer._dir.path().join("ca.pem")),
+    };
+    let mut req = outbound(peer.port, vec![]);
+    req.max_rsp = 1024; // policy cap far below the body
+    let resp = exec.execute(&req).expect("request succeeds");
+    assert!(resp.truncated, "must be flagged");
+    assert_eq!(resp.body.len(), 1024, "capped at max_rsp");
+}
+
+#[test]
+fn redirects_are_not_followed() {
+    let peer = spawn_peer();
+    // The peer answers 302 to a different host. Following it would
+    // carry the Authorization header cross-origin; curl must hand us
+    // the 302 as-is.
+    *peer.status_override.lock().unwrap() =
+        Some("HTTP/1.1 302 Found\r\nLocation: https://127.0.0.1:1/evil\r\n".into());
+    let exec = RealExecutor {
+        ca_path: Some(peer._dir.path().join("ca.pem")),
+    };
+    let resp = exec.execute(&outbound(peer.port, vec![])).expect("request succeeds");
+    assert_eq!(resp.status, 302);
 }

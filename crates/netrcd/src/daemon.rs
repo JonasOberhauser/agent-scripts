@@ -34,6 +34,11 @@ pub struct DaemonConfig {
     /// fuse-mounted one-read files without the daemon racing mounts.
     pub netrc_texts: Vec<(String, String)>,
     pub executor: Arc<dyn Executor>,
+    /// Install the process-wide SIGHUP handler for THIS daemon. The
+    /// production binary sets true; tests with coexisting daemons set
+    /// false (instance-level `request_reload` instead) so the OS
+    /// signal has exactly one deterministic consumer.
+    pub install_signal_handler: bool,
 }
 
 struct Shared {
@@ -78,9 +83,12 @@ impl Daemon {
         });
         let running = Arc::new(AtomicBool::new(true));
         let reload = Arc::new(AtomicBool::new(false));
-        let signal_owner = !SIGNAL_REGISTERED.swap(true, Ordering::SeqCst);
-        unsafe {
-            libc::signal(libc::SIGHUP, on_sighup as *const () as usize);
+        let signal_owner =
+            cfg.install_signal_handler && !SIGNAL_REGISTERED.swap(true, Ordering::SeqCst);
+        if signal_owner {
+            unsafe {
+                libc::signal(libc::SIGHUP, on_sighup as *const () as usize);
+            }
         }
 
         let thread_cfg = ThreadCfg {

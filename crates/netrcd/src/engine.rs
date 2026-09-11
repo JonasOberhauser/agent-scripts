@@ -239,6 +239,20 @@ mod tests {
     }
 
     #[test]
+    fn any_method_rule_matches_every_method() {
+        let (_p, _g, rt) = setup(
+            "[[machine]]\nname = \"api.x.com\"\n[[machine.allow]]\nmethod = \"*\"\nurl = '/any.*'\n",
+        );
+        let mut rates = RateState::default();
+        for m in ["GET", "POST", "DELETE"] {
+            assert!(
+                matches!(adjudicate(&rt, &mut rates, &req(m, "/anything")), Verdict::Allow(_)),
+                "{m} must pass an any-method rule"
+            );
+        }
+    }
+
+    #[test]
     fn auto_anchor_prevents_partial_matches() {
         let (_p, _g, rt) = setup(
             "[[machine]]\nname = \"api.x.com\"\n[[machine.allow]]\nmethod = \"GET\"\nurl = '/zen'\n",
