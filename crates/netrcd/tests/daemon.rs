@@ -77,6 +77,7 @@ fn setup(grant_toml: &str, exec: Arc<dyn Executor>) -> (Fixture, Daemon) {
         grants_dir: grants.path().to_path_buf(),
         netrc_texts: vec![("netrc".into(), "machine api.x.com login u password sekrit".into())],
         executor: exec,
+        install_signal_handler: false,
     })
     .unwrap();
     (
@@ -174,6 +175,7 @@ fn restart_between_two_commands() {
         grants_dir: grants.path().to_path_buf(),
         netrc_texts: vec![("netrc".into(), "machine api.x.com login u password sekrit".into())],
         executor: exec,
+        install_signal_handler: false,
     };
 
     let exec1 = StubExecutor::with(vec![ok_response()]);
@@ -210,6 +212,7 @@ fn sighup_reload_flips_permission_atomically() {
         grants_dir: grants.path().to_path_buf(),
         netrc_texts: vec![("netrc".into(), "machine api.x.com login u password sekrit".into())],
         executor: exec,
+        install_signal_handler: false,
     })
     .unwrap();
     let socket = daemon.socket_path().to_path_buf();
@@ -257,6 +260,7 @@ fn refused_machine_does_not_take_down_the_rest() {
             "machine good.com login u password p1\nmachine bad.com login v password p2".into(),
         )],
         executor: exec,
+        install_signal_handler: false,
     })
     .unwrap();
     let socket = daemon.socket_path();
@@ -274,6 +278,38 @@ fn refused_machine_does_not_take_down_the_rest() {
     )
     .unwrap();
     assert!(matches!(resp, WireResponse::Response { .. }));
+}
+
+/// The `nrq` binary against the in-process daemon: flag parsing,
+/// exit codes, output.
+#[test]
+fn nrq_cli_talks_to_the_daemon() {
+    let exec = StubExecutor::with(vec![ok_response()]);
+    let (_f, _d) = setup(
+        "[[machine]]\nname = \"api.x.com\"\n[[machine.allow]]\nmethod = \"GET\"\nurl = '/zen'\n",
+        exec,
+    );
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_nrq"))
+        .arg("--socket")
+        .arg(&_f.dir)
+        .args(["GET", "api.x.com", "/zen"])
+        .env_remove("NETRCD_SOCK")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "payload");
+
+    // A refusal exits 1 and names the code.
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_nrq"))
+        .arg("--socket")
+        .arg(&_f.dir)
+        .args(["GET", "api.x.com", "/nope"])
+        .env_remove("NETRCD_SOCK")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("NotAllowed"), "{stderr}");
 }
 
 #[test]
@@ -325,6 +361,7 @@ fn unknown_machine_and_no_credentials_are_typed() {
         // no netrc for configured.com at all
         netrc_texts: vec![("netrc".into(), "machine other.com login u password p".into())],
         executor: exec,
+        install_signal_handler: false,
     })
     .unwrap();
     let socket = daemon.socket_path();
@@ -355,6 +392,49 @@ fn unknown_machine_and_no_credentials_are_typed() {
     )
     .unwrap();
     assert_eq!(err_code(&resp), ErrorCode::NoCredentials);
+}
+
+/// The REAL signal path: kill(getpid(), SIGHUP) → handler → static
+/// flag → the owning daemon's accept loop reloads.
+#[test]
+fn real_sighup_signal_reaches_the_owning_daemon() {
+    let exec = Arc::new(StubExecutor::default());
+    let profiles = tempfile::tempdir().unwrap();
+    let grants = tempfile::tempdir().unwrap();
+    std::fs::write(
+        profiles.path().join("m.toml"),
+        "[[machine]]\nname = \"api.x.com\"\nauth = \"bearer\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(grants.path().join("sock")).unwrap();
+    write_grant(grants.path(), "[[machine]]\nname = \"api.x.com\"\n[[machine.allow]]\nmethod = \"GET\"\nurl = '/zen'\n");
+    let daemon = Daemon::start(DaemonConfig {
+        socket: grants.path().join("sock/netrcd.sock"),
+        profiles_dir: profiles.path().to_path_buf(),
+        grants_dir: grants.path().to_path_buf(),
+        netrc_texts: vec![("netrc".into(), "machine api.x.com login u password sekrit".into())],
+        executor: exec,
+        install_signal_handler: true,
+    })
+    .unwrap();
+    let socket = daemon.socket_path().to_path_buf();
+    assert!(matches!(get(&socket, "/zen").unwrap(), WireResponse::Response { .. }));
+
+    // Revoke, then deliver an actual SIGHUP to this process.
+    write_grant(grants.path(), "[[machine]]\nname = \"api.x.com\"\n");
+    unsafe {
+        libc::kill(libc::getpid(), libc::SIGHUP);
+    }
+    // The signal owner consumes it; poll for the flip.
+    for _ in 0..100 {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let resp = get(&socket, "/zen").unwrap();
+        if let WireResponse::Error { code, .. } = &resp {
+            assert_eq!(*code, ErrorCode::NotAllowed);
+            return;
+        }
+    }
+    panic!("SIGHUP never flipped the policy");
 }
 
 #[test]

@@ -110,6 +110,7 @@ struct ProfileAcc {
 fn merge_profiles(files: &[(String, String, ProfileFile)], rt: &mut Runtime) -> HashMap<String, ProfileAcc> {
     let mut accs: HashMap<String, ProfileAcc> = HashMap::new();
     for (file, text, pf) in files {
+        let mut seen_in_file: std::collections::HashSet<String> = std::collections::HashSet::new();
         for m in &pf.machine {
             let name = match deser_machine_name(m.name.get_ref()) {
                 Ok(n) => n,
@@ -118,6 +119,13 @@ fn merge_profiles(files: &[(String, String, ProfileFile)], rt: &mut Runtime) -> 
                     continue;
                 }
             };
+            if !seen_in_file.insert(name.clone()) {
+                rt.push(Level::Error, format!(
+                    "{file}:{}: machine '{name}' declared twice in the same file — refusing the second",
+                    line_of(text, m.name.span().start)
+                ));
+                continue;
+            }
             let prov = |s: &toml::Spanned<String>| format!("{file}:{}", line_of(text, s.span().start));
             let acc = accs.entry(name.clone()).or_insert_with(|| ProfileAcc {
                 files: Vec::new(),
@@ -214,6 +222,7 @@ fn merge_scalar<T: PartialEq>(
 fn merge_grants(files: &[(String, String, GrantFile)], rt: &mut Runtime) -> HashMap<String, GrantAcc> {
     let mut accs: HashMap<String, GrantAcc> = HashMap::new();
     for (file, text, gf) in files {
+        let mut seen_in_file: std::collections::HashSet<String> = std::collections::HashSet::new();
         for m in &gf.machine {
             let name = match deser_machine_name(m.name.get_ref()) {
                 Ok(n) => n,
@@ -222,6 +231,13 @@ fn merge_grants(files: &[(String, String, GrantFile)], rt: &mut Runtime) -> Hash
                     continue;
                 }
             };
+            if !seen_in_file.insert(name.clone()) {
+                rt.push(Level::Error, format!(
+                    "{file}:{}: machine '{name}' declared twice in the same file — refusing the second",
+                    line_of(text, m.name.span().start)
+                ));
+                continue;
+            }
             let prov = |s: &toml::Spanned<String>| format!("{file}:{}", line_of(text, s.span().start));
             let acc = accs.entry(name.clone()).or_insert_with(|| GrantAcc {
                 files: Vec::new(),
@@ -539,6 +555,38 @@ name = "github.com"
         write(p.path(), "a.toml", profile_toml());
         let rt = load_runtime(p.path(), g.path(), &[("n".into(), String::new())]);
         assert!(rt.diagnostics.iter().any(|d| d.level == Level::Error && d.msg.contains("no netrc credentials")), "{:?}", rt.diagnostics);
+    }
+
+    #[test]
+    fn same_file_duplicate_machine_is_refused() {
+        let (p, g) = dirs();
+        write(
+            p.path(),
+            "a.toml",
+            "[[machine]]\nname = \"x.com\"\nauth = \"bearer\"\n[[machine]]\nname = \"x.com\"\nauth = \"basic\"\n",
+        );
+        let rt = load_runtime(p.path(), g.path(), &[]);
+        assert!(
+            rt.diagnostics.iter().any(|d| d.level == Level::Error && d.msg.contains("twice in the same file")),
+            "{:?}",
+            rt.diagnostics
+        );
+    }
+
+    #[test]
+    fn pins_concat_across_files_with_dedupe() {
+        let (p, g) = dirs();
+        let pin = "sha256//AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        use base64::Engine as _;
+        let pin2 = format!(
+            "sha256//{}",
+            base64::engine::general_purpose::STANDARD.encode([1u8; 32])
+        );
+        write(p.path(), "a.toml", &format!("[[machine]]\nname = \"x.com\"\nauth = \"bearer\"\npins = [\"{pin}\"]\n"));
+        write(p.path(), "b.toml", &format!("[[machine]]\nname = \"x.com\"\npins = [\"{pin}\", \"{pin2}\"]\n"));
+        let rt = load_runtime(p.path(), g.path(), &[]);
+        let pins = &rt.machines["x.com"].profile.pins;
+        assert_eq!(pins.len(), 2, "identical pin deduped, new pin concatenated: {pins:?}");
     }
 
     #[test]
