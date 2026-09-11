@@ -4,6 +4,7 @@ use clap::Parser;
 use fuse_protocol::{client_protocols, ServerStateFile, VERSION as CLIENT_VERSION};
 use servyi_servatui::App;
 
+mod heal;
 mod pending_layer;
 
 #[derive(Parser)]
@@ -31,9 +32,17 @@ enum Commands {
     Deny { id: u64 },
     GetVersion,
     GetLogPath,
+    /// Probe every gatekeeper component and repair what is broken
+    /// (issue #23): FUSE mount first, then the policy server, then the
+    /// container.  Unknown states are reported, never guessed.
+    Heal {
+        /// Container name to heal (state file does not carry it).
+        #[arg(long)]
+        container: Option<String>,
+    },
 }
 
-fn main() {
+fn main() -> std::process::ExitCode {
     // Panel actions log to a file next to the state file: the TUI's
     // alternate screen hides stderr, and truncated title messages are
     // not a debugging interface.
@@ -66,6 +75,11 @@ fn main() {
     let app = App::builder(&cli.socket)
         .protocol_all(client_protocols())
         .build();
+
+    if let Some(Commands::Heal { container }) = &cli.command {
+        return heal::run_heal(&cli.socket, container.as_deref());
+    }
+
 
     if app.server_running() {
         check_version_or_restart(&app);
@@ -140,6 +154,7 @@ fn main() {
             }
         }
     }
+    std::process::ExitCode::SUCCESS
 }
 
 fn build_clap_command(cmd: &Commands) -> (String, String) {
@@ -159,6 +174,7 @@ fn build_clap_command(cmd: &Commands) -> (String, String) {
         Commands::Deny { id } => ("deny".into(), id.to_string()),
         Commands::GetVersion => ("version".into(), "".into()),
         Commands::GetLogPath => ("logpath".into(), "".into()),
+        Commands::Heal { .. } => unreachable!("heal runs its own flow"),
     }
 }
 
