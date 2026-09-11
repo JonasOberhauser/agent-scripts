@@ -223,21 +223,94 @@ Options:
       --restart-container           Recreate the persistent container from scratch
 ```
 
-## Package hashing — not supported in the current version
+## Package hashing — optional hashd helper
 
-Reader package hashes (the input to grant-forever) would require
-following `/proc/<pid>/map_files`, which demands `CAP_SYS_ADMIN` or
+Reader package hashes (the input to grant-forever) require following
+`/proc/<pid>/map_files`, which demands `CAP_SYS_ADMIN` or
 `CAP_CHECKPOINT_RESTORE` in the *initial* user namespace — more
 privilege than the deliberately-unprivileged fuse-server may hold.
-The server still performs the hashd socket lookup and lets it fail
-(no hashd is shipped), and the refusal is deliberately bare:
+The server delegates to the optional `hashd` helper over
+`/run/fuse-hashd.sock`; with no hashd deployed the lookup fails and
+grant-forever names the fix:
 
 ```text
 fuse-client grant-forever 7
-Error: forever grant is not supported in the current version.
+Error: pending access 7 has no package hash — hashd unreachable — No such file or directory (os error 2). (Re)start hashd now:
+  sudo install -m 755 <build-dir>/hashd /usr/local/bin/hashd
+  sudo systemctl stop fuse-hashd.service 2>/dev/null; sudo systemctl reset-failed fuse-hashd.service 2>/dev/null
+  sudo systemd-run --unit=fuse-hashd /usr/local/bin/hashd --socket /run/fuse-hashd.sock
+Or install it permanently (one-time, root):
+  sudo install -m 755 target/{debug,release}/hashd /usr/local/bin/hashd
+  sudo install -m 644 crates/hashd/fuse-hashd.socket crates/hashd/fuse-hashd.service /etc/systemd/system/
+  sudo systemctl daemon-reload && sudo systemctl enable --now fuse-hashd.socket
+```
+
+(The commands work in every state — hashd down, running but
+unreachable, or a failed unit still occupying the name. Install before
+`systemd-run`: on SELinux-enforcing systems a service cannot execute
+binaries from `$HOME` — it fails with 203/EXEC.)
+
+Deploying the helper (root once at install; systemd owns the socket,
+the service carries exactly one capability; no polkit):
+
+```sh
+sudo install -m 644 crates/hashd/fuse-hashd.socket crates/hashd/fuse-hashd.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now fuse-hashd.socket
 ```
 
 The technical reason for a missing hash only goes to the server log.
+
+## Threat model
+
+The gate's goal is **containment**: a confused, overly eager actor
+inside the agent container must not spread secrets to the outside
+world. It provides:
+
+- one-read-per-secret with binary-hash verification; every other
+  reader pends for manual approval
+- package identity — the executable plus every mapped library, read
+  through `/proc/<pid>/map_files` (the mapped inodes, never on-disk
+  paths, failing closed on anything unreadable)
+- two grant tiers: one-shot manual grants (strict) and
+  grant-forever (convenience)
+
+What it deliberately does **not** provide:
+
+- **instance authorization** — grant-forever whitelists a package
+  *class*, not the verified process: whoever can later execute the
+  same executable + libraries inherits the access
+- **defense against full container compromise** — an actor
+  controlling env, argv, DNS and the trust stores can coerce any
+  credentialed client; that tier is mitigated in the consuming
+  binary (below), not in the gate
+- **memory identity** — JIT-generated (anonymous executable) pages
+  are outside the hash by construction; the hash is a *package*
+  identity
+
+## Using a forever-granted secret securely
+
+A binary that gets grant-forever should be built to:
+
+1. **Be closed-mouth**: the secret never appears on stdout/stderr,
+   in logs, in verbose output, or in error paths.
+2. **Restrict its operations**: confine what it does *with* the
+   credential — otherwise the actor drives a confused deputy that
+   acts as you.
+3. **Harden its memory**: `prctl(PR_SET_DUMPABLE, 0)` at startup (as
+   ssh-agent does) — blocks core dumps and `/proc/<pid>/mem` even
+   for same-uid attackers. The flag resets on `execve`: set it
+   yourself, re-set after exec.
+4. **Pin the peer**: verify the destination's leaf public key
+   (compiled in), ignore environment-overridable CA paths
+   (`SSL_CERT_FILE` and friends), hard-fail on certificate change,
+   never fall back to plain HTTP. HTTPS alone is **not** sufficient —
+   with container control the actor owns the trust store, and a fake
+   endpoint receives the credentials as Basic auth after its own TLS
+   termination.
+5. **Strongest form**: keep the credentialed client outside the
+   compromisable container — a host-side proxy performing approved
+   actions on the container's behalf, so the secret never enters the
+   container at all.
 
 ## Project layout
 

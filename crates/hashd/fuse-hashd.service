@@ -1,0 +1,22 @@
+# /etc/systemd/system/fuse-hashd.service
+#
+# The helper itself: unprivileged uid, exactly ONE capability — enough
+# to follow /proc/<pid>/map_files (kernel fs/proc/base.c) and nothing
+# else. Started by systemd on demand when a client connects to
+# fuse-hashd.socket; restarts freely, never blocks server updates.
+#
+# Adjust User/Group to the account that runs the fuse-server.
+
+[Unit]
+Description=FUSE gatekeeper package-hash helper
+
+[Service]
+Type=simple
+User=jonas
+AmbientCapabilities=CAP_CHECKPOINT_RESTORE
+CapabilityBoundingSet=CAP_CHECKPOINT_RESTORE
+ExecStart=/usr/local/bin/hashd --socket /run/fuse-hashd.sock
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

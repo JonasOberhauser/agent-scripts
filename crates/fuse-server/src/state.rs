@@ -5,8 +5,6 @@ use std::time::{Duration, Instant};
 use dashmap::DashMap;
 use tracing::error;
 
-use crate::oracle_service::NOT_SUPPORTED;
-
 /// One secret file tracked by the gatekeeper.
 #[derive(Debug, Clone)]
 pub struct SecretRecord {
@@ -295,6 +293,30 @@ impl ServerState {
         !self.pending.contains_key(&id)
     }
 
+    /// The reader pid of a live pending that still lacks a package
+    /// hash — grant-forever retries the hashd lookup at decision time,
+    /// so an operator who starts hashd in response to the pending's
+    /// remediation message can grant the SAME pending.
+    pub fn pending_pid_needing_hash(&self, id: u64) -> Option<u32> {
+        self.pending
+            .get(&id)
+            .filter(|e| e.pid_hash.is_none() && e.expires_at > Instant::now())
+            .map(|e| e.pid)
+    }
+
+    /// Overwrite a pending's hash fields with a live retry's outcome.
+    pub fn refresh_pending_hash(
+        &self,
+        id: u64,
+        pid_hash: Option<String>,
+        hash_error: Option<String>,
+    ) {
+        if let Some(mut entry) = self.pending.get_mut(&id) {
+            entry.pid_hash = pid_hash;
+            entry.hash_error = hash_error;
+        }
+    }
+
     /// Grant a pending access permanently: the observed package hash
     /// becomes the secret's allowed hash and the read limit is lifted.
     /// The waiting reader is served like a normal grant.
@@ -310,7 +332,14 @@ impl ServerState {
             let hash = entry
                 .pid_hash
                 .clone()
-                .ok_or_else(|| NOT_SUPPORTED.to_string())?;
+                .ok_or_else(|| match &entry.hash_error {
+                    Some(why) => format!("pending access {id} has no package hash — {why}"),
+                    None => format!(
+                        "pending access {id} has no package hash — the reading \
+                         process's package could not be inspected, so there is \
+                         nothing to whitelist"
+                    ),
+                })?;
             (entry.secret_name.clone(), hash)
         };
         if let Some(rec_arc) = self.secrets.get(&secret_name).map(|e| Arc::clone(e.value())) {
@@ -526,18 +555,18 @@ mod tests {
         s.create_pending("k", 7, None, "hash unknown", None);
         let id = s.pending.iter().next().unwrap().id;
         let err = s.grant_pending_forever(id).unwrap_err();
-        assert_eq!(err, NOT_SUPPORTED, "got: {err}");
+        assert!(err.contains("no package hash"), "got: {err}");
         assert!(matches!(
             s.attempt_read("k", 9, Some("h2"), 0, 1),
             ReadOutcome::HashMismatch { .. }
         ));
     }
 
-    /// The refusal is deliberately bare: no recorded-inspection text,
-    /// no remediation commands — grant-forever is simply not supported
-    /// in the current version, whatever the technical reason.
+    /// grant-forever must NAME the recorded inspection failure — the
+    /// real reason AND the command that fixes it; that is the whole
+    /// point of the message.
     #[test]
-    fn grant_forever_refusal_stays_bare_even_with_a_recorded_failure() {
+    fn grant_forever_names_the_recorded_inspection_failure() {
         let s = ServerState::new();
         s.add("k", b"V".to_vec(), "h");
         s.create_pending_with_hash_error(
@@ -545,18 +574,20 @@ mod tests {
             42,
             None,
             Some(
-                "read /proc/42/maps: Permission denied. Permission denied: /proc \
-                 ptrace checks failed (SELinux? daemon lacks CAP_SYS_PTRACE? ...)",
+                "hashd unreachable — connect: No such file or directory (os error 2). \
+                 Start hashd now:\n  sudo systemd-run --unit=fuse-hashd \
+                 /opt/hashd --socket /run/fuse-hashd.sock",
             ),
             "hash mismatch",
             None,
         );
         let id = s.pending.iter().next().unwrap().id;
         let err = s.grant_pending_forever(id).unwrap_err();
-        assert_eq!(err, NOT_SUPPORTED, "got: {err}");
+        assert!(err.contains("no package hash"), "got: {err}");
         assert!(
-            !err.contains("Permission denied") && !err.contains("hashd"),
-            "no cause or remediation may leak into the refusal: {err}"
+            err.contains("hashd unreachable")
+                && err.contains("sudo systemd-run --unit=fuse-hashd"),
+            "the recorded reason and its remediation must be embedded verbatim: {err}"
         );
     }
 

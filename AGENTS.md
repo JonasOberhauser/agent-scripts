@@ -34,7 +34,7 @@ cargo test -p fuse-server                # fuse-server only (unit)
 cargo clippy --workspace                 # zero warnings required
 ```
 
-The workspace has five crates: `fuse-protocol`, `fuse-server`, `fuse-client`, `run-agent`, `fuse-mount`.
+The workspace has six crates: `fuse-protocol`, `fuse-server`, `fuse-client`, `run-agent`, `hashd`, `fuse-mount`.
 
 ## Architecture
 
@@ -49,10 +49,37 @@ The workspace has five crates: `fuse-protocol`, `fuse-server`, `fuse-client`, `r
 - **fuse-protocol**: Shared types, `SystemIo` trait, `RealSystemIo` /
   `MockSystemIo` implementations.
 - **fuse-mount** (`fused`): DATA daemon — holds the secret bytes and the FUSE mount; every read asks the policy daemon over the oracle socket. Either half alone is useless; the mount survives policy restarts.
-- **package hashing**: NOT SUPPORTED in the current version. The server
-  still performs the (unshipped) hashd lookup via `fuse_protocol::hashd`
-  and lets it fail; grant-forever answers with a bare not-supported
-  message and the reason only goes to the server log.
+- **hashd**: optional socket-activated helper (`pid → sha256 of its loaded
+  package`) so the unprivileged fuse-server can hash readers for
+  grant-forever; needs CAP_CHECKPOINT_RESTORE in the initial user
+  namespace (kernel `fs/proc/base.c` gate on `/proc/<pid>/map_files`).
+  Not deployed by default: without it the lookup fails and grant-forever
+  answers with a bare not-supported message (the reason only goes to the
+  server log). Protocol: `fuse_protocol::hashd`; units in `crates/hashd`.
+
+## Threat Model
+
+Goal: **containment** — a confused, overly eager actor inside the agent
+container must not spread secrets to the outside world. The gate
+provides one-read semantics, package identity (`map_files` inodes,
+fail-closed), pendings with manual grants, and grant-forever as a
+convenience tier.
+
+Limits every contributor must know:
+
+- grant-forever authorizes a package **class**, not the verified
+  instance: whoever can later execute the same executable + libraries
+  inherits the access.
+- Full container compromise (env/argv/DNS/trust-store control) is out
+  of scope; a credentialed client under that control can be coerced.
+  Mitigations belong in the consuming binary: closed-mouth,
+  operation-restricted, `PR_SET_DUMPABLE=0`, compiled-in leaf-key
+  pinning (HTTPS against an attacker-owned CA store is no protection),
+  or keeping the credentialed client outside the container entirely.
+- Package hashing is file-backed identity; anonymous executable pages
+  (JIT) are outside the hash by construction.
+
+Do not weaken these properties without updating this section.
 
 ## Testing Philosophy
 

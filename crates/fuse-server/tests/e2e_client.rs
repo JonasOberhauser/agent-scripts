@@ -153,3 +153,77 @@ fn e2e_client_binary_against_server() {
     assert!(stderr.contains("not found") || stdout.contains("not found") || stderr.contains("Error"),
         "should report error for missing secret: {stdout} | {stderr}");
 }
+
+/// The remediation round trip: a pending born while hashd was down
+/// carries no hash and an unreachable snapshot; after an operator
+/// starts hashd (a stub here), grant-forever must retry the lookup
+/// LIVE and succeed on the very same pending.
+#[test]
+fn grant_forever_retries_hashd_after_remediation() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("remediation.sock");
+    let hashd_sock = dir.path().join("hashd.sock");
+
+    // No hashd yet: point the server at the (silent) socket path.
+    std::env::set_var("FUSE_HASHD_SOCK", &hashd_sock);
+
+    let state = Arc::new({
+        let s = ServerState::new();
+        s.add("netrc", b"SEKRIT".to_vec(), "wrong_hash");
+        s
+    });
+
+    // A pending from a read that happened while hashd was down: no
+    // hash, stale unreachable snapshot — exactly what the panel shows.
+    state.create_pending_with_hash_error(
+        "netrc",
+        4242,
+        None,
+        Some("hashd unreachable — No such file or directory (os error 2). Start hashd now: ..."),
+        "hash mismatch",
+        None,
+    );
+    let id = state.pending.iter().next().unwrap().id;
+
+    let sock = socket.clone();
+    let st = Arc::clone(&state);
+    let _server = std::thread::spawn(move || {
+        let _ = run_socket_server(&sock, st);
+    });
+    wait_for_server(&socket);
+
+    // Operator follows the printed fix: hashd comes up mid-pending.
+    let stub = {
+        use std::io::{BufRead as _, BufReader, Write as _};
+        let listener = std::os::unix::net::UnixListener::bind(&hashd_sock).unwrap();
+        std::thread::spawn(move || {
+            for conn in listener.incoming().flatten() {
+                let Ok(clone) = conn.try_clone() else { continue };
+                let mut reader = BufReader::new(clone);
+                let mut stream = conn;
+                let mut line = String::new();
+                if reader.read_line(&mut line).is_err() {
+                    continue;
+                }
+                let reply = if line.trim() == format!("hash {}", 4242) {
+                    format!("ok {}\n", "c".repeat(64))
+                } else {
+                    "error gone test\n".to_string()
+                };
+                let _ = stream.write_all(reply.as_bytes());
+                let _ = stream.flush();
+            }
+        })
+    };
+
+    let (stdout, stderr, code) = run_client(&socket, &["grant-forever", &id.to_string()]);
+    assert_eq!(code, 0, "grant-forever after starting hashd failed: {stderr}");
+    assert!(stdout.contains("OK"), "grant-forever should print OK: {stdout}");
+
+    // The live-retried hash became the whitelisted package: unlimited reads.
+    let probe = state.attempt_read("netrc", 555, Some(&"c".repeat(64)), 0, 6);
+    assert!(matches!(probe, fuse_server::ReadOutcome::Granted), "got: {probe:?}");
+
+    let _ = stub;
+    std::env::remove_var("FUSE_HASHD_SOCK");
+}
