@@ -1,0 +1,25 @@
+# /etc/systemd/system/netrcd.service
+#
+# The host-side credential broker. Runs as the user whose netrc and
+# config.d it serves; holds credentials in memory only (Dumpable=no so
+# a crash cannot leave a credential-bearing core on the host).
+
+[Unit]
+Description=netrcd credential broker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=%i
+Type=simple
+ExecStart=/usr/local/bin/netrcd \
+    --socket /run/netrcd/netrcd.sock \
+    --profiles-dir /etc/netrcd/profiles.d \
+    --grants-dir %h/.config/netrcd/config.d \
+    --netrc %h/.netrc
+Dumpable=no
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

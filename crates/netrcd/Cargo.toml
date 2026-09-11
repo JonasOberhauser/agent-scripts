@@ -1,0 +1,37 @@
+[package]
+name = "netrcd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Host-side credential broker: holds netrc secrets, performs policy-checked HTTPS requests on behalf of container clients. Credentials never cross the boundary."
+
+[lib]
+name = "netrcd"
+path = "src/lib.rs"
+
+[[bin]]
+name = "netrcd"
+path = "src/main.rs"
+
+[[bin]]
+name = "nrq"
+path = "src/nrq.rs"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = "0.8"
+regex = "1"
+base64 = "0.22"
+libc = "0.2"
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+# Static curl+openssl: deterministic linkage, and CURLOPT_PINNEDPUBLICKEY
+# for SPKI pinning (any-of, leaf or chain, sha256// pins).
+curl = { version = "0.4", features = ["static-curl", "static-ssl"] }
+
+[dev-dependencies]
+tempfile = "3"
+rustls = "0.23"
+rcgen = "0.13"
