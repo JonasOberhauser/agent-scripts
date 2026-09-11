@@ -84,6 +84,28 @@ fn speaks_the_protocol_over_a_real_socket() {
         "any well-formed status reply counts, got: {reply:?}"
     );
 
+    // Hash a real process: in a privileged context this must be a
+    // 64-hex digest; unprivileged contexts fail classified. Either way
+    // the reply is well-formed — never garbage, never silence.
+    let reply = ask(
+        &hashd.socket,
+        &format!("hash {}", std::process::id()),
+    );
+    if let Some(rest) = reply.strip_prefix("ok ") {
+        assert_eq!(rest.trim().len(), 64, "digest must be sha256 hex: {reply:?}");
+        assert!(
+            rest.trim().chars().all(|c| c.is_ascii_hexdigit()),
+            "digest must be hex: {reply:?}"
+        );
+    } else {
+        assert!(
+            reply.starts_with("error unprivileged ")
+                || reply.starts_with("error gone ")
+                || reply.starts_with("error "),
+            "hash failures must be classified, got: {reply:?}"
+        );
+    }
+
     let reply = ask(&hashd.socket, "nonsense");
     assert!(
         reply.starts_with("error "),
