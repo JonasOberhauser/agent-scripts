@@ -34,7 +34,7 @@ cargo test -p fuse-server                # fuse-server only (unit)
 cargo clippy --workspace                 # zero warnings required
 ```
 
-The workspace has six crates: `fuse-protocol`, `fuse-server`, `fuse-client`, `run-agent`, `hashd`, `fuse-mount`.
+The workspace has seven crates: `fuse-protocol`, `fuse-server`, `fuse-client`, `run-agent`, `hashd`, `fuse-mount`, `netrcd`.
 
 ## Architecture
 
@@ -56,6 +56,18 @@ The workspace has six crates: `fuse-protocol`, `fuse-server`, `fuse-client`, `ru
   Not deployed by default: without it the lookup fails and grant-forever
   answers with a bare not-supported message (the reason only goes to the
   server log). Protocol: `fuse_protocol::hashd`; units in `crates/hashd`.
+- **netrcd**: host-side credential broker. Containers send typed
+  requests over a unix socket ("perform this allowlisted authenticated
+  request against machine X"); the daemon joins them with a host-side
+  netrc (the secret) and a two-layer policy (shared site *profiles*:
+  auth/pins/headers; per-user *grants*: allow rules + limits), performs
+  the pinned HTTPS call itself, and returns the response. Credentials
+  never cross the container boundary; channel access is unconditional
+  (0666 socket), authorization is per-request in policy. TOML config
+  with typed structs (serde, deny_unknown_fields, compile-at-load
+  regexes/pins); compatible files merge with a warning, conflicts
+  refuse only that machine. Everything fails closed; units in
+  `crates/netrcd`.
 
 ## Threat Model
 

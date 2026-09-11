@@ -312,6 +312,71 @@ A binary that gets grant-forever should be built to:
    actions on the container's behalf, so the secret never enters the
    container at all.
 
+## netrcd — the host-side credential broker
+
+Containers hold no long-lived API credentials. `netrcd` listens on a
+unix socket (bind-mount the **directory**, not the socket file — a
+bind-mounted file pins the inode and breaks across restarts); clients
+send one JSON line per request:
+
+```text
+→ {"op":"request","machine":"api.github.com","method":"GET","url":"/zen"}
+← {"op":"response","status":200,"headers":{…},"body":"…"}
+← {"op":"error","code":"not_allowed","detail":"no rule matches …"}
+```
+
+The daemon joins the request with a **netrc** (the secret, host-side
+only) and a two-layer policy, performs the pinned HTTPS call itself,
+and returns the response. The credential's only journey is
+netrc → Authorization header → TLS, entirely on the host.
+
+Two config layers, TOML, typed structs (`deny_unknown_fields`,
+compile-at-load regexes and pins):
+
+```toml
+# /etc/netrcd/profiles.d/api.github.com.toml — shared FACTS
+[[machine]]
+name = "api.github.com"
+auth = "bearer"                       # basic | bearer | header: <Name>: <{login}/{password} template>
+pins = ["sha256//…", "sha256//…"]     # any-of SPKI pins; absent = ordinary CA validation
+
+  [machine.headers]
+  "X-GitHub-Api-Version" = "2022-11-28"
+
+# ~/.config/netrcd/config.d/api.github.com.toml — user GRANTS
+# (limits BEFORE [[machine.allow]] — TOML keys bind to the last open table)
+[[machine]]
+name = "api.github.com"
+rate = "30/min"
+max_req = "1 MiB"
+timeout = "30s"
+
+  [[machine.allow]]
+  method = "POST"                     # GET/POST/… or * (closed vocabulary)
+  url = '/repos/[^/]+/pulls'          # auto-anchored whole-match
+  headers = ['Content-Type: application/json']   # find-match, AND within a rule
+  body = ['"model":"gpt-4o[^"]*"']               # find-match; anchor with ^…$ for exact
+```
+
+Merging: machines spanning files merge when compatible (warning);
+conflicting values refuse only that machine. Fail-closed everywhere:
+unknown machine / no grant / no credential / oversized / pin mismatch
+are typed errors — never a guess, never a secret.
+
+Deploy (socket activation keeps the inode stable across restarts):
+
+```sh
+sudo install -m 755 target/release/netrcd /usr/local/bin/netrcd
+sudo install -m 644 crates/netrcd/netrcd.socket crates/netrcd/netrcd.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now netrcd.socket
+```
+
+In-container client:
+
+```sh
+NETRCD_SOCK=/netrcd/netrcd.sock nrq GET api.github.com /zen
+```
+
 ## Project layout
 
 ```
@@ -321,7 +386,8 @@ agents/
 │   ├── fuse-protocol/         # shared types + IoProvider<I,O> trait
 │   ├── fuse-server/           # FUSE filesystem + socket server
 │   ├── fuse-client/           # CLI client
-│   └── run-agent/             # orchestrator
+│   ├── run-agent/             # orchestrator
+│   └── netrcd/               # host-side credential broker
 ├── Dockerfile                 # agentbox container image
 └── run-agent.sh               # original bash version (kept for reference)
 ```
