@@ -2366,6 +2366,93 @@ mod tests {
         assert!(reversed(widgets.last().expect("all-row widget")));
     }
 
+    /// Model rule 1+2: hovering means ON A BUTTON. With the mouse
+    /// over the panel but NOT on a button, the keyboard wins — its
+    /// highlight stays visible (no dead zone between buttons).
+    #[test]
+    fn mouse_over_panel_but_off_buttons_keeps_the_keyboard_highlight() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("hover-gap.sock");
+        let _seen = fake_server(&sock, vec![31]);
+
+        let mut layer_obj = layer(Arc::new(Mutex::new(ids(&[31]))), &sock);
+        let mut ctx = servatui_display::LayerCtx {
+            id: servatui_display::LayerId::BUILTIN,
+            color: Color::Reset,
+            terminal_area: Rect::new(0, 0, 80, 24),
+            my_widgets: &[],
+        };
+        let mut widgets = Vec::new();
+        layer_obj.on_overlay(&mut ctx, &mut widgets); // frame 1
+
+        // A real Moved event landing in the row's leading text area
+        // (on the row, not on any button): not hovering.
+        let panel = panel_rect(ctx.terminal_area);
+        let row0 = row_rect(panel, 0);
+        let moved = Event::Mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: row0.x + 1,
+            row: row0.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(matches!(layer_obj.on_event(&moved, &ctx), EventResult::Swallow));
+        assert_eq!(
+            layer_obj.owner.get(),
+            Owner::Keyboard,
+            "off-button = not hovering = keyboard wins"
+        );
+
+        let mut widgets = Vec::new();
+        layer_obj.on_overlay(&mut ctx, &mut widgets); // frame 2
+        let reversed = |entry: &servyi_servatui::WidgetEntry| {
+            let mut buf = ratatui::buffer::Buffer::empty(entry.area);
+            entry.widget.render_ref(entry.area, &mut buf);
+            buf.content().iter().any(|c| c.modifier.contains(Modifier::REVERSED))
+        };
+        // Default All{grant} cursor visible.
+        assert!(reversed(widgets.last().expect("all-row widget")));
+    }
+
+    /// Takeover seam with in-flight rows: the keyboard may take over
+    /// from a hover on a DISABLED button — the cursor must then land
+    /// on a LIVE row (never invisibly on the grayed one).
+    #[test]
+    fn keyboard_takeover_from_a_disabled_hover_lands_on_a_live_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("hover-disabled.sock");
+        let _seen = fake_server(&sock, vec![31, 37]);
+
+        let mut layer_obj = layer(Arc::new(Mutex::new(ids(&[31, 37]))), &sock);
+        let mut ctx = servatui_display::LayerCtx {
+            id: servatui_display::LayerId::BUILTIN,
+            color: Color::Reset,
+            terminal_area: Rect::new(0, 0, 80, 24),
+            my_widgets: &[],
+        };
+        let mut widgets = Vec::new();
+        layer_obj.on_overlay(&mut ctx, &mut widgets); // frame 1
+
+        // 31 is in flight (grayed); the mouse rests on its [deny].
+        layer_obj.in_flight.borrow_mut().insert(31, Instant::now());
+        let panel = panel_rect(ctx.terminal_area);
+        let (deny, _) = button_pair(row_rect(panel, 0), false);
+        layer_obj.hover.set(Some((deny.x + 1, deny.y)));
+        layer_obj.owner.set(Owner::Mouse);
+
+        // Keyboard takeover: Down syncs to the (disabled) hovered
+        // button, then traversal skips it — landing on the live 37.
+        assert!(matches!(
+            layer_obj.on_event(&key(KeyCode::Down), &ctx),
+            EventResult::Swallow
+        ));
+        assert_eq!(
+            layer_obj.cursor,
+            Cursor::Request { slot: 1, sel: Sel::Deny },
+            "cursor must land on the LIVE row below, not the grayed one"
+        );
+        assert_eq!(layer_obj.owner.get(), Owner::Keyboard);
+    }
+
     /// Regression (live finding): the all-row buttons must highlight
     /// under hover when driven through REAL frames — the grid children
     /// have to be registered BEFORE the frame's hit-test, and the
