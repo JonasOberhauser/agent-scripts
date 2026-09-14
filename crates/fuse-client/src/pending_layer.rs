@@ -450,6 +450,23 @@ fn requester_and_secret(req: &PendingAccessInfo) -> String {
     format!("{} → {}", requester(req), req.secret_name)
 }
 
+/// Hover (#25): the button under the mouse renders with the same
+/// reverse-video highlight as the keyboard selection.
+fn grid_row_line_hover(
+    row: GridRow,
+    width: u16,
+    sel_here: Option<Sel>,
+    hovered: Option<&Button>,
+) -> Line<'static> {
+    let sel_here = match hovered {
+        Some(Button::GrantForever { .. }) => Some(Sel::Forever),
+        Some(Button::Grant { .. }) | Some(Button::GrantAll) => Some(Sel::Grant),
+        Some(Button::Deny { .. }) | Some(Button::DenyAll) => Some(Sel::Deny),
+        None => sel_here,
+    };
+    grid_row_line(row, width, sel_here)
+}
+
 fn grid_row_line(row: GridRow, width: u16, sel_here: Option<Sel>) -> Line<'static> {
     let all = matches!(row, GridRow::All);
     let (deny_l, grant_l) = if all { ("[deny all]", "[grant all]") } else { ("[deny]", "[grant]") };
@@ -639,6 +656,31 @@ impl ServerTalk for WorkerTalk {
     }
 }
 
+/// Who owns the panel highlight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Owner {
+    Mouse,
+    Keyboard,
+}
+
+/// The keyboard cursor corresponding to a grid button (used when the
+/// keyboard takes over from a hover: the arrow keys then move FROM
+/// the highlighted button, not from the stale internal cursor).
+fn cursor_of_child(child: &GridChild) -> Cursor {
+    if child.row == MAX_SHOWN {
+        Cursor::All {
+            grant: matches!(child.button, Button::GrantAll),
+        }
+    } else {
+        let sel = match child.button {
+            Button::GrantForever { .. } => Sel::Forever,
+            Button::Grant { .. } | Button::GrantAll => Sel::Grant,
+            Button::Deny { .. } | Button::DenyAll => Sel::Deny,
+        };
+        Cursor::Request { slot: child.row, sel }
+    }
+}
+
 // ── The layer ─────────────────────────────────────────────────────
 
 /// One laid-out button child of the grid.
@@ -683,6 +725,13 @@ pub(crate) struct PendingPanelLayer {
     /// Writes a line into the shell's log window (the builtin TUI's
     /// log area).  Optional: absent in tests that only assert layout.
     log_window: Option<LogWindow>,
+    /// Last mouse position; HOVERING means a button is under it
+    /// (hit-tested per frame against the grid).
+    hover: std::cell::Cell<Option<(u16, u16)>>,
+    /// Which input device owns the highlight (#25): when the mouse
+    /// rests on a button, the last device to act wins; otherwise the
+    /// keyboard always wins.
+    owner: std::cell::Cell<Owner>,
     /// Latches when the shell first becomes too small; resets once it
     /// is big enough again so a later shrink re-warns.
     small_warned: std::cell::Cell<bool>,
@@ -702,6 +751,8 @@ impl PendingPanelLayer {
             pending,
             talk,
             log_window: None,
+            hover: std::cell::Cell::new(None),
+            owner: std::cell::Cell::new(Owner::Keyboard),
             small_warned: std::cell::Cell::new(false),
             slots: empty_slots(),
             cursor: Cursor::All { grant: true },
@@ -759,12 +810,21 @@ impl DisplayLayer for PendingPanelLayer {
         self.seen.extend(snapshot.iter().map(|p| p.id));
         let intent = if has_new { StackIntent::Top } else { StackIntent::Keep };
 
+        // Capture the hover hit from the PREVIOUS frame's grid before
+        // the clear — the same geometry the input handlers used, and
+        // hit-testing the freshly cleared grid would always miss.
+        let hovered_child = self.hover.get().and_then(|(c, r)| self.grid.hit(c, r));
         self.grid.clear();
         if !self.slots.iter().any(|s| s.is_some()) {
             return StackIntent::Keep;
         }
 
         let panel = panel_rect(ctx.terminal_area);
+        // Ownership decides the highlight: the mouse's hover shows
+        // only while the mouse BOTH owns and rests on a button; in
+        // every other state the keyboard cursor is the visible
+        // selection.
+        let mouse_shows = self.owner.get() == Owner::Mouse && hovered_child.is_some();
         if panel.width < PANEL_WIDTH {
             if !self.small_warned.replace(true) {
                 let warning = format!(
@@ -829,7 +889,18 @@ impl DisplayLayer for PendingPanelLayer {
                         Cursor::Request { slot, sel } if slot == i => Some(sel),
                         _ => None,
                     };
-                    grid_row_line(GridRow::Request(req), row.width, sel_here)
+                    let sel_here = if mouse_shows { None } else { sel_here };
+                    let hovered = if mouse_shows && hovered_child.is_some_and(|h| h.row == i) {
+                        hovered_child.map(|h| h.button)
+                    } else {
+                        None
+                    };
+                    grid_row_line_hover(
+                        GridRow::Request(req),
+                        row.width,
+                        sel_here,
+                        hovered.as_ref(),
+                    )
                 }
             };
             widgets.push(WidgetEntry {
@@ -845,15 +916,25 @@ impl DisplayLayer for PendingPanelLayer {
             Cursor::All { grant } => Some(if grant { Sel::Grant } else { Sel::Deny }),
             _ => None,
         };
+        let sel_here = if mouse_shows { None } else { sel_here };
+        // Register the all-row buttons BEFORE hit-testing: the grid is
+        // cleared at frame start, so last frame's children are gone —
+        // a hit-test run before re-registering never finds them.
         let (deny, grant) = button_pair(all_row, true);
         self.grid.children.push(GridChild { row: MAX_SHOWN, button: Button::DenyAll, rect: deny });
         self.grid.children.push(GridChild { row: MAX_SHOWN, button: Button::GrantAll, rect: grant });
+        let all_hovered = if mouse_shows && hovered_child.is_some_and(|h| h.row == MAX_SHOWN) {
+            hovered_child.map(|h| h.button)
+        } else {
+            None
+        };
         widgets.push(WidgetEntry {
             name: PANEL_NAME,
-            widget: Box::new(Paragraph::new(grid_row_line(
+            widget: Box::new(Paragraph::new(grid_row_line_hover(
                 GridRow::All,
                 all_row.width,
                 sel_here,
+                all_hovered.as_ref(),
             ))),
             area: all_row,
         });
@@ -876,12 +957,44 @@ impl DisplayLayer for PendingPanelLayer {
                     EventResult::Pass
                 }
                 MouseEventKind::Drag(_) | MouseEventKind::Up(_) => EventResult::Swallow,
+                MouseEventKind::Moved => {
+                    // Claim mouse moves only over the panel itself;
+                    // layers beneath see everything else. Ownership
+                    // follows HOVERING: on a button the mouse claims
+                    // the highlight, off it the keyboard wins.
+                    self.hover.set(Some((m.column, m.row)));
+                    let hovering = self.grid.hit(m.column, m.row).is_some();
+                    self.owner.set(if hovering { Owner::Mouse } else { Owner::Keyboard });
+                    let over_panel = self
+                        .grid
+                        .rows
+                        .iter()
+                        .any(|area| contains(area, m.column, m.row));
+                    if over_panel {
+                        EventResult::Swallow
+                    } else {
+                        EventResult::Pass
+                    }
+                }
                 _ => EventResult::Pass,
             },
             Event::Key(k) if k.kind == KeyEventKind::Press => {
                 if !self.slots.iter().any(|s| s.is_some()) {
                     return EventResult::Pass;
                 }
+                // Last input device wins — but the keyboard takes
+                // over FROM the highlighted button: if the mouse was
+                // hovering one, the cursor first syncs to it, so
+                // arrow movement starts where the user last saw the
+                // highlight, not from a stale internal position.
+                if self.owner.get() == Owner::Mouse {
+                    if let Some((c, r)) = self.hover.get() {
+                        if let Some(child) = self.grid.hit(c, r) {
+                            self.cursor = cursor_of_child(&child);
+                        }
+                    }
+                }
+                self.owner.set(Owner::Keyboard);
                 match k.code {
                     KeyCode::Up => {
                         self.cursor = cursor_up(&self.slots, self.cursor);
@@ -1683,6 +1796,281 @@ mod tests {
     // ── grant-forever panel tests (#11) ───────────────────────────
 
     /// Left/Right step through forever -> grant -> deny, clamped.
+    fn moved(x: u16, y: u16) -> Event {
+        Event::Mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: x,
+            row: y,
+            modifiers: KeyModifiers::NONE,
+        })
+    }
+
+    /// Hovering a button highlights it (reverse video) even without any
+    /// keyboard selection, on request rows and the all-row alike (#25).
+    #[test]
+    fn hovered_button_renders_highlighted() {
+        for (button, sel) in [
+            (Button::GrantForever { id: 31 }, Sel::Forever),
+            (Button::Grant { id: 31 }, Sel::Grant),
+            (Button::Deny { id: 31 }, Sel::Deny),
+        ] {
+            let line = grid_row_line_hover(
+                GridRow::Request(&pending_info(31)),
+                PANEL_WIDTH,
+                None,
+                Some(&button),
+            );
+            assert!(
+                line.spans
+                    .iter()
+                    .any(|s| s.style.add_modifier.contains(Modifier::REVERSED)),
+                "hover on {button:?} must reverse-highlight"
+            );
+            let _ = sel;
+        }
+        let line = grid_row_line_hover(GridRow::All, PANEL_WIDTH, None, Some(&Button::GrantAll));
+        assert!(
+            line.spans
+                .iter()
+                .any(|s| s.style.add_modifier.contains(Modifier::REVERSED)),
+            "hover on grant-all must reverse-highlight"
+        );
+    }
+
+    /// No hover -> no highlight change (pure renderer pass-through).
+    #[test]
+    fn hover_absent_leaves_selection_untouched() {
+        let line =
+            grid_row_line_hover(GridRow::Request(&pending_info(31)), PANEL_WIDTH, None, None);
+        assert!(
+            !line.spans
+                .iter()
+                .any(|s| s.style.add_modifier.contains(Modifier::REVERSED)),
+            "no hover and no selection: no highlight"
+        );
+    }
+
+    /// Regression (live finding #2): while the mouse is over the
+    /// panel, the keyboard cursor must not keep its highlight — the
+    /// default All{grant} cursor otherwise leaves [grant all] lit
+    /// while the user hovers a request row, looking stuck.
+    #[test]
+    fn hover_over_request_row_suppresses_the_all_row_cursor_highlight() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("hover-suppress.sock");
+        let _seen = fake_server(&sock, vec![31]);
+
+        let mut layer_obj = layer(Arc::new(Mutex::new(ids(&[31]))), &sock);
+        // DEFAULT cursor: All{grant} — [grant all] is keyboard-lit.
+        let mut ctx = servatui_display::LayerCtx {
+            id: servatui_display::LayerId::BUILTIN,
+            color: Color::Reset,
+            terminal_area: Rect::new(0, 0, 80, 24),
+            my_widgets: &[],
+        };
+        let mut widgets = Vec::new();
+        layer_obj.on_overlay(&mut ctx, &mut widgets); // frame 1
+
+        // Hover over request 31's [deny] button (top row).
+        let panel = panel_rect(ctx.terminal_area);
+        let first_row = row_rect(panel, 0);
+        let (deny, _) = button_pair(first_row, false);
+        layer_obj.hover.set(Some((deny.x + 1, deny.y)));
+        layer_obj.owner.set(Owner::Mouse);
+
+        let mut widgets = Vec::new();
+        layer_obj.on_overlay(&mut ctx, &mut widgets); // frame 2
+
+        let reversed = |entry: &servyi_servatui::WidgetEntry| {
+            let mut buf = ratatui::buffer::Buffer::empty(entry.area);
+            entry.widget.render_ref(entry.area, &mut buf);
+            buf.content().iter().any(|c| c.modifier.contains(Modifier::REVERSED))
+        };
+        let all = widgets.last().expect("all-row widget");
+        assert!(!reversed(all), "cursor highlight must not keep [grant all] lit under hover");
+        assert!(
+            widgets.iter().take(widgets.len() - 1).any(reversed),
+            "the hovered request button highlights instead"
+        );
+    }
+
+    /// Regression (live finding #3): the keyboard must be able to
+    /// RE-TAKE visual authority — a key press clears hover, so a
+    /// resting mouse over the panel cannot hide keyboard navigation.
+    #[test]
+    fn key_press_takes_the_highlight_back_from_hover() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("hover-key.sock");
+        let _seen = fake_server(&sock, vec![31]);
+
+        let mut layer_obj = layer(Arc::new(Mutex::new(ids(&[31]))), &sock);
+        let mut ctx = servatui_display::LayerCtx {
+            id: servatui_display::LayerId::BUILTIN,
+            color: Color::Reset,
+            terminal_area: Rect::new(0, 0, 80, 24),
+            my_widgets: &[],
+        };
+        let mut widgets = Vec::new();
+        layer_obj.on_overlay(&mut ctx, &mut widgets); // frame 1
+
+        // Mouse hovering request 31's [deny] — hover owns the highlight.
+        let panel = panel_rect(ctx.terminal_area);
+        let (deny, _) = button_pair(row_rect(panel, 0), false);
+        layer_obj.hover.set(Some((deny.x + 1, deny.y)));
+        layer_obj.owner.set(Owner::Mouse);
+        let mut widgets = Vec::new();
+        layer_obj.on_overlay(&mut ctx, &mut widgets); // frame 2: hover visible
+
+        // The user presses Left: the keyboard takes over FROM THE
+        // HIGHLIGHTED BUTTON (request 0's deny), so the cursor
+        // becomes Request{0, Deny} and Left steps to Grant.
+        assert!(matches!(
+            layer_obj.on_event(&key(KeyCode::Left), &ctx),
+            EventResult::Swallow
+        ));
+        assert_eq!(
+            layer_obj.cursor,
+            Cursor::Request { slot: 0, sel: Sel::Grant },
+            "arrow movement must start from the HIGHLIGHTED button, not the stale cursor"
+        );
+        assert_eq!(layer_obj.owner.get(), Owner::Keyboard);
+        let mut widgets = Vec::new();
+        layer_obj.on_overlay(&mut ctx, &mut widgets); // frame 3
+
+        let reversed = |entry: &servyi_servatui::WidgetEntry| {
+            let mut buf = ratatui::buffer::Buffer::empty(entry.area);
+            entry.widget.render_ref(entry.area, &mut buf);
+            buf.content().iter().any(|c| c.modifier.contains(Modifier::REVERSED))
+        };
+        // Keyboard owns now: its highlight is visible again.
+        assert!(
+            widgets.iter().take(widgets.len() - 1).any(reversed),
+            "cursor highlight must be visible after a key press"
+        );
+    }
+
+    /// Regression (live finding #3b): a mouse move OUTSIDE the panel
+    /// clears hover (and passes the event on) — the keyboard cursor
+    /// highlight returns without any key press.
+    #[test]
+    fn mouse_leaving_the_panel_releases_the_highlight() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("hover-leave.sock");
+        let _seen = fake_server(&sock, vec![31]);
+
+        let mut layer_obj = layer(Arc::new(Mutex::new(ids(&[31]))), &sock);
+        let mut ctx = servatui_display::LayerCtx {
+            id: servatui_display::LayerId::BUILTIN,
+            color: Color::Reset,
+            terminal_area: Rect::new(0, 0, 80, 24),
+            my_widgets: &[],
+        };
+        let mut widgets = Vec::new();
+        layer_obj.on_overlay(&mut ctx, &mut widgets); // frame 1
+
+        let panel = panel_rect(ctx.terminal_area);
+        let (deny, _) = button_pair(row_rect(panel, 0), false);
+        layer_obj.hover.set(Some((deny.x + 1, deny.y)));
+        layer_obj.owner.set(Owner::Mouse);
+        let mut widgets = Vec::new();
+        layer_obj.on_overlay(&mut ctx, &mut widgets); // frame 2
+
+        // Mouse moves off the panel (below it), via the real handler.
+        let below = Event::Mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: 10,
+            row: panel.y + panel.height + 2,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(
+            matches!(layer_obj.on_event(&below, &ctx), EventResult::Pass),
+            "moves outside the panel must pass through"
+        );
+        let mut widgets = Vec::new();
+        layer_obj.on_overlay(&mut ctx, &mut widgets); // frame 3
+
+        let reversed = |entry: &servyi_servatui::WidgetEntry| {
+            let mut buf = ratatui::buffer::Buffer::empty(entry.area);
+            entry.widget.render_ref(entry.area, &mut buf);
+            buf.content().iter().any(|c| c.modifier.contains(Modifier::REVERSED))
+        };
+        // Hover gone; the DEFAULT All{grant} cursor lights again.
+        assert!(reversed(widgets.last().expect("all-row widget")));
+    }
+
+    /// Regression (live finding): the all-row buttons must highlight
+    /// under hover when driven through REAL frames — the grid children
+    /// have to be registered BEFORE the frame's hit-test, and the
+    /// per-frame `grid.clear()` makes "one frame later" never arrive.
+    #[test]
+    fn hover_highlights_all_buttons_across_real_frames() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("hover-all.sock");
+        let _seen = fake_server(&sock, vec![31]);
+
+        let mut layer_obj = layer(Arc::new(Mutex::new(ids(&[31]))), &sock);
+        // Neutral keyboard cursor: the default All{grant} would highlight
+        // [grant all] regardless of hover and mask the regression.
+        layer_obj.cursor = Cursor::Request { slot: 0, sel: Sel::Forever };
+        let mut ctx = servatui_display::LayerCtx {
+            id: servatui_display::LayerId::BUILTIN,
+            color: Color::Reset,
+            terminal_area: Rect::new(0, 0, 80, 24),
+            my_widgets: &[],
+        };
+
+        // Frame 1: populates the button grid.
+        let mut widgets = Vec::new();
+        layer_obj.on_overlay(&mut ctx, &mut widgets);
+
+        // Mouse moved over the all-row's [deny all] button.
+        let panel = panel_rect(ctx.terminal_area);
+        let (deny_all, _) = button_pair(all_row_rect(panel), true);
+        layer_obj.hover.set(Some((deny_all.x + 2, deny_all.y)));
+        layer_obj.owner.set(Owner::Mouse);
+
+        // Frame 2 renders WITH the hover — the all-row widget is the
+        // last pushed; render it into a buffer and require the
+        // reverse-video highlight the user actually sees.
+        let mut widgets = Vec::new();
+        layer_obj.on_overlay(&mut ctx, &mut widgets);
+        let entry = widgets.last().expect("all-row widget");
+        assert_eq!(entry.area, all_row_rect(panel), "last widget is the all-row");
+        let mut buf = ratatui::buffer::Buffer::empty(entry.area);
+        entry.widget.render_ref(entry.area, &mut buf);
+        assert!(
+            buf.content().iter().any(|c| c.modifier.contains(Modifier::REVERSED)),
+            "deny-all must render highlighted under hover"
+        );
+    }
+
+    /// Moving the mouse over a [forever] button highlights it in the
+    /// NEXT frame, and moving off clears it.
+    #[test]
+    fn mouse_move_updates_hover_across_frames() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("panel.sock");
+        fake_server(&sock, vec![31, 37]);
+
+        let pending: PendingIds = Arc::new(Mutex::new(ids(&[31, 37])));
+        let mut display = servatui_display::Display::with_palette(Vec::new());
+        display.add_layer(Box::new(layer(pending, &sock)));
+        frame_with_pending(&mut display);
+
+        let row = row_rect(panel_rect(Rect::new(0, 0, 80, 24)), 1);
+        let forever = forever_rect(row);
+        assert!(
+            display.route_event(&moved(forever.x + 1, forever.y)),
+            "Moved swallowed"
+        );
+        frame_with_pending(&mut display);
+        assert!(
+            display.route_event(&moved(row.x, row.y)),
+            "Moved off (still inside the panel, over no button) swallowed"
+        );
+        frame_with_pending(&mut display);
+    }
+
     #[test]
     fn left_right_step_through_forever() {
         assert_eq!(Sel::Forever.step(false), Sel::Grant);
