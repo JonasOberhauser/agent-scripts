@@ -931,8 +931,20 @@ impl DisplayLayer for PendingPanelLayer {
                 }
                 MouseEventKind::Drag(_) | MouseEventKind::Up(_) => EventResult::Swallow,
                 MouseEventKind::Moved => {
-                    self.hover.set(Some((m.column, m.row)));
-                    EventResult::Swallow
+                    // Claim mouse moves only over the panel itself:
+                    // outside, the coordinates still clear hover (the
+                    // pointer left), and layers beneath see the event.
+                    let over_panel = self
+                        .grid
+                        .rows
+                        .iter()
+                        .any(|area| contains(area, m.column, m.row));
+                    self.hover.set(if over_panel { Some((m.column, m.row)) } else { None });
+                    if over_panel {
+                        EventResult::Swallow
+                    } else {
+                        EventResult::Pass
+                    }
                 }
                 _ => EventResult::Pass,
             },
@@ -940,6 +952,11 @@ impl DisplayLayer for PendingPanelLayer {
                 if !self.slots.iter().any(|s| s.is_some()) {
                     return EventResult::Pass;
                 }
+                // Last input device wins: any key press hands visual
+                // authority back to the keyboard cursor — without
+                // this, a resting mouse over the panel would hide
+                // keyboard navigation entirely.
+                self.hover.set(None);
                 match k.code {
                     KeyCode::Up => {
                         self.cursor = cursor_up(&self.slots, self.cursor);
@@ -1836,6 +1853,104 @@ mod tests {
             widgets.iter().take(widgets.len() - 1).any(reversed),
             "the hovered request button highlights instead"
         );
+    }
+
+    /// Regression (live finding #3): the keyboard must be able to
+    /// RE-TAKE visual authority — a key press clears hover, so a
+    /// resting mouse over the panel cannot hide keyboard navigation.
+    #[test]
+    fn key_press_takes_the_highlight_back_from_hover() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("hover-key.sock");
+        let _seen = fake_server(&sock, vec![31]);
+
+        let mut layer_obj = layer(Arc::new(Mutex::new(ids(&[31]))), &sock);
+        let mut ctx = servatui_display::LayerCtx {
+            id: servatui_display::LayerId::BUILTIN,
+            color: Color::Reset,
+            terminal_area: Rect::new(0, 0, 80, 24),
+            my_widgets: &[],
+        };
+        let mut widgets = Vec::new();
+        layer_obj.on_overlay(&mut ctx, &mut widgets); // frame 1
+
+        // Mouse hovering request 31's [deny] — hover owns the highlight.
+        let panel = panel_rect(ctx.terminal_area);
+        let (deny, _) = button_pair(row_rect(panel, 0), false);
+        layer_obj.hover.set(Some((deny.x + 1, deny.y)));
+        let mut widgets = Vec::new();
+        layer_obj.on_overlay(&mut ctx, &mut widgets); // frame 2: hover visible
+
+        // Now the user presses Down: keyboard takes over.
+        assert!(matches!(
+            layer_obj.on_event(&key(KeyCode::Down), &ctx),
+            EventResult::Swallow
+        ));
+        let mut widgets = Vec::new();
+        layer_obj.on_overlay(&mut ctx, &mut widgets); // frame 3
+
+        let reversed = |entry: &servyi_servatui::WidgetEntry| {
+            let mut buf = ratatui::buffer::Buffer::empty(entry.area);
+            entry.widget.render_ref(entry.area, &mut buf);
+            buf.content().iter().any(|c| c.modifier.contains(Modifier::REVERSED))
+        };
+        let all = widgets.last().expect("all-row widget");
+        // Down from the All cursor lands the cursor on request 0:
+        // the request row must show the CURSOR highlight, and with
+        // hover cleared the all-row stays dark.
+        assert!(
+            widgets.iter().take(widgets.len() - 1).any(reversed),
+            "cursor highlight must be visible after a key press"
+        );
+        let _ = all;
+    }
+
+    /// Regression (live finding #3b): a mouse move OUTSIDE the panel
+    /// clears hover (and passes the event on) — the keyboard cursor
+    /// highlight returns without any key press.
+    #[test]
+    fn mouse_leaving_the_panel_releases_the_highlight() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("hover-leave.sock");
+        let _seen = fake_server(&sock, vec![31]);
+
+        let mut layer_obj = layer(Arc::new(Mutex::new(ids(&[31]))), &sock);
+        let mut ctx = servatui_display::LayerCtx {
+            id: servatui_display::LayerId::BUILTIN,
+            color: Color::Reset,
+            terminal_area: Rect::new(0, 0, 80, 24),
+            my_widgets: &[],
+        };
+        let mut widgets = Vec::new();
+        layer_obj.on_overlay(&mut ctx, &mut widgets); // frame 1
+
+        let panel = panel_rect(ctx.terminal_area);
+        let (deny, _) = button_pair(row_rect(panel, 0), false);
+        layer_obj.hover.set(Some((deny.x + 1, deny.y)));
+        let mut widgets = Vec::new();
+        layer_obj.on_overlay(&mut ctx, &mut widgets); // frame 2
+
+        // Mouse moves off the panel (below it), via the real handler.
+        let below = Event::Mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: 10,
+            row: panel.y + panel.height + 2,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(
+            matches!(layer_obj.on_event(&below, &ctx), EventResult::Pass),
+            "moves outside the panel must pass through"
+        );
+        let mut widgets = Vec::new();
+        layer_obj.on_overlay(&mut ctx, &mut widgets); // frame 3
+
+        let reversed = |entry: &servyi_servatui::WidgetEntry| {
+            let mut buf = ratatui::buffer::Buffer::empty(entry.area);
+            entry.widget.render_ref(entry.area, &mut buf);
+            buf.content().iter().any(|c| c.modifier.contains(Modifier::REVERSED))
+        };
+        // Hover gone; the DEFAULT All{grant} cursor lights again.
+        assert!(reversed(widgets.last().expect("all-row widget")));
     }
 
     /// Regression (live finding): the all-row buttons must highlight
