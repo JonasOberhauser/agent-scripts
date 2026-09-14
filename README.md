@@ -377,7 +377,30 @@ In-container client:
 NETRCD_SOCK=/netrcd/netrcd.sock nrq GET api.github.com /zen
 ```
 
-**SELinux on enforcing Fedora — two separate gates, both required:**
+**SELinux on enforcing Fedora — two deployment paths:**
+
+*Rootless (recommended; zero sudo, zero policy fights).* Run the
+daemon itself as a container, pinned to a fixed MCS level — stock
+policy allows `container_t -> container_t` socket connects *within
+the same category pair*, and podman's random per-container levels are
+the only thing standing in the way. Pinning daemon and clients to
+e.g. `s0:c100,c200` legalizes the connect with no policy edits:
+
+```sh
+./crates/netrcd/deploy-rootless.sh            # builds image, installs quadlet unit
+systemctl --user status netrcd.service        # rootless systemd, Restart=always
+# client containers — the ONLY extras are the level and the socket dir:
+podman run --rm --security-opt label=level=s0:c100,c200 \
+  -v ~/.local/share/netrcd/socket:/netrcd:Z localhost/netrcd:latest \
+  env NETRCD_SOCK=/netrcd/netrcd.sock nrq GET api.github.com /zen
+```
+
+The credential lives as a copy under `~/.local/share/netrcd/creds/`
+(mounted read-only into the daemon only); clients mount the socket
+dir, which contains no credentials. Rotate by re-running the deploy
+script (it refreshes the copy) — the daemon re-reads on SIGHUP.
+
+*System unit (admin-managed deployments) — two separate gates, both required:*
 
 1. **Path labels** — `container_t` cannot touch host `/run` or home
    types. Bind-mount the socket DIRECTORY with `:Z` (relabels to

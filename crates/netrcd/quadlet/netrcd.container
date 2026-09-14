@@ -1,0 +1,30 @@
+# Rootless netrcd — install to ~/.config/containers/systemd/netrcd.container
+# (deploy-rootless.sh does this for you), then:
+#   systemctl --user daemon-reload && systemctl --user enable --now netrcd.service
+#
+# SELinux: the fixed MCS level is the whole trick. Stock policy allows
+# container_t -> container_t unix_stream_socket connectto only within
+# the SAME category pair; podman assigns random pairs per container.
+# Pinning daemon and clients to s0:c100,c200 makes the connect legal
+# without any policy change, sudo, or relabeling of host secrets.
+#
+# Clients then run with:
+#   podman run --security-opt label=level:s0:c100,c200 \
+#     -v ~/.local/share/netrcd/socket:/netrcd:Z <image> \
+#     env NETRCD_SOCK=/netrcd/netrcd.sock nrq GET api.github.com /zen
+[Container]
+Image=localhost/netrcd:latest
+# socket + policy dirs only — the credential volume is deliberately
+# NOT under this path; client containers mount this and must never
+# see credentials.
+Volume=%h/.local/share/netrcd/socket:/run/netrcd:Z
+Volume=%h/.local/share/netrcd/creds/netrc:/etc/netrcd/netrc:ro,Z
+SecurityLabelType=container_t
+SecurityLabelLevel=s0:c100,c200
+Exec=netrcd --socket /run/netrcd/netrcd.sock --profiles-dir /run/netrcd/profiles.d --grants-dir /run/netrcd/config.d --netrc /etc/netrcd/netrc
+
+[Service]
+Restart=always
+
+[Install]
+WantedBy=default.target

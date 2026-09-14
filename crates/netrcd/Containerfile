@@ -1,0 +1,14 @@
+# Build from the REPO ROOT:
+#   podman build -f crates/netrcd/Containerfile -t localhost/netrcd:latest .
+FROM docker.io/library/rust:1-slim AS build
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ crates/
+RUN cargo build --release --bin netrcd --bin nrq
+
+FROM quay.io/fedora/fedora-minimal:41
+COPY --from=build /build/target/release/netrcd /usr/local/bin/netrcd
+COPY --from=build /build/target/release/nrq /usr/local/bin/nrq
+# never needed at runtime; curl is exec'd only if netrcd is built with it
+USER 1000:1000
+ENTRYPOINT ["/usr/local/bin/netrcd"]
