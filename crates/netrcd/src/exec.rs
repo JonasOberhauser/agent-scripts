@@ -76,6 +76,25 @@ impl curl::easy::Handler for Collector {
     }
 }
 
+/// Final header set for an outbound request: the client's headers,
+/// plus an identifying User-Agent when the client did not send one
+/// (GitHub and friends reject UA-less requests with 403; a broker
+/// should also identify itself honestly). UA is not credential-owned:
+/// a client-supplied one passes through untouched.
+pub fn effective_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
+    let has_ua = headers
+        .iter()
+        .any(|(k, _)| k.eq_ignore_ascii_case("user-agent"));
+    let mut out = headers.to_vec();
+    if !has_ua {
+        out.push((
+            "User-Agent".to_string(),
+            format!("netrcd/{}", env!("CARGO_PKG_VERSION")),
+        ));
+    }
+    out
+}
+
 impl Executor for RealExecutor {
     fn execute(&self, req: &OutboundRequest) -> Result<UpstreamResponse, ExecError> {
         let mut easy = curl::easy::Easy2::new(Collector {
@@ -93,7 +112,7 @@ impl Executor for RealExecutor {
                 easy.post_fields_copy(body)?;
             }
             let mut list = curl::easy::List::new();
-            for (name, value) in &req.headers {
+            for (name, value) in effective_headers(&req.headers) {
                 list.append(&format!("{name}: {value}"))?;
             }
             easy.http_headers(list)?;
@@ -184,6 +203,21 @@ pub fn request_over_socket(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn user_agent_is_injected_unless_the_client_sends_one() {
+        let with = effective_headers(&[("X-Org".into(), "acme".into())]);
+        assert!(
+            with.iter().any(|(k, v)| k == "User-Agent" && v.starts_with("netrcd/")),
+            "a UA-less request must be identified: {with:?}"
+        );
+        let without = effective_headers(&[("User-Agent".into(), "my-agent/1".into())]);
+        assert!(
+            without.iter().any(|(k, v)| k == "User-Agent" && v == "my-agent/1")
+                && without.iter().filter(|(k, _)| k.eq_ignore_ascii_case("user-agent")).count() == 1,
+            "the client's UA passes through, exactly once: {without:?}"
+        );
+    }
 
     #[test]
     fn header_block_parses_names_and_skips_status_and_folds() {

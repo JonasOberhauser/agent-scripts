@@ -4,7 +4,7 @@
 //! success without pins, and fail-closed pin mismatch (the
 //! "possible MITM" case).
 
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::sync::Arc;
 
 use netrcd::exec::{ExecError, Executor, OutboundRequest, RealExecutor};
@@ -21,11 +21,45 @@ fn serve_one(
     let (stream, _) = listener.accept().expect("accept");
     let mut conn = rustls::ServerConnection::new(config).expect("server conn");
     let mut stream = stream;
-    let _ = conn.complete_io(&mut stream);
-    let mut tls = conn;
-    let _ = tls.read_tls(&mut stream);
-    let _ = tls.write_tls(&mut stream);
-    let _ = tls.process_new_packets();
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .ok();
+
+    // Handshake + read until the request HEADERS are complete (or the
+    // peer goes quiet). complete_io drives whatever the connection
+    // still wants; the plaintext is drained record by record — one
+    // read/write cycle is not enough when headers span TLS records.
+    let mut plaintext = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        if (conn.wants_write() || conn.wants_read()) && conn.complete_io(&mut stream).is_err() {
+            break;
+        }
+        loop {
+            match conn.reader().read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => plaintext.extend_from_slice(&buf[..n]),
+                Err(ref e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    break
+                }
+                Err(_) => return,
+            }
+        }
+        if plaintext.windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
+        }
+        if !conn.wants_read() && !conn.wants_write() {
+            // No more records in flight and no full headers yet: give
+            // the client a moment, then answer anyway (its request may
+            // simply lack the blank line in a degenerate test case).
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            break;
+        }
+    }
+
     let body = body.lock().unwrap().clone().unwrap_or_else(|| b"ok".to_vec());
     let status = status_line
         .lock()
@@ -36,8 +70,13 @@ fn serve_one(
     let mut response = head.into_bytes();
     response.extend_from_slice(b"\r\n");
     response.extend_from_slice(&body);
-    let _ = tls.writer().write_all(&response);
-    let _ = tls.write_tls(&mut stream);
+    let _ = conn.writer().write_all(&response);
+    // Flush until the connection no longer wants to write.
+    while conn.wants_write() {
+        if conn.complete_io(&mut stream).is_err() {
+            break;
+        }
+    }
 }
 
 struct TestPeer {
