@@ -18,6 +18,17 @@ ExecStart=/usr/local/bin/netrcd \
     --grants-dir %h/.config/netrcd/config.d \
     --netrc %h/.netrc
 Dumpable=no
+# SELinux (enforcing Fedora): containers may not connectto unix
+# sockets owned by unconfined_t processes — the socket OBJECT carries
+# the creator's context regardless of the socket FILE's label
+# (verified live: EACCES enforcing, success permissive).
+# container_runtime_t is the context podman's own socket uses and the
+# one container_t is allowed to connect to. NOTE: this context cannot
+# read credentials under user_home_t — place the netrc somewhere it
+# may read (e.g. /etc/netrcd/, labeled accordingly); never relabel the
+# secret itself (container_file_t credentials are readable by EVERY
+# container).
+SELinuxContext=system_u:system_r:container_runtime_t:s0
 Restart=on-failure
 RestartSec=2
 

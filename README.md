@@ -377,6 +377,26 @@ In-container client:
 NETRCD_SOCK=/netrcd/netrcd.sock nrq GET api.github.com /zen
 ```
 
+**SELinux on enforcing Fedora — two separate gates, both required:**
+
+1. **Path labels** — `container_t` cannot touch host `/run` or home
+   types. Bind-mount the socket DIRECTORY with `:Z` (relabels to
+   `container_file_t`; files created later inherit it):
+   `-v /run/netrcd:/netrcd:Z`. Never mount the socket FILE itself
+   (bind mounts pin the inode; restarts orphan it).
+2. **Socket object label** — `connect(2)` additionally checks
+   `container_t -> <creator domain>:unix_stream_socket connectto`
+   against the KERNEL socket object, which carries the daemon's
+   process context; the socket file's label is irrelevant to this
+   gate (verified live: a fully `container_file_t`-labeled socket was
+   still `EACCES` until the daemon ran under a connectable context).
+   The shipped unit sets `SELinuxContext=...container_runtime_t`
+   (the context podman's own socket uses). Consequence: that context
+   cannot read `user_home_t` credentials — keep the netrc where it
+   may read it (e.g. `/etc/netrcd/`); NEVER relabel the secret itself
+   (`container_file_t` credentials would be readable by every
+   container).
+
 ## Project layout
 
 ```
