@@ -9,7 +9,7 @@ use std::sync::Arc;
 use clap::Parser;
 
 use netrcd::daemon::{Daemon, DaemonConfig};
-use netrcd::exec::RealExecutor;
+use netrcd::exec::{RealExecutor, default_ca_bundle};
 
 #[derive(Parser)]
 #[command(about = "Host-side netrc credential broker")]
@@ -61,7 +61,9 @@ fn main() {
         profiles_dir: cli.profiles_dir.clone(),
         grants_dir: cli.grants_dir.clone(),
         netrc_texts,
-        executor: Arc::new(RealExecutor { ca_path: None }),
+        executor: Arc::new(RealExecutor {
+            ca_path: default_ca_bundle(),
+        }),
         install_signal_handler: true,
     };
 

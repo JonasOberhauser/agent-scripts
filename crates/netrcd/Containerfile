@@ -1,14 +1,26 @@
 # Build from the REPO ROOT:
 #   podman build -f crates/netrcd/Containerfile -t localhost/netrcd:latest .
 FROM docker.io/library/rust:1-slim AS build
+# Full perl: openssl-sys's vendored Configure needs FindBin.pm, which
+# perl-base (slim default) does not ship. This is the known
+# rust:*-slim + static-ssl failure: "Can't locate FindBin.pm".
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends perl \
+  && rm -rf /var/lib/apt/lists/*
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
 RUN cargo build --release --bin netrcd --bin nrq
 
 FROM quay.io/fedora/fedora-minimal:41
+# CA bundle for TLS verification: the daemon probes well-known paths
+# (see exec.rs pick_ca), this guarantees one exists. The vendored
+# curl's baked-in path is the BUILD host's Debian path and is wrong
+# here by construction.
+RUN microdnf -y install ca-certificates && microdnf clean all
 COPY --from=build /build/target/release/netrcd /usr/local/bin/netrcd
 COPY --from=build /build/target/release/nrq /usr/local/bin/nrq
-# never needed at runtime; curl is exec'd only if netrcd is built with it
-USER 1000:1000
+# No USER directive: under rootless podman, host-owned volumes map to
+# container uid 0 (the host user) — running as 1000 would be denied
+# writing the socket.
 ENTRYPOINT ["/usr/local/bin/netrcd"]

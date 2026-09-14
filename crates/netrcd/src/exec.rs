@@ -5,6 +5,7 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::policy::Method;
@@ -46,6 +47,41 @@ pub trait Executor: Send + Sync {
 /// production leaves it None (system store) — pins are the real gate.
 pub struct RealExecutor {
     pub ca_path: Option<std::path::PathBuf>,
+}
+
+/// CA bundle candidates, first existing file wins. The vendored
+/// static curl bakes in the BUILD host's distro path (Debian's
+/// /etc/ssl/certs/ca-certificates.crt), which is wrong on Fedora
+/// images and any other distro — probe instead of trusting it.
+pub const CA_CANDIDATES: &[&str] = &[
+    "/etc/ssl/certs/ca-certificates.crt", // Debian/Ubuntu
+    "/etc/pki/tls/certs/ca-bundle.crt",   // Fedora/RHEL (symlink)
+    "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem", // Fedora (target)
+    "/etc/ssl/ca-bundle.pem",             // openSUSE
+    "/etc/ssl/cert.pem",                  // Alpine/macOS
+];
+
+/// Pick the CA bundle: `SSL_CERT_FILE` (if it points at an existing
+/// file) wins, then the distro candidates. Pure over its inputs so
+/// it stays testable without mutating process env.
+pub fn pick_ca(
+    env_cert_file: Option<&std::path::Path>,
+    candidates: &[&str],
+) -> Option<std::path::PathBuf> {
+    if let Some(p) = env_cert_file {
+        if p.is_file() {
+            return Some(p.to_path_buf());
+        }
+    }
+    candidates
+        .iter()
+        .find(|c| std::path::Path::new(c).is_file())
+        .map(PathBuf::from)
+}
+
+/// Process-env wrapper: resolve the bundle to pin CURLOPT_CAINFO to.
+pub fn default_ca_bundle() -> Option<std::path::PathBuf> {
+    pick_ca(std::env::var_os("SSL_CERT_FILE").as_deref().map(Path::new), CA_CANDIDATES)
 }
 
 struct Collector {
@@ -203,6 +239,39 @@ pub fn request_over_socket(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pick_ca_prefers_existing_ssl_cert_file_over_candidates() {
+        let dir = std::env::temp_dir().join("netrcd-pickca-env");
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("custom-bundle.pem");
+        std::fs::write(&f, b"# test bundle\n").unwrap();
+        assert_eq!(
+            pick_ca(Some(&f), &["/definitely/not/here"]),
+            Some(f.clone())
+        );
+        std::fs::remove_file(&f).unwrap();
+    }
+
+    #[test]
+    fn pick_ca_skips_dangling_env_and_missing_candidates() {
+        // env var pointing at a nonexistent file is ignored, not fatal
+        assert_eq!(
+            pick_ca(Some(Path::new("/definitely/not/here")), &["/also/not/here"]),
+            None
+        );
+        // first EXISTING candidate wins even if earlier ones are absent
+        let dir = std::env::temp_dir().join("netrcd-pickca-cand");
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("bundle.pem");
+        std::fs::write(&f, b"# test bundle\n").unwrap();
+        let found = f.to_str().unwrap();
+        assert_eq!(
+            pick_ca(None, &["/definitely/not/here", found]),
+            Some(PathBuf::from(found))
+        );
+        std::fs::remove_file(&f).unwrap();
+    }
 
     #[test]
     fn user_agent_is_injected_unless_the_client_sends_one() {
