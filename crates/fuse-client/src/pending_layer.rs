@@ -219,6 +219,20 @@ fn occupied(slots: &Slots) -> Vec<usize> {
     (0..slots.len()).filter(|&i| slots[i].is_some()).collect()
 }
 
+/// Slot indices holding a request whose decision is NOT already in
+/// flight — the traversal set for arrow keys: a grayed row must be
+/// SKIPPED, not traversed invisibly (it would be confusing to land
+/// the cursor somewhere nothing renders).
+fn occupied_live(slots: &Slots, disabled: &std::collections::HashSet<u64>) -> Vec<usize> {
+    (0..slots.len())
+        .filter(|&i| {
+            slots[i]
+                .as_ref()
+                .is_some_and(|r| !disabled.contains(&r.id))
+        })
+        .collect()
+}
+
 /// Where the cursor goes after the request in `slot` was handled: the
 /// next request below (wrapping; itself when it is the only one), or
 /// the all-row when none remain.
@@ -237,10 +251,12 @@ pub(crate) fn cursor_after_action(slots: &Slots, slot: usize) -> Cursor {
 
 /// Move the cursor one line up (requests, then the all-row, wrapping;
 /// freed slots are skipped).
-pub(crate) fn cursor_up(slots: &Slots, cur: Cursor) -> Cursor {
-    let occ = occupied(slots);
+pub(crate) fn cursor_up(slots: &Slots, cur: Cursor, disabled: &std::collections::HashSet<u64>) -> Cursor {
+    let occ = occupied_live(slots, disabled);
     if occ.is_empty() {
-        return Cursor::All { grant: cur_is_grant(cur) };
+        // Everything (including the all-row) is disabled: arrows are
+        // no-ops — the cursor stays exactly where it is.
+        return cur;
     }
     match cur {
         Cursor::Request { slot, sel } => {
@@ -260,10 +276,10 @@ pub(crate) fn cursor_up(slots: &Slots, cur: Cursor) -> Cursor {
 
 /// Move the cursor one line down (requests, then the all-row, wrapping;
 /// freed slots are skipped).
-pub(crate) fn cursor_down(slots: &Slots, cur: Cursor) -> Cursor {
-    let occ = occupied(slots);
+pub(crate) fn cursor_down(slots: &Slots, cur: Cursor, disabled: &std::collections::HashSet<u64>) -> Cursor {
+    let occ = occupied_live(slots, disabled);
     if occ.is_empty() {
-        return Cursor::All { grant: cur_is_grant(cur) };
+        return cur;
     }
     match cur {
         Cursor::Request { slot, sel } => {
@@ -278,13 +294,6 @@ pub(crate) fn cursor_down(slots: &Slots, cur: Cursor) -> Cursor {
             slot: occ[0],
             sel: if grant { Sel::Grant } else { Sel::Deny },
         },
-    }
-}
-
-fn cur_is_grant(cur: Cursor) -> bool {
-    match cur {
-        Cursor::Request { sel, .. } => sel != Sel::Deny,
-        Cursor::All { grant } => grant,
     }
 }
 
@@ -1084,11 +1093,15 @@ impl DisplayLayer for PendingPanelLayer {
                 self.owner.set(Owner::Keyboard);
                 match k.code {
                     KeyCode::Up => {
-                        self.cursor = cursor_up(&self.slots, self.cursor);
+                        let disabled: std::collections::HashSet<u64> =
+                            self.in_flight.borrow().keys().copied().collect();
+                        self.cursor = cursor_up(&self.slots, self.cursor, &disabled);
                         EventResult::Swallow
                     }
                     KeyCode::Down => {
-                        self.cursor = cursor_down(&self.slots, self.cursor);
+                        let disabled: std::collections::HashSet<u64> =
+                            self.in_flight.borrow().keys().copied().collect();
+                        self.cursor = cursor_down(&self.slots, self.cursor, &disabled);
                         EventResult::Swallow
                     }
                     KeyCode::Left | KeyCode::Right => {
@@ -1255,7 +1268,45 @@ mod tests {
         let shown: Vec<Option<u64>> =
             slots.iter().map(|s| s.as_ref().map(|r| r.id)).collect();
         assert_eq!(shown, vec![Some(5), Some(6), Some(4), None, None]);
-        assert_eq!(cursor_up(&slots, cursor), Cursor::Request { slot: 0, sel: Sel::Grant });
+        assert_eq!(
+            cursor_up(&slots, cursor, &Default::default()),
+            Cursor::Request { slot: 0, sel: Sel::Grant }
+        );
+    }
+
+    /// Arrow keys SKIP in-flight rows entirely (issue #24): a grayed
+    /// row is not a traversal stop, and when everything is grayed the
+    /// arrows are no-ops.
+    #[test]
+    fn arrows_skip_in_flight_rows() {
+        // Slots [1, 2, 3], request 2 in flight: Down from slot 0 must
+        // land on slot 2 (skipping 1), and Up from slot 2 must wrap to
+        // the all-row (skipping 1 again).
+        let mut slots = empty_slots();
+        sync_slots(&mut slots, &ids(&[1, 2, 3]));
+        let disabled: std::collections::HashSet<u64> = [2u64].into_iter().collect();
+        let c = Cursor::Request { slot: 0, sel: Sel::Grant };
+        assert_eq!(
+            cursor_down(&slots, c, &disabled),
+            Cursor::Request { slot: 2, sel: Sel::Grant },
+            "the in-flight slot 1 is skipped"
+        );
+        assert_eq!(
+            cursor_up(&slots, Cursor::Request { slot: 2, sel: Sel::Grant }, &disabled),
+            Cursor::Request { slot: 0, sel: Sel::Grant },
+            "up skips the in-flight row and lands on the live one above"
+        );
+        assert_eq!(
+            cursor_up(&slots, Cursor::Request { slot: 0, sel: Sel::Grant }, &disabled),
+            Cursor::All { grant: true },
+            "up from the top live row wraps to the all-row"
+        );
+
+        // Everything in flight: arrows do nothing at all.
+        let all: std::collections::HashSet<u64> = [1u64, 2, 3].into_iter().collect();
+        let c = Cursor::Request { slot: 0, sel: Sel::Grant };
+        assert_eq!(cursor_down(&slots, c, &all), c, "all disabled: Down is a no-op");
+        assert_eq!(cursor_up(&slots, c, &all), c, "all disabled: Up is a no-op");
     }
 
     #[test]
@@ -1265,14 +1316,14 @@ mod tests {
         sync_slots(&mut slots, &ids(&[1, 2, 3]));
         sync_slots(&mut slots, &ids(&[1, 3]));
         let c = Cursor::Request { slot: 0, sel: Sel::Grant };
-        let c = cursor_down(&slots, c);
+        let c = cursor_down(&slots, c, &Default::default());
         assert_eq!(c, Cursor::Request { slot: 2, sel: Sel::Grant }, "empty slot 1 is skipped");
-        let c = cursor_down(&slots, c);
+        let c = cursor_down(&slots, c, &Default::default());
         assert_eq!(c, Cursor::All { grant: true });
-        let c = cursor_down(&slots, c);
+        let c = cursor_down(&slots, c, &Default::default());
         assert_eq!(c, Cursor::Request { slot: 0, sel: Sel::Grant }, "wraps to the top");
         assert_eq!(
-            cursor_up(&slots, c),
+            cursor_up(&slots, c, &Default::default()),
             Cursor::All { grant: true },
             "up from the top wraps to the all-row"
         );
