@@ -877,15 +877,18 @@ impl DisplayLayer for PendingPanelLayer {
             Cursor::All { grant } => Some(if grant { Sel::Grant } else { Sel::Deny }),
             _ => None,
         };
+        // Register the all-row buttons BEFORE hit-testing: the grid is
+        // cleared at frame start, so last frame's children are gone —
+        // a hit-test run before re-registering never finds them.
+        let (deny, grant) = button_pair(all_row, true);
+        self.grid.children.push(GridChild { row: MAX_SHOWN, button: Button::DenyAll, rect: deny });
+        self.grid.children.push(GridChild { row: MAX_SHOWN, button: Button::GrantAll, rect: grant });
         let all_hovered = self
             .hover
             .get()
             .and_then(|(c, r)| self.grid.hit(c, r))
             .filter(|h| h.row == MAX_SHOWN)
             .map(|h| h.button);
-        let (deny, grant) = button_pair(all_row, true);
-        self.grid.children.push(GridChild { row: MAX_SHOWN, button: Button::DenyAll, rect: deny });
-        self.grid.children.push(GridChild { row: MAX_SHOWN, button: Button::GrantAll, rect: grant });
         widgets.push(WidgetEntry {
             name: PANEL_NAME,
             widget: Box::new(Paragraph::new(grid_row_line_hover(
@@ -1777,6 +1780,51 @@ mod tests {
                 .iter()
                 .any(|s| s.style.add_modifier.contains(Modifier::REVERSED)),
             "no hover and no selection: no highlight"
+        );
+    }
+
+    /// Regression (live finding): the all-row buttons must highlight
+    /// under hover when driven through REAL frames — the grid children
+    /// have to be registered BEFORE the frame's hit-test, and the
+    /// per-frame `grid.clear()` makes "one frame later" never arrive.
+    #[test]
+    fn hover_highlights_all_buttons_across_real_frames() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("hover-all.sock");
+        let _seen = fake_server(&sock, vec![31]);
+
+        let mut layer_obj = layer(Arc::new(Mutex::new(ids(&[31]))), &sock);
+        // Neutral keyboard cursor: the default All{grant} would highlight
+        // [grant all] regardless of hover and mask the regression.
+        layer_obj.cursor = Cursor::Request { slot: 0, sel: Sel::Forever };
+        let mut ctx = servatui_display::LayerCtx {
+            id: servatui_display::LayerId::BUILTIN,
+            color: Color::Reset,
+            terminal_area: Rect::new(0, 0, 80, 24),
+            my_widgets: &[],
+        };
+
+        // Frame 1: populates the button grid.
+        let mut widgets = Vec::new();
+        layer_obj.on_overlay(&mut ctx, &mut widgets);
+
+        // Mouse moved over the all-row's [deny all] button.
+        let panel = panel_rect(ctx.terminal_area);
+        let (deny_all, _) = button_pair(all_row_rect(panel), true);
+        layer_obj.hover.set(Some((deny_all.x + 2, deny_all.y)));
+
+        // Frame 2 renders WITH the hover — the all-row widget is the
+        // last pushed; render it into a buffer and require the
+        // reverse-video highlight the user actually sees.
+        let mut widgets = Vec::new();
+        layer_obj.on_overlay(&mut ctx, &mut widgets);
+        let entry = widgets.last().expect("all-row widget");
+        assert_eq!(entry.area, all_row_rect(panel), "last widget is the all-row");
+        let mut buf = ratatui::buffer::Buffer::empty(entry.area);
+        entry.widget.render_ref(entry.area, &mut buf);
+        assert!(
+            buf.content().iter().any(|c| c.modifier.contains(Modifier::REVERSED)),
+            "deny-all must render highlighted under hover"
         );
     }
 
