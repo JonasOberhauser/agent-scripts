@@ -17,7 +17,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{Event, KeyCode, KeyEventKind, MouseEventKind};
 use fuse_protocol::{
@@ -38,6 +38,11 @@ const PANEL_NAME: &str = "fuse.pending_panel";
 
 /// How many request lines the panel shows at once.
 const MAX_SHOWN: usize = 5;
+
+/// How long a dispatched decision stays in flight without the poll
+/// confirming its consumption (poll cadence is 1s; a few round-trips
+/// of headroom, then the row un-grays rather than sticking).
+const IN_FLIGHT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Total panel width in terminal columns.
 // Wide enough for `id requester → p{pid}_s{n}_{file}` plus the three
@@ -214,6 +219,20 @@ fn occupied(slots: &Slots) -> Vec<usize> {
     (0..slots.len()).filter(|&i| slots[i].is_some()).collect()
 }
 
+/// Slot indices holding a request whose decision is NOT already in
+/// flight — the traversal set for arrow keys: a grayed row must be
+/// SKIPPED, not traversed invisibly (it would be confusing to land
+/// the cursor somewhere nothing renders).
+fn occupied_live(slots: &Slots, disabled: &std::collections::HashSet<u64>) -> Vec<usize> {
+    (0..slots.len())
+        .filter(|&i| {
+            slots[i]
+                .as_ref()
+                .is_some_and(|r| !disabled.contains(&r.id))
+        })
+        .collect()
+}
+
 /// Where the cursor goes after the request in `slot` was handled: the
 /// next request below (wrapping; itself when it is the only one), or
 /// the all-row when none remain.
@@ -232,10 +251,12 @@ pub(crate) fn cursor_after_action(slots: &Slots, slot: usize) -> Cursor {
 
 /// Move the cursor one line up (requests, then the all-row, wrapping;
 /// freed slots are skipped).
-pub(crate) fn cursor_up(slots: &Slots, cur: Cursor) -> Cursor {
-    let occ = occupied(slots);
+pub(crate) fn cursor_up(slots: &Slots, cur: Cursor, disabled: &std::collections::HashSet<u64>) -> Cursor {
+    let occ = occupied_live(slots, disabled);
     if occ.is_empty() {
-        return Cursor::All { grant: cur_is_grant(cur) };
+        // Everything (including the all-row) is disabled: arrows are
+        // no-ops — the cursor stays exactly where it is.
+        return cur;
     }
     match cur {
         Cursor::Request { slot, sel } => {
@@ -255,10 +276,10 @@ pub(crate) fn cursor_up(slots: &Slots, cur: Cursor) -> Cursor {
 
 /// Move the cursor one line down (requests, then the all-row, wrapping;
 /// freed slots are skipped).
-pub(crate) fn cursor_down(slots: &Slots, cur: Cursor) -> Cursor {
-    let occ = occupied(slots);
+pub(crate) fn cursor_down(slots: &Slots, cur: Cursor, disabled: &std::collections::HashSet<u64>) -> Cursor {
+    let occ = occupied_live(slots, disabled);
     if occ.is_empty() {
-        return Cursor::All { grant: cur_is_grant(cur) };
+        return cur;
     }
     match cur {
         Cursor::Request { slot, sel } => {
@@ -273,13 +294,6 @@ pub(crate) fn cursor_down(slots: &Slots, cur: Cursor) -> Cursor {
             slot: occ[0],
             sel: if grant { Sel::Grant } else { Sel::Deny },
         },
-    }
-}
-
-fn cur_is_grant(cur: Cursor) -> bool {
-    match cur {
-        Cursor::Request { sel, .. } => sel != Sel::Deny,
-        Cursor::All { grant } => grant,
     }
 }
 
@@ -397,7 +411,20 @@ fn truncate_pad(s: &str, max: usize) -> String {
 
 /// A button as colored brackets around plain text; the selected button
 /// is reversed instead, so the cursor stays obvious.
-fn button_spans(button: Button, selected: bool) -> Vec<Span<'static>> {
+/// `disabled`: the request's decision is in flight — render the
+/// button dimmed (normal colors, `DIM`, never reverse-highlighted);
+/// plain DarkGray was unreadable against the panel backdrop.
+fn button_spans_styled(button: Button, selected: bool, disabled: bool) -> Vec<Span<'static>> {
+    if disabled {
+        let label = button.label();
+        let word = &label[1..label.len() - 1];
+        let brackets = Style::default().fg(button.color()).add_modifier(Modifier::DIM);
+        return vec![
+            Span::styled("[", brackets),
+            Span::styled(word.to_string(), Style::default().add_modifier(Modifier::DIM)),
+            Span::styled("]", brackets),
+        ];
+    }
     if selected {
         return vec![Span::styled(
             button.label().to_string(),
@@ -468,6 +495,15 @@ fn grid_row_line_hover(
 }
 
 fn grid_row_line(row: GridRow, width: u16, sel_here: Option<Sel>) -> Line<'static> {
+    grid_row_line_styled(row, width, sel_here, false)
+}
+
+fn grid_row_line_styled(
+    row: GridRow,
+    width: u16,
+    sel_here: Option<Sel>,
+    disabled: bool,
+) -> Line<'static> {
     let all = matches!(row, GridRow::All);
     let (deny_l, grant_l) = if all { ("[deny all]", "[grant all]") } else { ("[deny]", "[grant]") };
     let forever_w = if all { 0 } else { "[forever]".len() + 1 };
@@ -493,14 +529,18 @@ fn grid_row_line(row: GridRow, width: u16, sel_here: Option<Sel>) -> Line<'stati
     )));
     let deny = if all { Button::DenyAll } else { Button::Deny { id: 0 } };
     let grant = if all { Button::GrantAll } else { Button::Grant { id: 0 } };
-    let sel = sel_here;
+    let sel = if disabled { None } else { sel_here };
     if let GridRow::Request(_) = row {
-        spans.extend(button_spans(Button::GrantForever { id: 0 }, sel == Some(Sel::Forever)));
+        spans.extend(button_spans_styled(
+            Button::GrantForever { id: 0 },
+            sel == Some(Sel::Forever),
+            disabled,
+        ));
         spans.push(Span::raw(" "));
     }
-    spans.extend(button_spans(grant, sel == Some(Sel::Grant)));
+    spans.extend(button_spans_styled(grant, sel == Some(Sel::Grant), disabled));
     spans.push(Span::raw(" "));
-    spans.extend(button_spans(deny, sel == Some(Sel::Deny)));
+    spans.extend(button_spans_styled(deny, sel == Some(Sel::Deny), disabled));
     Line::from(spans)
 }
 
@@ -735,6 +775,11 @@ pub(crate) struct PendingPanelLayer {
     /// Latches when the shell first becomes too small; resets once it
     /// is big enough again so a later shrink re-warns.
     small_warned: std::cell::Cell<bool>,
+    /// Decisions dispatched but not yet confirmed by the server
+    /// (issue #24): request id -> dispatch time.  Rows gray out while
+    /// present; cleared when the poll snapshot drops the id or the
+    /// in-flight timeout passes.
+    in_flight: std::cell::RefCell<std::collections::HashMap<u64, Instant>>,
     slots: Slots,
     cursor: Cursor,
     grid: ButtonGrid,
@@ -754,6 +799,7 @@ impl PendingPanelLayer {
             hover: std::cell::Cell::new(None),
             owner: std::cell::Cell::new(Owner::Keyboard),
             small_warned: std::cell::Cell::new(false),
+            in_flight: Default::default(),
             slots: empty_slots(),
             cursor: Cursor::All { grant: true },
             grid: ButtonGrid::default(),
@@ -771,8 +817,33 @@ impl PendingPanelLayer {
     /// Press a button: dispatch its commands through the (non-blocking)
     /// talk, then advance the cursor to the next request.
     fn press(&mut self, row: usize, button: Button) {
+        // A decision already in flight must not be dispatched again
+        // (issue #24): the server has it; the row stays grayed until
+        // the poll confirms consumption.  All-row buttons expand over
+        // the snapshot, so the same guard filters their expansion.
+        let in_flight_ids: Vec<u64> = self.in_flight.borrow().keys().copied().collect();
+        let already_sent = |command: &Command| match command {
+            Command::Grant { id } | Command::GrantForever { id } | Command::Deny { id } => {
+                in_flight_ids.contains(id)
+            }
+            _ => false,
+        };
+
         let snapshot = self.pending.lock().unwrap().clone();
-        for (name, command) in button.commands(&snapshot) {
+        let dispatch: Vec<(String, Command)> = button
+            .commands(&snapshot)
+            .into_iter()
+            .filter(|(_, command)| !already_sent(command))
+            .collect();
+        if dispatch.is_empty() {
+            return;
+        }
+        for (name, command) in dispatch {
+            if let Command::Grant { id } | Command::GrantForever { id } | Command::Deny { id } =
+                &command
+            {
+                self.in_flight.borrow_mut().insert(*id, Instant::now());
+            }
             self.talk
                 .request(&self.pending, PanelRequest::Action { name, command });
         }
@@ -795,6 +866,12 @@ impl DisplayLayer for PendingPanelLayer {
         // reconcile, new-request detection and the title count.
         let snapshot = self.pending.lock().unwrap().clone();
         sync_slots(&mut self.slots, &snapshot);
+        // Confirm in-flight decisions: once the server consumed a
+        // decision the request leaves the snapshot.  A timeout guards
+        // against a lost reply keeping a row grayed forever.
+        self.in_flight.borrow_mut().retain(|id, since| {
+            snapshot.iter().any(|p| p.id == *id) && since.elapsed() < IN_FLIGHT_TIMEOUT
+        });
         if let Cursor::Request { slot, .. } = self.cursor {
             if self.slots.get(slot).is_none_or(|s| s.is_none()) {
                 self.cursor = cursor_after_action(&self.slots, slot);
@@ -895,12 +972,20 @@ impl DisplayLayer for PendingPanelLayer {
                     } else {
                         None
                     };
-                    grid_row_line_hover(
-                        GridRow::Request(req),
-                        row.width,
-                        sel_here,
-                        hovered.as_ref(),
-                    )
+                    // An in-flight decision grays the row and shows no
+                    // highlight at all (issue #24) — neither cursor
+                    // nor hover may suggest it is still pressable.
+                    let disabled = self.in_flight.borrow().contains_key(&req.id);
+                    if disabled {
+                        grid_row_line_styled(GridRow::Request(req), row.width, None, true)
+                    } else {
+                        grid_row_line_hover(
+                            GridRow::Request(req),
+                            row.width,
+                            sel_here,
+                            hovered.as_ref(),
+                        )
+                    }
                 }
             };
             widgets.push(WidgetEntry {
@@ -928,14 +1013,25 @@ impl DisplayLayer for PendingPanelLayer {
         } else {
             None
         };
+        // The all-row grays exactly when EVERY visible request is
+        // already in flight — expanding over the disabled set would
+        // only dispatch what the per-id guard allows anyway, and a
+        // lit all-row would mislead.
+        let all_disabled = {
+            let in_flight = self.in_flight.borrow();
+            self.slots
+                .iter()
+                .flatten()
+                .all(|req| in_flight.contains_key(&req.id))
+        };
+        let all_line = if all_disabled {
+            grid_row_line_styled(GridRow::All, all_row.width, None, true)
+        } else {
+            grid_row_line_hover(GridRow::All, all_row.width, sel_here, all_hovered.as_ref())
+        };
         widgets.push(WidgetEntry {
             name: PANEL_NAME,
-            widget: Box::new(Paragraph::new(grid_row_line_hover(
-                GridRow::All,
-                all_row.width,
-                sel_here,
-                all_hovered.as_ref(),
-            ))),
+            widget: Box::new(Paragraph::new(all_line)),
             area: all_row,
         });
 
@@ -997,11 +1093,15 @@ impl DisplayLayer for PendingPanelLayer {
                 self.owner.set(Owner::Keyboard);
                 match k.code {
                     KeyCode::Up => {
-                        self.cursor = cursor_up(&self.slots, self.cursor);
+                        let disabled: std::collections::HashSet<u64> =
+                            self.in_flight.borrow().keys().copied().collect();
+                        self.cursor = cursor_up(&self.slots, self.cursor, &disabled);
                         EventResult::Swallow
                     }
                     KeyCode::Down => {
-                        self.cursor = cursor_down(&self.slots, self.cursor);
+                        let disabled: std::collections::HashSet<u64> =
+                            self.in_flight.borrow().keys().copied().collect();
+                        self.cursor = cursor_down(&self.slots, self.cursor, &disabled);
                         EventResult::Swallow
                     }
                     KeyCode::Left | KeyCode::Right => {
@@ -1168,7 +1268,45 @@ mod tests {
         let shown: Vec<Option<u64>> =
             slots.iter().map(|s| s.as_ref().map(|r| r.id)).collect();
         assert_eq!(shown, vec![Some(5), Some(6), Some(4), None, None]);
-        assert_eq!(cursor_up(&slots, cursor), Cursor::Request { slot: 0, sel: Sel::Grant });
+        assert_eq!(
+            cursor_up(&slots, cursor, &Default::default()),
+            Cursor::Request { slot: 0, sel: Sel::Grant }
+        );
+    }
+
+    /// Arrow keys SKIP in-flight rows entirely (issue #24): a grayed
+    /// row is not a traversal stop, and when everything is grayed the
+    /// arrows are no-ops.
+    #[test]
+    fn arrows_skip_in_flight_rows() {
+        // Slots [1, 2, 3], request 2 in flight: Down from slot 0 must
+        // land on slot 2 (skipping 1), and Up from slot 2 must wrap to
+        // the all-row (skipping 1 again).
+        let mut slots = empty_slots();
+        sync_slots(&mut slots, &ids(&[1, 2, 3]));
+        let disabled: std::collections::HashSet<u64> = [2u64].into_iter().collect();
+        let c = Cursor::Request { slot: 0, sel: Sel::Grant };
+        assert_eq!(
+            cursor_down(&slots, c, &disabled),
+            Cursor::Request { slot: 2, sel: Sel::Grant },
+            "the in-flight slot 1 is skipped"
+        );
+        assert_eq!(
+            cursor_up(&slots, Cursor::Request { slot: 2, sel: Sel::Grant }, &disabled),
+            Cursor::Request { slot: 0, sel: Sel::Grant },
+            "up skips the in-flight row and lands on the live one above"
+        );
+        assert_eq!(
+            cursor_up(&slots, Cursor::Request { slot: 0, sel: Sel::Grant }, &disabled),
+            Cursor::All { grant: true },
+            "up from the top live row wraps to the all-row"
+        );
+
+        // Everything in flight: arrows do nothing at all.
+        let all: std::collections::HashSet<u64> = [1u64, 2, 3].into_iter().collect();
+        let c = Cursor::Request { slot: 0, sel: Sel::Grant };
+        assert_eq!(cursor_down(&slots, c, &all), c, "all disabled: Down is a no-op");
+        assert_eq!(cursor_up(&slots, c, &all), c, "all disabled: Up is a no-op");
     }
 
     #[test]
@@ -1178,14 +1316,14 @@ mod tests {
         sync_slots(&mut slots, &ids(&[1, 2, 3]));
         sync_slots(&mut slots, &ids(&[1, 3]));
         let c = Cursor::Request { slot: 0, sel: Sel::Grant };
-        let c = cursor_down(&slots, c);
+        let c = cursor_down(&slots, c, &Default::default());
         assert_eq!(c, Cursor::Request { slot: 2, sel: Sel::Grant }, "empty slot 1 is skipped");
-        let c = cursor_down(&slots, c);
+        let c = cursor_down(&slots, c, &Default::default());
         assert_eq!(c, Cursor::All { grant: true });
-        let c = cursor_down(&slots, c);
+        let c = cursor_down(&slots, c, &Default::default());
         assert_eq!(c, Cursor::Request { slot: 0, sel: Sel::Grant }, "wraps to the top");
         assert_eq!(
-            cursor_up(&slots, c),
+            cursor_up(&slots, c, &Default::default()),
             Cursor::All { grant: true },
             "up from the top wraps to the all-row"
         );
@@ -1210,6 +1348,236 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A dispatched decision blocks duplicate dispatch (same button or
+    /// the all-row expansion) until the poll confirms consumption (#24).
+    #[test]
+    fn in_flight_decision_blocks_duplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("panel.sock");
+        let seen = fake_server(&sock, vec![31]);
+
+        let pending: PendingIds = Arc::new(Mutex::new(ids(&[31])));
+        let mut display = servatui_display::Display::with_palette(Vec::new());
+        display.add_layer(Box::new(layer(pending, &sock)));
+        frame_with_pending(&mut display);
+
+        // Press Enter (grant 31), then Down + Enter (all-row grant-all,
+        // which would also target 31): only ONE dispatch for id 31.
+        assert!(display.route_event(&key(KeyCode::Down)), "swallowed");
+        assert!(display.route_event(&key(KeyCode::Enter)), "swallowed");
+        assert!(display.route_event(&key(KeyCode::Enter)), "swallowed");
+        let conversations = seen.lock().unwrap().clone();
+        let grants = conversations.iter().filter(|(n, _)| n == "grant").count();
+        assert_eq!(grants, 1, "duplicate dispatch must be blocked: {conversations:?}");
+    }
+
+    /// The row renders gray while its decision is in flight, and the
+    /// keyboard selection does not reverse-highlight a grayed button.
+    #[test]
+    fn in_flight_row_renders_gray() {
+        let line = grid_row_line_styled(
+            GridRow::Request(&pending_info(31)),
+            PANEL_WIDTH,
+            Some(Sel::Grant),
+            true,
+        );
+        assert!(
+            line.spans.iter().any(|s| s.style.add_modifier.contains(Modifier::DIM)),
+            "dimmed buttons expected: {line:?}"
+        );
+        assert!(
+            !line.spans
+                .iter()
+                .any(|s| s.style.add_modifier.contains(Modifier::REVERSED)),
+            "no selection highlight on a grayed row"
+        );
+    }
+
+    /// EVERY button of a disabled row is dimmed — forever included
+    /// (it used to stay lit), and the text is not the old unreadable
+    /// DarkGray.
+    #[test]
+    fn disabled_row_dims_forever_grant_and_deny() {
+        let line = grid_row_line_styled(
+            GridRow::Request(&pending_info(31)),
+            PANEL_WIDTH,
+            Some(Sel::Forever),
+            true,
+        );
+        // Locate the three button labels and require DIM on each.
+        for label in ["[forever]", "[grant]", "[deny]"] {
+            let span = line
+                .spans
+                .iter()
+                .find(|s| s.content.contains(&label[1..label.len() - 1]))
+                .unwrap_or_else(|| panic!("{label} not rendered: {line:?}"));
+            assert!(
+                span.style.add_modifier.contains(Modifier::DIM),
+                "{label} must be dimmed on a disabled row"
+            );
+        }
+    }
+
+    /// The all-row grays exactly when EVERY visible request is in
+    /// flight — with one pending decision left it must stay live.
+    #[test]
+    fn all_row_grays_only_when_every_request_is_in_flight() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("all-gray.sock");
+        let _seen = fake_server(&sock, vec![31, 37]);
+
+        let mut layer_obj = layer(Arc::new(Mutex::new(ids(&[31, 37]))), &sock);
+        let mut ctx = servatui_display::LayerCtx {
+            id: servatui_display::LayerId::BUILTIN,
+            color: Color::Reset,
+            terminal_area: Rect::new(0, 0, 80, 24),
+            my_widgets: &[],
+        };
+        let mut widgets = Vec::new();
+        layer_obj.on_overlay(&mut ctx, &mut widgets);
+
+        let dimmed = |entry: &servyi_servatui::WidgetEntry| {
+            let mut buf = ratatui::buffer::Buffer::empty(entry.area);
+            entry.widget.render_ref(entry.area, &mut buf);
+            buf.content().iter().any(|c| c.modifier.contains(Modifier::DIM))
+        };
+
+        // One of two in flight: all-row still live.
+        layer_obj.in_flight.borrow_mut().insert(31, Instant::now());
+        let mut widgets = Vec::new();
+        layer_obj.on_overlay(&mut ctx, &mut widgets);
+        assert!(!dimmed(widgets.last().unwrap()), "one live request keeps the all-row live");
+
+        // Both in flight: all-row dims.
+        layer_obj.in_flight.borrow_mut().insert(37, Instant::now());
+        let mut widgets = Vec::new();
+        layer_obj.on_overlay(&mut ctx, &mut widgets);
+        assert!(dimmed(widgets.last().unwrap()), "all in flight dims the all-row");
+    }
+
+    /// Disabled buttons are CLICK noops: after a decision is
+    /// dispatched, clicking the row's other buttons (and the all-row)
+    /// must not produce a second dispatch.
+    #[test]
+    fn disabled_buttons_are_click_noops() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("noop.sock");
+        let seen = fake_server(&sock, vec![31, 37]);
+
+        let mut display = servatui_display::Display::with_palette(Vec::new());
+        let pending: PendingIds = Arc::new(Mutex::new(ids(&[31, 37])));
+        display.add_layer(Box::new(layer(pending, &sock)));
+        frame_with_pending(&mut display);
+
+        // Dispatch request 31's grant via keyboard.
+        assert!(display.route_event(&key(KeyCode::Down)));
+        assert!(display.route_event(&key(KeyCode::Enter)));
+
+        // 31 is in flight: hammer its OTHER buttons by mouse.
+        let panel = panel_rect(Rect::new(0, 0, 80, 24));
+        let row0 = row_rect(panel, 0);
+        let (deny, _) = button_pair(row0, false);
+        let forever = forever_rect(row0);
+        for (x, y) in [(deny.x + 1, deny.y), (forever.x + 1, forever.y)] {
+            let _ = display.route_event(&click(x, y));
+        }
+        // The all-row would expand over 31 (and 37): with 31 blocked
+        // it must dispatch ONLY 37.
+        let all = all_row_rect(panel);
+        let (_, grant_all) = button_pair(all, true);
+        let _ = display.route_event(&click(grant_all.x + 1, grant_all.y));
+
+        let conversations = seen.lock().unwrap().clone();
+        let count = |name: &str, id: &str| {
+            conversations
+                .iter()
+                .filter(|(n, p)| n == name && p.contains(id))
+                .count()
+        };
+        assert_eq!(count("grant", "31"), 1, "no second dispatch for in-flight 31");
+        assert_eq!(count("deny", "31"), 0, "deny on an in-flight row is a noop");
+        assert_eq!(count("grant-forever", "31"), 0, "forever on an in-flight row is a noop");
+        assert_eq!(count("grant", "37"), 1, "all-row still serves the LIVE request");
+    }
+
+    /// Neither hover nor the keyboard cursor may highlight a disabled
+    /// row's buttons — it must not look selectable by any device.
+    #[test]
+    fn disabled_rows_show_no_highlight_from_any_device() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("nohl.sock");
+        let _seen = fake_server(&sock, vec![31]);
+
+        let mut layer_obj = layer(Arc::new(Mutex::new(ids(&[31]))), &sock);
+        let mut ctx = servatui_display::LayerCtx {
+            id: servatui_display::LayerId::BUILTIN,
+            color: Color::Reset,
+            terminal_area: Rect::new(0, 0, 80, 24),
+            my_widgets: &[],
+        };
+        let mut widgets = Vec::new();
+        layer_obj.on_overlay(&mut ctx, &mut widgets);
+
+        // 31 in flight; cursor ON it; mouse hovering its [deny].
+        layer_obj.in_flight.borrow_mut().insert(31, Instant::now());
+        layer_obj.cursor = Cursor::Request { slot: 0, sel: Sel::Grant };
+        let panel = panel_rect(ctx.terminal_area);
+        let (deny, _) = button_pair(row_rect(panel, 0), false);
+        layer_obj.hover.set(Some((deny.x + 1, deny.y)));
+        layer_obj.owner.set(Owner::Mouse);
+
+        let mut widgets = Vec::new();
+        layer_obj.on_overlay(&mut ctx, &mut widgets);
+        let entry = &widgets[widgets.len() - 2]; // first request row widget
+        let mut buf = ratatui::buffer::Buffer::empty(entry.area);
+        entry.widget.render_ref(entry.area, &mut buf);
+        assert!(
+            !buf.content().iter().any(|c| c.modifier.contains(Modifier::REVERSED)),
+            "a disabled row must not highlight for hover or cursor"
+        );
+    }
+
+    /// In-flight clears when the poll snapshot drops the request.
+    #[test]
+    fn in_flight_clears_when_request_disappears() {
+        let mut layer_obj = layer(Arc::new(Mutex::new(ids(&[31]))), Path::new("/x"));
+        let mut widgets = Vec::new();
+        let mut ctx = servatui_display::LayerCtx {
+            id: servatui_display::LayerId::BUILTIN,
+            color: Color::Reset,
+            terminal_area: Rect::new(0, 0, 80, 24),
+            my_widgets: &[],
+        };
+        layer_obj.on_overlay(&mut ctx, &mut widgets);
+        layer_obj.in_flight.borrow_mut().insert(31, Instant::now());
+        *layer_obj.pending.lock().unwrap() = Vec::new();
+        layer_obj.on_overlay(&mut ctx, &mut widgets);
+        assert!(
+            layer_obj.in_flight.borrow().is_empty(),
+            "consumed decision must clear in-flight"
+        );
+    }
+
+    /// In-flight times out so a lost reply cannot gray a row forever.
+    #[test]
+    fn in_flight_times_out() {
+        let mut layer_obj = layer(Arc::new(Mutex::new(ids(&[31]))), Path::new("/x"));
+        let mut widgets = Vec::new();
+        let mut ctx = servatui_display::LayerCtx {
+            id: servatui_display::LayerId::BUILTIN,
+            color: Color::Reset,
+            terminal_area: Rect::new(0, 0, 80, 24),
+            my_widgets: &[],
+        };
+        layer_obj.on_overlay(&mut ctx, &mut widgets);
+        layer_obj
+            .in_flight
+            .borrow_mut()
+            .insert(31, Instant::now() - IN_FLIGHT_TIMEOUT - Duration::from_secs(1));
+        layer_obj.on_overlay(&mut ctx, &mut widgets);
+        assert!(layer_obj.in_flight.borrow().is_empty(), "stale in-flight must expire");
     }
 
     /// The too-small warning reaches the shell's LOG WINDOW via the
@@ -1996,6 +2364,93 @@ mod tests {
         };
         // Hover gone; the DEFAULT All{grant} cursor lights again.
         assert!(reversed(widgets.last().expect("all-row widget")));
+    }
+
+    /// Model rule 1+2: hovering means ON A BUTTON. With the mouse
+    /// over the panel but NOT on a button, the keyboard wins — its
+    /// highlight stays visible (no dead zone between buttons).
+    #[test]
+    fn mouse_over_panel_but_off_buttons_keeps_the_keyboard_highlight() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("hover-gap.sock");
+        let _seen = fake_server(&sock, vec![31]);
+
+        let mut layer_obj = layer(Arc::new(Mutex::new(ids(&[31]))), &sock);
+        let mut ctx = servatui_display::LayerCtx {
+            id: servatui_display::LayerId::BUILTIN,
+            color: Color::Reset,
+            terminal_area: Rect::new(0, 0, 80, 24),
+            my_widgets: &[],
+        };
+        let mut widgets = Vec::new();
+        layer_obj.on_overlay(&mut ctx, &mut widgets); // frame 1
+
+        // A real Moved event landing in the row's leading text area
+        // (on the row, not on any button): not hovering.
+        let panel = panel_rect(ctx.terminal_area);
+        let row0 = row_rect(panel, 0);
+        let moved = Event::Mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: row0.x + 1,
+            row: row0.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(matches!(layer_obj.on_event(&moved, &ctx), EventResult::Swallow));
+        assert_eq!(
+            layer_obj.owner.get(),
+            Owner::Keyboard,
+            "off-button = not hovering = keyboard wins"
+        );
+
+        let mut widgets = Vec::new();
+        layer_obj.on_overlay(&mut ctx, &mut widgets); // frame 2
+        let reversed = |entry: &servyi_servatui::WidgetEntry| {
+            let mut buf = ratatui::buffer::Buffer::empty(entry.area);
+            entry.widget.render_ref(entry.area, &mut buf);
+            buf.content().iter().any(|c| c.modifier.contains(Modifier::REVERSED))
+        };
+        // Default All{grant} cursor visible.
+        assert!(reversed(widgets.last().expect("all-row widget")));
+    }
+
+    /// Takeover seam with in-flight rows: the keyboard may take over
+    /// from a hover on a DISABLED button — the cursor must then land
+    /// on a LIVE row (never invisibly on the grayed one).
+    #[test]
+    fn keyboard_takeover_from_a_disabled_hover_lands_on_a_live_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("hover-disabled.sock");
+        let _seen = fake_server(&sock, vec![31, 37]);
+
+        let mut layer_obj = layer(Arc::new(Mutex::new(ids(&[31, 37]))), &sock);
+        let mut ctx = servatui_display::LayerCtx {
+            id: servatui_display::LayerId::BUILTIN,
+            color: Color::Reset,
+            terminal_area: Rect::new(0, 0, 80, 24),
+            my_widgets: &[],
+        };
+        let mut widgets = Vec::new();
+        layer_obj.on_overlay(&mut ctx, &mut widgets); // frame 1
+
+        // 31 is in flight (grayed); the mouse rests on its [deny].
+        layer_obj.in_flight.borrow_mut().insert(31, Instant::now());
+        let panel = panel_rect(ctx.terminal_area);
+        let (deny, _) = button_pair(row_rect(panel, 0), false);
+        layer_obj.hover.set(Some((deny.x + 1, deny.y)));
+        layer_obj.owner.set(Owner::Mouse);
+
+        // Keyboard takeover: Down syncs to the (disabled) hovered
+        // button, then traversal skips it — landing on the live 37.
+        assert!(matches!(
+            layer_obj.on_event(&key(KeyCode::Down), &ctx),
+            EventResult::Swallow
+        ));
+        assert_eq!(
+            layer_obj.cursor,
+            Cursor::Request { slot: 1, sel: Sel::Deny },
+            "cursor must land on the LIVE row below, not the grayed one"
+        );
+        assert_eq!(layer_obj.owner.get(), Owner::Keyboard);
     }
 
     /// Regression (live finding): the all-row buttons must highlight
