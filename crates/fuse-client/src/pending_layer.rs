@@ -786,6 +786,16 @@ impl DisplayLayer for PendingPanelLayer {
         }
 
         let panel = panel_rect(ctx.terminal_area);
+        // While the mouse is anywhere over the panel, hover is the sole
+        // visual authority: the keyboard cursor's highlight is
+        // suppressed (otherwise e.g. the default All{grant} cursor
+        // keeps [grant all] lit while the user hovers request rows,
+        // looking like a stuck highlight). Mouse leaves -> the cursor
+        // highlight returns.
+        let hover_in_panel = self
+            .hover
+            .get()
+            .is_some_and(|(c, r)| contains(&panel, c, r));
         if panel.width < PANEL_WIDTH {
             if !self.small_warned.replace(true) {
                 let warning = format!(
@@ -850,6 +860,7 @@ impl DisplayLayer for PendingPanelLayer {
                         Cursor::Request { slot, sel } if slot == i => Some(sel),
                         _ => None,
                     };
+                    let sel_here = if hover_in_panel { None } else { sel_here };
                     let hovered = self
                         .hover
                         .get()
@@ -877,6 +888,7 @@ impl DisplayLayer for PendingPanelLayer {
             Cursor::All { grant } => Some(if grant { Sel::Grant } else { Sel::Deny }),
             _ => None,
         };
+        let sel_here = if hover_in_panel { None } else { sel_here };
         // Register the all-row buttons BEFORE hit-testing: the grid is
         // cleared at frame start, so last frame's children are gone —
         // a hit-test run before re-registering never finds them.
@@ -1780,6 +1792,49 @@ mod tests {
                 .iter()
                 .any(|s| s.style.add_modifier.contains(Modifier::REVERSED)),
             "no hover and no selection: no highlight"
+        );
+    }
+
+    /// Regression (live finding #2): while the mouse is over the
+    /// panel, the keyboard cursor must not keep its highlight — the
+    /// default All{grant} cursor otherwise leaves [grant all] lit
+    /// while the user hovers a request row, looking stuck.
+    #[test]
+    fn hover_over_request_row_suppresses_the_all_row_cursor_highlight() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("hover-suppress.sock");
+        let _seen = fake_server(&sock, vec![31]);
+
+        let mut layer_obj = layer(Arc::new(Mutex::new(ids(&[31]))), &sock);
+        // DEFAULT cursor: All{grant} — [grant all] is keyboard-lit.
+        let mut ctx = servatui_display::LayerCtx {
+            id: servatui_display::LayerId::BUILTIN,
+            color: Color::Reset,
+            terminal_area: Rect::new(0, 0, 80, 24),
+            my_widgets: &[],
+        };
+        let mut widgets = Vec::new();
+        layer_obj.on_overlay(&mut ctx, &mut widgets); // frame 1
+
+        // Hover over request 31's [deny] button (top row).
+        let panel = panel_rect(ctx.terminal_area);
+        let first_row = row_rect(panel, 0);
+        let (deny, _) = button_pair(first_row, false);
+        layer_obj.hover.set(Some((deny.x + 1, deny.y)));
+
+        let mut widgets = Vec::new();
+        layer_obj.on_overlay(&mut ctx, &mut widgets); // frame 2
+
+        let reversed = |entry: &servyi_servatui::WidgetEntry| {
+            let mut buf = ratatui::buffer::Buffer::empty(entry.area);
+            entry.widget.render_ref(entry.area, &mut buf);
+            buf.content().iter().any(|c| c.modifier.contains(Modifier::REVERSED))
+        };
+        let all = widgets.last().expect("all-row widget");
+        assert!(!reversed(all), "cursor highlight must not keep [grant all] lit under hover");
+        assert!(
+            widgets.iter().take(widgets.len() - 1).any(reversed),
+            "the hovered request button highlights instead"
         );
     }
 
