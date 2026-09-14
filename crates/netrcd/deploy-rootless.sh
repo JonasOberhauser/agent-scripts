@@ -18,6 +18,32 @@ ROOT=$(CDPATH= cd -- "$HERE/../.." && pwd)
 mkdir -p "$BASE/socket/profiles.d" "$BASE/socket/config.d" "$BASE/creds"
 install -m 600 "$NETRC_SRC" "$BASE/creds/netrc"
 
+# Starter policy: api.github.com GET /user and /rate_limit, SPKI-pinned
+# (the pair validated live against the real endpoint). Empty dirs
+# would have the daemon refuse everything — confusing first contact.
+cat > "$BASE/socket/profiles.d/api.github.com.toml" <<'EOF'
+[[machine]]
+name = "api.github.com"
+auth = "bearer"
+pins = [
+  "sha256//ZSagvDzjltLkewXEBuDxIzpW/dpVw1Juvvmd0hhkzdY=",
+  "sha256//S2LUIbq4yUg5w+MYbj5LZOWAZAzaeNGJ9rTTc4GjvBQ=",
+]
+EOF
+cat > "$BASE/socket/config.d/api.github.com.toml" <<'EOF'
+[[machine]]
+name = "api.github.com"
+rate = "30/min"
+
+  [[machine.allow]]
+  method = "GET"
+  url = '/user'
+
+  [[machine.allow]]
+  method = "GET"
+  url = '/rate_limit'
+EOF
+
 podman build -f "$ROOT/crates/netrcd/Containerfile" -t localhost/netrcd:latest "$ROOT"
 
 mkdir -p "$HOME/.config/containers/systemd"
