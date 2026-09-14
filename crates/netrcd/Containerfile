@@ -1,12 +1,11 @@
 # Build from the REPO ROOT:
 #   podman build -f crates/netrcd/Containerfile -t localhost/netrcd:latest .
-FROM docker.io/library/rust:1-slim AS build
-# Full perl: openssl-sys's vendored Configure needs FindBin.pm, which
-# perl-base (slim default) does not ship. This is the known
-# rust:*-slim + static-ssl failure: "Can't locate FindBin.pm".
-RUN apt-get update \
-  && apt-get install -y --no-install-recommends perl \
-  && rm -rf /var/lib/apt/lists/*
+#
+# Builder is FULL rust:1, deliberately not rust:1-slim: the vendored
+# OpenSSL (static-ssl) needs perl with FindBin.pm (slim ships only
+# perl-base), make (slim has none) and cc. Two slim iterations failed
+# on exactly those; the full image ships them all.
+FROM docker.io/library/rust:1 AS build
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/

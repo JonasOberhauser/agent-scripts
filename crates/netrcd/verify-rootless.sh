@@ -1,14 +1,20 @@
-#!/bin/sh
+#!/usr/bin/env bash
 # Rootless netrcd verification — run AFTER deploy-rootless.sh.
 # Everything here is plain podman: no sudo, no systemd-run.
 #   sh crates/netrcd/verify-rootless.sh
 # Prediction: 6/6 PASS with SELinux enforcing.
+# Logged to ~/.local/share/netrcd/verify.log.
 set -u
 
 BASE=${NETRCD_ROOT:-$HOME/.local/share/netrcd}
 MCS=${NETRCD_MCS:-s0:c100,c200}
 IMG=localhost/netrcd:latest
 PASS=0; FAIL=0
+
+mkdir -p "$BASE"
+LOG="$BASE/verify.log"
+exec > >(tee -a "$LOG") 2>&1
+echo "=== netrcd verify $(date -u +%Y-%m-%dT%H:%M:%SZ) ==="
 
 ck() { # ck <desc> <want_ok:0|1> <cmd...>
   desc=$1; want_ok=$2; shift 2
