@@ -402,18 +402,19 @@ fn truncate_pad(s: &str, max: usize) -> String {
 
 /// A button as colored brackets around plain text; the selected button
 /// is reversed instead, so the cursor stays obvious.
-fn button_spans(button: Button, selected: bool) -> Vec<Span<'static>> {
-    button_spans_styled(button, selected, false)
-}
-
-/// `disabled`: the request's decision is in flight — gray the whole
-/// button, never reverse-highlight it (issue #24).
+/// `disabled`: the request's decision is in flight — render the
+/// button dimmed (normal colors, `DIM`, never reverse-highlighted);
+/// plain DarkGray was unreadable against the panel backdrop.
 fn button_spans_styled(button: Button, selected: bool, disabled: bool) -> Vec<Span<'static>> {
     if disabled {
-        return vec![Span::styled(
-            button.label().to_string(),
-            Style::default().fg(Color::DarkGray),
-        )];
+        let label = button.label();
+        let word = &label[1..label.len() - 1];
+        let brackets = Style::default().fg(button.color()).add_modifier(Modifier::DIM);
+        return vec![
+            Span::styled("[", brackets),
+            Span::styled(word.to_string(), Style::default().add_modifier(Modifier::DIM)),
+            Span::styled("]", brackets),
+        ];
     }
     if selected {
         return vec![Span::styled(
@@ -521,7 +522,11 @@ fn grid_row_line_styled(
     let grant = if all { Button::GrantAll } else { Button::Grant { id: 0 } };
     let sel = if disabled { None } else { sel_here };
     if let GridRow::Request(_) = row {
-        spans.extend(button_spans(Button::GrantForever { id: 0 }, sel == Some(Sel::Forever)));
+        spans.extend(button_spans_styled(
+            Button::GrantForever { id: 0 },
+            sel == Some(Sel::Forever),
+            disabled,
+        ));
         spans.push(Span::raw(" "));
     }
     spans.extend(button_spans_styled(grant, sel == Some(Sel::Grant), disabled));
@@ -999,14 +1004,25 @@ impl DisplayLayer for PendingPanelLayer {
         } else {
             None
         };
+        // The all-row grays exactly when EVERY visible request is
+        // already in flight — expanding over the disabled set would
+        // only dispatch what the per-id guard allows anyway, and a
+        // lit all-row would mislead.
+        let all_disabled = {
+            let in_flight = self.in_flight.borrow();
+            self.slots
+                .iter()
+                .flatten()
+                .all(|req| in_flight.contains_key(&req.id))
+        };
+        let all_line = if all_disabled {
+            grid_row_line_styled(GridRow::All, all_row.width, None, true)
+        } else {
+            grid_row_line_hover(GridRow::All, all_row.width, sel_here, all_hovered.as_ref())
+        };
         widgets.push(WidgetEntry {
             name: PANEL_NAME,
-            widget: Box::new(Paragraph::new(grid_row_line_hover(
-                GridRow::All,
-                all_row.width,
-                sel_here,
-                all_hovered.as_ref(),
-            ))),
+            widget: Box::new(Paragraph::new(all_line)),
             area: all_row,
         });
 
@@ -1317,14 +1333,158 @@ mod tests {
             true,
         );
         assert!(
-            line.spans.iter().any(|s| s.style.fg == Some(Color::DarkGray)),
-            "grayed buttons expected: {line:?}"
+            line.spans.iter().any(|s| s.style.add_modifier.contains(Modifier::DIM)),
+            "dimmed buttons expected: {line:?}"
         );
         assert!(
             !line.spans
                 .iter()
                 .any(|s| s.style.add_modifier.contains(Modifier::REVERSED)),
             "no selection highlight on a grayed row"
+        );
+    }
+
+    /// EVERY button of a disabled row is dimmed — forever included
+    /// (it used to stay lit), and the text is not the old unreadable
+    /// DarkGray.
+    #[test]
+    fn disabled_row_dims_forever_grant_and_deny() {
+        let line = grid_row_line_styled(
+            GridRow::Request(&pending_info(31)),
+            PANEL_WIDTH,
+            Some(Sel::Forever),
+            true,
+        );
+        // Locate the three button labels and require DIM on each.
+        for label in ["[forever]", "[grant]", "[deny]"] {
+            let span = line
+                .spans
+                .iter()
+                .find(|s| s.content.contains(&label[1..label.len() - 1]))
+                .unwrap_or_else(|| panic!("{label} not rendered: {line:?}"));
+            assert!(
+                span.style.add_modifier.contains(Modifier::DIM),
+                "{label} must be dimmed on a disabled row"
+            );
+        }
+    }
+
+    /// The all-row grays exactly when EVERY visible request is in
+    /// flight — with one pending decision left it must stay live.
+    #[test]
+    fn all_row_grays_only_when_every_request_is_in_flight() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("all-gray.sock");
+        let _seen = fake_server(&sock, vec![31, 37]);
+
+        let mut layer_obj = layer(Arc::new(Mutex::new(ids(&[31, 37]))), &sock);
+        let mut ctx = servatui_display::LayerCtx {
+            id: servatui_display::LayerId::BUILTIN,
+            color: Color::Reset,
+            terminal_area: Rect::new(0, 0, 80, 24),
+            my_widgets: &[],
+        };
+        let mut widgets = Vec::new();
+        layer_obj.on_overlay(&mut ctx, &mut widgets);
+
+        let dimmed = |entry: &servyi_servatui::WidgetEntry| {
+            let mut buf = ratatui::buffer::Buffer::empty(entry.area);
+            entry.widget.render_ref(entry.area, &mut buf);
+            buf.content().iter().any(|c| c.modifier.contains(Modifier::DIM))
+        };
+
+        // One of two in flight: all-row still live.
+        layer_obj.in_flight.borrow_mut().insert(31, Instant::now());
+        let mut widgets = Vec::new();
+        layer_obj.on_overlay(&mut ctx, &mut widgets);
+        assert!(!dimmed(widgets.last().unwrap()), "one live request keeps the all-row live");
+
+        // Both in flight: all-row dims.
+        layer_obj.in_flight.borrow_mut().insert(37, Instant::now());
+        let mut widgets = Vec::new();
+        layer_obj.on_overlay(&mut ctx, &mut widgets);
+        assert!(dimmed(widgets.last().unwrap()), "all in flight dims the all-row");
+    }
+
+    /// Disabled buttons are CLICK noops: after a decision is
+    /// dispatched, clicking the row's other buttons (and the all-row)
+    /// must not produce a second dispatch.
+    #[test]
+    fn disabled_buttons_are_click_noops() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("noop.sock");
+        let seen = fake_server(&sock, vec![31, 37]);
+
+        let mut display = servatui_display::Display::with_palette(Vec::new());
+        let pending: PendingIds = Arc::new(Mutex::new(ids(&[31, 37])));
+        display.add_layer(Box::new(layer(pending, &sock)));
+        frame_with_pending(&mut display);
+
+        // Dispatch request 31's grant via keyboard.
+        assert!(display.route_event(&key(KeyCode::Down)));
+        assert!(display.route_event(&key(KeyCode::Enter)));
+
+        // 31 is in flight: hammer its OTHER buttons by mouse.
+        let panel = panel_rect(Rect::new(0, 0, 80, 24));
+        let row0 = row_rect(panel, 0);
+        let (deny, _) = button_pair(row0, false);
+        let forever = forever_rect(row0);
+        for (x, y) in [(deny.x + 1, deny.y), (forever.x + 1, forever.y)] {
+            let _ = display.route_event(&click(x, y));
+        }
+        // The all-row would expand over 31 (and 37): with 31 blocked
+        // it must dispatch ONLY 37.
+        let all = all_row_rect(panel);
+        let (_, grant_all) = button_pair(all, true);
+        let _ = display.route_event(&click(grant_all.x + 1, grant_all.y));
+
+        let conversations = seen.lock().unwrap().clone();
+        let count = |name: &str, id: &str| {
+            conversations
+                .iter()
+                .filter(|(n, p)| n == name && p.contains(id))
+                .count()
+        };
+        assert_eq!(count("grant", "31"), 1, "no second dispatch for in-flight 31");
+        assert_eq!(count("deny", "31"), 0, "deny on an in-flight row is a noop");
+        assert_eq!(count("grant-forever", "31"), 0, "forever on an in-flight row is a noop");
+        assert_eq!(count("grant", "37"), 1, "all-row still serves the LIVE request");
+    }
+
+    /// Neither hover nor the keyboard cursor may highlight a disabled
+    /// row's buttons — it must not look selectable by any device.
+    #[test]
+    fn disabled_rows_show_no_highlight_from_any_device() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("nohl.sock");
+        let _seen = fake_server(&sock, vec![31]);
+
+        let mut layer_obj = layer(Arc::new(Mutex::new(ids(&[31]))), &sock);
+        let mut ctx = servatui_display::LayerCtx {
+            id: servatui_display::LayerId::BUILTIN,
+            color: Color::Reset,
+            terminal_area: Rect::new(0, 0, 80, 24),
+            my_widgets: &[],
+        };
+        let mut widgets = Vec::new();
+        layer_obj.on_overlay(&mut ctx, &mut widgets);
+
+        // 31 in flight; cursor ON it; mouse hovering its [deny].
+        layer_obj.in_flight.borrow_mut().insert(31, Instant::now());
+        layer_obj.cursor = Cursor::Request { slot: 0, sel: Sel::Grant };
+        let panel = panel_rect(ctx.terminal_area);
+        let (deny, _) = button_pair(row_rect(panel, 0), false);
+        layer_obj.hover.set(Some((deny.x + 1, deny.y)));
+        layer_obj.owner.set(Owner::Mouse);
+
+        let mut widgets = Vec::new();
+        layer_obj.on_overlay(&mut ctx, &mut widgets);
+        let entry = &widgets[widgets.len() - 2]; // first request row widget
+        let mut buf = ratatui::buffer::Buffer::empty(entry.area);
+        entry.widget.render_ref(entry.area, &mut buf);
+        assert!(
+            !buf.content().iter().any(|c| c.modifier.contains(Modifier::REVERSED)),
+            "a disabled row must not highlight for hover or cursor"
         );
     }
 
