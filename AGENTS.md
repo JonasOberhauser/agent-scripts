@@ -155,3 +155,10 @@ Do not guess. The agent should:
 When a bug is found in production that tests missed, **add a test that would
 have caught it** before fixing the bug. This ensures the regression is
 permanently guarded against.
+
+**Read the test run, don't just see it green.** Before running, state the
+expected test COUNT derived from what you changed (n new tests → old + n).
+After running — locally or in CI — verify the number and that the new test
+NAMES actually appear. A silently no-op'd patch (missed conflict hunk,
+failed string replace, empty commit) otherwise hides as "still green, one
+test short". A green run you didn't count is a green run you didn't check.
