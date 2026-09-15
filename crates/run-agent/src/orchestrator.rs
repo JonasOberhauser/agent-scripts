@@ -506,14 +506,12 @@ where
         }
 
         // ── 4. Expand + load secrets into FUSE ───────────────────────
-        let pid = std::process::id();
-        let mut counter = 0usize;
         let mut loaded: Vec<LoadedSecret> = Vec::new();
 
         for mapping in &config.secrets {
             load_secret_recursive(
                 io, send, &mapping.host, &mapping.container,
-                config, pid, &mut counter, &mut loaded,
+                config, &mut loaded,
             )?;
         }
 
@@ -730,11 +728,26 @@ pub(crate) struct LoadedSecret {
 /// FUSE-visible secret name carrying the sanitized host file name
 /// (issue #18): recognizable in /fuse listings and pending requests,
 /// while the pid/counter prefix keeps it collision-free.
-fn secret_name(host: &Path, pid: u32, counter: usize) -> String {
-    let safe: String = host
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_default()
+/// Stable, collision-free secret name for a host file (issue #18 +
+/// the stable-filenames directive): `<stem>.<8 hex of
+/// sha256(path)><ext>`.
+///
+/// Derived from the HOST PATH ONLY — never the PID or a per-run
+/// counter — so the same file always maps to the same name across
+/// run-agent instances and restarts. That is what makes the file
+/// shareable between containers (concurrently and sequentially) and
+/// what lets name-keyed settings survive: the server's hash grants
+/// and the state file stay attached to the same name from run to run.
+///
+/// The path digest keeps two different files with the same basename
+/// distinct; identical paths are idempotent (same name twice re-adds
+/// the same secret). The name is purely lexical — symlinked host
+/// paths count as distinct files.
+fn secret_name(host: &Path) -> String {
+    use sha2::{Digest as _, Sha256};
+
+    let raw = host.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    let safe: String = raw
         .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
@@ -744,22 +757,34 @@ fn secret_name(host: &Path, pid: u32, counter: usize) -> String {
             }
         })
         .collect();
-    if safe.is_empty() {
-        format!("p{pid}_s{counter}")
-    } else {
-        format!("p{pid}_s{counter}_{safe}")
-    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(host.to_string_lossy().as_bytes());
+    let digest = hasher.finalize();
+    let tag: String = digest.iter().take(4).map(|b| format!("{b:02x}")).collect();
+
+    // Split stem/extension of the SANITIZED name so the extension
+    // survives at the end (bind mounts of /fuse/<name> keep working
+    // for tools that care): `auth.json` -> `auth.a1b2c3d4.json`,
+    // `id_ed25519` -> `id_ed25519.a1b2c3d4`.
+    let stem = match safe.rfind('.') {
+        Some(i) if i > 0 && i < safe.len() - 1 => safe[..i].to_string(),
+        _ => safe.clone(),
+    };
+    let ext = match safe.rfind('.') {
+        Some(i) if i > 0 && i < safe.len() - 1 => safe[i..].to_string(),
+        _ => String::new(),
+    };
+    let stem = if stem.is_empty() { String::from("secret") } else { stem };
+    format!("{stem}.{tag}{ext}")
 }
 
-#[allow(clippy::too_many_arguments)]
 fn load_secret_recursive<S, F>(
     io: &mut S,
     send: &F,
     host: &Path,
     container: &Path,
     config: &AgentConfig,
-    pid: u32,
-    counter: &mut usize,
     loaded: &mut Vec<LoadedSecret>,
 ) -> Result<(), String>
 where
@@ -776,7 +801,7 @@ where
                 .ok_or_else(|| format!("invalid path: {}", entry.display()))?;
             load_secret_recursive(
                 io, send, &entry, &container.join(name),
-                config, pid, counter, loaded,
+                config, loaded,
             )?;
         }
         return Ok(());
@@ -786,12 +811,10 @@ where
     // cp semantics: if container ends with '/', it's a directory destination.
     let dest = resolve_dest(host, container);
 
-    // Names carry the host file name (issue #18): p{pid}_s{n}_{file}
-    // so /fuse listings and pending requests are recognizable.  The
-    // pid/counter prefix keeps names collision-free even when two
-    // secrets share a file name.
-    let fuse_name = secret_name(host, pid, *counter);
-    *counter += 1;
+    // Stable names (see secret_name): derived from the host path, so
+    // restarts reuse the same secret — grants and hash settings stay
+    // attached — and the same file can be shared between containers.
+    let fuse_name = secret_name(host);
 
     let args = format!("{} {} {}", fuse_name, host.display(), config.binary_hash);
     send("add", &args)
@@ -1271,20 +1294,43 @@ mod tests {
     // ── secret naming (#18) ────────────────────────────────────────
 
     #[test]
-    fn secret_name_carries_the_host_file_name() {
-        let n = secret_name(Path::new("/home/u/.config/goose/auth.json"), 42, 0);
-        assert_eq!(n, "p42_s0_auth.json");
+    fn secret_name_is_stable_across_calls_and_instances() {
+        // The whole point: no PID, no per-run counter — the same path
+        // maps to the same name forever, so name-keyed grants, hash
+        // settings and container bind-mounts survive restarts.
+        let a = secret_name(Path::new("/home/u/.config/goose/auth.json"));
+        let b = secret_name(Path::new("/home/u/.config/goose/auth.json"));
+        assert_eq!(a, b);
+        assert!(a.starts_with("auth."), "carries the file name: {a}");
+        assert!(a.ends_with(".json"), "extension survives: {a}");
+    }
+
+    #[test]
+    fn secret_name_separates_same_basenames_in_different_dirs() {
+        let a = secret_name(Path::new("/secrets/a/token"));
+        let b = secret_name(Path::new("/keys/token"));
+        assert_ne!(a, b, "path digest must disambiguate: {a} vs {b}");
+        assert!(a.starts_with("token.") && b.starts_with("token."));
     }
 
     #[test]
     fn secret_name_sanitizes_unsafe_characters() {
-        let n = secret_name(Path::new("/x/my key! v2.bin"), 7, 3);
-        assert_eq!(n, "p7_s3_my_key__v2.bin");
+        let n = secret_name(Path::new("/x/my key! v2.bin"));
+        assert!(n.starts_with("my_key__v2.") && n.ends_with(".bin"), "sanitized + digest inserted: {n}");
     }
 
     #[test]
     fn secret_name_falls_back_when_no_file_name() {
-        assert_eq!(secret_name(Path::new("/"), 9, 1), "p9_s1");
+        let n = secret_name(Path::new("/"));
+        assert!(n.starts_with("secret."), "digest-only fallback: {n}");
+    }
+
+    #[test]
+    fn secret_name_preserves_extensionless_keys() {
+        // ssh picks keys by file name; bind mounts of /fuse/<name>
+        // must keep workable names for extensionless files too.
+        let n = secret_name(Path::new("/home/u/.ssh/id_ed25519"));
+        assert!(n.starts_with("id_ed25519."), "digest appended, no invented extension: {n}");
     }
 
     // ── run_agent integration ────────────────────────────────────
@@ -2183,9 +2229,10 @@ mod tests {
                 && probe.1.contains(&"stat".to_string()),
             "probe must be `timeout stat`: {probe:?}"
         );
+        let expected = format!("/fuse/{}", secret_name(Path::new("/home/user/secrets.yaml")));
         assert!(
-            probe.1.iter().any(|a| a.contains("/fuse/p")),
-            "probe must stat the fuse-side secret path: {probe:?}"
+            probe.1.contains(&expected),
+            "probe must stat the fuse-side secret path ({expected}): {probe:?}"
         );
     }
 
