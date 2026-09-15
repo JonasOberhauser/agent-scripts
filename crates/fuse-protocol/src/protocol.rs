@@ -67,7 +67,27 @@ pub struct StateSecretEntry {
 
 // ── Commands (client → server) ─────────────────────────────────
 
-fn default_secret_mode() -> u32 {
+/// Default permission bits for secrets whose sender does not carry the
+/// mode field (conservative read-only).  Shared by the client-facing
+/// `AddSecret` and the oracle `Upsert` wire formats.
+/// Whether a server version and a client version speak the same
+/// protocol: major and minor must match; the patch component is
+/// ignored by design (AGENTS.md) so patch releases never force a
+/// server restart.  Malformed versions are incompatible — fail closed.
+pub fn versions_compatible(server: &str, client: &str) -> bool {
+    fn parts(v: &str) -> Option<(u32, u32)> {
+        let mut it = v.split('.');
+        let maj = it.next()?.parse().ok()?;
+        let min = it.next()?.parse().ok()?;
+        Some((maj, min))
+    }
+    match (parts(server), parts(client)) {
+        (Some(s), Some(c)) => s == c,
+        _ => false,
+    }
+}
+
+pub fn default_secret_mode() -> u32 {
     0o400
 }
 
@@ -143,6 +163,30 @@ pub enum Response {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn versions_compatible_ignores_patch_only() {
+        assert!(versions_compatible("0.27.0", "0.27.9"));
+        assert!(versions_compatible("1.2.3", "1.2.4"));
+    }
+
+    #[test]
+    fn versions_compatible_rejects_major_minor_drift() {
+        assert!(!versions_compatible("0.26.5", "0.27.0"));
+        assert!(!versions_compatible("1.3.0", "1.2.9"));
+        assert!(!versions_compatible("2.0.0", "1.99.0"));
+    }
+
+    #[test]
+    fn versions_compatible_fails_closed_on_garbage() {
+        assert!(!versions_compatible("", "0.27.0"));
+        assert!(!versions_compatible("zero.27.0", "0.27.0"));
+        // A missing patch component is still major.minor — compatible.
+        assert!(versions_compatible("0.27", "0.27.0"));
+    }
+
+
     use super::PendingAccessInfo;
 
     /// Wire compatibility: the `pid_hash_error` field is additive — a

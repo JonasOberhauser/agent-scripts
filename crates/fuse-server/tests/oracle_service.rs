@@ -193,8 +193,10 @@ fn control_channel_replays_snapshot_and_pushes_updates() {
     }
 
     // Late-joining data daemon must receive the seed via the snapshot.
+    // Old daemons send a bare hello (no version) — must still parse
+    // and still receive the snapshot.
     let mut conn = std::os::unix::net::UnixStream::connect(&path).unwrap();
-    conn.write_all(format!("{}\n", serde_json::to_string(&OracleRequest::Hello).unwrap()).as_bytes()).unwrap();
+    conn.write_all(b"{\"type\":\"hello\"}\n").unwrap();
     let mut reader = BufReader::new(conn.try_clone().unwrap());
     let mut line = String::new();
     reader.read_line(&mut line).unwrap(); // Ok ack

@@ -19,7 +19,13 @@ pub enum OracleRequest {
     Ask { name: String, pid: u32, offset: u64, size: u32 },
     /// First message of a persistent CONTROL connection: the policy
     /// daemon pushes Upsert/Remove commands to it as secrets change.
-    Hello,
+    /// `version` is the data daemon's protocol VERSION — wire-optional
+    /// (older `fused` sends a bare `hello`), used only to LOG mixed
+    /// vintages loudly instead of failing silently across them.
+    Hello {
+        #[serde(default)]
+        version: Option<String>,
+    },
 }
 
 /// Policy daemon → fused.
@@ -27,7 +33,19 @@ pub enum OracleRequest {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum OracleCommand {
     /// Serve this secret from now on (new or replaced content).
-    Upsert { name: String, content: Vec<u8>, mode: u32 },
+    ///
+    /// `mode` is wire-OPTIONAL: policy daemons that predate mode
+    /// passthrough do not send it, and a required field would make
+    /// them silently invisible to a newer fused (the PR #37 field
+    /// report: an alive mount listing only `.` and `..`).  Older
+    /// senders therefore keep working; the conservative 0o400 default
+    /// matches the client-facing AddSecret contract.
+    Upsert {
+        name: String,
+        content: Vec<u8>,
+        #[serde(default = "crate::protocol::default_secret_mode")]
+        mode: u32,
+    },
     /// Stop serving this secret (readers get ENOENT).
     Remove { name: String },
 }
@@ -48,6 +66,21 @@ pub enum OracleReply {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn upsert_without_mode_parses_with_conservative_default() {
+        // Wire backward compatibility (PR #37 field report): policy
+        // daemons that predate mode passthrough send no `mode`; a
+        // required field made their upserts silently invisible to a
+        // newer fused. It must parse, defaulting to read-only.
+        let old = r#"{"type":"upsert","name":"s.yaml","content":[104,105]}"#;
+        let cmd: OracleCommand = serde_json::from_str(old).expect("old-format upsert must parse");
+        assert_eq!(
+            cmd,
+            OracleCommand::Upsert { name: "s.yaml".into(), content: b"hi".to_vec(), mode: 0o400 }
+        );
+    }
+
+
     use super::*;
 
     #[test]
@@ -101,5 +134,24 @@ mod tests {
         assert_eq!(back, OracleReply::Ok);
         let back: OracleReply = serde_json::from_str(&msgs[6]).unwrap();
         assert_eq!(back, OracleReply::Error { message: "boom".into() });
+    }
+
+    #[test]
+    fn hello_carries_version_and_round_trips() {
+        let wire = serde_json::to_string(&OracleRequest::Hello {
+            version: Some("0.27.1".into()),
+        })
+        .unwrap();
+        let back: OracleRequest = serde_json::from_str(&wire).unwrap();
+        assert_eq!(back, OracleRequest::Hello { version: Some("0.27.1".into()) });
+    }
+
+    #[test]
+    fn bare_hello_from_an_old_data_daemon_still_parses() {
+        // Pre-version daemons send {"type":"hello"} — the field is
+        // wire-optional so they interoperate; the server just cannot
+        // skew-check them.
+        let back: OracleRequest = serde_json::from_str("{\"type\":\"hello\"}").unwrap();
+        assert_eq!(back, OracleRequest::Hello { version: None });
     }
 }
