@@ -243,13 +243,17 @@ fn wait_mount(mount: &Path, dirs: &[tempfile::TempDir]) {
 /// needs the setuid bit (or the direct-mount fallback needs root +
 /// CAP_SYS_ADMIN). A stripped setuid bit is a classic silent killer.
 fn fusermount3_state() -> String {
+    use std::os::unix::fs::MetadataExt;
     match std::fs::metadata("/usr/bin/fusermount3") {
-        Ok(m) => format!(
-            "present, mode {:o}, uid {} (setuid: {})",
-            std::os::unix::fs::MetadataExt::mode(&m),
-            std::os::unix::fs::MetadataExt::uid(&m),
-            m.permissions().mode() & 0o4000 != 0
-        ),
+        Ok(m) => {
+            let mode = m.mode();
+            format!(
+                "present, mode {:o}, uid {} (setuid: {})",
+                mode,
+                m.uid(),
+                mode & 0o4000 != 0
+            )
+        }
         Err(_) => String::from("absent"),
     }
 }
