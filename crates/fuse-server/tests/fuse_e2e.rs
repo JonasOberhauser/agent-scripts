@@ -281,7 +281,7 @@ fn mounted_fuse(path: &Path) -> bool {
         Err(_) => return false,
     };
     let mut st = unsafe { std::mem::zeroed::<libc::statfs>() };
-    unsafe { libc::statfs(c.as_ptr(), &mut st) == 0 && st.f_type as u64 == 0x65735546 }
+    unsafe { libc::statfs(c.as_ptr(), &mut st) == 0 && st.f_type == libc::FUSE_SUPER_MAGIC }
 }
 
 fn log_tail(path: Option<&Path>) -> String {
