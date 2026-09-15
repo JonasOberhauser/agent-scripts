@@ -331,6 +331,11 @@ impl Filesystem for FusedFs {
 /// to a newer fused left an alive-but-empty mount with no diagnostic
 /// anywhere.
 fn apply_control_line(store: &Store, line: &str) -> bool {
+    // The server's Hello ack ({"type":"ok"}) shares the stream with
+    // commands — replies are not commands; consume silently.
+    if serde_json::from_str::<OracleReply>(line.trim()).is_ok() {
+        return false;
+    }
     match serde_json::from_str::<OracleCommand>(line.trim()) {
         Ok(OracleCommand::Upsert { name, content, mode }) => {
             store.upsert(&name, content, mode);
@@ -392,6 +397,24 @@ mod tests {
         assert!(has(&s, "a"), "upsert must land in the store");
         assert!(apply_control_line(&s, r#"{"type":"remove","name":"a"}"#));
         assert!(!has(&s, "a"), "remove must clear the store");
+    }
+
+    #[test]
+    fn control_line_replies_are_acks_not_garbage() {
+        // The Hello ack shares the control stream with commands. It is
+        // a REPLY — consuming it silently is correct; flagging it as a
+        // parse failure would cry "version skew" on every healthy
+        // connection (seen live while reproducing #39).
+        let s = Store::default();
+        assert!(!apply_control_line(&s, r#"{"type":"ok"}"#));
+        let has = |s: &Store, n: &str| s.listing().iter().any(|(_, name, _, _)| name == n);
+        assert!(!has(&s, "a"));
+        // and a real command after an ack still applies
+        assert!(apply_control_line(
+            &s,
+            r#"{"type":"upsert","name":"a","content":[104,105],"mode":420}"#
+        ));
+        assert!(has(&s, "a"));
     }
 
     #[test]

@@ -12,7 +12,7 @@
 
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -128,6 +128,12 @@ impl Split {
         std::fs::create_dir_all(&mount).unwrap();
         let socket = dirs[1].path().join("cmd.sock");
         let oracle = dirs[2].path().join("oracle.sock");
+        // Daemon output goes to files, not /dev/null: a failing mount
+        // or a broken control loop must be DIAGNOSABLE from the test
+        // failure, not guessed at (#39 — "content sync broken" hid
+        // `fusermount3: mount failed: Operation not permitted`).
+        let server_log = std::fs::File::create(dirs[1].path().join("server.log")).unwrap();
+        let fused_log = std::fs::File::create(dirs[2].path().join("fused.log")).unwrap();
 
         // The policy daemon loads secrets from files (--secret N:F:H).
         let secret_dir = tempfile::tempdir().unwrap();
@@ -149,7 +155,7 @@ impl Split {
             ));
         }
         let policy = policy
-            .stdout(Stdio::null()).stderr(Stdio::null())
+            .stdout(server_log.try_clone().unwrap()).stderr(server_log)
             .spawn()
             .expect("spawn fuse-server (policy)");
 
@@ -159,12 +165,12 @@ impl Split {
         let data = Command::new(bin("fused"))
             .arg("--mount-point").arg(&mount)
             .arg("--oracle-socket").arg(&oracle)
-            .env("RUST_LOG", "error")
-            .stdout(Stdio::null()).stderr(Stdio::null())
+            .env("RUST_LOG", "info")
+            .stdout(fused_log.try_clone().unwrap()).stderr(fused_log)
             .spawn()
             .expect("spawn fused (data daemon)");
 
-        wait_mount(&mount);
+        wait_mount(&mount, &dirs);
         // Wait until the content snapshot has landed in the data daemon.
         for (name, _, _) in secrets {
             let target = mount.join(name);
@@ -209,15 +215,59 @@ fn wait_connect(path: &Path, what: &str) {
     panic!("{what} never came up at {}", path.display());
 }
 
-fn wait_mount(mount: &Path) {
+fn wait_mount(mount: &Path, dirs: &[tempfile::TempDir]) {
+    // The mountpoint DIRECTORY always exists (we made it) — checking
+    // read_dir() would pass trivially with no mount at all and later
+    // surface as a misleading "content sync broken" (#39). Verify the
+    // kernel actually has a FUSE mount on the path.
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
-        if std::fs::read_dir(mount).is_ok() {
+        if mounted_fuse(mount) {
             return;
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    panic!("mount never came up at {}", mount.display());
+    panic!(
+        "FUSE mount never came up at {} — /dev/fuse present: {}, fusermount3 present: {}\
+         \n--- server.log ---\n{}--- fused.log ---\n{}",
+        mount.display(),
+        Path::new("/dev/fuse").exists(),
+        Command::new("fusermount3").arg("--version").output().is_ok(),
+        log_tail(dirs.get(1).map(|d| d.path().join("server.log")).as_deref()),
+        log_tail(dirs.get(2).map(|d| d.path().join("fused.log")).as_deref()),
+    );
+}
+
+/// Whether the kernel has a fuse mount on `path` (Linux: /proc/mounts
+/// carries the real mount table regardless of /etc/mtab state).
+fn mounted_fuse(path: &Path) -> bool {
+    let want = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let Ok(s) = std::fs::read_to_string("/proc/self/mounts") else {
+        return false;
+    };
+    s.lines().any(|l| {
+        let mut it = l.split(' ');
+        match (it.next(), it.next()) {
+            (Some(fs), Some(mp)) => {
+                (fs == "fuse" || fs.starts_with("fuse."))
+                    && Path::new(&mp.replace("\\040", " ")) == want
+            }
+            _ => false,
+        }
+    })
+}
+
+fn log_tail(path: Option<&Path>) -> String {
+    match path.and_then(|p| std::fs::read_to_string(p).ok()) {
+        Some(s) => {
+            let lines: Vec<&str> = s.lines().collect();
+            let start = lines.len().saturating_sub(25);
+            let mut out = lines[start..].join("\n");
+            out.push('\n');
+            out
+        }
+        None => String::from("(no log)\n"),
+    }
 }
 
 fn write_out(out: &std::process::Output) -> String {
