@@ -272,6 +272,9 @@ fn probe_env() -> String {
 
 /// Whether the kernel has a fuse mount on `path` (Linux: /proc/mounts
 /// carries the real mount table regardless of /etc/mtab state).
+/// Format: `device mountpoint fstype options dump pass` — for FUSE
+/// mounts the DEVICE field carries the subtype (e.g. `gatekeeper`),
+/// the FSTYPE (third field) is `fuse` or `fuse.<subtype>`.
 fn mounted_fuse(path: &Path) -> bool {
     let want = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     let Ok(s) = std::fs::read_to_string("/proc/self/mounts") else {
@@ -279,8 +282,8 @@ fn mounted_fuse(path: &Path) -> bool {
     };
     s.lines().any(|l| {
         let mut it = l.split(' ');
-        match (it.next(), it.next()) {
-            (Some(fs), Some(mp)) => {
+        match (it.next(), it.next(), it.next()) {
+            (Some(_dev), Some(mp), Some(fs)) => {
                 (fs == "fuse" || fs.starts_with("fuse."))
                     && Path::new(&mp.replace("\\040", " ")) == want
             }
