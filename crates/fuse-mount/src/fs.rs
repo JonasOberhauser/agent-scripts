@@ -29,6 +29,14 @@ struct StoreInner {
     next_ino: u64,
     by_name: HashMap<String, u64>,
     by_ino: HashMap<u64, (String, Content)>,
+    /// Implicit directory layer (issue #34): names are normalized
+    /// host paths (`home/u/auth.json`); directories materialize from
+    /// the path components and vanish when no name lives under them.
+    /// Inodes come from a separate high range so they can never
+    /// collide with file inodes (which count up from ROOT_INO).
+    dir_by_path: HashMap<String, u64>,
+    path_by_dir_ino: HashMap<u64, String>,
+    next_dir_ino: u64,
 }
 
 /// Content store: name⇄inode bookkeeping plus the bytes.
@@ -53,6 +61,97 @@ impl Store {
         if let Some(ino) = s.by_name.remove(name) {
             s.by_ino.remove(&ino);
         }
+    }
+
+    /// Stable inode for the implicit directory at `path` ("" = root).
+    fn dir_ino(&self, path: &str) -> u64 {
+        let mut s = self.0.lock().unwrap();
+        if let Some(&ino) = s.dir_by_path.get(path) {
+            return ino;
+        }
+        // Far away from file inodes (ROOT_INO + small counters) and
+        // from 1 (root): count DOWN from u64::MAX/2.
+        s.next_dir_ino += 1;
+        let ino = DIR_INO_BASE - s.next_dir_ino;
+        s.dir_by_path.insert(path.to_string(), ino);
+        s.path_by_dir_ino.insert(ino, path.to_string());
+        ino
+    }
+
+    /// Path of a directory inode, None for non-directories.
+    fn dir_path(&self, ino: u64) -> Option<String> {
+        self.0.lock().unwrap().path_by_dir_ino.get(&ino).cloned()
+    }
+
+    /// Resolve one lookup step under `prefix` ("" = root): a served
+    /// file, an implicit directory, or nothing.
+    fn child_of(&self, prefix: &str, name: &str) -> Option<Child> {
+        let full = if prefix.is_empty() {
+            name.to_string()
+        } else {
+            format!("{prefix}/{name}")
+        };
+        let s = self.0.lock().unwrap();
+        if s.by_name.contains_key(&full) {
+            return Some(Child::File(s.by_name[&full]));
+        }
+        let is_dir = s
+            .by_name
+            .keys()
+            .any(|n| n.len() > full.len() + 1 && n.starts_with(&full) && n.as_bytes()[full.len()] == b'/');
+        drop(s);
+        if is_dir {
+            Some(Child::Dir(self.dir_ino(&full)))
+        } else {
+            None
+        }
+    }
+
+    /// Entries of the directory at `prefix`: distinct next components
+    /// with their kinds, sorted by name (readdir order stability).
+    fn dir_children(&self, prefix: &str) -> Vec<(u64, bool, String)> {
+        let s = self.0.lock().unwrap();
+        // component -> (is_dir, file ino when !is_dir); collected
+        // under the lock, dir inodes allocated after the release.
+        let mut comps: std::collections::BTreeMap<String, (bool, Option<u64>)> =
+            Default::default();
+        for name in s.by_name.keys() {
+            let rest = if prefix.is_empty() {
+                name.as_str()
+            } else if name.len() > prefix.len() + 1
+                && name.starts_with(prefix)
+                && name.as_bytes()[prefix.len()] == b'/'
+            {
+                &name[prefix.len() + 1..]
+            } else {
+                continue;
+            };
+            if rest.is_empty() {
+                continue;
+            }
+            match rest.find('/') {
+                Some(i) => {
+                    comps.insert(rest[..i].to_string(), (true, None));
+                }
+                None => {
+                    comps.insert(rest.to_string(), (false, Some(s.by_name[name])));
+                }
+            }
+        }
+        let resolved: Vec<_> = comps.into_iter().map(|(c, v)| (c, v.0, v.1)).collect();
+        drop(s);
+        resolved
+            .into_iter()
+            .map(|(c, is_dir, file_ino)| {
+                let full = if prefix.is_empty() {
+                    c.clone()
+                } else {
+                    format!("{prefix}/{c}")
+                };
+                let ino = if is_dir { self.dir_ino(&full) } else { file_ino.unwrap() };
+                (ino, is_dir, c)
+            })
+            .collect()
     }
 
     fn lookup(&self, ino: u64) -> Option<(String, Content)> {
@@ -98,6 +197,17 @@ pub fn ask_policy(socket: &str, name: &str, pid: u32, offset: u64, size: u32) ->
     reader.read_line(&mut line).map_err(|e| e.to_string())?;
     serde_json::from_str(line.trim()).map_err(|e| e.to_string())
 }
+
+/// One resolved path component: a served file or an implicit
+/// directory (issue #34 path-shaped names).
+enum Child {
+    File(u64),
+    Dir(u64),
+}
+
+/// Implicit directory inodes count DOWN from here — far from file
+/// inodes (small counters above ROOT_INO).
+const DIR_INO_BASE: u64 = u64::MAX / 2;
 
 pub struct FusedFs {
     store: Store,
@@ -164,25 +274,33 @@ impl Filesystem for FusedFs {
     fn destroy(&mut self) {}
 
     fn lookup(&mut self, req: &Request<'_>, parent: u64, name: &std::ffi::OsStr, reply: ReplyEntry) {
-        if parent != ROOT_INO {
-            reply.error(libc::ENOENT);
-            return;
-        }
+        let prefix = if parent == ROOT_INO {
+            String::new()
+        } else {
+            match self.store.dir_path(parent) {
+                Some(p) => p,
+                None => {
+                    reply.error(libc::ENOENT);
+                    return;
+                }
+            }
+        };
         let name = name.to_string_lossy();
-        let s = self.store.0.lock().unwrap();
-        let Some(&ino) = s.by_name.get(name.as_ref()) else {
-            reply.error(libc::ENOENT);
-            return;
-        };
-        let Some((_, c)) = s.by_ino.get(&ino) else {
-            reply.error(libc::ENOENT);
-            return;
-        };
-        let size = c.bytes.len() as u64;
-        let mode = c.mode;
-        drop(s);
-        let attr = self.file_attr(ino, size, req.uid(), req.gid(), mode);
-        reply.entry(&TTL, &attr, 0);
+        match self.store.child_of(&prefix, &name) {
+            Some(Child::File(ino)) => {
+                if let Some((_, c)) = self.store.lookup(ino) {
+                    let attr =
+                        self.file_attr(ino, c.bytes.len() as u64, req.uid(), req.gid(), c.mode);
+                    reply.entry(&TTL, &attr, 0);
+                } else {
+                    reply.error(libc::ENOENT);
+                }
+            }
+            Some(Child::Dir(ino)) => {
+                reply.entry(&TTL, &self.dir_attr(ino, req.uid(), req.gid()), 0);
+            }
+            None => reply.error(libc::ENOENT),
+        }
     }
 
     fn getattr(&mut self, req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
@@ -195,7 +313,13 @@ impl Filesystem for FusedFs {
                 let attr = self.file_attr(ino, c.bytes.len() as u64, req.uid(), req.gid(), c.mode);
                 reply.attr(&TTL, &attr);
             }
-            None => reply.error(libc::ENOENT),
+            None => {
+                if self.store.dir_path(ino).is_some() {
+                    reply.attr(&TTL, &self.dir_attr(ino, req.uid(), req.gid()));
+                } else {
+                    reply.error(libc::ENOENT);
+                }
+            }
         }
     }
 
@@ -253,20 +377,29 @@ impl Filesystem for FusedFs {
         offset: i64,
         mut reply: ReplyDirectory,
     ) {
-        if ino != ROOT_INO {
-            reply.error(libc::ENOENT);
-            return;
-        }
+        let prefix = if ino == ROOT_INO {
+            String::new()
+        } else {
+            match self.store.dir_path(ino) {
+                Some(p) => p,
+                None => {
+                    reply.error(libc::ENOENT);
+                    return;
+                }
+            }
+        };
         // FUSE readdir contract: each entry carries the offset the NEXT
         // readdir call should start from — strictly increasing, never 0,
         // or the kernel re-reads from the start forever.
-        let listing = self.store.listing();
+        let children = self.store.dir_children(&prefix);
         let all: Vec<(u64, FileType, String)> = vec![
             (ROOT_INO, FileType::Directory, ".".into()),
             (ROOT_INO, FileType::Directory, "..".into()),
         ]
         .into_iter()
-        .chain(listing.into_iter().map(|(i, n, _, _)| (i, FileType::RegularFile, n)))
+        .chain(children.into_iter().map(|(i, is_dir, n)| {
+            (i, if is_dir { FileType::Directory } else { FileType::RegularFile }, n)
+        }))
         .collect();
         for (idx, (e_ino, kind, name)) in all.into_iter().enumerate() {
             let next_offset = (idx + 1) as i64;
@@ -397,6 +530,43 @@ mod tests {
         assert!(has(&s, "a"), "upsert must land in the store");
         assert!(apply_control_line(&s, r#"{"type":"remove","name":"a"}"#));
         assert!(!has(&s, "a"), "remove must clear the store");
+    }
+
+    #[test]
+    fn implicit_directories_materialize_from_path_names() {
+        // Issue #34: names are normalized host paths; directories
+        // derive from the components.
+        let s = Store::default();
+        s.upsert("home/u/auth.json", b"A".to_vec(), 0o400);
+        s.upsert("home/u/keys/token", b"T".to_vec(), 0o400);
+        s.upsert("other.txt", b"O".to_vec(), 0o400);
+
+        let root = s.dir_children("");
+        let names: Vec<&str> = root.iter().map(|(_, _, n)| n.as_str()).collect();
+        assert_eq!(names, ["home", "other.txt"], "root: one dir + one file");
+        assert!(root[0].1, "home is a directory");
+        assert!(!root[1].1, "other.txt is a file");
+
+        let home = s.dir_children("home");
+        assert_eq!(home.iter().map(|(_, _, n)| n.clone()).collect::<Vec<_>>(), ["u"]);
+        let u = s.dir_children("home/u");
+        let names: Vec<&str> = u.iter().map(|(_, _, n)| n.as_str()).collect();
+        assert_eq!(names, ["auth.json", "keys"], "mixed dir+file under u");
+
+        // resolution matches the listing
+        assert!(matches!(s.child_of("", "home"), Some(Child::Dir(_))));
+        assert!(matches!(s.child_of("home/u", "auth.json"), Some(Child::File(_))));
+        assert!(matches!(s.child_of("home/u/keys", "token"), Some(Child::File(_))));
+        assert!(s.child_of("home", "auth.json").is_none(), "no such sibling");
+    }
+
+    #[test]
+    fn directories_vanish_when_their_last_name_leaves() {
+        let s = Store::default();
+        s.upsert("a/b/c.txt", b"C".to_vec(), 0o400);
+        assert!(matches!(s.child_of("a", "b"), Some(Child::Dir(_))));
+        s.remove("a/b/c.txt");
+        assert!(s.child_of("", "a").is_none(), "empty trees disappear");
     }
 
     #[test]

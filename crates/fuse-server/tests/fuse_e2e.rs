@@ -335,6 +335,19 @@ fn e2e_nonexistent_file_enoent() {
 }
 
 #[test]
+fn e2e_path_shaped_names_serve_a_directory_tree() {
+    // Issue #34: names are normalized host paths; the mount must show
+    // the intermediate directories and serve the file at the nested
+    // path — full stack: add -> oracle -> fused tree -> read.
+    if !fuse_available() { return; }
+    let _g = serial();
+    let split = Split::new("paths", &[("a/b/c.txt", b"NESTED", "*")]);
+    assert!(split.path("a").is_dir(), "implicit directory materializes");
+    assert!(split.path("a/b").is_dir());
+    assert_eq!(std::fs::read(split.path("a/b/c.txt")).unwrap(), b"NESTED");
+}
+
+#[test]
 fn e2e_one_read_per_secret_without_reset() {
     if !fuse_available() { return; }
     let _g = serial();

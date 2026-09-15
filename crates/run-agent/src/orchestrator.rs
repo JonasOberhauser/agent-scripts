@@ -728,55 +728,47 @@ pub(crate) struct LoadedSecret {
 /// FUSE-visible secret name carrying the sanitized host file name
 /// (issue #18): recognizable in /fuse listings and pending requests,
 /// while the pid/counter prefix keeps it collision-free.
-/// Stable, collision-free secret name for a host file (issue #18 +
-/// the stable-filenames directive): `<stem>.<8 hex of
-/// sha256(path)><ext>`.
+/// Stable secret name for a host file (issue #34): the NORMALIZED
+/// HOST PATH itself, sanitized per component — `home/u/.config/goose/
+/// auth.json`, leading root stripped, components joined with `/`.
 ///
-/// Derived from the HOST PATH ONLY — never the PID or a per-run
-/// counter — so the same file always maps to the same name across
-/// run-agent instances and restarts. That is what makes the file
-/// shareable between containers (concurrently and sequentially) and
-/// what lets name-keyed settings survive: the server's hash grants
-/// and the state file stay attached to the same name from run to run.
-///
-/// The path digest keeps two different files with the same basename
-/// distinct; identical paths are idempotent (same name twice re-adds
-/// the same secret). The name is purely lexical — symlinked host
-/// paths count as distinct files.
+/// Normalized paths are unique by construction, so no uniquifiers
+/// (PID prefixes, counters, digests) are needed. The same file maps
+/// to the same name from every container and across restarts, which
+/// is what keeps name-keyed settings attached; `fused` materializes
+/// the intermediate directories implicitly. The derivation is purely
+/// lexical — symlinked host paths count as distinct files.
 fn secret_name(host: &Path) -> String {
-    use sha2::{Digest as _, Sha256};
-
-    let raw = host.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-    let safe: String = raw
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
-                c
-            } else {
-                '_'
+    let mut comps: Vec<String> = Vec::new();
+    for c in host.components() {
+        match c {
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {}
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                // lexical normalization: `a/../b` -> `b`
+                comps.pop();
             }
-        })
-        .collect();
-
-    let mut hasher = Sha256::new();
-    hasher.update(host.to_string_lossy().as_bytes());
-    let digest = hasher.finalize();
-    let tag: String = digest.iter().take(4).map(|b| format!("{b:02x}")).collect();
-
-    // Split stem/extension of the SANITIZED name so the extension
-    // survives at the end (bind mounts of /fuse/<name> keep working
-    // for tools that care): `auth.json` -> `auth.a1b2c3d4.json`,
-    // `id_ed25519` -> `id_ed25519.a1b2c3d4`.
-    let stem = match safe.rfind('.') {
-        Some(i) if i > 0 && i < safe.len() - 1 => safe[..i].to_string(),
-        _ => safe.clone(),
-    };
-    let ext = match safe.rfind('.') {
-        Some(i) if i > 0 && i < safe.len() - 1 => safe[i..].to_string(),
-        _ => String::new(),
-    };
-    let stem = if stem.is_empty() { String::from("secret") } else { stem };
-    format!("{stem}.{tag}{ext}")
+            std::path::Component::Normal(part) => {
+                let raw = part.to_string_lossy();
+                let safe: String = raw
+                    .chars()
+                    .map(|ch| {
+                        if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
+                            ch
+                        } else {
+                            '_'
+                        }
+                    })
+                    .collect();
+                comps.push(if safe.is_empty() { "_".to_string() } else { safe });
+            }
+        }
+    }
+    if comps.is_empty() {
+        "secret".to_string()
+    } else {
+        comps.join("/")
+    }
 }
 
 fn load_secret_recursive<S, F>(
@@ -1294,43 +1286,43 @@ mod tests {
     // ── secret naming (#18) ────────────────────────────────────────
 
     #[test]
-    fn secret_name_is_stable_across_calls_and_instances() {
-        // The whole point: no PID, no per-run counter — the same path
-        // maps to the same name forever, so name-keyed grants, hash
-        // settings and container bind-mounts survive restarts.
+    fn secret_name_is_the_normalized_host_path() {
+        // Issue #34: the path itself, no uniquifiers — stable across
+        // instances and restarts, so name-keyed settings persist and
+        // containers can share files.
         let a = secret_name(Path::new("/home/u/.config/goose/auth.json"));
         let b = secret_name(Path::new("/home/u/.config/goose/auth.json"));
         assert_eq!(a, b);
-        assert!(a.starts_with("auth."), "carries the file name: {a}");
-        assert!(a.ends_with(".json"), "extension survives: {a}");
+        assert_eq!(a, "home/u/.config/goose/auth.json");
     }
 
     #[test]
-    fn secret_name_separates_same_basenames_in_different_dirs() {
+    fn secret_name_normalizes_lexically_and_sanitizes_components() {
+        assert_eq!(
+            secret_name(Path::new("/x/../home/u/my key!/v2.bin")),
+            "home/u/my_key_/v2.bin",
+            "parent dirs collapse, each component sanitized in place"
+        );
+        assert_eq!(secret_name(Path::new("/")), "secret");
+    }
+
+    #[test]
+    fn same_basename_different_paths_stay_distinct_without_uniquifiers() {
         let a = secret_name(Path::new("/secrets/a/token"));
         let b = secret_name(Path::new("/keys/token"));
-        assert_ne!(a, b, "path digest must disambiguate: {a} vs {b}");
-        assert!(a.starts_with("token.") && b.starts_with("token."));
+        assert_eq!(a, "secrets/a/token");
+        assert_eq!(b, "keys/token");
+        assert_ne!(a, b, "full paths are unique by construction");
     }
 
     #[test]
-    fn secret_name_sanitizes_unsafe_characters() {
-        let n = secret_name(Path::new("/x/my key! v2.bin"));
-        assert!(n.starts_with("my_key__v2.") && n.ends_with(".bin"), "sanitized + digest inserted: {n}");
-    }
-
-    #[test]
-    fn secret_name_falls_back_when_no_file_name() {
-        let n = secret_name(Path::new("/"));
-        assert!(n.starts_with("secret."), "digest-only fallback: {n}");
-    }
-
-    #[test]
-    fn secret_name_preserves_extensionless_keys() {
-        // ssh picks keys by file name; bind mounts of /fuse/<name>
-        // must keep workable names for extensionless files too.
+    fn secret_name_serves_a_directory_tree_in_the_mount() {
+        // fused materializes intermediate directories from the path:
+        // the container-side symlink target /fuse/<name> must be a
+        // walkable nested path.
         let n = secret_name(Path::new("/home/u/.ssh/id_ed25519"));
-        assert!(n.starts_with("id_ed25519."), "digest appended, no invented extension: {n}");
+        assert!(n.contains('/'), "nested: {n}");
+        assert!(n.ends_with("id_ed25519"));
     }
 
     // ── run_agent integration ────────────────────────────────────

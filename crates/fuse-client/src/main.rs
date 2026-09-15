@@ -120,6 +120,8 @@ fn main() {
             // as an ordinary layer, so the builtin input line and the
             // panel are peers with activation-based keyboard focus.
             let panel_error = pending_layer::no_error();
+            // Display snapshot for issue #34 collapsed name rendering.
+            let collapsed_names: pending_layer::CollapsedNames = Default::default();
             // Supported log-window path (servatui >= 0.8.3): both the
             // panel and the worker push into the sink; Display::run
             // drains it into the builtin log at the start of every
@@ -132,6 +134,7 @@ fn main() {
                 cli.socket.clone(),
                 pending.clone(),
                 secrets,
+                collapsed_names.clone(),
                 panel_error.clone(),
                 log_sink.clone(),
             );
