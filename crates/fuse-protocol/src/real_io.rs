@@ -408,6 +408,18 @@ pub struct MockSystemIo {
     pub spawned: Vec<(String, Vec<String>)>,
     pub spawn_error_msg: Option<String>,
     pub busy_paths: std::cell::RefCell<std::collections::HashSet<String>>,
+    /// Paths that model a **dead FUSE mount**: the daemon behind the mount
+    /// died, so the kernel still holds the name but `stat()` fails
+    /// (ENOTCONN/EBUSY) and `mkdir` returns EEXIST.
+    ///
+    /// HONESTY NOTE (per maintainer directive): this models an *assumed*
+    /// real-world behavior, derived from the incident log
+    /// (`create_dir_all` → "File exists (os error 17)" on
+    /// /tmp/fuse-gatekeeper-mnt after a fused restart) plus kernel FUSE
+    /// semantics — not from controlled observation. If real incidents show
+    /// different error kinds (e.g. stat succeeding but readdir hanging),
+    /// refine this model instead of writing around it.
+    pub stale_mounts: std::cell::RefCell<std::collections::HashSet<String>>,
     pub unix_connected: bool,
     pub unix_responses: std::cell::RefCell<std::collections::VecDeque<Vec<u8>>>,
     pub symlinks: std::collections::HashMap<String, String>,
@@ -451,6 +463,19 @@ impl MockSystemIo {
     /// mounted FUSE filesystem, or EPERM on a root-owned file).
     pub fn with_busy_path(mut self, path: &str) -> Self {
         self.busy_paths.get_mut().insert(path.to_string());
+        self
+    }
+
+    /// Model `path` as a **dead FUSE mount**: the FUSE daemon died, the
+    /// kernel still holds the name. `create_dir_all` then fails with
+    /// EEXIST (mkdir says it exists, stat says it is not a directory —
+    /// the exact incident signature from issue #23), and `remove_path`
+    /// fails with EBUSY. A successful `fusermount -uz`/`umount -l` in
+    /// `run_command` clears the state, as in the real world.
+    ///
+    /// See the honesty note on [`MockSystemIo::stale_mounts`].
+    pub fn with_stale_mount(mut self, path: &str) -> Self {
+        self.stale_mounts.get_mut().insert(path.to_string());
         self
     }
 
@@ -538,17 +563,32 @@ impl SystemIo for MockSystemIo {
         self.files.contains_key(&key)
             || self.dirs.contains(&key)
             || self.created_dirs.borrow().contains(&key)
+            || self.stale_mounts.borrow().contains(&key)
     }
 
     fn create_dir_all(&self, path: &Path) -> Result<(), IoError> {
+        let key = path.to_string_lossy().to_string();
+        // Real behavior, mirrored:
+        // - a dead FUSE mount at `path`: mkdir → EEXIST, stat → ENOTCONN
+        //   ⇒ create_dir_all errors with "File exists (os error 17)"
+        //   (the #23 incident signature).
+        // - a regular file at `path`: mkdir → EEXIST, is_dir → false
+        //   ⇒ same error kind.
+        if self.stale_mounts.borrow().contains(&key) || self.files.contains_key(&key) {
+            return Err(IoError("File exists (os error 17)".into()));
+        }
         // Record the creation so tests can assert which folders the
         // orchestrator generates; file_exists then answers true.
-        self.created_dirs.borrow_mut().push(path.to_string_lossy().to_string());
+        self.created_dirs.borrow_mut().push(key);
         Ok(())
     }
 
     fn remove_path(&mut self, path: &Path) -> Result<(), IoError> {
         let key = path.to_string_lossy().to_string();
+        if self.stale_mounts.borrow().contains(&key) {
+            // rmdir(2) on a mountpoint → EBUSY, same as a busy path.
+            return Err(IoError("Device or resource busy (os error 16)".into()));
+        }
         if self.busy_paths.borrow().contains(&key) {
             return Err(IoError("Device or resource busy (os error 16)".into()));
         }
@@ -575,6 +615,7 @@ impl SystemIo for MockSystemIo {
         ));
         // Argv-scoped rules take precedence, most recently added first, and
         // expire once their countdown reaches zero (`None` = unlimited).
+        let mut rule_status = None;
         {
             let rules = self.command_arg_results.borrow();
             if let Some(rule) = rules.iter().rev().find(|r| {
@@ -582,26 +623,27 @@ impl SystemIo for MockSystemIo {
                     && r.uses_left.get().is_none_or(|n| n > 0)
                     && args.iter().any(|a| a.contains(&r.arg_contains))
             }) {
-                let status = rule.status;
                 if let Some(n) = rule.uses_left.get() {
                     rule.uses_left.set(Some(n.saturating_sub(1)));
                 }
-                return Ok(CommandOutput {
-                    stdout: self.command_stdout.clone(),
-                    stderr: String::new(),
-                    status,
-                });
+                rule_status = Some(rule.status);
             }
         }
-        let status = if let Some(s) = self.command_results.get(program) {
-            *s
-        } else {
-            self.command_status
-        };
+        let status = rule_status.unwrap_or(match self.command_results.get(program) {
+            Some(s) => *s,
+            None => self.command_status,
+        });
         // Simulate: a successful unmount clears the busy state, just as
         // `fusermount -uz` frees the mount point in the real world.
         if status == Some(0) && args.iter().any(|a| *a == "-uz" || *a == "-l") {
             self.busy_paths.borrow_mut().clear();
+            // A successful lazy unmount of a dead mount turns the name back
+            // into a plain directory: the stale entry goes away and later
+            // create_dir_all succeeds. Assumption-based model — see the
+            // honesty note on `stale_mounts`.
+            self.stale_mounts
+                .borrow_mut()
+                .retain(|p| !args.iter().any(|a| a == p));
         }
         Ok(CommandOutput {
             stdout: self.command_stdout.clone(),
@@ -905,6 +947,62 @@ mod tests {
         assert!(mock.file_exists(Path::new("/tmp/sock")));
         assert!(mock.file_exists(Path::new("/tmp/mnt")));
         assert!(!mock.file_exists(Path::new("/tmp/other")));
+    }
+
+    #[test]
+    fn mock_stale_mount_blocks_create_like_the_incident() {
+        // The #23 signature: create_dir_all on a dead mount errors with
+        // "File exists (os error 17)", the path still exists, and rmdir
+        // fails EBUSY.
+        let mut mock = MockSystemIo::new().with_stale_mount("/tmp/mnt");
+        assert!(mock.file_exists(Path::new("/tmp/mnt")));
+        let err = mock
+            .create_dir_all(Path::new("/tmp/mnt"))
+            .expect_err("dead mount must block create_dir_all");
+        assert!(err.to_string().contains("os error 17"), "got: {err}");
+        let rm = mock.remove_path(Path::new("/tmp/mnt"));
+        assert!(rm.is_err(), "rmdir on a mountpoint must fail EBUSY");
+    }
+
+    #[test]
+    fn mock_stale_mount_cleared_by_successful_lazy_unmount() {
+        let mut mock = MockSystemIo::new().with_stale_mount("/tmp/mnt");
+        mock.run_command("fusermount", &["-uz", "/tmp/mnt"]).unwrap();
+        mock.create_dir_all(Path::new("/tmp/mnt"))
+            .expect("after a successful lazy unmount the name is a plain dir again");
+    }
+
+    #[test]
+    fn mock_stale_mount_survives_failed_and_unrelated_unmounts() {
+        let mut mock = MockSystemIo::new().with_stale_mount("/tmp/mnt");
+        // Unmounting a DIFFERENT path succeeds but must not clear /tmp/mnt.
+        mock.run_command("fusermount", &["-uz", "/tmp/other"]).unwrap();
+        assert!(
+            mock.create_dir_all(Path::new("/tmp/mnt")).is_err(),
+            "unmounting a different path must not clear the stale mount"
+        );
+        // A FAILING unmount of the right path must not clear it either.
+        let mut failing = MockSystemIo::new().with_stale_mount("/tmp/mnt");
+        failing
+            .command_results
+            .insert("fusermount".into(), Some(1));
+        failing.run_command("fusermount", &["-uz", "/tmp/mnt"]).unwrap();
+        assert!(
+            failing.create_dir_all(Path::new("/tmp/mnt")).is_err(),
+            "a failed unmount must leave the stale mount in place"
+        );
+    }
+
+    #[test]
+    fn mock_file_blocks_create_dir_all() {
+        // Real mkdir on an existing file name: EEXIST, is_dir false →
+        // create_dir_all errors. (Previously the mock always succeeded,
+        // hiding this failure mode.)
+        let mock = MockSystemIo::new().with_file("/tmp/mnt", b"junk");
+        let err = mock
+            .create_dir_all(Path::new("/tmp/mnt"))
+            .expect_err("a file at the path must block create_dir_all");
+        assert!(err.to_string().contains("os error 17"), "got: {err}");
     }
 
     #[test]

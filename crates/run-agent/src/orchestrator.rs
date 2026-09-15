@@ -57,6 +57,87 @@ pub struct RunResult {
     pub server_was_spawned: bool,
 }
 
+// ── mount-point recovery ───────────────────────────────────────
+
+/// Try to clear a stale FUSE mount from `mount_point` with a lazy
+/// unmount, trying the available unmount helpers in turn. Returns true
+/// when one of them reports success.
+fn lazy_unmount<S: SystemIo>(io: &S, mount_point: &str, wrapper: Option<&str>) -> bool {
+    for (cmd, flag) in [("fusermount", "-uz"), ("fusermount3", "-uz"), ("umount", "-l")] {
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(w) = wrapper {
+            let (prog, prefix) = crate::config::split_wrapper(w);
+            parts.push(prog);
+            parts.extend(prefix);
+        }
+        parts.push(cmd.to_string());
+        parts.push(flag.to_string());
+        parts.push(mount_point.to_string());
+
+        let prog = parts[0].clone();
+        let args: Vec<&str> = parts[1..].iter().map(|s| s.as_str()).collect();
+        if io.run_command(&prog, &args).map(|o| o.success()).unwrap_or(false) {
+            info!("Lazy unmount succeeded via {cmd} {flag}");
+            return true;
+        }
+    }
+    false
+}
+
+/// Make sure `mount_point` is a usable plain directory (issue #23).
+///
+/// `create_dir_all` fails there in two real-world situations:
+/// - a **dead FUSE mount** (the data daemon died; mkdir → EEXIST and
+///   stat → ENOTCONN, reported as "File exists (os error 17)"), and
+/// - a **regular file** blocking the name.
+///
+/// Recovery: lazy-unmount a stale mount and retry; remove a blocking
+/// file and retry. Only an irrecoverable mount fails, with the manual
+/// remediation spelled out.
+fn ensure_mount_point<S: SystemIo>(
+    io: &mut S,
+    mount_point: &Path,
+    wrapper: Option<&str>,
+) -> Result<(), String> {
+    let mount_str = mount_point.to_string_lossy().to_string();
+    let try_create = |io: &S| {
+        io.create_dir_all(mount_point)
+            .map_err(|e| format!("cannot create mount point {}: {e}", mount_point.display()))
+    };
+    if try_create(io).is_ok() {
+        return Ok(());
+    }
+
+    // create_dir_all failed: recover.
+    if lazy_unmount(io, &mount_str, wrapper) {
+        // Wait for the lazy unmount to take effect, then try again.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        if try_create(io).is_ok() {
+            info!("Recovered mount point {} from a stale FUSE mount", mount_point.display());
+            return Ok(());
+        }
+    }
+    // Either nothing was mounted (plain file blocks the name) or the
+    // unmount did not help — a blocking file is ours to remove; a
+    // still-busy mount makes remove_path fail and we fall through to
+    // the actionable error.
+    if io.remove_path(mount_point).is_ok() && try_create(io).is_ok() {
+        info!("Removed a file blocking the mount point {}", mount_point.display());
+        return Ok(());
+    }
+
+    Err(format!(
+        "cannot create mount point {}: a stale FUSE mount is blocking it.\n\
+         Recover manually with:\n  \
+         fusermount -uz {m} && rm -rf {m}\n  \
+         (root-owned: sudo umount -l {m} && sudo rm -rf {m})\n\
+         or run: fuse-client restart",
+        mount_point.display(),
+        m = mount_str,
+    ))
+}
+
+
 /// Full orchestration loop — the Rust replacement for `run-agent.sh`.
 ///
 /// The fuse-server is **shared**: `run-agent` probes for an existing server
@@ -91,7 +172,7 @@ where
     // podman would generate it root-owned, breaking later host access.
     let host_config = config.host_config_dir();
     let host_workspace = config.host_workspace();
-    for dir in [&host_config, &host_workspace, &config.host_fuse()] {
+    for dir in [&host_config, &host_workspace] {
         io.create_dir_all(dir).map_err(|e| {
             format!(
                 "cannot create {}: {e}.\n\
@@ -100,6 +181,12 @@ where
             )
         })?;
     }
+    // The fuse mountpoint is special: after the data daemon (`fused`)
+    // dies, the kernel keeps a dead mount on the name — mkdir returns
+    // EEXIST and stat fails (ENOTCONN), so create_dir_all errors with
+    // "File exists" (issue #23). Recover instead of aborting: lazy-
+    // unmount, then retry; a plain file blocking the name is removed.
+    ensure_mount_point(io, &config.mount_point, config.runtime_wrapper.as_deref())?;
     info!("Workspace folders ready.");
 
     // ── 2. Probe for existing server ─────────────────────────────
@@ -158,24 +245,7 @@ where
             let wrapper = config.runtime_wrapper.as_deref();
 
             // Try lazy unmount to clear any stale FUSE mount.
-            for (cmd, flag) in [("fusermount", "-uz"), ("fusermount3", "-uz"), ("umount", "-l")] {
-                let mut parts: Vec<String> = Vec::new();
-                if let Some(w) = wrapper {
-                    let (prog, prefix) = crate::config::split_wrapper(w);
-                    parts.push(prog);
-                    parts.extend(prefix);
-                }
-                parts.push(cmd.to_string());
-                parts.push(flag.to_string());
-                parts.push(mount_str.clone());
-
-                let prog = parts[0].clone();
-                let args: Vec<&str> = parts[1..].iter().map(|s| s.as_str()).collect();
-                if io.run_command(&prog, &args).map(|o| o.success()).unwrap_or(false) {
-                    info!("Lazy unmount succeeded via {cmd} {flag}");
-                    break;
-                }
-            }
+            lazy_unmount(io, &mount_str, wrapper);
 
             // Wait for lazy unmount, then remove + recreate.
             std::thread::sleep(std::time::Duration::from_millis(200));
@@ -972,8 +1042,10 @@ mod tests {
 
     fn base_mock() -> MockSystemIo {
         MockSystemIo::new()
-            .with_file("/work/agent1/config", b"")
-            .with_file("/work/agent1/workspace", b"")
+            // These are directories in reality; modeling them as files
+            // would now (correctly) make create_dir_all fail with EEXIST.
+            .with_dir("/work/agent1/config")
+            .with_dir("/work/agent1/workspace")
     }
 
     // ── resolve_dest (cp semantics) ──────────────────────────────
@@ -1363,6 +1435,11 @@ mod tests {
 
     #[test]
     fn stale_mount_point_all_unmounts_fail() {
+        // A LIVE mount whose dir is still stat-able: create_dir_all
+        // succeeds on the real system (is_dir → true), so cleanup stays
+        // best-effort and the run proceeds — the mount failure, if any,
+        // would surface in the FUSE server later. The DEAD-mount variant
+        // (stat fails, create_dir_all errors) is covered below.
         let mut mock = base_mock()
             .with_dir("/tmp/fgk-mnt")
             .with_busy_path("/tmp/fgk-mnt")
@@ -1373,10 +1450,71 @@ mod tests {
 
         let cfg = test_config();
         let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()), false);
-        // Mount cleanup is best-effort: remove_path failure is silently
-        // ignored, and create_dir_all succeeds on the existing directory.
-        // The actual mount failure would happen later in the real FUSE server.
         assert!(result.is_ok(), "got: {:?}", result.err());
+    }
+
+    #[test]
+    fn dead_fuse_mount_recovered_at_startup() {
+        // Issue #23 incident: fused died, the kernel keeps the dead
+        // mount — mkdir → EEXIST, stat → ENOTCONN, create_dir_all
+        // errors "File exists (os error 17)". The run must recover via
+        // a lazy unmount instead of aborting at step 1.
+        let mut mock = base_mock()
+            .with_stale_mount("/tmp/fgk-mnt")
+            .with_command_result("fusermount", Some(0))
+            .with_file("/home/user/secrets.yaml", b"DATA");
+
+        let cfg = test_config();
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()), false);
+        assert!(result.is_ok(), "got: {:?}", result.err());
+        let calls = mock.command_calls.borrow();
+        assert!(
+            calls.iter().any(|(p, a)| p == "fusermount"
+                && a.first().map(|s| s.as_str()) == Some("-uz")
+                && a.contains(&"/tmp/fgk-mnt".to_string())),
+            "recovery must lazy-unmount the dead mount: {:?}",
+            calls
+        );
+    }
+
+    #[test]
+    fn dead_fuse_mount_all_unmounts_fail_early_actionable_error() {
+        // The dead mount cannot be cleared: run-agent must abort BEFORE
+        // spawning a server or touching the container, and spell out the
+        // manual fix (this is the error the #23 report got as a
+        // misleading "Is the agent path writable" instead).
+        let mut mock = base_mock()
+            .with_stale_mount("/tmp/fgk-mnt")
+            .with_command_result("fusermount", Some(1))
+            .with_command_result("fusermount3", Some(1))
+            .with_command_result("umount", Some(1))
+            .with_file("/home/user/secrets.yaml", b"DATA");
+
+        let cfg = test_config();
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()), false);
+        let err = result.expect_err("an unclearable dead mount must abort the run");
+        assert!(err.contains("fusermount -uz"), "must spell out the manual fix: {err}");
+        assert!(
+            mock.spawned.is_empty(),
+            "no fuse-server may be spawned before the mount point is usable"
+        );
+    }
+
+    #[test]
+    fn file_blocking_mount_point_is_removed() {
+        // A regular file occupies the mount-point name: mkdir → EEXIST
+        // with a healthy stat — not a mount, so it is simply removed.
+        let mut mock = base_mock()
+            .with_file("/tmp/fgk-mnt", b"not a dir")
+            .with_file("/home/user/secrets.yaml", b"DATA");
+
+        let cfg = test_config();
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()), false);
+        assert!(result.is_ok(), "got: {:?}", result.err());
+        assert!(
+            !mock.files.contains_key("/tmp/fgk-mnt"),
+            "the blocking file must have been removed"
+        );
     }
 
     // ── spawn argv validation ────────────────────────────────────
