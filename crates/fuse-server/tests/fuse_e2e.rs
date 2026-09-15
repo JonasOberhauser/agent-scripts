@@ -352,7 +352,7 @@ fn e2e_re_add_unchanged_content_preserves_state_end_to_end() {
     let src = tempfile::tempdir().unwrap();
     let f = src.path().join("s");
     std::fs::write(&f, b"KEEP").unwrap();
-    let out = split.client(&["add-secret", "s", f.to_str().unwrap(), "*"]);
+    let out = split.client(&["add-secret", "--file", f.to_str().unwrap(), "--hash", "*", "s"]);
     assert!(out.status.success(), "re-add failed: {}", write_out(&out));
 
     // Read state persisted: still consumed, not a fresh cycle.
