@@ -195,7 +195,23 @@ fn handle_conn(state: &Arc<ServerState>, hub: &OracleHub, conn: UnixStream) {
     }
     // Control connection: hello — register and hold the stream open;
     // the hub writes commands into it.
-    if let Ok(OracleRequest::Hello) = serde_json::from_str(first.trim()) {
+    if let Ok(OracleRequest::Hello { version }) = serde_json::from_str(first.trim()) {
+        // Mixed vintages are the #37 field-report failure mode: an old
+        // `fused` still holding the mount speaks a protocol the new
+        // server's upserts no longer match, and every read goes ENOENT
+        // with nothing in any log. Surface the skew the moment we can
+        // see it. Old daemons send no version — we cannot check those.
+        match version.as_deref() {
+            Some(v) if !fuse_protocol::versions_compatible(v, fuse_protocol::VERSION) => {
+                warn!(
+                    "data daemon reports protocol v{} vs server v{} — mixed vintages; \
+                     its mount may silently miss content. Rebuild (cargo build \
+                     --workspace) and restart the data daemon (fused).",
+                    v, fuse_protocol::VERSION
+                );
+            }
+            _ => {}
+        }
         let _ = writeln!(stream, "{}", serde_json::to_string(&OracleReply::Ok).unwrap());
         // Replay the content snapshot: late joiners get every secret.
         for cmd in hub.snapshot.lock().unwrap().iter() {

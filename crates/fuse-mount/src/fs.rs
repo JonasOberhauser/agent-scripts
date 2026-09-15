@@ -325,12 +325,39 @@ impl Filesystem for FusedFs {
 
 /// Maintain the CONTROL connection to the policy daemon: say hello,
 /// then apply every Upsert/Remove it pushes. Reconnects on loss.
+/// Apply one oracle control line to the store. Returns whether the
+/// line was understood. Unparsable lines are LOUD — silently dropping
+/// them produced the PR #37 field report: an old fuse-server upserting
+/// to a newer fused left an alive-but-empty mount with no diagnostic
+/// anywhere.
+fn apply_control_line(store: &Store, line: &str) -> bool {
+    match serde_json::from_str::<OracleCommand>(line.trim()) {
+        Ok(OracleCommand::Upsert { name, content, mode }) => {
+            store.upsert(&name, content, mode);
+            true
+        }
+        Ok(OracleCommand::Remove { name }) => {
+            store.remove(&name);
+            true
+        }
+        Err(e) => {
+            warn!(
+                "oracle control line not understood ({e}): {line:?} — version skew between \
+                 fuse-server and fused? `cargo build --workspace` refreshes both"
+            );
+            false
+        }
+    }
+}
+
 pub fn run_control_loop(store: Store, oracle_socket: String) {
     loop {
         if let Ok(conn) = UnixStream::connect(&oracle_socket) {
             let mut reader = BufReader::new(conn.try_clone().expect("clone control conn"));
             let mut w = conn;
-            if writeln!(w, "{}", serde_json::to_string(&OracleRequest::Hello).unwrap()).is_err() {
+            if writeln!(w, "{}", serde_json::to_string(&OracleRequest::Hello {
+                version: Some(fuse_protocol::VERSION.to_string()),
+            }).unwrap()).is_err() {
                 std::thread::sleep(Duration::from_secs(1));
                 continue;
             }
@@ -342,15 +369,7 @@ pub fn run_control_loop(store: Store, oracle_socket: String) {
                 match reader.read_line(&mut line) {
                     Ok(0) | Err(_) => break,
                     Ok(_) => {
-                        if let Ok(OracleCommand::Upsert { name, content, mode }) =
-                            serde_json::from_str::<OracleCommand>(line.trim())
-                        {
-                            store.upsert(&name, content, mode);
-                        } else if let Ok(OracleCommand::Remove { name }) =
-                            serde_json::from_str::<OracleCommand>(line.trim())
-                        {
-                            store.remove(&name);
-                        }
+                        apply_control_line(&store, &line);
                         // anything else: Ok acks on the same stream
                     }
                 }
@@ -362,6 +381,45 @@ pub fn run_control_loop(store: Store, oracle_socket: String) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn control_line_upsert_and_remove_apply() {
+        let s = Store::default();
+        assert!(apply_control_line(
+            &s,
+            r#"{"type":"upsert","name":"a","content":[104,105],"mode":420}"#
+        ));
+        let has = |s: &Store, n: &str| s.listing().iter().any(|(_, name, _, _)| name == n);
+        assert!(has(&s, "a"), "upsert must land in the store");
+        assert!(apply_control_line(&s, r#"{"type":"remove","name":"a"}"#));
+        assert!(!has(&s, "a"), "remove must clear the store");
+    }
+
+    #[test]
+    fn control_line_upsert_without_mode_applies_default() {
+        // Old policy daemons predate the mode field (see oracle.rs).
+        let s = Store::default();
+        assert!(apply_control_line(
+            &s,
+            r#"{"type":"upsert","name":"a","content":[1]}"#
+        ));
+        let has = |s: &Store| s.listing().iter().any(|(_, name, _, _)| name == "a");
+        assert!(has(&s), "old-format upsert must NOT be dropped");
+    }
+
+    #[test]
+    fn control_line_garbage_is_rejected_not_swallowed() {
+        // The PR #37 failure mode: unparsable lines were silently
+        // dropped, leaving an alive-but-empty mount. The handler must
+        // report rejection so the caller (and the log) can surface it.
+        let s = Store::default();
+        apply_control_line(&s, r#"{"type":"upsert","name":"a","content":[1]}"#);
+        assert!(!apply_control_line(&s, r#"{"type":"teleport","where":"mars"}"#));
+        assert!(!apply_control_line(&s, "not json at all"));
+        let has = |s: &Store| s.listing().iter().any(|(_, name, _, _)| name == "a");
+        assert!(has(&s), "store must be untouched by garbage");
+    }
+
+
     use super::*;
 
     fn store_with(name: &str, bytes: &[u8], mode: u32) -> Store {

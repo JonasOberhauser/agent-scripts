@@ -106,10 +106,18 @@ fn main() {
                     Err(e) => error!("cannot spawn data daemon {}: {e}", fused.display()),
                 }
             }
-            None => error!(
-                "--mount-point given but no data daemon found next to {} —                  build `fused` or start it manually",
-                exe.display()
-            ),
+            None => {
+                // Serving adds with no data daemon looks "healthy" to
+                // every client while nothing ever reaches a mount —
+                // the PR #37 field-report trap.  Fail loudly instead.
+                error!(
+                    "--mount-point given but no data daemon found next to {} — build it \\
+                     (cargo build --workspace) or start `fused` manually; refusing to run \\
+                     mount-less",
+                    exe.display()
+                );
+                std::process::exit(1);
+            }
         }
     }
     let _ = cli.allow_other;
