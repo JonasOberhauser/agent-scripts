@@ -498,6 +498,7 @@ fn grid_row_line_hover(
     grid_row_line_styled_collapsed(row, width, sel_here, false, collapsed)
 }
 
+#[cfg(test)]
 fn grid_row_line(row: GridRow, width: u16, sel_here: Option<Sel>) -> Line<'static> {
     grid_row_line_styled(row, width, sel_here, false)
 }
@@ -2185,7 +2186,7 @@ mod tests {
 
         let pending: PendingIds = Arc::new(Mutex::new(Vec::new()));
         let secrets: SecretNames = Arc::new(Mutex::new(Vec::new()));
-        let talk = spawn_worker(sock.clone(), pending.clone(), secrets.clone(), no_error(), empty_sink());
+        let talk = spawn_worker(sock.clone(), pending.clone(), secrets.clone(), Default::default(), no_error(), empty_sink());
         talk.request(
             &pending,
             PanelRequest::Action {
@@ -2234,6 +2235,7 @@ mod tests {
                 PANEL_WIDTH,
                 None,
                 Some(&button),
+                None,
             );
             assert!(
                 line.spans
@@ -2243,7 +2245,7 @@ mod tests {
             );
             let _ = sel;
         }
-        let line = grid_row_line_hover(GridRow::All, PANEL_WIDTH, None, Some(&Button::GrantAll));
+        let line = grid_row_line_hover(GridRow::All, PANEL_WIDTH, None, Some(&Button::GrantAll), None);
         assert!(
             line.spans
                 .iter()
@@ -2256,7 +2258,7 @@ mod tests {
     #[test]
     fn hover_absent_leaves_selection_untouched() {
         let line =
-            grid_row_line_hover(GridRow::Request(&pending_info(31)), PANEL_WIDTH, None, None);
+            grid_row_line_hover(GridRow::Request(&pending_info(31)), PANEL_WIDTH, None, None, None);
         assert!(
             !line.spans
                 .iter()
@@ -2705,7 +2707,7 @@ mod tests {
         let secrets: SecretNames = Arc::new(Mutex::new(Vec::new()));
         let error: LastError = no_error();
         let log: LogSink = empty_sink();
-        let talk = spawn_worker(sock.clone(), pending.clone(), secrets.clone(), error.clone(), log.clone());
+        let talk = spawn_worker(sock.clone(), pending.clone(), secrets.clone(), Default::default(), error.clone(), log.clone());
         talk.request(
             &pending,
             PanelRequest::Action {
