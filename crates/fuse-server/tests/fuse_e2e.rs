@@ -228,14 +228,42 @@ fn wait_mount(mount: &Path, dirs: &[tempfile::TempDir]) {
         std::thread::sleep(Duration::from_millis(50));
     }
     panic!(
-        "FUSE mount never came up at {} — /dev/fuse present: {}, fusermount3 present: {}\
-         \n--- server.log ---\n{}--- fused.log ---\n{}",
+        "FUSE mount never came up at {} — /dev/fuse present: {}, fusermount3: {}\
+         \n--- env ---\n{}--- server.log ---\n{}--- fused.log ---\n{}",
         mount.display(),
         Path::new("/dev/fuse").exists(),
-        Command::new("fusermount3").arg("--version").output().is_ok(),
+        fusermount3_state(),
+        probe_env(),
         log_tail(dirs.get(1).map(|d| d.path().join("server.log")).as_deref()),
         log_tail(dirs.get(2).map(|d| d.path().join("fused.log")).as_deref()),
     );
+}
+
+/// fusermount3 presence + permission bits: mounting as a non-root user
+/// needs the setuid bit (or the direct-mount fallback needs root +
+/// CAP_SYS_ADMIN). A stripped setuid bit is a classic silent killer.
+fn fusermount3_state() -> String {
+    match std::fs::metadata("/usr/bin/fusermount3") {
+        Ok(m) => format!(
+            "present, mode {:o}, uid {} (setuid: {})",
+            std::os::unix::fs::MetadataExt::mode(&m),
+            std::os::unix::fs::MetadataExt::uid(&m),
+            m.permissions().mode() & 0o4000 != 0
+        ),
+        Err(_) => String::from("absent"),
+    }
+}
+
+fn probe_env() -> String {
+    let id = Command::new("id").output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_else(|e| format!("id failed: {e}"));
+    let caps = Command::new("sh")
+        .args(["-c", "grep '^Cap' /proc/self/status"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    format!("{id}\n{caps}\n")
 }
 
 /// Whether the kernel has a fuse mount on `path` (Linux: /proc/mounts
