@@ -16,6 +16,26 @@ impl CommandOutput {
     }
 }
 
+/// stat(2)-like probe of a single path, carrying the information a
+/// caller needs to *decide* how to react instead of parsing errno
+/// strings:
+///
+/// - `Dir` — a plain directory, or a **live** mount (stat works)
+/// - `File` — a regular file / symlink occupies the name
+/// - `Missing` — nothing there (ENOENT)
+/// - `Unreachable(reason)` — the name exists but stat fails: the
+///   signature of a **dead FUSE mount** (ENOTCONN/EBUSY and friends;
+///   the reason string is the OS error text). mkdir on such a name
+///   returns EEXIST, which is why `create_dir_all` surfaces
+///   "File exists (os error 17)" — see issue #23.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PathState {
+    Dir,
+    File,
+    Missing,
+    Unreachable(String),
+}
+
 /// Filesystem, process, and hashing operations — the non-generic half of
 /// [`IoProvider`].
 pub trait SystemIo {
@@ -23,6 +43,16 @@ pub trait SystemIo {
     fn write_file(&mut self, path: &Path, data: &[u8]) -> Result<(), IoError>;
     fn set_file_mode(&self, path: &Path, mode: u32) -> Result<(), IoError>;
     fn file_exists(&self, path: &Path) -> bool;
+    /// Probe one path without conceding to a boolean: distinguishes a
+    /// directory (mounts included), a blocking file, absence, and a
+    /// name that exists but cannot be stat'ed (dead mount). See
+    /// [`PathState`].
+    fn path_state(&self, path: &Path) -> PathState;
+    /// mkdir(2) of the final component only — no parents, no
+    /// EEXIST-tolerance. Composing this with [`SystemIo::path_state`]
+    /// is what `create_dir_all` does internally; callers that need to
+    /// *react* to a blocked name use the primitives instead.
+    fn mkdir(&self, path: &Path) -> Result<(), IoError>;
     fn create_dir_all(&self, path: &Path) -> Result<(), IoError>;
     fn remove_path(&mut self, path: &Path) -> Result<(), IoError>;
     fn create_symlink(&mut self, original: &Path, link: &Path) -> Result<(), IoError>;

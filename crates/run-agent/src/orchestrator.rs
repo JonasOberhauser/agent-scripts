@@ -86,55 +86,74 @@ fn lazy_unmount<S: SystemIo>(io: &S, mount_point: &str, wrapper: Option<&str>) -
 
 /// Make sure `mount_point` is a usable plain directory (issue #23).
 ///
-/// `create_dir_all` fails there in two real-world situations:
-/// - a **dead FUSE mount** (the data daemon died; mkdir → EEXIST and
-///   stat → ENOTCONN, reported as "File exists (os error 17)"), and
-/// - a **regular file** blocking the name.
-///
-/// Recovery: lazy-unmount a stale mount and retry; remove a blocking
-/// file and retry. Only an irrecoverable mount fails, with the manual
-/// remediation spelled out.
+/// Decides via [`SystemIo::path_state`] — no errno-string guessing:
+/// - `Dir` — a plain directory or a **live** mount: nothing to do.
+/// - `Missing` — create it.
+/// - `File` — a regular file blocks the name: remove, create.
+/// - `Unreachable` — the name exists but stat fails: a **dead FUSE
+///   mount** (the data daemon died). Clear it with a lazy unmount,
+///   wait, and re-probe; only an unclearable mount aborts, with the
+///   manual remediation spelled out.
 fn ensure_mount_point<S: SystemIo>(
     io: &mut S,
     mount_point: &Path,
     wrapper: Option<&str>,
 ) -> Result<(), String> {
-    let mount_str = mount_point.to_string_lossy().to_string();
-    let try_create = |io: &S| {
-        io.create_dir_all(mount_point)
-            .map_err(|e| format!("cannot create mount point {}: {e}", mount_point.display()))
-    };
-    if try_create(io).is_ok() {
-        return Ok(());
+    use fuse_protocol::PathState;
+
+    fn create(io: &impl SystemIo, mp: &Path) -> Result<(), String> {
+        io.create_dir_all(mp)
+            .map_err(|e| format!("cannot create mount point {}: {e}", mp.display()))
     }
 
-    // create_dir_all failed: recover.
-    if lazy_unmount(io, &mount_str, wrapper) {
-        // Wait for the lazy unmount to take effect, then try again.
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        if try_create(io).is_ok() {
+    match io.path_state(mount_point) {
+        PathState::Dir => return Ok(()),
+        PathState::Missing => return create(io, mount_point),
+        PathState::File => {
+            io.remove_path(mount_point).map_err(|e| {
+                format!(
+                    "a file blocks the mount point {} and cannot be removed: {e}",
+                    mount_point.display()
+                )
+            })?;
+            info!("Removed a file blocking the mount point {}", mount_point.display());
+            return create(io, mount_point);
+        }
+        PathState::Unreachable(_) => {}
+    }
+
+    // Dead mount: clear it, wait for the lazy unmount, re-probe.
+    lazy_unmount(io, &mount_point.to_string_lossy(), wrapper);
+    io.sleep_ms(200);
+    match io.path_state(mount_point) {
+        PathState::Dir | PathState::Missing => {
             info!("Recovered mount point {} from a stale FUSE mount", mount_point.display());
-            return Ok(());
+            create(io, mount_point)
+        }
+        state @ (PathState::File | PathState::Unreachable(_)) => {
+            // File: remove + create, same as above. Unreachable: give up
+            // with the manual remediation.
+            if matches!(state, PathState::File) {
+                io.remove_path(mount_point).map_err(|e| {
+                    format!(
+                        "a file blocks the mount point {} and cannot be removed: {e}",
+                        mount_point.display()
+                    )
+                })?;
+                return create(io, mount_point);
+            }
+            Err(format!(
+                "cannot use mount point {}: a stale FUSE mount is blocking it and could not be \
+                 cleared.\n\
+                 Recover manually with:\n  \
+                 fusermount -uz {m} && rm -rf {m}\n  \
+                 (root-owned: sudo umount -l {m} && sudo rm -rf {m})\n\
+                 or run: fuse-client restart",
+                mount_point.display(),
+                m = mount_point.display(),
+            ))
         }
     }
-    // Either nothing was mounted (plain file blocks the name) or the
-    // unmount did not help — a blocking file is ours to remove; a
-    // still-busy mount makes remove_path fail and we fall through to
-    // the actionable error.
-    if io.remove_path(mount_point).is_ok() && try_create(io).is_ok() {
-        info!("Removed a file blocking the mount point {}", mount_point.display());
-        return Ok(());
-    }
-
-    Err(format!(
-        "cannot create mount point {}: a stale FUSE mount is blocking it.\n\
-         Recover manually with:\n  \
-         fusermount -uz {m} && rm -rf {m}\n  \
-         (root-owned: sudo umount -l {m} && sudo rm -rf {m})\n\
-         or run: fuse-client restart",
-        mount_point.display(),
-        m = mount_str,
-    ))
 }
 
 
