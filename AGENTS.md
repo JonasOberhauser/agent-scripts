@@ -42,8 +42,11 @@ The workspace has six crates: `fuse-protocol`, `fuse-server`, `fuse-client`, `ru
   at `/tmp/fuse-gatekeeper-mnt`, listens on `/tmp/fuse-gatekeeper.sock`. Enforces
   one-read-per-secret with binary-hash verification and forward-only multi-chunk
   reads.
-- **run-agent** (orchestrator): Spawns/reuses the fuse-server, loads secrets via
-  socket, launches a podman/docker container with symlinks pointing into `/fuse`.
+- **run-agent** (orchestrator): Spawns/reuses the fuse-server (policy-only)
+  and the data daemon `fused` (independently — mounting is client-side
+  orchestration and must not depend on the server's build state), loads
+  secrets via socket, launches a podman/docker container with symlinks
+  pointing into `/fuse`.
 - **fuse-client**: CLI to send CRUD commands (status, reset, add, remove) to the
   socket server.
 - **fuse-protocol**: Shared types, `SystemIo` trait, `RealSystemIo` /

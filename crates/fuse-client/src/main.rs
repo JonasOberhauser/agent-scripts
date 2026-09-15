@@ -245,8 +245,10 @@ fn read_state_file() -> Option<ServerStateFile> {
 }
 
 fn start_server_from_state(app: &App, state: &ServerStateFile, log_path: Option<&str>) {
+    // Policy-only server: the data daemon is spawned directly below
+    // (client-side mounting — must not depend on the server's build
+    // state, PR #37).
     let mut cmd_args: Vec<String> = vec![
-        "--mount-point".into(), state.mount_point.clone(),
         "--socket".into(), state.socket.clone(),
     ];
     if state.allow_other { cmd_args.push("--allow-other".into()); }
@@ -329,6 +331,42 @@ fn start_server_from_state(app: &App, state: &ServerStateFile, log_path: Option<
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
 
+    // Data daemon: spawned next to the server binary, independent (the
+    // mount survives policy restarts). Its control loop connects to
+    // the server's oracle socket (both default to the same path).
+    let fused_bin = std::path::Path::new(&state.server_binary)
+        .parent()
+        .map(|d| d.join("fused"))
+        .filter(|p| p.exists());
+    match fused_bin {
+        Some(fused) => {
+            eprintln!("Starting data daemon (fused)...");
+            let mut fused_cmd = std::process::Command::new(fused);
+            fused_cmd
+                .arg("--mount-point").arg(&state.mount_point)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            unsafe { fused_cmd.pre_exec(|| { libc::setsid(); Ok(()) }); }
+            match fused_cmd.spawn() {
+                Ok(child) => eprintln!("  Spawned pid {}", child.id()),
+                Err(e) => {
+                    eprintln!("Failed to start data daemon: {e}");
+                    eprintln!("Build it: cargo build --workspace");
+                    std::process::exit(1);
+                }
+            }
+        }
+        None => {
+            eprintln!(
+                "Data daemon not found next to {} — no mount can come up.",
+                state.server_binary
+            );
+            eprintln!("Build it: cargo build --workspace");
+            std::process::exit(1);
+        }
+    }
+
     eprintln!("Restoring {} secret(s)...", state.secrets.len());
     for entry in &state.secrets {
         let args = format!("{} {} {}", entry.fuse_name, entry.host_path, entry.hash);
@@ -366,14 +404,21 @@ fn restart_server(app: &App, log_path: Option<&str>) {
     };
     eprintln!("Current server state: {status_info}");
 
-    eprintln!("Stopping old server...");
+    eprintln!("Stopping old server (and any data daemon)...");
     if let Some(w) = &state.runtime_wrapper {
         let wparts: Vec<&str> = w.split_whitespace().collect();
         let mut kill_args: Vec<&str> = wparts[1..].to_vec();
         kill_args.extend(&["pkill", "-f", "fuse-server"]);
         let _ = std::process::Command::new(wparts[0]).args(&kill_args).output();
+        let mut fused_args: Vec<&str> = wparts[1..].to_vec();
+        fused_args.extend(&["pkill", "-x", "fused"]);
+        let _ = std::process::Command::new(wparts[0]).args(&fused_args).output();
     } else {
         let _ = std::process::Command::new("pkill").arg("-f").arg("fuse-server").output();
+        // An independently spawned data daemon survives the policy
+        // server (the mount is supposed to outlive policy restarts) —
+        // take it down too, it gets respawned below.
+        let _ = std::process::Command::new("pkill").arg("-x").arg("fused").output();
     }
     std::thread::sleep(std::time::Duration::from_secs(2));
 

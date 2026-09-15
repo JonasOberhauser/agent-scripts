@@ -175,6 +175,11 @@ pub struct AgentConfig {
     pub agent_path: PathBuf,
     /// Path to the `fuse-server` binary.
     pub fuse_server_path: PathBuf,
+    /// Resolved data-daemon (`fused`) binary. Empty when not found —
+    /// run_agent then refuses to start (mounting is client-side
+    /// orchestration; a missing data daemon must never degrade into a
+    /// silent empty mountpoint, PR #37).
+    pub fused_path: PathBuf,
     /// Docker/Podman image name.
     pub image_name: String,
     /// Host-side path of the seccomp profile passed via
@@ -231,6 +236,7 @@ impl AgentConfig {
             container_args: container_args.to_vec(),
             agent_path: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             fuse_server_path: PathBuf::from("fuse-server"),
+            fused_path: PathBuf::new(),
             image_name: "agentbox".to_string(),
             seccomp_profile: seccomp_profile_path(),
             memory: "224G".to_string(),
@@ -432,6 +438,7 @@ mod tests {
             container_args: vec![],
             agent_path: PathBuf::from("/work/myagent"),
             fuse_server_path: "fuse-server".into(),
+            fused_path: "/tmp/fused".into(),
             image_name: "myimg".into(),
             seccomp_profile: PathBuf::from("/tmp/agentbox-seccomp.json"),
             memory: "16G".into(),
@@ -486,6 +493,7 @@ mod tests {
             container_args: vec![],
             agent_path: PathBuf::from("/work/myagent"),
             fuse_server_path: "fuse-server".into(),
+            fused_path: "/tmp/fused".into(),
             image_name: "myimg".into(),
             seccomp_profile: PathBuf::from("/tmp/agentbox-seccomp.json"),
             memory: "16G".into(),
@@ -521,6 +529,7 @@ mod tests {
             container_args: vec!["--flag".into()],
             agent_path: PathBuf::from("/work/myagent"),
             fuse_server_path: "fuse-server".into(),
+            fused_path: "/tmp/fused".into(),
             image_name: "myimg".into(),
             seccomp_profile: PathBuf::from("/tmp/agentbox-seccomp.json"),
             memory: "16G".into(),

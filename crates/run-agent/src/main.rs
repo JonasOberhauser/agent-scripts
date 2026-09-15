@@ -140,6 +140,7 @@ fn main() -> ExitCode {
         );
     }
     config.fuse_server_path = resolve_fuse_server(&cli.fuse_server);
+    config.fused_path = resolve_fused(&config.fuse_server_path);
     config.socket_path = cli.socket;
     config.mount_point = cli.mount_point;
     config.use_sudo = cli.sudo;
@@ -208,6 +209,30 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Resolve the data-daemon (`fused`) binary: next to this executable,
+/// then next to the resolved fuse-server. Empty when not found —
+/// run_agent turns that into an actionable error instead of silently
+/// running without a mount (PR #37: the mountpoint was a plain empty
+/// directory the whole time because fused was never built/co-located).
+fn resolve_fused(server: &Path) -> PathBuf {
+    let name = "fused";
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let candidate = dir.join(name);
+            if candidate.exists() {
+                return candidate;
+            }
+        }
+    }
+    if let Some(dir) = server.parent() {
+        let candidate = dir.join(name);
+        if candidate.exists() {
+            return candidate;
+        }
+    }
+    PathBuf::new()
 }
 
 /// Resolve the fuse-server binary path.

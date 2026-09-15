@@ -264,6 +264,18 @@ where
     ensure_mount_point(io, &config.mount_point, config.runtime_wrapper.as_deref())?;
     info!("Workspace folders ready.");
 
+    // Mounting is CLIENT-side orchestration: run-agent owns the data
+    // daemon. A missing fused must abort here, loudly — never degrade
+    // into a mount-less server accepting adds into an empty directory
+    // (the PR #37 field report).
+    if config.fused_path.as_os_str().is_empty() || !io.file_exists(&config.fused_path) {
+        return Err(
+            "data daemon (`fused`) not found — no mount can come up.\n\
+             Build it and re-run: cargo build --workspace"
+                .to_string(),
+        );
+    }
+
     // ── 2..4.5  Build-and-verify loop ────────────────────────────
     // The stack (server + data daemon + mount) can turn out stale at
     // pre-flight — e.g. an orphaned `fused` still owns the mount and
@@ -370,15 +382,13 @@ where
                 }
             }
 
-            let mount = config
-                .mount_point
-                .to_str()
-                .ok_or_else(|| format!("mount point is not valid UTF-8: {}", config.mount_point.display()))?;
             let sock = socket
                 .to_str()
                 .ok_or_else(|| format!("socket path is not valid UTF-8: {}", socket.display()))?;
+            // Policy-only: the data daemon is spawned by run-agent
+            // directly below — mounting must not depend on the
+            // server's build state or co-located binaries.
             let mut fuse_args: Vec<&str> = vec![
-                "--mount-point", mount,
                 "--socket", sock,
             ];
             if config.allow_other {
@@ -507,6 +517,42 @@ where
                 // command, or a transient failure) — proceed, loudly.
                 warn!("could not verify fuse-server version ({e}) — proceeding");
             }
+        }
+
+        // ── 3.6 Data daemon ─────────────────────────────────────────
+        // On a fresh stack run-agent mounts directly: fused is spawned
+        // HERE (independent — survives run-agent AND policy-daemon
+        // restarts, per the split design), connecting to the server's
+        // oracle socket (both default to the same path). On a reused
+        // healthy stack the existing mount stays; if it is gone or out
+        // of sync, pre-flight triggers the rebuild path which respawns
+        // everything, fused included.
+        if server_was_spawned {
+            let fused_str = config
+                .fused_path
+                .to_str()
+                .ok_or_else(|| format!("fused path is not valid UTF-8: {}", config.fused_path.display()))?;
+            let mountpoint_str = config.mount_point.to_string_lossy().to_string();
+            let mut fused_parts: Vec<String> = Vec::new();
+            if let Some(w) = &config.runtime_wrapper {
+                let (prog, prefix) = crate::config::split_wrapper(w);
+                fused_parts.push(prog);
+                fused_parts.extend(prefix);
+            }
+            fused_parts.push(fused_str.to_string());
+            fused_parts.push("--mount-point".into());
+            fused_parts.push(mountpoint_str.clone());
+            fused_parts.push("--log-level".into());
+            fused_parts.push(config.log_level.clone());
+            let fused_prog = fused_parts[0].clone();
+            let fused_args: Vec<&str> = fused_parts[1..].iter().map(|s| s.as_str()).collect();
+            let fused_pid = io
+                .spawn_independent(&fused_prog, &fused_args, None)
+                .map_err(|e| format!("spawn data daemon (fused): {e}"))?;
+            info!(
+                "data daemon (fused) spawned independently (pid {fused_pid}) — mount at {}",
+                config.mount_point.display()
+            );
         }
 
         // ── 4. Expand + load secrets into FUSE ───────────────────────
@@ -1172,6 +1218,7 @@ mod tests {
             container_args: vec![],
             agent_path: PathBuf::from("/work/agent1"),
             fuse_server_path: "fuse-server".into(),
+            fused_path: "/tmp/fused".into(),
             image_name: "agentbox".into(),
             seccomp_profile: PathBuf::from("/tmp/agentbox-seccomp.json"),
             memory: "16G".into(),
@@ -1195,6 +1242,9 @@ mod tests {
             // would now (correctly) make create_dir_all fail with EEXIST.
             .with_dir("/work/agent1/config")
             .with_dir("/work/agent1/workspace")
+            // The resolved data-daemon binary exists (fused_path in
+            // test_config points here).
+            .with_file("/tmp/fused", b"")
     }
 
     // ── resolve_dest (cp semantics) ──────────────────────────────
@@ -1372,7 +1422,9 @@ mod tests {
     fn missing_workspace_folders_are_created() {
         // A fresh agent path with none of the structure present: run-agent
         // generates the missing folders instead of refusing to run.
-        let mut mock = MockSystemIo::new().with_file("/home/user/secrets.yaml", b"DATA");
+        let mut mock = MockSystemIo::new()
+            .with_file("/home/user/secrets.yaml", b"DATA")
+            .with_file("/tmp/fused", b"");
         let cfg = test_config();
         let result = run_agent(&mut mock, &cfg, &|_, _| Ok(String::new()), false);
         assert!(result.is_ok(), "got: {:?}", result.err());
@@ -1666,6 +1718,55 @@ mod tests {
         );
     }
 
+    #[test]
+    fn fused_spawned_directly_and_server_is_policy_only() {
+        // PR #37 design fix: mounting is client-side — run-agent spawns
+        // the data daemon itself; the policy server gets NO
+        // --mount-point (its fused supervision stays for standalone
+        // use only).
+        let mut mock = base_mock().with_file("/home/user/secrets.yaml", b"DATA");
+        let cfg = test_config();
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(String::new()), false);
+        assert!(result.is_ok(), "got: {:?}", result.err());
+        let server_spawn = mock
+            .spawned
+            .iter()
+            .find(|(p, _)| p.contains("fuse-server"))
+            .expect("policy server must be spawned");
+        assert!(
+            !server_spawn.1.contains(&"--mount-point".to_string()),
+            "server must be policy-only: {server_spawn:?}"
+        );
+        let fused_spawn = mock
+            .spawned
+            .iter()
+            .find(|(p, _)| p.ends_with("fused"))
+            .expect("data daemon must be spawned directly");
+        assert!(
+            fused_spawn.1.contains(&"--mount-point".to_string())
+                && fused_spawn.1.contains(&"/tmp/fgk-mnt".to_string()),
+            "fused must mount the configured mountpoint: {fused_spawn:?}"
+        );
+    }
+
+    #[test]
+    fn missing_fused_binary_fails_fast_without_spawning() {
+        // The PR #37 field report: fused was never built, the stack ran
+        // mount-less, and adds succeeded into an empty directory. Now
+        // the run refuses to start and names the repair.
+        let mut mock = base_mock().with_file("/home/user/secrets.yaml", b"DATA");
+        // base_mock seeds /tmp/fused — remove it for this scenario.
+        mock.files.remove("/tmp/fused");
+        let cfg = test_config();
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(String::new()), false);
+        let err = result.expect_err("a missing data daemon must abort the run");
+        assert!(err.contains("cargo build --workspace"), "must name the repair: {err}");
+        assert!(
+            mock.spawned.is_empty(),
+            "nothing may be spawned without a data daemon"
+        );
+    }
+
     // ── out-of-sync stack: automatic rebuild (PR #37 review) ──────
 
     #[test]
@@ -1715,7 +1816,7 @@ mod tests {
         }, false);
         assert!(result.is_ok(), "got: {:?}", result.err());
         assert_eq!(adds.get(), 2, "secrets must be re-added after the rebuild");
-        assert_eq!(mock.spawned.len(), 2, "the server must be respawned once");
+        assert_eq!(mock.spawned.len(), 4, "server + fused per stack build, rebuilt once");
         let calls = mock.command_calls.borrow();
         assert!(
             calls
@@ -1740,7 +1841,7 @@ mod tests {
         let cfg = test_config();
         let result = run_agent(&mut mock, &cfg, &|_, _| Ok(String::new()), false);
         assert!(result.is_ok(), "got: {:?}", result.err());
-        assert_eq!(mock.spawned.len(), 2, "the server must be respawned once");
+        assert_eq!(mock.spawned.len(), 4, "server + fused per stack build, rebuilt once");
     }
 
     #[test]
@@ -1758,8 +1859,8 @@ mod tests {
         assert!(result.is_ok(), "got: {:?}", result.err());
         assert_eq!(
             mock.spawned.len(),
-            1,
-            "a late mount must NOT trigger a stack rebuild"
+            2,
+            "one stack (server + fused); a late mount must NOT rebuild it"
         );
         let calls = mock.command_calls.borrow();
         assert!(
@@ -1797,7 +1898,7 @@ mod tests {
             Ok(String::new())
         }, false);
         assert!(result.is_ok(), "got: {:?}", result.err());
-        assert_eq!(mock.spawned.len(), 1, "the stale server must be respawned once");
+        assert_eq!(mock.spawned.len(), 2, "one fresh stack: policy server + data daemon");
         let calls = mock.command_calls.borrow();
         assert!(
             calls.iter().any(|(p, a)| p == "pkill" && a.contains(&"fuse-server".to_string())),
@@ -1846,7 +1947,7 @@ mod tests {
         assert!(err.contains("pre-flight"), "got: {err}");
         assert!(err.contains("fuse-client restart"), "must point at manual repair: {err}");
         assert_eq!(adds.get(), 2, "exactly one rebuild, then abort");
-        assert_eq!(mock.spawned.len(), 2);
+        assert_eq!(mock.spawned.len(), 4);
         assert!(
             mock.interactive_calls.borrow().is_empty(),
             "no container interaction may happen after pre-flight failure"
