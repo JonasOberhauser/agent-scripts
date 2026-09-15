@@ -335,6 +335,40 @@ fn e2e_nonexistent_file_enoent() {
 }
 
 #[test]
+fn e2e_re_add_unchanged_content_preserves_state_end_to_end() {
+    // Stable filenames (PR sequence): re-running run-agent re-adds the
+    // SAME name. Re-adding with unchanged content must NOT reset the
+    // approval/read state — here proven through the full stack
+    // (socket add → oracle → mount → read), not just the state unit.
+    if !fuse_available() { return; }
+    let _g = serial();
+    let split = Split::new("readd", &[("s", b"KEEP", "*")]);
+    assert_eq!(std::fs::read(split.path("s")).unwrap(), b"KEEP");
+    let err = std::fs::read(split.path("s")).unwrap_err();
+    assert_eq!(err.raw_os_error(), Some(libc::EACCES), "budget spent");
+
+    // Re-add the same name from the same source file (unchanged
+    // content) via the client — the run-agent re-run shape.
+    let src = tempfile::tempdir().unwrap();
+    let f = src.path().join("s");
+    std::fs::write(&f, b"KEEP").unwrap();
+    let out = split.client(&["add-secret", "--file", f.to_str().unwrap(), "--hash", "*", "s"]);
+    assert!(out.status.success(), "re-add failed: {}", write_out(&out));
+
+    // Read state persisted: still consumed, not a fresh cycle.
+    let err = std::fs::read(split.path("s")).unwrap_err();
+    assert_eq!(
+        err.raw_os_error(),
+        Some(libc::EACCES),
+        "unchanged re-add must not reset the read budget"
+    );
+    // And the mount still serves the (unchanged) bytes for checks
+    // that do not consume: size via metadata.
+    let meta = std::fs::metadata(split.path("s")).unwrap();
+    assert_eq!(meta.len(), 4);
+}
+
+#[test]
 fn e2e_one_read_per_secret_without_reset() {
     if !fuse_available() { return; }
     let _g = serial();

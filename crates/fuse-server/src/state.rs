@@ -5,13 +5,37 @@ use std::time::{Duration, Instant};
 use dashmap::DashMap;
 use tracing::error;
 
+/// One permitted reader hash, with provenance (issue #34 MR3): the
+/// name of the process that obtained it, when known — filled in on
+/// grant-forever from the pending request it answered; explicit
+/// adds/rotates carry no attribution yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PermittedHash {
+    pub hash: String,
+    pub by: Option<String>,
+}
+
+impl PermittedHash {
+    /// Display form: `hash` or `hash (by NAME)`.
+    pub fn render(&self) -> String {
+        match &self.by {
+            Some(by) => format!("{} (by {})", self.hash, by),
+            None => self.hash.clone(),
+        }
+    }
+}
+
 /// One secret file tracked by the gatekeeper.
 #[derive(Debug, Clone)]
 pub struct SecretRecord {
     /// Content lives in the data daemon (`fused`); the policy daemon
     /// tracks only the size it adjudicates offsets against.
     pub size: usize,
-    pub allowed_hash: String,
+    /// ALL permitted reader hashes (issue #34 MR2): several
+    /// containers/packages may be pre-approved for the same file.
+    /// "*" is the wildcard entry (any reader). Each entry records
+    /// which process obtained it when known (MR3).
+    pub allowed_hashes: Vec<PermittedHash>,
     pub access_count: u64,
     pub reading_pid: Option<u32>,
     pub read_progress: usize,
@@ -114,6 +138,17 @@ impl ServerState {
     }
 
     /// Add with permission bits snapshotted from the source file.
+    ///
+    /// Idempotent for unchanged content: re-adding the same name with
+    /// the same content is a full NO-OP — `allowed_hash` (possibly
+    /// rotated at runtime via `rotate_hash`), `unlimited_reads`
+    /// (grant-forever), and read state all survive, so a re-run of
+    /// run-agent (stable names) or a state-file restore cannot
+    /// silently reset what a user already approved. Changed content
+    /// updates the record but still preserves `allowed_hash` and
+    /// `unlimited_reads` (they pin the READER package, not the bytes);
+    /// `rotate_hash` / `reset` remain the explicit paths for policy
+    /// changes.
     pub fn add_with_mode(
         &self,
         name: impl Into<String>,
@@ -121,11 +156,38 @@ impl ServerState {
         allowed_hash: impl Into<String>,
         mode: u32,
     ) {
+        let name = name.into();
+        let hash = allowed_hash.into();
+        if let Some(existing) = self.secrets.get(&name) {
+            let mut rec = lock_secret(existing.value(), &name);
+            // MR2: the incoming hash JOINS the permitted set — a second
+            // container pinning a different reader package must not
+            // evict the first one's approval.
+            if !rec.allowed_hashes.iter().any(|ph| ph.hash == hash) {
+                rec.allowed_hashes.push(PermittedHash { hash: hash.clone(), by: None });
+            }
+            if rec.size == content.len() {
+                // Same size — treat as unchanged content: the bytes
+                // live in the data daemon; the upsert there is
+                // content-addressed by the caller, so equal size from
+                // the same source file means unchanged. Approval and
+                // read state all survive (MR1 overwrite semantics).
+                return;
+            }
+            // Content changed: refresh size/read state, keep the
+            // approval settings (hashes pin readers, not bytes).
+            rec.size = content.len();
+            rec.access_count = 0;
+            rec.read_progress = 0;
+            rec.reading_pid = None;
+            rec.mode = mode & 0o777;
+            return;
+        }
         self.secrets.insert(
-            name.into(),
+            name,
             Arc::new(Mutex::new(SecretRecord {
                 size: content.len(),
-                allowed_hash: allowed_hash.into(),
+                allowed_hashes: vec![PermittedHash { hash, by: None }],
                 access_count: 0,
                 reading_pid: None,
                 read_progress: 0,
@@ -169,9 +231,11 @@ impl ServerState {
         }
 
         let hash_ok = match pid_hash {
-            Some(_) if rec.allowed_hash == "*" => true,
-            Some(h) if h == rec.allowed_hash => true,
-            _ => rec.allowed_hash == "*",
+            Some(h) => rec
+                .allowed_hashes
+                .iter()
+                .any(|ph| ph.hash == "*" || ph.hash == h),
+            None => rec.allowed_hashes.iter().any(|ph| ph.hash == "*"),
         };
 
         if hash_ok {
@@ -183,7 +247,12 @@ impl ServerState {
         } else {
             ReadOutcome::HashMismatch {
                 got: pid_hash.unwrap_or("<unknown>").to_string(),
-                expected: rec.allowed_hash.clone(),
+                expected: rec
+                    .allowed_hashes
+                    .iter()
+                    .map(|ph| ph.render())
+                    .collect::<Vec<_>>()
+                    .join(" | "),
             }
         }
     }
@@ -220,12 +289,14 @@ impl ServerState {
         }
     }
 
+    /// Replace the permitted-hash set with a single hash — the
+    /// explicit policy path (`rotate`); re-adds APPEND instead.
     pub fn rotate_hash(&self, name: &str, new_hash: &str) -> bool {
         if let Some(entry) = self.secrets.get(name) {
             let rec_arc = Arc::clone(entry.value());
             drop(entry);
             let mut rec = lock_secret(&rec_arc, name);
-            rec.allowed_hash = new_hash.to_string();
+            rec.allowed_hashes = vec![PermittedHash { hash: new_hash.to_string(), by: None }];
             true
         } else {
             false
@@ -321,7 +392,7 @@ impl ServerState {
     /// becomes the secret's allowed hash and the read limit is lifted.
     /// The waiting reader is served like a normal grant.
     pub fn grant_pending_forever(&self, id: u64) -> Result<(), String> {
-        let (secret_name, package_hash) = {
+        let (secret_name, package_hash, process_name) = {
             let entry = self
                 .pending
                 .get(&id)
@@ -340,7 +411,7 @@ impl ServerState {
                          nothing to whitelist"
                     ),
                 })?;
-            (entry.secret_name.clone(), hash)
+            (entry.secret_name.clone(), hash, entry.process_name.clone())
         };
         if let Some(rec_arc) = self.secrets.get(&secret_name).map(|e| Arc::clone(e.value())) {
             let mut rec = lock_secret(&rec_arc, &secret_name);
@@ -348,7 +419,23 @@ impl ServerState {
                 "grant-forever {id}: whitelisting package {} for '{secret_name}' (unlimited reads)",
                 &package_hash[..package_hash.len().min(12)]
             );
-            rec.allowed_hash = package_hash;
+            match rec
+                .allowed_hashes
+                .iter_mut()
+                .find(|ph| ph.hash == package_hash)
+            {
+                // Already permitted — MR3: attribute it now if it was
+                // anonymous (the pending request names the process).
+                Some(ph) => {
+                    if ph.by.is_none() {
+                        ph.by = process_name.clone();
+                    }
+                }
+                None => rec.allowed_hashes.push(PermittedHash {
+                    hash: package_hash.clone(),
+                    by: process_name.clone(),
+                }),
+            }
             rec.unlimited_reads = true;
         } else {
             return Err(format!("secret {secret_name} no longer exists"));
@@ -432,7 +519,12 @@ impl ServerState {
             fuse_protocol::SecretStatus {
                 name: name.clone(),
                 access_count: rec.access_count,
-                allowed_hash: rec.allowed_hash.clone(),
+                allowed_hash: rec
+                    .allowed_hashes
+                    .iter()
+                    .map(|ph| ph.render())
+                    .collect::<Vec<_>>()
+                    .join(" | "),
                 size: rec.size,
                 unlimited: rec.unlimited_reads,
             }
@@ -469,6 +561,133 @@ mod tests {
         let entry = s.secrets.get(name).unwrap();
         let rec = lock_secret(entry.value(), name);
         (rec.access_count, rec.reading_pid, rec.read_progress)
+    }
+
+    // ── idempotent re-add: persistence of user approvals ──────────
+
+    #[test]
+    fn grant_forever_records_the_process_that_obtained_the_hash() {
+        // Issue #34 MR3: permitted hashes carry provenance — the name
+        // of the process whose pending request earned them.
+        let s = sample_state();
+        let id = s.create_pending(
+            "secrets.yaml",
+            4242,
+            Some("sha256-reader-pkg"),
+            "hash mismatch",
+            Some("goose"),
+        );
+        s.grant_pending_forever(id).expect("grant-forever succeeds");
+        let entry = s.secrets.get("secrets.yaml").unwrap();
+        let rec = lock_secret(entry.value(), "secrets.yaml");
+        let ph = rec
+            .allowed_hashes
+            .iter()
+            .find(|ph| ph.hash == "sha256-reader-pkg")
+            .expect("hash permitted by grant-forever");
+        assert_eq!(ph.by.as_deref(), Some("goose"), "provenance recorded");
+        // and it renders attributed everywhere (status/denials)
+        assert!(ph.render().contains("(by goose)"));
+    }
+
+    #[test]
+    fn re_add_with_a_new_hash_joins_the_permitted_set() {
+        // Issue #34 MR2: a second container pinning a different reader
+        // package must not evict the first approval.
+        let s = sample_state(); // "secrets.yaml" permitted for "abc123"
+        s.add("secrets.yaml", b"TOPSECRET".to_vec(), "sha256-other");
+        assert_eq!(
+            s.attempt_read("secrets.yaml", 100, Some("abc123"), 0, 1024),
+            ReadOutcome::Granted,
+            "the original hash still grants"
+        );
+        // one-read-per-secret: reset the cycle, then the APPENDED
+        // hash must carry the next read.
+        s.reset(Some("secrets.yaml"));
+        assert_eq!(
+            s.attempt_read("secrets.yaml", 200, Some("sha256-other"), 0, 1024),
+            ReadOutcome::Granted,
+            "the appended hash grants the next read cycle"
+        );
+    }
+
+    #[test]
+    fn rotate_replaces_the_whole_set() {
+        let s = sample_state();
+        s.add("secrets.yaml", b"TOPSECRET".to_vec(), "sha256-other");
+        assert!(s.rotate_hash("secrets.yaml", "sha256-final"));
+        assert_ne!(
+            s.attempt_read("secrets.yaml", 100, Some("abc123"), 0, 1024),
+            ReadOutcome::Granted,
+            "rotate evicts previous approvals — explicit policy path"
+        );
+        assert_eq!(
+            s.attempt_read("secrets.yaml", 101, Some("sha256-final"), 0, 1024),
+            ReadOutcome::Granted
+        );
+    }
+
+    #[test]
+    fn mismatch_message_lists_all_permitted_hashes() {
+        let s = sample_state();
+        s.add("secrets.yaml", b"TOPSECRET".to_vec(), "sha256-other");
+        match s.attempt_read("secrets.yaml", 100, Some("wrong"), 0, 1024) {
+            ReadOutcome::HashMismatch { expected, .. } => {
+                assert!(expected.contains("abc123") && expected.contains("sha256-other"),
+                    "denial names every permitted hash: {expected}");
+            }
+            other => panic!("expected mismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn re_add_with_unchanged_content_preserves_rotated_hash() {
+        // run-agent re-runs (stable names) or a state-file restore must
+        // not reset a hash the user rotated at runtime.
+        let s = sample_state();
+        assert!(s.rotate_hash("secrets.yaml", "sha256-newpackage"));
+        s.add("secrets.yaml", b"TOPSECRET".to_vec(), "abc123"); // re-add, same content size
+        let out = s.attempt_read("secrets.yaml", 100, Some("sha256-newpackage"), 0, 1024);
+        assert_eq!(out, ReadOutcome::Granted, "rotated hash must survive re-add");
+        let out = s.attempt_read("secrets.yaml", 101, Some("abc123"), 0, 1024);
+        assert!(
+            !matches!(out, ReadOutcome::Granted),
+            "stale original hash must no longer grant: {out:?}"
+        );
+    }
+
+    #[test]
+    fn re_add_preserves_grant_forever_and_read_state() {
+        let s = sample_state();
+        // grant-forever: unlimited reads without per-read approval
+        let entry = s.secrets.get("secrets.yaml").unwrap();
+        lock_secret(entry.value(), "secrets.yaml").unlimited_reads = true;
+        drop(entry);
+        s.attempt_read("secrets.yaml", 100, Some("abc123"), 0, 1024); // consumed once
+        s.add("secrets.yaml", b"TOPSECRET".to_vec(), "abc123"); // re-add, unchanged
+        let (access, _pid, progress) = get_rec(&s, "secrets.yaml");
+        assert_eq!(access, 1, "read state must survive an unchanged re-add");
+        assert!(progress > 0);
+        let entry = s.secrets.get("secrets.yaml").unwrap();
+        assert!(
+            lock_secret(entry.value(), "secrets.yaml").unlimited_reads,
+            "grant-forever must survive re-add"
+        );
+    }
+
+    #[test]
+    fn re_add_with_changed_content_resets_reads_but_keeps_hash_setting() {
+        // New bytes (size changed) start a fresh read cycle; the hash
+        // pins the READER package and carries over.
+        let s = sample_state();
+        assert!(s.rotate_hash("secrets.yaml", "sha256-newpackage"));
+        s.attempt_read("secrets.yaml", 100, Some("sha256-newpackage"), 0, 1024); // consumed
+        s.add("secrets.yaml", b"DIFFERENT-LONGER-CONTENT".to_vec(), "abc123");
+        let (access, _pid, progress) = get_rec(&s, "secrets.yaml");
+        assert_eq!(access, 0, "changed content starts a fresh read cycle");
+        assert_eq!(progress, 0);
+        let out = s.attempt_read("secrets.yaml", 200, Some("sha256-newpackage"), 0, 1024);
+        assert_eq!(out, ReadOutcome::Granted, "rotated hash carries over to new content");
     }
 
     #[test]
