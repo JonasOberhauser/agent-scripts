@@ -31,6 +31,13 @@ enum Commands {
     Deny { id: u64 },
     GetVersion,
     GetLogPath,
+    /// Restart the fuse-server from the state file: stop the old
+    /// daemon (and its supervised data daemon), clean up socket and
+    /// mount point, respawn with the same configuration and re-add
+    /// every secret from the state file's host paths.  This is the
+    /// same flow the client runs on a version mismatch, exposed as a
+    /// one-word command; it asks no questions.
+    Restart,
 }
 
 fn main() {
@@ -66,6 +73,12 @@ fn main() {
     let app = App::builder(&cli.socket)
         .protocol_all(client_protocols())
         .build();
+
+    if let Some(Commands::Restart) = &cli.command {
+        let log_path = discover_log_path(&app);
+        restart_server(&app, log_path.as_deref());
+        return;
+    }
 
     if app.server_running() {
         check_version_or_restart(&app);
@@ -159,10 +172,24 @@ fn build_clap_command(cmd: &Commands) -> (String, String) {
         Commands::Deny { id } => ("deny".into(), id.to_string()),
         Commands::GetVersion => ("version".into(), "".into()),
         Commands::GetLogPath => ("logpath".into(), "".into()),
+        Commands::Restart => unreachable!("restart runs its own local flow"),
     }
 }
 
 // ── Version check & server restart ─────────────────────────────
+
+/// Where the running server says it logs; None when unreachable or it
+/// predates logpath discovery (callers decide their own fallback).
+fn discover_log_path(app: &App) -> Option<String> {
+    use fuse_protocol::Response;
+    app.run_cli_command_raw("logpath", "")
+        .ok()
+        .and_then(|(_, raw)| serde_json::from_slice::<Response>(&raw).ok())
+        .and_then(|r| match r {
+            Response::LogPath { path } if !path.is_empty() => Some(path),
+            _ => None,
+        })
+}
 
 fn check_version_or_restart(app: &App) {
     use fuse_protocol::Response;
@@ -197,15 +224,7 @@ fn check_version_or_restart(app: &App) {
         std::process::exit(1);
     }
 
-    let log_path = match app.run_cli_command_raw("logpath", "") {
-        Ok((_, raw)) => serde_json::from_slice::<Response>(&raw)
-            .ok()
-            .and_then(|r| match r {
-                Response::LogPath { path } if !path.is_empty() => Some(path),
-                _ => None,
-            }),
-        Err(_) => None,
-    };
+    let log_path = discover_log_path(app);
 
     let log_path = log_path.unwrap_or_else(|| {
         eprintln!("Old server doesn't support log path discovery.");
