@@ -148,6 +148,9 @@ impl Split {
         }
         for (name, content, hash) in secrets {
             let f = secret_dir.path().join(name);
+            // Path-shaped names (issue #34) carry directories — the
+            // source tree must exist before the write.
+            std::fs::create_dir_all(f.parent().unwrap()).unwrap();
             std::fs::write(&f, content).unwrap();
             policy.arg("--secret").arg(format!(
                 "{name}:{}:{hash}",
