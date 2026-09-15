@@ -24,8 +24,11 @@ pub const DEFAULT_TIMEOUT_SECS: u64 = 3;
 
 /// A freshly spawned data daemon can take a moment to mount — adds land
 /// through the socket instantly, the mount lags.  Before declaring an
-/// exit-1 stat a hard failure, retry this often …
-const MOUNT_APPEAR_RETRIES: usize = 8;
+/// exit-1 stat a hard failure, retry this often …  Bounded tightly: the
+/// retry must never turn a broken stack into an apparent hang (PR #37
+/// review), and a root that already lists OTHER names means the mount
+/// is up and the name is genuinely missing — no retry can help.
+const MOUNT_APPEAR_RETRIES: usize = 4;
 /// … waiting this long between tries.
 const MOUNT_APPEAR_WAIT_MS: u64 = 250;
 
@@ -137,13 +140,21 @@ fn check_mount<S: SystemIo>(
             }
             Ok(o) if o.status == Some(1) => {
                 last_stderr = o.stderr.trim().to_string();
-                // The mount may still be coming up after a (re)spawn:
-                // retry briefly before declaring a hard failure.
-                if attempts < MOUNT_APPEAR_RETRIES {
-                    io.sleep_ms(MOUNT_APPEAR_WAIT_MS);
-                    continue;
+                let root = probe_mount_root(io, mount_point, timeout_secs);
+                // Mount up and serving OTHER names?  The name is
+                // genuinely missing — retrying cannot conjure it.
+                if matches!(root, RootProbe::Entries(_))
+                    || attempts >= MOUNT_APPEAR_RETRIES
+                {
+                    break (
+                        false,
+                        mount_one_failure_detail(&mount_side_str, &last_stderr, attempts, root),
+                    );
                 }
-                break (false, mount_one_failure_detail(io, mount_point, timeout_secs, &mount_side_str, &last_stderr, attempts));
+                // Empty or unreachable root: the mount may still be
+                // coming up after a (re)spawn — retry briefly.
+                io.sleep_ms(MOUNT_APPEAR_WAIT_MS);
+                continue;
             }
             Ok(o) => {
                 break (
@@ -172,36 +183,61 @@ fn check_mount<S: SystemIo>(
     }
 }
 
-/// Human-readable detail for a persistent exit-1 stat: the actual stat
-/// error plus what the mount root says — an empty listing points at a
-/// sync problem, a failing/unreachable root at a dead or inaccessible
-/// mount, names-present-but-not-ours at a naming problem.
-fn mount_one_failure_detail<S: SystemIo>(
+/// What a `timeout ls -a` of the mount root showed.
+enum RootProbe {
+    /// The mount is up and lists these entries beyond `.`/`..`.
+    Entries(String),
+    /// The mount answers but lists nothing — empty store (sync
+    /// problem, or the data daemon is still starting).
+    Empty,
+    /// The root itself cannot be listed — dead or inaccessible mount.
+    Failed(String),
+}
+
+fn probe_mount_root<S: SystemIo>(
     io: &S,
     mount_point: &Path,
     timeout_secs: u64,
-    mount_side: &str,
-    stat_stderr: &str,
-    attempts: usize,
-) -> String {
+) -> RootProbe {
     let secs = timeout_secs.to_string();
     let root_str = mount_point.display().to_string();
-    let listing = io.run_command("timeout", &[&secs, "ls", "-a", &root_str]);
-    let root_part = match &listing {
+    match io.run_command("timeout", &[&secs, "ls", "-a", &root_str]) {
         Ok(o) if o.success() => {
-            let names = o.stdout.trim();
+            let names: Vec<&str> = o
+                .stdout
+                .lines()
+                .map(|l| l.trim())
+                .filter(|l| !l.is_empty() && *l != "." && *l != "..")
+                .collect();
             if names.is_empty() {
-                "mount root lists NOTHING (server/mount out of sync?)".to_string()
+                RootProbe::Empty
             } else {
-                format!("mount root lists: {names}")
+                RootProbe::Entries(names.join(" "))
             }
         }
-        Ok(o) => format!(
+        Ok(o) => RootProbe::Failed(format!(
             "mount root itself failed (ls exit {:?}: {}) — dead or inaccessible mount",
             o.status,
             o.stderr.trim()
-        ),
-        Err(e) => format!("mount root could not be probed ({e})"),
+        )),
+        Err(e) => RootProbe::Failed(format!("mount root could not be probed ({e})")),
+    }
+}
+
+/// Human-readable detail for a persistent exit-1 stat: the actual stat
+/// error plus what the mount root said — entries-but-not-ours points at
+/// a sync/naming problem, an empty root at an empty store, a failing
+/// root at a dead or inaccessible mount.
+fn mount_one_failure_detail(
+    mount_side: &str,
+    stat_stderr: &str,
+    attempts: usize,
+    root: RootProbe,
+) -> String {
+    let root_part = match root {
+        RootProbe::Entries(names) => format!("mount root lists: {names}"),
+        RootProbe::Empty => "mount root lists NOTHING (empty store — sync problem or data daemon still starting)".into(),
+        RootProbe::Failed(why) => why,
     };
     format!(
         "not visible in the FUSE mount at {mount_side} after {attempts} tries.\
@@ -378,6 +414,34 @@ mod tests {
         assert!(
             mnt.detail.contains("p9_s0_somebody_else"),
             "the listing must show the actually-present names: {mnt}"
+        );
+    }
+
+    #[test]
+    fn populated_root_fails_fast_without_retries() {
+        // Mount up and listing OTHER names: the missing name is a sync
+        // problem — retrying (or rebuilding) cannot conjure it, so the
+        // check must NOT burn the appear-retries (PR #37 review: the
+        // waits made broken stacks feel like hangs).
+        let mock = MockSystemIo::new()
+            .with_file("/host/auth.json", b"DATA")
+            .with_command_stdout("p9_s0_somebody_else")
+            .with_command_result_when("timeout", "/tmp/fgk-mnt", Some(0))
+            .with_command_result_when_n("timeout", "p100_s0", Some(1), MOUNT_APPEAR_RETRIES);
+        let loaded = vec![secret("/host/auth.json")];
+        let results = run(&mock, &loaded, &mount_point(), DEFAULT_TIMEOUT_SECS);
+        let mnt = results
+            .iter()
+            .find(|r| r.check == "fuse-mount")
+            .expect("fuse-mount check must run");
+        assert!(!mnt.ok, "got: {mnt}");
+        assert!(
+            mnt.detail.contains("after 1 tries"),
+            "must fail on the first try: {mnt}"
+        );
+        assert!(
+            mock.sleeps.borrow().is_empty(),
+            "no appear-retry waits may run when the mount already lists names"
         );
     }
 

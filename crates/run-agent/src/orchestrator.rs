@@ -110,6 +110,22 @@ fn teardown_stack<S: SystemIo>(io: &mut S, config: &AgentConfig) {
     let _ = io.remove_path(&config.mount_point);
 }
 
+/// Ask the running server for its version. `Ok(None)` when the reply
+/// is not a version response; `Err` when the command failed or the
+/// payload was unparseable.
+fn server_version<F>(send: &F) -> Result<Option<String>, String>
+where
+    F: Fn(&str, &str) -> Result<String, String>,
+{
+    let payload = send("version", "")?;
+    let resp: fuse_protocol::Response =
+        serde_json::from_str(payload.trim()).map_err(|e| format!("unparseable reply: {e}"))?;
+    match resp {
+        fuse_protocol::Response::Version { version } => Ok(Some(version)),
+        _ => Ok(None),
+    }
+}
+
 /// Whether a failed pre-flight justifies rebuilding the stack: a
 /// broken mount side does (an orphaned or dead mount heals by
 /// respawning server + data daemon), a missing host-side source file
@@ -222,7 +238,7 @@ pub fn run_agent<S, F>(
 ) -> Result<RunResult, String>
 where
     S: SystemIo,
-    F: Fn(&str, &str) -> Result<(), String>,
+    F: Fn(&str, &str) -> Result<String, String>,
 {
     // ── 1. Generate missing workspace folders ────────────────────
     // The agent's structure (config/, workspace/, fuse_mnt/) is created
@@ -275,7 +291,7 @@ where
         // the backlog — later adds then die with 'Broken pipe'.  Do a real
         // read-only round-trip before trusting the server.
         match send("status", "") {
-            Ok(()) => {
+            Ok(_) => {
                 info!("Reusing existing fuse-server at {}", socket.display());
                 server_healthy = true;
             }
@@ -456,6 +472,41 @@ where
                 std::thread::sleep(Duration::from_millis(100));
             }
             info!("Socket ready at {}", socket.display());
+        }
+
+        // ── 3.5 Version handshake ───────────────────────────────────
+        // The reused-or-spawned fuse-server may be a stale binary from
+        // an older build — dev checkouts routinely mix vintages when
+        // only some crates get rebuilt.  fuse-client has always checked
+        // this; run-agent — the SPAWNER — must too, or a mixed-vintage
+        // stack surfaces later as a mystery empty mount (PR #37).
+        match server_version(send) {
+            Ok(Some(v)) if !fuse_protocol::versions_compatible(&v, fuse_protocol::VERSION) => {
+                warn!(
+                    "fuse-server v{v} at {} is protocol-incompatible with this run-agent \
+                     (v{}) — mixed-vintage binaries",
+                    socket.display(),
+                    fuse_protocol::VERSION
+                );
+                if stack_rebuilds == 0 {
+                    stack_rebuilds += 1;
+                    warn!("respawning the server from the current binaries and retrying once");
+                    teardown_stack(io, config);
+                    force_respawn = true;
+                    continue;
+                }
+                break Err(format!(
+                    "fuse-server v{v} is protocol-incompatible with run-agent v{} — the \
+                     binaries are mixed-vintage. Rebuild everything: cargo build --workspace",
+                    fuse_protocol::VERSION
+                ));
+            }
+            Ok(_) => {}
+            Err(e) => {
+                // Cannot determine (ancient server without the version
+                // command, or a transient failure) — proceed, loudly.
+                warn!("could not verify fuse-server version ({e}) — proceeding");
+            }
         }
 
         // ── 4. Expand + load secrets into FUSE ───────────────────────
@@ -646,7 +697,7 @@ where
     let mut reset_ok = true;
     for s in &loaded {
         match send("reset", &s.fuse_name) {
-            Ok(()) => {
+            Ok(_) => {
                 info!("Auto-reset successful for '{}'.", s.fuse_name);
             }
             Err(e) => {
@@ -716,7 +767,7 @@ fn load_secret_recursive<S, F>(
 ) -> Result<(), String>
 where
     S: SystemIo,
-    F: Fn(&str, &str) -> Result<(), String>,
+    F: Fn(&str, &str) -> Result<String, String>,
 {
     if io.is_dir(host) {
         let entries = io
@@ -1249,7 +1300,7 @@ mod tests {
             .with_command_result_when("podman", "inspect", Some(1))
             .with_command_result_when("podman", "exists", Some(1));
         let cfg = test_config();
-        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()), false);
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(String::new()), false);
         let err = result.expect_err("missing image must fail run_agent");
         assert!(
             err.contains("agentbox"),
@@ -1276,7 +1327,7 @@ mod tests {
             .with_command_result_when("podman", "build", Some(0));
         let mut cfg = test_config();
         cfg.image_name = "agentbox".into();
-        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()), false);
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(String::new()), false);
         let err = result.expect_err("declined build must fail run_agent");
         assert!(err.contains("create it first"), "got: {err}");
         // The build command must NOT have run: the image probe would
@@ -1296,7 +1347,7 @@ mod tests {
             .with_command_result_when_n("podman", "exists", Some(1), 1);
         let mut cfg = test_config();
         cfg.auto_confirm = true;
-        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()), false);
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(String::new()), false);
         assert!(result.is_ok(), "got: {:?}", result.err());
         // The build must STREAM (run_interactive: inherited stdio) so the
         // user sees podman/apt progress instead of a silent multi-minute
@@ -1323,7 +1374,7 @@ mod tests {
         // generates the missing folders instead of refusing to run.
         let mut mock = MockSystemIo::new().with_file("/home/user/secrets.yaml", b"DATA");
         let cfg = test_config();
-        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()), false);
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(String::new()), false);
         assert!(result.is_ok(), "got: {:?}", result.err());
         let created = mock.created_dirs.borrow();
         let fuse = cfg.host_fuse().to_string_lossy().to_string();
@@ -1341,7 +1392,7 @@ mod tests {
             .with_file("/home/user/secrets.yaml", b"DATA");
 
         let cfg = test_config();
-        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()), false);
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(String::new()), false);
 
         assert!(result.is_ok(), "got: {:?}", result.err());
         let run = result.unwrap();
@@ -1356,7 +1407,7 @@ mod tests {
         mock.unix_connected = true;
 
         let cfg = test_config();
-        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()), false);
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(String::new()), false);
 
         assert!(result.is_ok(), "got: {:?}", result.err());
         assert!(!result.unwrap().server_was_spawned);
@@ -1375,7 +1426,7 @@ mod tests {
             if name == "add" {
                 captured.borrow_mut().push(args.to_string());
             }
-            Ok(())
+            Ok(String::new())
         }, false)
         .unwrap();
         let adds = sent.borrow();
@@ -1391,7 +1442,7 @@ mod tests {
         cfg.secrets = vec![];
 
         let mut mock = base_mock();
-        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()), false);
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(String::new()), false);
         assert!(result.is_ok(), "got: {:?}", result.err());
     }
 
@@ -1409,7 +1460,7 @@ mod tests {
         let mut mock = base_mock()
             .with_file("/home/user/key.json", b"KEY");
 
-        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()), false);
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(String::new()), false);
         assert!(result.is_ok(), "got: {:?}", result.err());
     }
 
@@ -1426,7 +1477,7 @@ mod tests {
         let mut mock = base_mock()
             .with_file("/home/user/key.json", b"KEY");
 
-        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()), false);
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(String::new()), false);
         assert!(result.is_ok(), "got: {:?}", result.err());
     }
 
@@ -1445,7 +1496,7 @@ mod tests {
             .with_file("/home/user/secrets/key1.json", b"K1")
             .with_file("/home/user/secrets/subdir/key2.json", b"K2");
 
-        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()), false);
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(String::new()), false);
         assert!(result.is_ok(), "got: {:?}", result.err());
     }
 
@@ -1463,7 +1514,7 @@ mod tests {
             .with_file("/home/user/secrets/key1.json", b"K1")
             .with_file("/home/user/secrets/key2.json", b"K2");
 
-        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()), false);
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(String::new()), false);
         assert!(result.is_ok(), "got: {:?}", result.err());
     }
 
@@ -1485,7 +1536,7 @@ mod tests {
             .with_file("/home/user/key.json", b"KEY")
             .with_file("/home/user/secrets/token.json", b"TOK");
 
-        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()), false);
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(String::new()), false);
         assert!(result.is_ok(), "got: {:?}", result.err());
     }
 
@@ -1498,7 +1549,7 @@ mod tests {
             .with_file("/home/user/secrets.yaml", b"DATA");
 
         let cfg = test_config();
-        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()), false);
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(String::new()), false);
         assert!(result.is_ok(), "got: {:?}", result.err());
         assert!(
             !mock.files.contains_key("/tmp/fgk.sock"),
@@ -1514,7 +1565,7 @@ mod tests {
             .with_file("/home/user/secrets.yaml", b"DATA");
 
         let cfg = test_config();
-        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()), false);
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(String::new()), false);
         assert!(result.is_err());
     }
 
@@ -1527,7 +1578,7 @@ mod tests {
             .with_file("/home/user/secrets.yaml", b"DATA");
 
         let cfg = test_config();
-        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()), false);
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(String::new()), false);
         assert!(result.is_ok(), "got: {:?}", result.err());
     }
 
@@ -1547,7 +1598,7 @@ mod tests {
             .with_file("/home/user/secrets.yaml", b"DATA");
 
         let cfg = test_config();
-        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()), false);
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(String::new()), false);
         assert!(result.is_ok(), "got: {:?}", result.err());
     }
 
@@ -1563,7 +1614,7 @@ mod tests {
             .with_file("/home/user/secrets.yaml", b"DATA");
 
         let cfg = test_config();
-        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()), false);
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(String::new()), false);
         assert!(result.is_ok(), "got: {:?}", result.err());
         let calls = mock.command_calls.borrow();
         assert!(
@@ -1589,7 +1640,7 @@ mod tests {
             .with_file("/home/user/secrets.yaml", b"DATA");
 
         let cfg = test_config();
-        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()), false);
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(String::new()), false);
         let err = result.expect_err("an unclearable dead mount must abort the run");
         assert!(err.contains("fusermount -uz"), "must spell out the manual fix: {err}");
         assert!(
@@ -1607,7 +1658,7 @@ mod tests {
             .with_file("/home/user/secrets.yaml", b"DATA");
 
         let cfg = test_config();
-        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()), false);
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(String::new()), false);
         assert!(result.is_ok(), "got: {:?}", result.err());
         assert!(
             !mock.files.contains_key("/tmp/fgk-mnt"),
@@ -1649,16 +1700,18 @@ mod tests {
         let adds = std::cell::Cell::new(0usize);
         let mut mock = base_mock()
             .with_file("/home/user/secrets.yaml", b"DATA")
-            // Persistent through pre-flight's appear-retries, gone after
-            // the rebuild: exactly one full rebuild, then success.
-            .with_command_result_when_n("timeout", "/tmp/fgk-mnt/", Some(1), 8);
+            // Persistent through pre-flight's 4 appear-retries in
+            // iteration 1 (uses 4), still failing once at the top of
+            // iteration 2 (5th use) before expiring: exactly one full
+            // rebuild, then success.
+            .with_command_result_when_n("timeout", "/tmp/fgk-mnt/", Some(1), 5);
 
         let cfg = test_config();
         let result = run_agent(&mut mock, &cfg, &|name, _| {
             if name == "add" {
                 adds.set(adds.get() + 1);
             }
-            Ok(())
+            Ok(String::new())
         }, false);
         assert!(result.is_ok(), "got: {:?}", result.err());
         assert_eq!(adds.get(), 2, "secrets must be re-added after the rebuild");
@@ -1685,7 +1738,7 @@ mod tests {
             .with_command_result_when_n("timeout", "/tmp/fgk-mnt/", Some(124), 1);
 
         let cfg = test_config();
-        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()), false);
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(String::new()), false);
         assert!(result.is_ok(), "got: {:?}", result.err());
         assert_eq!(mock.spawned.len(), 2, "the server must be respawned once");
     }
@@ -1701,7 +1754,7 @@ mod tests {
             .with_command_result_when_n("timeout", "/tmp/fgk-mnt/", Some(1), 3);
 
         let cfg = test_config();
-        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()), false);
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(String::new()), false);
         assert!(result.is_ok(), "got: {:?}", result.err());
         assert_eq!(
             mock.spawned.len(),
@@ -1712,6 +1765,66 @@ mod tests {
         assert!(
             !calls.iter().any(|(p, _)| p == "pkill"),
             "no teardown may run for a late mount: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn stale_version_server_respawned_from_current_binaries() {
+        // The PR #37 root cause: run-agent happily reused/spawned a
+        // fuse-server of incompatible vintage and failed later at
+        // pre-flight with an unexplained empty mount. The handshake
+        // must catch it, tear the stack down once, and respawn from
+        // the current binaries.
+        let payloads = std::cell::RefCell::new(vec![
+            "{\"type\":\"version\",\"version\":\"0.26.0\"}".to_string(),
+            format!("{{\"type\":\"version\",\"version\":\"{}\"}}", fuse_protocol::VERSION),
+        ]);
+        let mut mock = base_mock().with_file("/home/user/secrets.yaml", b"DATA");
+        mock.unix_connected = true;
+
+        let cfg = test_config();
+        let result = run_agent(&mut mock, &cfg, &|name, _| {
+            if name == "version" {
+                let mut p = payloads.borrow_mut();
+                if p.is_empty() {
+                    return Ok(format!(
+                        "{{\"type\":\"version\",\"version\":\"{}\"}}",
+                        fuse_protocol::VERSION
+                    ));
+                }
+                return Ok(p.remove(0));
+            }
+            Ok(String::new())
+        }, false);
+        assert!(result.is_ok(), "got: {:?}", result.err());
+        assert_eq!(mock.spawned.len(), 1, "the stale server must be respawned once");
+        let calls = mock.command_calls.borrow();
+        assert!(
+            calls.iter().any(|(p, a)| p == "pkill" && a.contains(&"fuse-server".to_string())),
+            "the incompatible server must be torn down: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn incompatible_version_aborts_with_rebuild_hint() {
+        // The respawned binary is STILL incompatible (everything stale):
+        // abort with the mixed-vintage diagnosis instead of a mystery.
+        let mut mock = base_mock().with_file("/home/user/secrets.yaml", b"DATA");
+        mock.unix_connected = true;
+
+        let cfg = test_config();
+        let result = run_agent(&mut mock, &cfg, &|name, _| {
+            if name == "version" {
+                return Ok("{\"type\":\"version\",\"version\":\"0.26.0\"}".to_string());
+            }
+            Ok(String::new())
+        }, false);
+        let err = result.expect_err("persistently incompatible server must abort");
+        assert!(err.contains("mixed-vintage"), "got: {err}");
+        assert!(err.contains("cargo build --workspace"), "must name the repair: {err}");
+        assert!(
+            mock.interactive_calls.borrow().is_empty(),
+            "no container interaction may happen"
         );
     }
 
@@ -1727,7 +1840,7 @@ mod tests {
             if name == "add" {
                 adds.set(adds.get() + 1);
             }
-            Ok(())
+            Ok(String::new())
         }, false);
         let err = result.expect_err("a persistently out-of-sync stack must abort");
         assert!(err.contains("pre-flight"), "got: {err}");
@@ -1748,7 +1861,7 @@ mod tests {
             .with_file("/home/user/secrets.yaml", b"DATA");
 
         let cfg = test_config();
-        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()), false);
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(String::new()), false);
         assert!(result.is_ok());
         assert!(!mock.spawned.is_empty(), "should have spawned fuse-server");
         assert!(
@@ -1766,7 +1879,7 @@ mod tests {
         let mut mock = base_mock()
             .with_file("/home/user/secrets.yaml", b"DATA");
 
-        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()), false);
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(String::new()), false);
         assert!(result.is_ok());
         assert!(
             mock.spawn_contains(0, &["--allow-other"]),
@@ -1782,7 +1895,7 @@ mod tests {
         let mut mock = base_mock()
             .with_file("/home/user/secrets.yaml", b"DATA");
 
-        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()), false);
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(String::new()), false);
         assert!(result.is_ok());
         assert!(
             mock.spawn_contains(0, &["--allow-other"]),
@@ -1799,7 +1912,7 @@ mod tests {
         let mut mock = base_mock()
             .with_file("/home/user/secrets.yaml", b"DATA");
 
-        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()), false);
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(String::new()), false);
         assert!(result.is_ok());
         assert!(!mock.spawned.is_empty());
         // Without wrapper: prog="sudo", args=["-n", "fuse-server", ...]
@@ -1818,7 +1931,7 @@ mod tests {
         let mut mock = base_mock()
             .with_file("/home/user/secrets.yaml", b"DATA");
 
-        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()), false);
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(String::new()), false);
         assert!(result.is_ok());
 
         let calls = mock.interactive_calls.borrow();
@@ -1838,7 +1951,7 @@ mod tests {
         let mut mock = base_mock()
             .with_file("/home/user/secrets.yaml", b"DATA");
 
-        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()), false);
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(String::new()), false);
         assert!(result.is_ok());
 
         let calls = mock.interactive_calls.borrow();
@@ -1856,7 +1969,7 @@ mod tests {
             .with_spawn_error("command not found");
 
         let cfg = test_config();
-        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()), false);
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(String::new()), false);
         assert!(result.is_err());
     }
 
@@ -1871,7 +1984,7 @@ mod tests {
             .with_command_result("timeout", Some(124));
 
         let cfg = test_config();
-        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()), false);
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(String::new()), false);
         let err = result.expect_err("must abort on stale mount");
         assert!(err.contains("pre-flight"), "got: {err}");
         assert!(err.to_lowercase().contains("hang"), "got: {err}");
@@ -1894,12 +2007,12 @@ mod tests {
         mock.unix_connected = true;
 
         let probed = std::cell::Cell::new(false);
-        let send = |name: &str, _args: &str| -> Result<(), String> {
+        let send = |name: &str, _args: &str| -> Result<String, String> {
             if name == "status" && !probed.get() {
                 probed.set(true);
                 return Err("server closed the connection".into());
             }
-            Ok(())
+            Ok(String::new())
         };
 
         let cfg = test_config();
@@ -1918,7 +2031,7 @@ mod tests {
         mock.unix_connected = true;
 
         let cfg = test_config();
-        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()), false);
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(String::new()), false);
         assert!(result.is_ok());
         assert!(
             mock.spawned.is_empty(),
@@ -1933,7 +2046,7 @@ mod tests {
         // inspect succeeds (container exists) but Running != true.
         let mut mock = base_mock().with_file("/home/user/secrets.yaml", b"DATA");
         let cfg = test_config();
-        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()), false);
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(String::new()), false);
         assert!(result.is_ok(), "got: {:?}", result.err());
         let calls = mock.command_calls.borrow();
         assert!(
@@ -1957,7 +2070,7 @@ mod tests {
             .with_file("/home/user/secrets.yaml", b"DATA")
             .with_command_result_when("podman", "inspect", Some(1));
         let cfg = test_config();
-        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()), false);
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(String::new()), false);
         assert!(result.is_ok(), "got: {:?}", result.err());
         let calls = mock.command_calls.borrow();
         assert!(
@@ -1979,7 +2092,7 @@ mod tests {
         mock = mock.with_command_result_when_n("podman", "exec", Some(1), 1);
 
         let cfg = test_config();
-        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()), false);
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(String::new()), false);
         assert!(
             result.is_ok(),
             "stop/start heal must recover the session: {:?}",
@@ -2012,7 +2125,7 @@ mod tests {
         mock = mock.with_command_result_when("podman", "exec", Some(1)); // always fails
 
         let cfg = test_config();
-        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()), false);
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(String::new()), false);
         let err = result.expect_err("must abort when /fuse cannot be healed");
         assert!(
             err.contains("restart-container"),
@@ -2034,7 +2147,7 @@ mod tests {
         let mut mock = base_mock().with_file("/home/user/secrets.yaml", b"DATA");
         mock.command_stdout = "true".into();
         let cfg = test_config();
-        let _ = run_agent(&mut mock, &cfg, &|_, _| Ok(()), false);
+        let _ = run_agent(&mut mock, &cfg, &|_, _| Ok(String::new()), false);
         let calls = mock.command_calls.borrow();
         let probe = calls
             .iter()
@@ -2067,7 +2180,7 @@ mod tests {
         mock = mock.with_command_result_when_n("podman", "exec", Some(1), 1);
 
         let cfg = test_config();
-        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()), false);
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(String::new()), false);
         assert!(result.is_ok(), "got: {:?}", result.err());
 
         let calls = mock.command_calls.borrow();
@@ -2111,7 +2224,7 @@ mod tests {
     fn restart_container_terms_processes_before_rm() {
         let mut mock = base_mock().with_file("/home/user/secrets.yaml", b"DATA");
         let cfg = test_config();
-        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()), true);
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(String::new()), true);
         assert!(result.is_ok(), "got: {:?}", result.err());
         let calls = mock.command_calls.borrow();
         let rm_idx = calls
@@ -2136,7 +2249,7 @@ mod tests {
         // heal it.
         let mut mock = base_mock().with_file("/home/user/secrets.yaml", b"DATA");
         let cfg = test_config();
-        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()), false);
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(String::new()), false);
         assert!(result.is_ok());
         assert!(
             !mock.interactive_calls.borrow().is_empty(),
@@ -2157,7 +2270,7 @@ mod tests {
             .with_file("/home/user/secrets.yaml", b"DATA");
 
         let cfg = test_config();
-        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()), false);
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(String::new()), false);
         assert!(result.is_ok());
         // No stale socket or mount point, so no removals attempted
         assert!(!mock.spawned.is_empty());

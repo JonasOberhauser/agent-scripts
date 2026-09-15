@@ -27,7 +27,19 @@ pub enum OracleRequest {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum OracleCommand {
     /// Serve this secret from now on (new or replaced content).
-    Upsert { name: String, content: Vec<u8>, mode: u32 },
+    ///
+    /// `mode` is wire-OPTIONAL: policy daemons that predate mode
+    /// passthrough do not send it, and a required field would make
+    /// them silently invisible to a newer fused (the PR #37 field
+    /// report: an alive mount listing only `.` and `..`).  Older
+    /// senders therefore keep working; the conservative 0o400 default
+    /// matches the client-facing AddSecret contract.
+    Upsert {
+        name: String,
+        content: Vec<u8>,
+        #[serde(default = "crate::protocol::default_secret_mode")]
+        mode: u32,
+    },
     /// Stop serving this secret (readers get ENOENT).
     Remove { name: String },
 }
@@ -48,6 +60,21 @@ pub enum OracleReply {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn upsert_without_mode_parses_with_conservative_default() {
+        // Wire backward compatibility (PR #37 field report): policy
+        // daemons that predate mode passthrough send no `mode`; a
+        // required field made their upserts silently invisible to a
+        // newer fused. It must parse, defaulting to read-only.
+        let old = r#"{"type":"upsert","name":"s.yaml","content":[104,105]}"#;
+        let cmd: OracleCommand = serde_json::from_str(old).expect("old-format upsert must parse");
+        assert_eq!(
+            cmd,
+            OracleCommand::Upsert { name: "s.yaml".into(), content: b"hi".to_vec(), mode: 0o400 }
+        );
+    }
+
+
     use super::*;
 
     #[test]

@@ -189,8 +189,11 @@ fn main() -> ExitCode {
         .protocol_all(fuse_protocol::client_protocols())
         .build();
 
-    let send = |name: &str, args: &str| -> Result<(), String> {
-        app.run_cli_command(name, args).map(|_| ())
+    // Returns the raw response payload so run_agent can do the version
+    // handshake (fuse-client has always checked; the spawner must too).
+    let send = |name: &str, args: &str| -> Result<String, String> {
+        app.run_cli_command_raw(name, args)
+            .map(|(_, raw)| String::from_utf8_lossy(&raw).into_owned())
     };
 
     match run_agent(&mut io, &config, &send, cli.restart_container) {
