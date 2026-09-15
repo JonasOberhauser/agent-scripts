@@ -7,6 +7,7 @@ members = [
     "crates/run-agent",
     "crates/hashd",
     "crates/fuse-mount",
+    "crates/netrcd",
 ]
 
 [workspace.package]

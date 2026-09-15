@@ -1,0 +1,18 @@
+# /etc/systemd/system/netrcd.socket
+#
+# Socket activation: systemd owns a stable socket inode (survives
+# service restarts — bind-mount the DIRECTORY into containers), the
+# service starts on first connection.
+#
+# SocketMode: connect(2) needs WRITE permission — 0666 so every
+# container client may ask (authorization is per-request, in policy).
+
+[Unit]
+Description=netrcd credential broker socket
+
+[Socket]
+ListenStream=/run/netrcd/netrcd.sock
+SocketMode=0666
+
+[Install]
+WantedBy=sockets.target
