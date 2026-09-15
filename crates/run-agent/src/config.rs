@@ -19,6 +19,8 @@ pub enum Runtime {
 
 /// Returns the Unix UID of the current process.
 fn current_uid() -> u32 {
+    // SAFETY: getuid(2) is a pure FFI getter with no preconditions,
+    // no pointers, and no failure mode on Linux.
     unsafe { libc::getuid() }
 }
 

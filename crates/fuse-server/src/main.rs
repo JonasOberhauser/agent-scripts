@@ -47,11 +47,17 @@ static CLEANUP_SOCKETS: OnceLock<(std::ffi::CString, std::ffi::CString)> = OnceL
 
 extern "C" fn shutdown_handler(_sig: libc::c_int) {
     if let Some((cmd, oracle)) = CLEANUP_SOCKETS.get() {
+        // SAFETY: signal-handler context — only unlink(2) (async-signal-
+        // safe) on CStrings precomputed before the handler was armed; no
+        // allocation, locks, or Rust runtime calls.
         unsafe {
             libc::unlink(cmd.as_ptr());
             libc::unlink(oracle.as_ptr());
         }
     }
+    // SAFETY: _exit(2) is the async-signal-safe way out of a handler; it
+    // intentionally skips atexit/destructors to avoid non-signal-safe
+    // cleanup in this context.
     unsafe { libc::_exit(130); }
 }
 
@@ -131,6 +137,10 @@ fn main() {
     ) {
         CLEANUP_SOCKETS.set((a, b)).ok();
     }
+    // SAFETY: the registered handler performs only async-signal-safe
+    // operations (see its own SAFETY note); signal(2) stores the raw
+    // handler address, which outlives the process lifetime (a static
+    // extern "C" fn).
     unsafe {
         libc::signal(libc::SIGINT, shutdown_handler as *const () as usize);
         libc::signal(libc::SIGTERM, shutdown_handler as *const () as usize);

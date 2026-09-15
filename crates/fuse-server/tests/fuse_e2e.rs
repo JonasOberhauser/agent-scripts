@@ -12,7 +12,7 @@
 
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -128,6 +128,12 @@ impl Split {
         std::fs::create_dir_all(&mount).unwrap();
         let socket = dirs[1].path().join("cmd.sock");
         let oracle = dirs[2].path().join("oracle.sock");
+        // Daemon output goes to files, not /dev/null: a failing mount
+        // or a broken control loop must be DIAGNOSABLE from the test
+        // failure, not guessed at (#39 — "content sync broken" hid
+        // `fusermount3: mount failed: Operation not permitted`).
+        let server_log = std::fs::File::create(dirs[1].path().join("server.log")).unwrap();
+        let fused_log = std::fs::File::create(dirs[2].path().join("fused.log")).unwrap();
 
         // The policy daemon loads secrets from files (--secret N:F:H).
         let secret_dir = tempfile::tempdir().unwrap();
@@ -149,7 +155,7 @@ impl Split {
             ));
         }
         let policy = policy
-            .stdout(Stdio::null()).stderr(Stdio::null())
+            .stdout(server_log.try_clone().unwrap()).stderr(server_log)
             .spawn()
             .expect("spawn fuse-server (policy)");
 
@@ -159,12 +165,12 @@ impl Split {
         let data = Command::new(bin("fused"))
             .arg("--mount-point").arg(&mount)
             .arg("--oracle-socket").arg(&oracle)
-            .env("RUST_LOG", "error")
-            .stdout(Stdio::null()).stderr(Stdio::null())
+            .env("RUST_LOG", "info")
+            .stdout(fused_log.try_clone().unwrap()).stderr(fused_log)
             .spawn()
             .expect("spawn fused (data daemon)");
 
-        wait_mount(&mount);
+        wait_mount(&mount, &dirs);
         // Wait until the content snapshot has landed in the data daemon.
         for (name, _, _) in secrets {
             let target = mount.join(name);
@@ -209,15 +215,90 @@ fn wait_connect(path: &Path, what: &str) {
     panic!("{what} never came up at {}", path.display());
 }
 
-fn wait_mount(mount: &Path) {
+fn wait_mount(mount: &Path, dirs: &[tempfile::TempDir]) {
+    // The mountpoint DIRECTORY always exists (we made it) — checking
+    // read_dir() would pass trivially with no mount at all and later
+    // surface as a misleading "content sync broken" (#39). Verify the
+    // kernel actually has a FUSE mount on the path.
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
-        if std::fs::read_dir(mount).is_ok() {
+        if mounted_fuse(mount) {
             return;
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    panic!("mount never came up at {}", mount.display());
+    panic!(
+        "FUSE mount never came up at {} — /dev/fuse present: {}, fusermount3: {}\
+         \n--- env ---\n{}--- server.log ---\n{}--- fused.log ---\n{}",
+        mount.display(),
+        Path::new("/dev/fuse").exists(),
+        fusermount3_state(),
+        probe_env(),
+        log_tail(dirs.get(1).map(|d| d.path().join("server.log")).as_deref()),
+        log_tail(dirs.get(2).map(|d| d.path().join("fused.log")).as_deref()),
+    );
+}
+
+/// fusermount3 presence + permission bits: mounting as a non-root user
+/// needs the setuid bit (or the direct-mount fallback needs root +
+/// CAP_SYS_ADMIN). A stripped setuid bit is a classic silent killer.
+fn fusermount3_state() -> String {
+    use std::os::unix::fs::MetadataExt;
+    match std::fs::metadata("/usr/bin/fusermount3") {
+        Ok(m) => {
+            let mode = m.mode();
+            format!(
+                "present, mode {:o}, uid {} (setuid: {})",
+                mode,
+                m.uid(),
+                mode & 0o4000 != 0
+            )
+        }
+        Err(_) => String::from("absent"),
+    }
+}
+
+fn probe_env() -> String {
+    let id = Command::new("id").output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_else(|e| format!("id failed: {e}"));
+    let caps = Command::new("sh")
+        .args(["-c", "grep '^Cap' /proc/self/status"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    format!("{id}\n{caps}\n")
+}
+
+/// Whether the kernel has a FUSE mount ON this exact path: statfs(2)
+/// reports FUSE_SUPER_MAGIC for the filesystem covering the path — a
+/// kernel-standardized ABI answer with no mounts-table format to
+/// parse (field order/escaping bugs cannot happen here). An unmounted
+/// mountpoint reports its parent filesystem instead (e.g. tmpfs).
+fn mounted_fuse(path: &Path) -> bool {
+    let c = match std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    // SAFETY: libc::statfs is a struct of plain integers/arrays with no
+    // invalid zero bit patterns; zero-init is a valid value.
+    let mut st = unsafe { std::mem::zeroed::<libc::statfs>() };
+    // SAFETY: the path is a valid NUL-terminated CString owned by `c`
+    // and `st` is a valid, aligned out-pointer for the duration of the call.
+    unsafe { libc::statfs(c.as_ptr(), &mut st) == 0 && st.f_type == libc::FUSE_SUPER_MAGIC }
+}
+
+fn log_tail(path: Option<&Path>) -> String {
+    match path.and_then(|p| std::fs::read_to_string(p).ok()) {
+        Some(s) => {
+            let lines: Vec<&str> = s.lines().collect();
+            let start = lines.len().saturating_sub(25);
+            let mut out = lines[start..].join("\n");
+            out.push('\n');
+            out
+        }
+        None => String::from("(no log)\n"),
+    }
 }
 
 fn write_out(out: &std::process::Output) -> String {

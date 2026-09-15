@@ -865,6 +865,8 @@ fn run_with_wrapper<S: SystemIo>(
 /// Ask an interactive user `prompt` (y/N) with a 10s countdown.  No TTY,
 /// timeout, or anything but an affirmative answer counts as No.
 fn prompt_yes_no(prompt: &str) -> bool {
+    // SAFETY: isatty(2) is a pure FFI probe on a constant fd with no
+    // preconditions and no failure mode beyond a negative return.
     if unsafe { libc::isatty(libc::STDIN_FILENO) } != 1 {
         return false;
     }
