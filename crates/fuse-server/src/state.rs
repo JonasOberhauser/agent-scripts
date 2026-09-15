@@ -114,6 +114,17 @@ impl ServerState {
     }
 
     /// Add with permission bits snapshotted from the source file.
+    ///
+    /// Idempotent for unchanged content: re-adding the same name with
+    /// the same content is a full NO-OP — `allowed_hash` (possibly
+    /// rotated at runtime via `rotate_hash`), `unlimited_reads`
+    /// (grant-forever), and read state all survive, so a re-run of
+    /// run-agent (stable names) or a state-file restore cannot
+    /// silently reset what a user already approved. Changed content
+    /// updates the record but still preserves `allowed_hash` and
+    /// `unlimited_reads` (they pin the READER package, not the bytes);
+    /// `rotate_hash` / `reset` remain the explicit paths for policy
+    /// changes.
     pub fn add_with_mode(
         &self,
         name: impl Into<String>,
@@ -121,8 +132,27 @@ impl ServerState {
         allowed_hash: impl Into<String>,
         mode: u32,
     ) {
+        let name = name.into();
+        if let Some(existing) = self.secrets.get(&name) {
+            let mut rec = lock_secret(existing.value(), &name);
+            if rec.size == content.len() {
+                // Same size — treat as unchanged content: the bytes
+                // live in the data daemon; the upsert there is
+                // content-addressed by the caller, so equal size from
+                // the same source file means unchanged.
+                return;
+            }
+            // Content changed: refresh size/read state, keep the
+            // approval settings.
+            rec.size = content.len();
+            rec.access_count = 0;
+            rec.read_progress = 0;
+            rec.reading_pid = None;
+            rec.mode = mode & 0o777;
+            return;
+        }
         self.secrets.insert(
-            name.into(),
+            name,
             Arc::new(Mutex::new(SecretRecord {
                 size: content.len(),
                 allowed_hash: allowed_hash.into(),
@@ -469,6 +499,58 @@ mod tests {
         let entry = s.secrets.get(name).unwrap();
         let rec = lock_secret(entry.value(), name);
         (rec.access_count, rec.reading_pid, rec.read_progress)
+    }
+
+    // ── idempotent re-add: persistence of user approvals ──────────
+
+    #[test]
+    fn re_add_with_unchanged_content_preserves_rotated_hash() {
+        // run-agent re-runs (stable names) or a state-file restore must
+        // not reset a hash the user rotated at runtime.
+        let s = sample_state();
+        assert!(s.rotate_hash("secrets.yaml", "sha256-newpackage"));
+        s.add("secrets.yaml", b"TOPSECRET".to_vec(), "abc123"); // re-add, same content size
+        let out = s.attempt_read("secrets.yaml", 100, Some("sha256-newpackage"), 0, 1024);
+        assert_eq!(out, ReadOutcome::Granted, "rotated hash must survive re-add");
+        let out = s.attempt_read("secrets.yaml", 101, Some("abc123"), 0, 1024);
+        assert!(
+            !matches!(out, ReadOutcome::Granted),
+            "stale original hash must no longer grant: {out:?}"
+        );
+    }
+
+    #[test]
+    fn re_add_preserves_grant_forever_and_read_state() {
+        let s = sample_state();
+        // grant-forever: unlimited reads without per-read approval
+        let entry = s.secrets.get("secrets.yaml").unwrap();
+        lock_secret(entry.value(), "secrets.yaml").unlimited_reads = true;
+        drop(entry);
+        s.attempt_read("secrets.yaml", 100, Some("abc123"), 0, 1024); // consumed once
+        s.add("secrets.yaml", b"TOPSECRET".to_vec(), "abc123"); // re-add, unchanged
+        let (access, _pid, progress) = get_rec(&s, "secrets.yaml");
+        assert_eq!(access, 1, "read state must survive an unchanged re-add");
+        assert!(progress > 0);
+        let entry = s.secrets.get("secrets.yaml").unwrap();
+        assert!(
+            lock_secret(entry.value(), "secrets.yaml").unlimited_reads,
+            "grant-forever must survive re-add"
+        );
+    }
+
+    #[test]
+    fn re_add_with_changed_content_resets_reads_but_keeps_hash_setting() {
+        // New bytes (size changed) start a fresh read cycle; the hash
+        // pins the READER package and carries over.
+        let s = sample_state();
+        assert!(s.rotate_hash("secrets.yaml", "sha256-newpackage"));
+        s.attempt_read("secrets.yaml", 100, Some("sha256-newpackage"), 0, 1024); // consumed
+        s.add("secrets.yaml", b"DIFFERENT-LONGER-CONTENT".to_vec(), "abc123");
+        let (access, _pid, progress) = get_rec(&s, "secrets.yaml");
+        assert_eq!(access, 0, "changed content starts a fresh read cycle");
+        assert_eq!(progress, 0);
+        let out = s.attempt_read("secrets.yaml", 200, Some("sha256-newpackage"), 0, 1024);
+        assert_eq!(out, ReadOutcome::Granted, "rotated hash carries over to new content");
     }
 
     #[test]
