@@ -14,6 +14,13 @@ version = "0.27.1"
 edition = "2021"
 license = "MIT"
 
+[workspace.lints.clippy]
+# Every unsafe block must carry a // SAFETY: justification (review
+# directive, PR #41): restriction-group lint, denied workspace-wide so
+# the plain `cargo clippy -- -D warnings` step in CI enforces it with
+# no workflow changes; locally the same command catches it early.
+undocumented_unsafe_blocks = "deny"
+
 [workspace.dependencies]
 fuse-protocol = { path = "crates/fuse-protocol" }
 fuse-server = { path = "crates/fuse-server" }

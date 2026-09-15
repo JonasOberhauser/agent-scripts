@@ -224,6 +224,9 @@ impl SystemIo for RealSystemIo {
             }
         }
 
+        // SAFETY: `pre_exec` callbacks run between fork(2) and execve(2)
+        // and must be async-signal-safe; the closure only calls
+        // setsid(2) — no allocation, no locks, no libc state touched.
         unsafe {
             cmd.pre_exec(|| {
                 libc::setsid();

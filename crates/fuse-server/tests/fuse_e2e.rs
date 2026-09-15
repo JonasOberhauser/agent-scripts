@@ -280,7 +280,11 @@ fn mounted_fuse(path: &Path) -> bool {
         Ok(c) => c,
         Err(_) => return false,
     };
+    // SAFETY: libc::statfs is a struct of plain integers/arrays with no
+    // invalid zero bit patterns; zero-init is a valid value.
     let mut st = unsafe { std::mem::zeroed::<libc::statfs>() };
+    // SAFETY: the path is a valid NUL-terminated CString owned by `c`
+    // and `st` is a valid, aligned out-pointer for the duration of the call.
     unsafe { libc::statfs(c.as_ptr(), &mut st) == 0 && st.f_type == libc::FUSE_SUPER_MAGIC }
 }
 

@@ -22,3 +22,6 @@ tui-input = "0.10"
 
 [dev-dependencies]
 tempfile = "3"
+
+[lints]
+workspace = true
