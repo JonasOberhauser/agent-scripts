@@ -70,6 +70,87 @@ pub struct StateSecretEntry {
 /// Default permission bits for secrets whose sender does not carry the
 /// mode field (conservative read-only).  Shared by the client-facing
 /// `AddSecret` and the oracle `Upsert` wire formats.
+/// Collapse a set of path-shaped secret names to their first points
+/// of difference (issue #34): each path renders as `.../<differing
+/// components>/.../<basename>` — the common leading components are
+/// elided, components after the divergence are elided UNLESS needed
+/// for uniqueness, the basename always survives.
+///
+///   [foo/bar/x/x1/bar.txt, foo/bar/y/y1/y2/bar.txt, foo/bar/baz.txt]
+///     -> .../x/.../bar.txt, .../y/.../bar.txt, .../baz.txt
+///
+/// Pure function over the input set; deterministic order out (same
+/// as in).
+pub fn collapse_paths(paths: &[String]) -> Vec<String> {
+    // Dedup, keep order.
+    let mut set: Vec<String> = Vec::new();
+    for p in paths {
+        if !set.contains(p) {
+            set.push(p.clone());
+        }
+    }
+    let comps: Vec<Vec<&str>> = set.iter().map(|p| p.split('/').collect()).collect();
+    let n_paths = comps.len();
+
+    // Common leading components over the whole set.
+    let mut common = 0;
+    'outer: loop {
+        let first = match comps.first().and_then(|c| c.get(common)) {
+            Some(f) => *f,
+            None => break 'outer,
+        };
+        for c in comps.iter().skip(1) {
+            if c.get(common) != Some(&first) {
+                break 'outer;
+            }
+        }
+        common += 1;
+    }
+
+    set.iter()
+        .enumerate()
+        .map(|(i, _)| {
+            let c = &comps[i];
+            let n = c.len();
+            if n == 0 {
+                return String::new();
+            }
+            // Single path in the set: the basename alone identifies it.
+            if n_paths == 1 {
+                let tail = c[n - 1].to_string();
+                return if n > 1 { format!(".../{tail}") } else { tail };
+            }
+            // `common` never reaches n here: paths are distinct files,
+            // so they diverge before the last component.
+            let d = common.min(n - 1);
+            // Extend the divergent run until no OTHER path shares it.
+            let mut j = d;
+            while j + 1 < n {
+                let shared = comps.iter().enumerate().any(|(k, other)| {
+                    k != i
+                        && other.len() > j
+                        && other[d..=j.min(other.len() - 1)] == c[d..=j]
+                });
+                if !shared {
+                    break;
+                }
+                j += 1;
+            }
+            let run = c[d..=j].join("/");
+            let lead = if d > 0 { "..." } else { "" };
+            if n - 1 > j + 1 {
+                format!("{lead}/{run}/.../{}", c[n - 1])
+            } else if j < n - 1 {
+                format!("{lead}/{run}/{}", c[n - 1])
+            } else {
+                format!("{lead}/{run}")
+            }
+            .trim_start_matches('/')
+            .to_string()
+        })
+        .collect()
+}
+
 /// Whether a server version and a client version speak the same
 /// protocol: major and minor must match; the patch component is
 /// ignored by design (AGENTS.md) so patch releases never force a
@@ -163,6 +244,56 @@ pub enum Response {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn collapse_to_first_points_of_difference_issue_example_1() {
+        let got = collapse_paths(&[
+            "foo/bar/x/x1/bar.txt".to_string(),
+            "foo/bar/y/y1/y2/bar.txt".to_string(),
+            "foo/bar/baz.txt".to_string(),
+        ]);
+        assert_eq!(
+            got,
+            vec![
+                ".../x/.../bar.txt".to_string(),
+                ".../y/.../bar.txt".to_string(),
+                ".../baz.txt".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn collapse_to_first_points_of_difference_issue_example_2() {
+        let got = collapse_paths(&[
+            "foo/bar/x/x1/bar.txt".to_string(),
+            "foo/bar/y/y1/y2/bar.txt".to_string(),
+            "foo/bar/x/x2/bar.txt".to_string(),
+        ]);
+        assert_eq!(
+            got,
+            vec![
+                ".../x/x1/bar.txt".to_string(),
+                ".../y/.../bar.txt".to_string(),
+                ".../x/x2/bar.txt".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn collapse_degenerate_cases() {
+        // single short path: itself
+        assert_eq!(collapse_paths(&["a.txt".into()]), vec!["a.txt".to_string()]);
+        // single long path: elided prefix + basename
+        assert_eq!(
+            collapse_paths(&["a/b/c/d.txt".into()]),
+            vec![".../d.txt".to_string()]
+        );
+        // no common prefix: nothing elided at the front
+        assert_eq!(
+            collapse_paths(&["a/x.txt".into(), "b/y.txt".into()]),
+            vec!["a/x.txt".to_string(), "b/y.txt".to_string()]
+        );
+    }
+
     use super::*;
 
     #[test]
