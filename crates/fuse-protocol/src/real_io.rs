@@ -409,6 +409,11 @@ pub struct MockSystemIo {
     pub file_hashes: HashMap<String, String>,
     pub process_hashes: HashMap<u32, String>,
     pub command_stdout: String,
+    /// Stderr returned by every `run_command` call.  Real commands
+    /// report their failure reason here (`stat: cannot statx '…':
+    /// No such file or directory` etc.) — callers must be able to test
+    /// their handling of that text.
+    pub command_stderr: String,
     pub command_status: Option<i32>,
     pub command_results: HashMap<String, Option<i32>>,
     /// Argv-scoped command results: match when the program equals and any
@@ -505,6 +510,22 @@ impl MockSystemIo {
     /// `Some(non-zero)` = failure, `None` = command not found.
     pub fn with_command_result(mut self, program: &str, status: Option<i32>) -> Self {
         self.command_results.insert(program.to_string(), status);
+        self
+    }
+
+    /// Set the stdout text every `run_command` call reports (e.g. a
+    /// directory listing).
+    pub fn with_command_stdout(mut self, stdout: &str) -> Self {
+        self.command_stdout = stdout.to_string();
+        self
+    }
+
+    /// Set the stderr text every `run_command` call reports — e.g.
+    /// `stat: cannot statx '…': No such file or directory`.  Real
+    /// commands carry their failure reason here; callers must be able
+    /// to test their handling of that text.
+    pub fn with_command_stderr(mut self, stderr: &str) -> Self {
+        self.command_stderr = stderr.to_string();
         self
     }
 
@@ -695,7 +716,7 @@ impl SystemIo for MockSystemIo {
         }
         Ok(CommandOutput {
             stdout: self.command_stdout.clone(),
-            stderr: String::new(),
+            stderr: self.command_stderr.clone(),
             status,
         })
     }

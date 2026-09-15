@@ -1649,7 +1649,9 @@ mod tests {
         let adds = std::cell::Cell::new(0usize);
         let mut mock = base_mock()
             .with_file("/home/user/secrets.yaml", b"DATA")
-            .with_command_result_when_n("timeout", "/tmp/fgk-mnt/", Some(1), 1);
+            // Persistent through pre-flight's appear-retries, gone after
+            // the rebuild: exactly one full rebuild, then success.
+            .with_command_result_when_n("timeout", "/tmp/fgk-mnt/", Some(1), 8);
 
         let cfg = test_config();
         let result = run_agent(&mut mock, &cfg, &|name, _| {
@@ -1686,6 +1688,31 @@ mod tests {
         let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()), false);
         assert!(result.is_ok(), "got: {:?}", result.err());
         assert_eq!(mock.spawned.len(), 2, "the server must be respawned once");
+    }
+
+    #[test]
+    fn mount_appearing_late_needs_no_rebuild() {
+        // A freshly spawned data daemon can take a moment to mount.
+        // The stat must retry briefly and succeed WITHOUT tearing the
+        // stack apart (PR #37 follow-up: rebuilds healed nothing when
+        // the mount was merely late).
+        let mut mock = base_mock()
+            .with_file("/home/user/secrets.yaml", b"DATA")
+            .with_command_result_when_n("timeout", "/tmp/fgk-mnt/", Some(1), 3);
+
+        let cfg = test_config();
+        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(()), false);
+        assert!(result.is_ok(), "got: {:?}", result.err());
+        assert_eq!(
+            mock.spawned.len(),
+            1,
+            "a late mount must NOT trigger a stack rebuild"
+        );
+        let calls = mock.command_calls.borrow();
+        assert!(
+            !calls.iter().any(|(p, _)| p == "pkill"),
+            "no teardown may run for a late mount: {calls:?}"
+        );
     }
 
     #[test]
