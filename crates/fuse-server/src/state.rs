@@ -11,7 +11,10 @@ pub struct SecretRecord {
     /// Content lives in the data daemon (`fused`); the policy daemon
     /// tracks only the size it adjudicates offsets against.
     pub size: usize,
-    pub allowed_hash: String,
+    /// ALL permitted reader hashes (issue #34 MR2): several
+    /// containers/packages may be pre-approved for the same file.
+    /// "*" is the wildcard entry (any reader).
+    pub allowed_hashes: Vec<String>,
     pub access_count: u64,
     pub reading_pid: Option<u32>,
     pub read_progress: usize,
@@ -137,8 +140,17 @@ impl ServerState {
         mode: u32,
     ) {
         let name = name.into();
+        let hash = allowed_hash.into();
         if let Some(existing) = self.secrets.get(&name) {
             let mut rec = lock_secret(existing.value(), &name);
+            // MR2: the incoming hash JOINS the permitted set — a second
+            // container pinning a different reader package must not
+            // evict the first one's approval.
+            if !rec.allowed_hashes.iter().any(|h| h == &hash) {
+                rec.allowed_hashes.push(hash.clone());
+            }
+            // Plain overwrite (no change detection, see MR1): refresh
+            // only the adjudication facts.
             rec.size = content.len();
             rec.mode = mode & 0o777;
             return;
@@ -147,7 +159,7 @@ impl ServerState {
             name,
             Arc::new(Mutex::new(SecretRecord {
                 size: content.len(),
-                allowed_hash: allowed_hash.into(),
+                allowed_hashes: vec![hash],
                 access_count: 0,
                 reading_pid: None,
                 read_progress: 0,
@@ -191,9 +203,10 @@ impl ServerState {
         }
 
         let hash_ok = match pid_hash {
-            Some(_) if rec.allowed_hash == "*" => true,
-            Some(h) if h == rec.allowed_hash => true,
-            _ => rec.allowed_hash == "*",
+            Some(h) => {
+                rec.allowed_hashes.iter().any(|allowed| allowed == "*" || allowed == h)
+            }
+            None => rec.allowed_hashes.iter().any(|allowed| allowed == "*"),
         };
 
         if hash_ok {
@@ -205,7 +218,7 @@ impl ServerState {
         } else {
             ReadOutcome::HashMismatch {
                 got: pid_hash.unwrap_or("<unknown>").to_string(),
-                expected: rec.allowed_hash.clone(),
+                expected: rec.allowed_hashes.join(" | "),
             }
         }
     }
@@ -242,12 +255,14 @@ impl ServerState {
         }
     }
 
+    /// Replace the permitted-hash set with a single hash — the
+    /// explicit policy path (`rotate`); re-adds APPEND instead.
     pub fn rotate_hash(&self, name: &str, new_hash: &str) -> bool {
         if let Some(entry) = self.secrets.get(name) {
             let rec_arc = Arc::clone(entry.value());
             drop(entry);
             let mut rec = lock_secret(&rec_arc, name);
-            rec.allowed_hash = new_hash.to_string();
+            rec.allowed_hashes = vec![new_hash.to_string()];
             true
         } else {
             false
@@ -370,7 +385,9 @@ impl ServerState {
                 "grant-forever {id}: whitelisting package {} for '{secret_name}' (unlimited reads)",
                 &package_hash[..package_hash.len().min(12)]
             );
-            rec.allowed_hash = package_hash;
+            if !rec.allowed_hashes.iter().any(|h| h == &package_hash) {
+                rec.allowed_hashes.push(package_hash.clone());
+            }
             rec.unlimited_reads = true;
         } else {
             return Err(format!("secret {secret_name} no longer exists"));
@@ -454,7 +471,7 @@ impl ServerState {
             fuse_protocol::SecretStatus {
                 name: name.clone(),
                 access_count: rec.access_count,
-                allowed_hash: rec.allowed_hash.clone(),
+                allowed_hash: rec.allowed_hashes.join(" | "),
                 size: rec.size,
                 unlimited: rec.unlimited_reads,
             }
@@ -494,6 +511,56 @@ mod tests {
     }
 
     // ── idempotent re-add: persistence of user approvals ──────────
+
+    #[test]
+    fn re_add_with_a_new_hash_joins_the_permitted_set() {
+        // Issue #34 MR2: a second container pinning a different reader
+        // package must not evict the first approval.
+        let s = sample_state(); // "secrets.yaml" permitted for "abc123"
+        s.add("secrets.yaml", b"TOPSECRET".to_vec(), "sha256-other");
+        assert_eq!(
+            s.attempt_read("secrets.yaml", 100, Some("abc123"), 0, 1024),
+            ReadOutcome::Granted,
+            "the original hash still grants"
+        );
+        // one-read-per-secret: reset the cycle, then the APPENDED
+        // hash must carry the next read.
+        s.reset(Some("secrets.yaml"));
+        assert_eq!(
+            s.attempt_read("secrets.yaml", 200, Some("sha256-other"), 0, 1024),
+            ReadOutcome::Granted,
+            "the appended hash grants the next read cycle"
+        );
+    }
+
+    #[test]
+    fn rotate_replaces_the_whole_set() {
+        let s = sample_state();
+        s.add("secrets.yaml", b"TOPSECRET".to_vec(), "sha256-other");
+        assert!(s.rotate_hash("secrets.yaml", "sha256-final"));
+        assert_ne!(
+            s.attempt_read("secrets.yaml", 100, Some("abc123"), 0, 1024),
+            ReadOutcome::Granted,
+            "rotate evicts previous approvals — explicit policy path"
+        );
+        assert_eq!(
+            s.attempt_read("secrets.yaml", 101, Some("sha256-final"), 0, 1024),
+            ReadOutcome::Granted
+        );
+    }
+
+    #[test]
+    fn mismatch_message_lists_all_permitted_hashes() {
+        let s = sample_state();
+        s.add("secrets.yaml", b"TOPSECRET".to_vec(), "sha256-other");
+        match s.attempt_read("secrets.yaml", 100, Some("wrong"), 0, 1024) {
+            ReadOutcome::HashMismatch { expected, .. } => {
+                assert!(expected.contains("abc123") && expected.contains("sha256-other"),
+                    "denial names every permitted hash: {expected}");
+            }
+            other => panic!("expected mismatch, got {other:?}"),
+        }
+    }
 
     #[test]
     fn re_add_with_unchanged_content_preserves_rotated_hash() {
