@@ -489,6 +489,7 @@ impl Filesystem for FusedFs {
 
     fn lookup(&mut self, req: &Request<'_>, parent: u64, name: &std::ffi::OsStr, reply: ReplyEntry) {
         let Some((fino, is_dir)) = self.store.child(parent, name) else {
+            tracing::info!("lookup {:?}: no such tree child", name);
             reply.error(libc::ENOENT);
             return;
         };
@@ -507,6 +508,10 @@ impl Filesystem for FusedFs {
                 // Keep the fino for the same incarnation; a changed
                 // host file mints a new number — fresh lookups (like
                 // this one) answer the NEW identity.
+                tracing::info!(
+                    "lookup {:?}: stat ok dev={kdev} ino={kino} size={size} mode={mode:o} (recorded dev={} ino={})",
+                    name, f.kdev, f.kino
+                );
                 if let Some(nf) = self.store.observe(&f.path, kdev, kino) {
                     let attr = self.file_attr(nf, size, req.uid(), req.gid(), mode);
                     reply.entry(&TTL, &attr, 0);
@@ -514,7 +519,10 @@ impl Filesystem for FusedFs {
                     reply.error(libc::ENOENT);
                 }
             }
-            Ok(_) => reply.error(libc::ENOENT),
+            Ok(other) => {
+                tracing::info!("lookup {:?}: stat said {other:?}", name);
+                reply.error(libc::ENOENT);
+            }
             Err(e) => {
                 // Server unreachable: attrs cannot be fabricated —
                 // fail loudly rather than serve stale metadata.
@@ -589,6 +597,7 @@ impl Filesystem for FusedFs {
             return;
         }
         let name = f.path.to_string_lossy().into_owned();
+        tracing::info!("open {name}: ino={ino} pid={} recorded dev={} ino={}", req.pid(), f.kdev, f.kino);
         match open_secret(&self.oracle, &name, req.pid(), f.kdev, f.kino) {
             Ok((OracleReply::Allow, Some(fd))) => {
                 use std::os::fd::AsRawFd;

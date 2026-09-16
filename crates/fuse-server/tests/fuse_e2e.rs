@@ -142,7 +142,7 @@ impl Split {
             .arg("--socket").arg(&socket)
             .arg("--oracle-socket").arg(&oracle)
             .arg("--pending-timeout").arg("5")
-            .env("RUST_LOG", "error");
+            .env("RUST_LOG", "fuse_mount=info,fuse_server=info");
         if let Some(sock) = hashd_sock {
             policy.env("FUSE_HASHD_SOCK", sock);
         }
@@ -226,7 +226,7 @@ impl Split {
         Command::new(bin("fuse-client"))
             .arg("--socket").arg(&self.socket)
             .args(args)
-            .env("RUST_LOG", "error")
+            .env("RUST_LOG", "fuse_mount=info,fuse_server=info")
             .output()
             .expect("run fuse-client")
     }
