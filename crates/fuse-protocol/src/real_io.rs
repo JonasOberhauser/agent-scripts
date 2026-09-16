@@ -122,6 +122,9 @@ impl RealSystemIo {
 }
 
 impl SystemIo for RealSystemIo {
+    fn canonicalize(&self, path: &Path) -> Result<PathBuf, IoError> {
+        Ok(std::fs::canonicalize(path)?)
+    }
     fn read_file(&self, path: &Path) -> Result<Vec<u8>, IoError> {
         Ok(std::fs::read(path)?)
     }
@@ -581,6 +584,20 @@ impl MockSystemIo {
 }
 
 impl SystemIo for MockSystemIo {
+    fn canonicalize(&self, path: &Path) -> Result<PathBuf, IoError> {
+        // Models existence; the real impl additionally resolves
+        // symlinks — that is exactly why normalization must go
+        // through here rather than string work.
+        let key = path.to_string_lossy().to_string();
+        if self.files.contains_key(&key) || self.dirs.contains(&key) {
+            Ok(path.to_path_buf())
+        } else {
+            Err(crate::error::IoError(format!(
+                "canonicalize {}: no such file or directory",
+                path.display()
+            )))
+        }
+    }
     fn read_file(&self, path: &Path) -> Result<Vec<u8>, IoError> {
         self.files
             .get(&path.to_string_lossy().to_string())

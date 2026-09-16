@@ -506,14 +506,12 @@ where
         }
 
         // ── 4. Expand + load secrets into FUSE ───────────────────────
-        let pid = std::process::id();
-        let mut counter = 0usize;
         let mut loaded: Vec<LoadedSecret> = Vec::new();
 
         for mapping in &config.secrets {
             load_secret_recursive(
                 io, send, &mapping.host, &mapping.container,
-                config, pid, &mut counter, &mut loaded,
+                config, &mut loaded,
             )?;
         }
 
@@ -730,36 +728,55 @@ pub(crate) struct LoadedSecret {
 /// FUSE-visible secret name carrying the sanitized host file name
 /// (issue #18): recognizable in /fuse listings and pending requests,
 /// while the pid/counter prefix keeps it collision-free.
-fn secret_name(host: &Path, pid: u32, counter: usize) -> String {
-    let safe: String = host
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_default()
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
-                c
-            } else {
-                '_'
+/// Stable secret name for a host file (issue #34): the NORMALIZED
+/// HOST PATH itself, sanitized per component — `home/u/.config/goose/
+/// auth.json`, leading root stripped, components joined with `/`.
+///
+/// Normalized paths are unique by construction, so no uniquifiers
+/// (PID prefixes, counters, digests) are needed. The same file maps
+/// to the same name from every container and across restarts, which
+/// is what keeps name-keyed settings attached; `fused` materializes
+/// the intermediate directories implicitly. The derivation is purely
+/// lexical — symlinked host paths count as distinct files.
+fn secret_name(host: &Path) -> String {
+    let mut comps: Vec<String> = Vec::new();
+    for c in host.components() {
+        match c {
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {}
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                // lexical normalization: `a/../b` -> `b`
+                comps.pop();
             }
-        })
-        .collect();
-    if safe.is_empty() {
-        format!("p{pid}_s{counter}")
+            std::path::Component::Normal(part) => {
+                let raw = part.to_string_lossy();
+                let safe: String = raw
+                    .chars()
+                    .map(|ch| {
+                        if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
+                            ch
+                        } else {
+                            '_'
+                        }
+                    })
+                    .collect();
+                comps.push(if safe.is_empty() { "_".to_string() } else { safe });
+            }
+        }
+    }
+    if comps.is_empty() {
+        "secret".to_string()
     } else {
-        format!("p{pid}_s{counter}_{safe}")
+        comps.join("/")
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn load_secret_recursive<S, F>(
     io: &mut S,
     send: &F,
     host: &Path,
     container: &Path,
     config: &AgentConfig,
-    pid: u32,
-    counter: &mut usize,
     loaded: &mut Vec<LoadedSecret>,
 ) -> Result<(), String>
 where
@@ -776,7 +793,7 @@ where
                 .ok_or_else(|| format!("invalid path: {}", entry.display()))?;
             load_secret_recursive(
                 io, send, &entry, &container.join(name),
-                config, pid, counter, loaded,
+                config, loaded,
             )?;
         }
         return Ok(());
@@ -786,12 +803,16 @@ where
     // cp semantics: if container ends with '/', it's a directory destination.
     let dest = resolve_dest(host, container);
 
-    // Names carry the host file name (issue #18): p{pid}_s{n}_{file}
-    // so /fuse listings and pending requests are recognizable.  The
-    // pid/counter prefix keeps names collision-free even when two
-    // secrets share a file name.
-    let fuse_name = secret_name(host, pid, *counter);
-    *counter += 1;
+    // Stable names (see secret_name): derived from the host path, so
+    // restarts reuse the same secret — grants and hash settings stay
+    // attached — and the same file can be shared between containers.
+    // Normalization is realpath — OS-resolved, symlinks included —
+    // so the SAME file always lands on the same name regardless of
+    // how the mapping spelled its path.
+    let canonical = io.canonicalize(host).map_err(|e| {
+        format!("cannot resolve secret path {}: {e}", host.display())
+    })?;
+    let fuse_name = secret_name(&canonical);
 
     let args = format!("{} {} {}", fuse_name, host.display(), config.binary_hash);
     send("add", &args)
@@ -1271,20 +1292,71 @@ mod tests {
     // ── secret naming (#18) ────────────────────────────────────────
 
     #[test]
-    fn secret_name_carries_the_host_file_name() {
-        let n = secret_name(Path::new("/home/u/.config/goose/auth.json"), 42, 0);
-        assert_eq!(n, "p42_s0_auth.json");
+    fn secret_name_is_the_normalized_host_path() {
+        // Issue #34: the path itself, no uniquifiers — stable across
+        // instances and restarts, so name-keyed settings persist and
+        // containers can share files.
+        let a = secret_name(Path::new("/home/u/.config/goose/auth.json"));
+        let b = secret_name(Path::new("/home/u/.config/goose/auth.json"));
+        assert_eq!(a, b);
+        assert_eq!(a, "home/u/.config/goose/auth.json");
     }
 
     #[test]
-    fn secret_name_sanitizes_unsafe_characters() {
-        let n = secret_name(Path::new("/x/my key! v2.bin"), 7, 3);
-        assert_eq!(n, "p7_s3_my_key__v2.bin");
+    fn secret_name_sanitizes_each_component_of_a_canonical_path() {
+        // Input contract: the path is CANONICAL (realpath-resolved by
+        // the caller) — only Normal components, nothing to normalize.
+        assert_eq!(
+            secret_name(Path::new("/home/u/my key!/v2.bin")),
+            "home/u/my_key_/v2.bin",
+            "each component sanitized in place, structure preserved"
+        );
+        assert_eq!(secret_name(Path::new("/")), "secret");
     }
 
     #[test]
-    fn secret_name_falls_back_when_no_file_name() {
-        assert_eq!(secret_name(Path::new("/"), 9, 1), "p9_s1");
+    fn naming_normalizes_via_the_os_before_the_name_is_built() {
+        // The load path must run SystemIo::canonicalize — symlinked
+        // and oddly-spelled mappings of the same file converge on one
+        // name (issue #34: "normalized host paths").
+        let mut mock = base_mock().with_file("/home/user/secrets.yaml", b"DATA");
+        mock.files.insert("/link/to/secrets.yaml".into(), b"DATA".to_vec());
+        let cfg = test_config();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = std::sync::Arc::clone(&seen);
+        let f = move |name: &str, args: &str| -> Result<String, String> {
+            if name == "add" {
+                sink.lock().unwrap().push(
+                    args.split_whitespace().next().unwrap_or_default().to_string(),
+                );
+            }
+            Ok(String::new())
+        };
+        let _ = run_agent(&mut mock, &cfg, &f, false);
+        let seen = seen.lock().unwrap();
+        assert!(
+            seen.iter().all(|n| n.starts_with("home/")),
+            "names derive from canonical paths: {seen:?}"
+        );
+    }
+
+    #[test]
+    fn same_basename_different_paths_stay_distinct_without_uniquifiers() {
+        let a = secret_name(Path::new("/secrets/a/token"));
+        let b = secret_name(Path::new("/keys/token"));
+        assert_eq!(a, "secrets/a/token");
+        assert_eq!(b, "keys/token");
+        assert_ne!(a, b, "full paths are unique by construction");
+    }
+
+    #[test]
+    fn secret_name_serves_a_directory_tree_in_the_mount() {
+        // fused materializes intermediate directories from the path:
+        // the container-side symlink target /fuse/<name> must be a
+        // walkable nested path.
+        let n = secret_name(Path::new("/home/u/.ssh/id_ed25519"));
+        assert!(n.contains('/'), "nested: {n}");
+        assert!(n.ends_with("id_ed25519"));
     }
 
     // ── run_agent integration ────────────────────────────────────
@@ -2183,9 +2255,10 @@ mod tests {
                 && probe.1.contains(&"stat".to_string()),
             "probe must be `timeout stat`: {probe:?}"
         );
+        let expected = format!("/fuse/{}", secret_name(Path::new("/home/user/secrets.yaml")));
         assert!(
-            probe.1.iter().any(|a| a.contains("/fuse/p")),
-            "probe must stat the fuse-side secret path: {probe:?}"
+            probe.1.contains(&expected),
+            "probe must stat the fuse-side secret path ({expected}): {probe:?}"
         );
     }
 

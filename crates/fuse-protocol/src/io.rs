@@ -39,6 +39,10 @@ pub enum PathState {
 /// Filesystem, process, and hashing operations — the non-generic half of
 /// [`IoProvider`].
 pub trait SystemIo {
+    /// Real path normalization (realpath(3)): resolves symlinks and
+    /// `..` against the ACTUAL filesystem, requires the path to
+    /// exist. Normalization is the OS's job — never hand-rolled.
+    fn canonicalize(&self, path: &Path) -> Result<PathBuf, IoError>;
     fn read_file(&self, path: &Path) -> Result<Vec<u8>, IoError>;
     fn write_file(&mut self, path: &Path, data: &[u8]) -> Result<(), IoError>;
     fn set_file_mode(&self, path: &Path, mode: u32) -> Result<(), IoError>;
