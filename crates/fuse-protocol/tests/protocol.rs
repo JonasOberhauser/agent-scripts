@@ -30,7 +30,7 @@ mod tests {
     fn add_secret_without_mode_uses_conservative_default() {
         // Old clients do not send the mode field: it must deserialize to
         // the conservative 0400 rather than fail the whole command.
-        let old = r#"{"type":"add_secret","name":"t","content":[1],"hash":"h"}"#;
+        let old = r#"{"type":"add_secret","name":"t","path":"/tmp/t.bin","hash":"h"}"#;
         let back: Command = serde_json::from_str(old).unwrap();
         match back {
             Command::AddSecret { mode, .. } => assert_eq!(mode, 0o400),
