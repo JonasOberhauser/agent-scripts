@@ -312,6 +312,114 @@ A binary that gets grant-forever should be built to:
    actions on the container's behalf, so the secret never enters the
    container at all.
 
+## netrcd — the host-side credential broker
+
+Containers hold no long-lived API credentials. `netrcd` listens on a
+unix socket (bind-mount the **directory**, not the socket file — a
+bind-mounted file pins the inode and breaks across restarts); clients
+send one JSON line per request:
+
+```text
+→ {"op":"request","machine":"api.github.com","method":"GET","url":"/zen"}
+← {"op":"response","status":200,"headers":{…},"body":"…"}
+← {"op":"error","code":"not_allowed","detail":"no rule matches …"}
+```
+
+The daemon joins the request with a **netrc** (the secret, host-side
+only) and a two-layer policy, performs the pinned HTTPS call itself,
+and returns the response. The credential's only journey is
+netrc → Authorization header → TLS, entirely on the host.
+
+Two config layers, TOML, typed structs (`deny_unknown_fields`,
+compile-at-load regexes and pins):
+
+```toml
+# /etc/netrcd/profiles.d/api.github.com.toml — shared FACTS
+[[machine]]
+name = "api.github.com"
+auth = "bearer"                       # basic | bearer | header: <Name>: <{login}/{password} template>
+pins = ["sha256//…", "sha256//…"]     # any-of SPKI pins; absent = ordinary CA validation
+
+  [machine.headers]
+  "X-GitHub-Api-Version" = "2022-11-28"
+
+# ~/.config/netrcd/config.d/api.github.com.toml — user GRANTS
+# (limits BEFORE [[machine.allow]] — TOML keys bind to the last open table)
+[[machine]]
+name = "api.github.com"
+rate = "30/min"
+max_req = "1 MiB"
+timeout = "30s"
+
+  [[machine.allow]]
+  method = "POST"                     # GET/POST/… or * (closed vocabulary)
+  url = '/repos/[^/]+/pulls'          # auto-anchored whole-match
+  headers = ['Content-Type: application/json']   # find-match, AND within a rule
+  body = ['"model":"gpt-4o[^"]*"']               # find-match; anchor with ^…$ for exact
+```
+
+Merging: machines spanning files merge when compatible (warning);
+conflicting values refuse only that machine. Fail-closed everywhere:
+unknown machine / no grant / no credential / oversized / pin mismatch
+are typed errors — never a guess, never a secret.
+
+Deploy (socket activation keeps the inode stable across restarts):
+
+```sh
+sudo install -m 755 target/release/netrcd /usr/local/bin/netrcd
+sudo install -m 644 crates/netrcd/netrcd.socket crates/netrcd/netrcd.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now netrcd.socket
+```
+
+In-container client:
+
+```sh
+NETRCD_SOCK=/netrcd/netrcd.sock nrq GET api.github.com /zen
+```
+
+**SELinux on enforcing Fedora — two deployment paths:**
+
+*Rootless (recommended; zero sudo, zero policy fights).* Run the
+daemon itself as a container, pinned to a fixed MCS level — stock
+policy allows `container_t -> container_t` socket connects *within
+the same category pair*, and podman's random per-container levels are
+the only thing standing in the way. Pinning daemon and clients to
+e.g. `s0:c100,c200` legalizes the connect with no policy edits:
+
+```sh
+./crates/netrcd/deploy-rootless.sh            # builds image, installs quadlet unit
+systemctl --user status netrcd.service        # rootless systemd, Restart=always
+# client containers — the ONLY extras are the level and the socket dir:
+podman run --rm --security-opt label=level=s0:c100,c200 \
+  -v ~/.local/share/netrcd/socket:/netrcd:Z localhost/netrcd:latest \
+  env NETRCD_SOCK=/netrcd/netrcd.sock nrq GET api.github.com /zen
+```
+
+The credential lives as a copy under `~/.local/share/netrcd/creds/`
+(mounted read-only into the daemon only); clients mount the socket
+dir, which contains no credentials. Rotate by re-running the deploy
+script (it refreshes the copy) — the daemon re-reads on SIGHUP.
+
+*System unit (admin-managed deployments) — two separate gates, both required:*
+
+1. **Path labels** — `container_t` cannot touch host `/run` or home
+   types. Bind-mount the socket DIRECTORY with `:Z` (relabels to
+   `container_file_t`; files created later inherit it):
+   `-v /run/netrcd:/netrcd:Z`. Never mount the socket FILE itself
+   (bind mounts pin the inode; restarts orphan it).
+2. **Socket object label** — `connect(2)` additionally checks
+   `container_t -> <creator domain>:unix_stream_socket connectto`
+   against the KERNEL socket object, which carries the daemon's
+   process context; the socket file's label is irrelevant to this
+   gate (verified live: a fully `container_file_t`-labeled socket was
+   still `EACCES` until the daemon ran under a connectable context).
+   The shipped unit sets `SELinuxContext=...container_runtime_t`
+   (the context podman's own socket uses). Consequence: that context
+   cannot read `user_home_t` credentials — keep the netrc where it
+   may read it (e.g. `/etc/netrcd/`); NEVER relabel the secret itself
+   (`container_file_t` credentials would be readable by every
+   container).
+
 ## Project layout
 
 ```
@@ -321,7 +429,8 @@ agents/
 │   ├── fuse-protocol/         # shared types + IoProvider<I,O> trait
 │   ├── fuse-server/           # FUSE filesystem + socket server
 │   ├── fuse-client/           # CLI client
-│   └── run-agent/             # orchestrator
+│   ├── run-agent/             # orchestrator
+│   └── netrcd/               # host-side credential broker
 ├── Dockerfile                 # agentbox container image
 └── run-agent.sh               # original bash version (kept for reference)
 ```

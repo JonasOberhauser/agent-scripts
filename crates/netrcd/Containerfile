@@ -1,0 +1,25 @@
+# Build from the REPO ROOT:
+#   podman build -f crates/netrcd/Containerfile -t localhost/netrcd:latest .
+#
+# Builder is FULL rust:1, deliberately not rust:1-slim: the vendored
+# OpenSSL (static-ssl) needs perl with FindBin.pm (slim ships only
+# perl-base), make (slim has none) and cc. Two slim iterations failed
+# on exactly those; the full image ships them all.
+FROM docker.io/library/rust:1 AS build
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ crates/
+RUN cargo build --release --bin netrcd --bin nrq
+
+FROM quay.io/fedora/fedora-minimal:41
+# CA bundle for TLS verification: the daemon probes well-known paths
+# (see exec.rs pick_ca), this guarantees one exists. The vendored
+# curl's baked-in path is the BUILD host's Debian path and is wrong
+# here by construction.
+RUN microdnf -y install ca-certificates && microdnf clean all
+COPY --from=build /build/target/release/netrcd /usr/local/bin/netrcd
+COPY --from=build /build/target/release/nrq /usr/local/bin/nrq
+# No USER directive: under rootless podman, host-owned volumes map to
+# container uid 0 (the host user) — running as 1000 would be denied
+# writing the socket.
+ENTRYPOINT ["/usr/local/bin/netrcd"]
