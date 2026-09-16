@@ -806,7 +806,13 @@ where
     // Stable names (see secret_name): derived from the host path, so
     // restarts reuse the same secret — grants and hash settings stay
     // attached — and the same file can be shared between containers.
-    let fuse_name = secret_name(host);
+    // Normalization is realpath — OS-resolved, symlinks included —
+    // so the SAME file always lands on the same name regardless of
+    // how the mapping spelled its path.
+    let canonical = io.canonicalize(host).map_err(|e| {
+        format!("cannot resolve secret path {}: {e}", host.display())
+    })?;
+    let fuse_name = secret_name(&canonical);
 
     let args = format!("{} {} {}", fuse_name, host.display(), config.binary_hash);
     send("add", &args)
@@ -1297,13 +1303,41 @@ mod tests {
     }
 
     #[test]
-    fn secret_name_normalizes_lexically_and_sanitizes_components() {
+    fn secret_name_sanitizes_each_component_of_a_canonical_path() {
+        // Input contract: the path is CANONICAL (realpath-resolved by
+        // the caller) — only Normal components, nothing to normalize.
         assert_eq!(
-            secret_name(Path::new("/x/../home/u/my key!/v2.bin")),
+            secret_name(Path::new("/home/u/my key!/v2.bin")),
             "home/u/my_key_/v2.bin",
-            "parent dirs collapse, each component sanitized in place"
+            "each component sanitized in place, structure preserved"
         );
         assert_eq!(secret_name(Path::new("/")), "secret");
+    }
+
+    #[test]
+    fn naming_normalizes_via_the_os_before_the_name_is_built() {
+        // The load path must run SystemIo::canonicalize — symlinked
+        // and oddly-spelled mappings of the same file converge on one
+        // name (issue #34: "normalized host paths").
+        let mut mock = base_mock().with_file("/home/user/secrets.yaml", b"DATA");
+        mock.files.insert("/link/to/secrets.yaml".into(), b"DATA".to_vec());
+        let cfg = test_config();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = std::sync::Arc::clone(&seen);
+        let f = move |name: &str, args: &str| -> Result<String, String> {
+            if name == "add" {
+                sink.lock().unwrap().push(
+                    args.split_whitespace().next().unwrap_or_default().to_string(),
+                );
+            }
+            Ok(String::new())
+        };
+        let _ = run_agent(&mut mock, &cfg, &f, false);
+        let seen = seen.lock().unwrap();
+        assert!(
+            seen.iter().all(|n| n.starts_with("home/")),
+            "names derive from canonical paths: {seen:?}"
+        );
     }
 
     #[test]

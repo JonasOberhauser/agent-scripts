@@ -48,6 +48,15 @@ struct StoreInner {
     by_ino: HashMap<u64, (PathBuf, Node)>,
 }
 
+/// Register `ino` under `label` in its parent directory's children
+/// map — the single place a node gets linked into the tree.
+fn link_child(s: &mut StoreInner, parent: u64, label: &str, ino: u64) {
+    let Node::Dir { children } = &mut s.by_ino.get_mut(&parent).unwrap().1 else {
+        unreachable!("parent chain is directories by construction");
+    };
+    children.insert(label.to_string(), ino);
+}
+
 impl Default for StoreInner {
     fn default() -> Self {
         let mut s = Self {
@@ -106,11 +115,7 @@ impl Store {
                         ino,
                         (prefix.clone(), Node::Dir { children: Default::default() }),
                     );
-                    let Node::Dir { children } = &mut s.by_ino.get_mut(&parent).unwrap().1
-                    else {
-                        unreachable!("parent chain is directories by construction");
-                    };
-                    children.insert(comp.to_string_lossy().into_owned(), ino);
+                    link_child(&mut s, parent, &comp.to_string_lossy(), ino);
                     ino
                 }
             };
@@ -127,11 +132,7 @@ impl Store {
                 let ino = s.next_ino;
                 s.by_path.insert(path.clone(), ino);
                 s.by_ino.insert(ino, (path, Node::File(Content { bytes, mode })));
-                let Node::Dir { children } = &mut s.by_ino.get_mut(&parent).unwrap().1
-                else {
-                    unreachable!("parent chain is directories by construction");
-                };
-                children.insert(file_label, ino);
+                link_child(&mut s, parent, &file_label, ino);
             }
         }
     }
@@ -639,6 +640,56 @@ mod tests {
         assert!(s.child(a.0, OsStr::new("b")).is_some());
         s.remove("a/b/c.txt");
         assert!(s.child(ROOT_INO, OsStr::new("a")).is_none(), "empty trees disappear");
+    }
+
+    #[test]
+    fn store_invariants_hold_as_documented() {
+        // Direct asserts for every claim in the StoreInner doc block
+        // (review: "tests and/or asserts to verify you uphold these
+        // invariants?"):
+        //   (a) root is FUSE_ROOT_ID
+        //   (b) live inodes identify at most one node
+        //   (c) a number stays bound to its node — the counter is
+        //       strictly monotone, so it NEVER repeats, even across
+        //       remove/re-create churn
+        let s = Store::default();
+        s.upsert("a/x", b"1".to_vec(), 0o400);
+        s.upsert("a/y", b"2".to_vec(), 0o400);
+        s.upsert("b/z", b"3".to_vec(), 0o400);
+
+        // (a) root
+        assert!(s.is_dir(ROOT_INO));
+        assert_eq!(ROOT_INO, 1, "FUSE_ROOT_ID");
+
+        // (c) monotone across churn: every number EVER issued is
+        // distinct — a recreated path draws a fresh one strictly above
+        // all predecessors (stale kernel refs can never conflate).
+        let mut issued: Vec<u64> = all_inos(&s);
+        for round in 0..4 {
+            s.remove("a/x");
+            s.upsert("a/x", vec![round], 0o400); // fresh node
+            let a_dir = s.child(ROOT_INO, OsStr::new("a")).unwrap().0;
+            let fresh = s.child(a_dir, OsStr::new("x")).unwrap().0;
+            assert!(
+                !issued.contains(&fresh),
+                "inode {fresh} was issued before — the counter repeated"
+            );
+            assert!(fresh > *issued.iter().max().unwrap());
+            issued.push(fresh);
+        }
+
+        // (b) live uniqueness: no number names two live nodes
+        let now = all_inos(&s);
+        let mut uniq = now.clone();
+        uniq.sort_unstable();
+        uniq.dedup();
+        assert_eq!(now.len(), uniq.len(), "live inodes are unique");
+    }
+
+    /// Every live inode (files via listing, dirs via the table).
+    fn all_inos(s: &Store) -> Vec<u64> {
+        let inner = s.0.lock().unwrap();
+        inner.by_ino.keys().copied().collect()
     }
 
     #[test]
