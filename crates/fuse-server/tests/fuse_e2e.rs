@@ -202,6 +202,12 @@ impl Split {
         self.mount.join(name)
     }
 
+    /// The host-side source file behind a served name (MR4 tests:
+    /// transparent reads observe it live).
+    fn source_path(&self, name: &str) -> PathBuf {
+        self._secret_dir.path().join(name)
+    }
+
     /// std::fs::read with daemon logs attached to any failure —
     /// mount-layer bugs must be diagnosable from the CI output, not
     /// guessed at (#41 lesson).
@@ -493,9 +499,13 @@ fn e2e_source_mode_is_passed_through() {
     // mode through the socket (`add` with mode) covers the passthrough:
     // covered by e2e_dynamic_add_visible.
     let split = Split::new("mode", &[("s", b"X", "*")]);
-    let md = std::fs::metadata(split.path("s")).unwrap();
+    // MR4: attrs are LIVE — the view follows the source's mode,
+    // masked read-only. A 0o600 source presents as 0o400.
     use std::os::unix::fs::PermissionsExt as _;
-    assert_eq!(md.permissions().mode() & 0o777, 0o400, "default view is owner-read-only");
+    let src = split.source_path("s");
+    std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let md = std::fs::metadata(split.path("s")).unwrap();
+    assert_eq!(md.permissions().mode() & 0o777, 0o400, "source mode passes through, masked read-only");
 }
 
 #[test]
@@ -598,17 +608,19 @@ fn e2e_pending_does_not_block_other_reads() {
     // Budget spent on "s": another read PENDS for up to 5s. Meanwhile a
     // different secret must serve fine (mount stays responsive).
     let other_path = split.path("other");
-    let reader = std::thread::spawn(move || std::fs::read(split_path_s(&split, "s")));
-    let _split = (); // keep borrow structure simple
+    let s_path = split.path("s");
+    let reader = std::thread::spawn(move || std::fs::read(s_path));
     std::thread::sleep(Duration::from_millis(200));
-    assert_eq!(std::fs::read(&other_path).unwrap(), b"O", "unrelated secret must serve during a pending");
+    match std::fs::read(&other_path) {
+        Ok(b) => assert_eq!(b, b"O", "unrelated secret must serve during a pending"),
+        Err(e) => panic!(
+            "read during pending failed: {e}\n{}",
+            split.dump_logs("pending-concurrency failure")
+        ),
+    }
     let _ = reader.join();
 }
 
-// helper so the pending read above can own its path
-fn split_path_s(split: &Split, name: &str) -> PathBuf {
-    split.path(name)
-}
 
 #[test]
 fn e2e_hash_mismatch_denied() {
