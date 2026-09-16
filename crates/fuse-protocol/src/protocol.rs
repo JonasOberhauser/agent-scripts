@@ -1,4 +1,3 @@
-use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 /// Read-only status snapshot for a secret.
@@ -69,17 +68,67 @@ pub struct StateSecretEntry {
 // ── Commands (client → server) ─────────────────────────────────
 
 /// Collapse a set of path-shaped secret names to their first points
-/// of difference (issue #34): each path renders as `.../<differing
-/// components>/.../<basename>` — the common leading components are
-/// elided, components after the divergence are elided UNLESS needed
-/// for uniqueness, the basename always survives.
+/// of difference (issue #34) — implemented as a prefix tree: each
+/// edge is exactly one path component, and the rendering follows
+/// directly from the tree shape:
+///
+/// - a component whose parent node has MULTIPLE children is written
+///   (it is one of the disambiguating alternatives — the "first
+///   point of difference"),
+/// - the final component (the file name) is always written,
+/// - every maximal chain of remaining single-child nodes collapses
+///   into one `...`.
 ///
 ///   [foo/bar/x/x1/bar.txt, foo/bar/y/y1/y2/bar.txt, foo/bar/baz.txt]
-///     -> .../x/.../bar.txt, .../y/.../bar.txt, .../baz.txt
-///
-/// Parsing is the OS path library's job (`Path::components`); this
-/// function only compares component sequences. Pure function over the
-/// input set; deterministic order out (same as in).
+///   -> .../x/.../bar.txt, .../y/.../bar.txt, .../baz.txt
+#[derive(Default)]
+struct CollapseTrie {
+    /// `terminal` marks a served name ending at this node (a name may
+    /// also be a prefix of another name).
+    terminal: bool,
+    children: std::collections::BTreeMap<String, CollapseTrie>,
+}
+
+impl CollapseTrie {
+    fn insert(&mut self, comps: &[&str]) {
+        let mut node = self;
+        for (i, c) in comps.iter().enumerate() {
+            node = node.children.entry(c.to_string()).or_default();
+            if i == comps.len() - 1 {
+                node.terminal = true;
+            }
+        }
+    }
+
+    /// Render one component sequence against the tree.
+    fn render(&self, comps: &[&str]) -> String {
+        let mut node = self;
+        let mut pieces: Vec<String> = Vec::new();
+        let mut elided = false;
+        for (i, c) in comps.iter().enumerate() {
+            let parent_branches = node.children.len() > 1;
+            node = node.children.get(*c).expect("inserted before render");
+            let write = i == comps.len() - 1 || parent_branches;
+            if write {
+                if elided {
+                    pieces.push("...".into());
+                    elided = false;
+                }
+                pieces.push((*c).to_string());
+            } else {
+                elided = true;
+            }
+        }
+        if elided {
+            // The sequence ended on an elided chain — cannot happen
+            // for rendered names (the last component is always
+            // written), kept for completeness.
+            pieces.push("...".into());
+        }
+        pieces.join("/")
+    }
+}
+
 pub fn collapse_paths(paths: &[String]) -> Vec<String> {
     // Dedup, keep order.
     let mut set: Vec<String> = Vec::new();
@@ -88,72 +137,13 @@ pub fn collapse_paths(paths: &[String]) -> Vec<String> {
             set.push(p.clone());
         }
     }
-    let comps: Vec<Vec<String>> = set
-        .iter()
-        .map(|p| {
-            Path::new(p)
-                .components()
-                .map(|c| c.as_os_str().to_string_lossy().into_owned())
-                .collect()
-        })
-        .collect();
-    let n_paths = comps.len();
+    let comps: Vec<Vec<&str>> = set.iter().map(|p| p.split('/').collect()).collect();
 
-    // Common leading components over the whole set.
-    let mut common = 0;
-    'outer: loop {
-        let first = match comps.first().and_then(|c| c.get(common)) {
-            Some(f) => f,
-            None => break 'outer,
-        };
-        for c in comps.iter().skip(1) {
-            if c.get(common) != Some(first) {
-                break 'outer;
-            }
-        }
-        common += 1;
+    let mut trie = CollapseTrie::default();
+    for c in &comps {
+        trie.insert(c);
     }
-
-    set.iter()
-        .enumerate()
-        .map(|(i, _)| {
-            let c = &comps[i];
-            let n = c.len();
-            if n == 0 {
-                return String::new();
-            }
-            // Single path in the set: the basename alone identifies it.
-            if n_paths == 1 {
-                let tail = c[n - 1].clone();
-                return if n > 1 { format!(".../{tail}") } else { tail };
-            }
-            // `common` never reaches n here: paths are distinct files,
-            // so they diverge before the last component.
-            let d = common.min(n - 1);
-            // Extend the divergent run until no OTHER path shares it.
-            let mut j = d;
-            while j + 1 < n {
-                let shared = comps.iter().enumerate().any(|(k, other)| {
-                    k != i && other.len() > j && other[d..=j.min(other.len() - 1)] == c[d..=j]
-                });
-                if !shared {
-                    break;
-                }
-                j += 1;
-            }
-            let run = c[d..=j].join("/");
-            let lead = if d > 0 { "..." } else { "" };
-            if n - 1 > j + 1 {
-                format!("{lead}/{run}/.../{}", c[n - 1])
-            } else if j < n - 1 {
-                format!("{lead}/{run}/{}", c[n - 1])
-            } else {
-                format!("{lead}/{run}")
-            }
-            .trim_start_matches('/')
-            .to_string()
-        })
-        .collect()
+    comps.iter().map(|c| trie.render(c)).collect()
 }
 
 /// Whether a server version and a client version speak the same
@@ -284,6 +274,14 @@ mod tests {
                 ".../x/x2/bar.txt".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn collapse_handles_names_nested_under_names() {
+        // The trie marks terminals mid-tree: a served name that is
+        // also a prefix of another renders both distinguishably.
+        let got = collapse_paths(&["a/b".to_string(), "a/b/c.txt".to_string()]);
+        assert_eq!(got, vec![".../b".to_string(), ".../c.txt".to_string()]);
     }
 
     #[test]
