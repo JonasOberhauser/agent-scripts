@@ -48,12 +48,56 @@ struct StoreInner {
     by_ino: HashMap<u64, (PathBuf, Node)>,
 }
 
+/// The live node at `path`, if any (borrowed lookup).
+fn node<'a>(s: &'a StoreInner, path: &std::path::Path) -> Option<(&'a std::path::Path, &'a Node)> {
+    let ino = s.by_path.get(path)?;
+    let (p, n) = s.by_ino.get(ino)?;
+    Some((p, n))
+}
+
+/// Register a NEW node — the one place entries enter either table,
+/// self-checking the store invariants as it goes: an inode number is
+/// never inserted into `by_ino` twice, a path never silently retargets
+/// to a different inode.
+fn insert_node(s: &mut StoreInner, path: PathBuf, make: impl FnOnce() -> Node) -> u64 {
+    s.next_ino += 1;
+    let ino = s.next_ino;
+    debug_assert!(!s.by_ino.contains_key(&ino), "inode {ino} already exists");
+    debug_assert!(
+        !s.by_path.contains_key(&path),
+        "path {} already mapped",
+        path.display()
+    );
+    s.by_path.insert(path.clone(), ino);
+    s.by_ino.insert(ino, (path, make()));
+    ino
+}
+
+/// Materialize the implicit directory at `path` under `parent`.
+fn ensure_dir(s: &mut StoreInner, parent: u64, path: &std::path::Path, label: &std::ffi::OsStr) -> u64 {
+    if let Some(&ino) = s.by_path.get(path) {
+        return ino;
+    }
+    let ino = insert_node(s, path.to_path_buf(), || Node::Dir { children: Default::default() });
+    link_child(s, parent, &label.to_string_lossy(), ino);
+    ino
+}
+
 /// Register `ino` under `label` in its parent directory's children
-/// map — the single place a node gets linked into the tree.
+/// map — the single place a node gets linked into the tree, with the
+/// same self-checks: the parent must be a directory and the label
+/// must not already point at a different node.
 fn link_child(s: &mut StoreInner, parent: u64, label: &str, ino: u64) {
-    let Node::Dir { children } = &mut s.by_ino.get_mut(&parent).unwrap().1 else {
-        unreachable!("parent chain is directories by construction");
+    debug_assert!(
+        matches!(s.by_ino.get(&parent).map(|(_, n)| n), Some(Node::Dir { .. })),
+        "link target {parent} is not a directory"
+    );
+    let Node::Dir { children } = &mut s.by_ino.get_mut(&parent).expect("parent exists").1 else {
+        unreachable!("checked above");
     };
+    if let Some(&old) = children.get(label) {
+        debug_assert_eq!(old, ino, "label {label} already links inode {old}");
+    }
     children.insert(label.to_string(), ino);
 }
 
@@ -88,51 +132,44 @@ impl Store {
         if comps.is_empty() {
             return;
         }
-        // Walk (and materialize) the parent chain of implicit dirs.
-        let mut prefix = PathBuf::new();
+        // Materialize the parent chain of implicit directories.
         let mut parent = ROOT_INO;
+        let mut prefix = PathBuf::new();
         for comp in comps.iter().take(comps.len() - 1) {
             prefix.push(comp);
-            let existing = s.by_path.get(&prefix).copied();
-            parent = match existing {
-                Some(ino) => match &s.by_ino[&ino].1 {
-                    Node::Dir { .. } => ino,
-                    // A served FILE occupies the directory position —
-                    // possible only via raw AddSecret with
-                    // non-normalized names.  Fail safe: keep the
-                    // shallower file, skip this name, say so.
-                    Node::File(_) => {
-                        warn!("cannot serve \"{name}\": \"{}\" is already a file",
-                              prefix.display());
-                        return;
-                    }
-                },
-                None => {
-                    s.next_ino += 1;
-                    let ino = s.next_ino;
-                    s.by_path.insert(prefix.clone(), ino);
-                    s.by_ino.insert(
-                        ino,
-                        (prefix.clone(), Node::Dir { children: Default::default() }),
+            parent = match node(&s, &prefix) {
+                Some((_, Node::Dir { .. })) => s.by_path[&prefix],
+                // A served FILE occupies the directory position —
+                // possible only via raw AddSecret with
+                // non-normalized names. Fail safe: keep the shallower
+                // file, skip this name, say so.
+                Some((occupied, Node::File(_))) => {
+                    warn!(
+                        "cannot serve \"{name}\": \"{}\" is already a file",
+                        occupied.display()
                     );
-                    link_child(&mut s, parent, &comp.to_string_lossy(), ino);
-                    ino
+                    return;
                 }
+                None => ensure_dir(&mut s, parent, &prefix, comp),
             };
         }
-        let file_label = comps.last().unwrap().to_string_lossy().into_owned();
-        match s.by_path.get(&path).copied() {
-            Some(ino) => {
-                // Live path: replace the content, KEEP the inode —
-                // open fds and kernel caches stay coherent.
+        // The file itself: live path -> replace content, keep the
+        // inode (open fds stay coherent); new -> create.
+        match node(&s, &path) {
+            Some((_, Node::File(_))) => {
+                let ino = s.by_path[&path];
                 s.by_ino.get_mut(&ino).unwrap().1 = Node::File(Content { bytes, mode });
             }
+            Some((occupied, Node::Dir { .. })) => {
+                warn!(
+                    "cannot serve \"{name}\" as a file: \"{}\" is already a directory",
+                    occupied.display()
+                );
+            }
             None => {
-                s.next_ino += 1;
-                let ino = s.next_ino;
-                s.by_path.insert(path.clone(), ino);
-                s.by_ino.insert(ino, (path, Node::File(Content { bytes, mode })));
-                link_child(&mut s, parent, &file_label, ino);
+                let ino = insert_node(&mut s, path, || Node::File(Content { bytes, mode }));
+                let label = comps.last().unwrap().to_string_lossy().into_owned();
+                link_child(&mut s, parent, &label, ino);
             }
         }
     }
@@ -150,6 +187,8 @@ impl Store {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
+        debug_assert_eq!(s.by_ino.get(&ino).map(|(p, _)| p.as_os_str()), Some(path.as_os_str()),
+            "by_ino disagrees with by_path before removal");
         s.by_path.remove(&path);
         s.by_ino.remove(&ino);
         // Unlink from the parent, then prune childless ancestors so
