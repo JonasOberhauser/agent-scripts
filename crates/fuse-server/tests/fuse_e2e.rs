@@ -197,6 +197,31 @@ impl Split {
         self.mount.join(name)
     }
 
+    /// std::fs::read with daemon logs attached to any failure —
+    /// mount-layer bugs must be diagnosable from the CI output, not
+    /// guessed at (#41 lesson).
+    fn read(&self, rel: &str) -> std::io::Result<Vec<u8>> {
+        std::fs::read(self.path(rel))
+    }
+
+    fn dump_logs(&self, what: &str) -> String {
+        let mut s = format!("--- {what} ---\n");
+        for name in ["server.log", "fused.log"] {
+            let p = self._dirs.iter().find_map(|d| {
+                let p = d.path().join(name);
+                p.exists().then_some(p)
+            });
+            if let Some(p) = p {
+                if let Ok(t) = std::fs::read_to_string(&p) {
+                    let lines: Vec<&str> = t.lines().collect();
+                    let start = lines.len().saturating_sub(25);
+                    s.push_str(&format!("== {name} ==\n{}\n", lines[start..].join("\n")));
+                }
+            }
+        }
+        s
+    }
+
     fn client(&self, args: &[&str]) -> std::process::Output {
         Command::new(bin("fuse-client"))
             .arg("--socket").arg(&self.socket)
@@ -317,7 +342,10 @@ fn e2e_read_secret() {
     if !fuse_available() { return; }
     let _g = serial();
     let split = Split::new("read", &[("s", b"TOPSECRET", "*")]);
-    assert_eq!(std::fs::read(split.path("s")).unwrap(), b"TOPSECRET");
+    match split.read("s") {
+        Ok(b) => assert_eq!(b, b"TOPSECRET"),
+        Err(e) => panic!("read through the mount failed: {e}\n{}", split.dump_logs("read failure")),
+    }
 }
 
 #[test]

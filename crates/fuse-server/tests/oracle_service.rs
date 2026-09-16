@@ -3,7 +3,7 @@
 //! content forwarding to (fake) data daemons, and snapshot replay for
 //! late joiners.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read as _, Write};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -41,6 +41,94 @@ fn ask(path: &std::path::Path, name: &str, pid: u32, offset: u64, size: u32) -> 
     reader.read_line(&mut line).unwrap();
     serde_json::from_str(line.trim()).unwrap()
 }
+
+#[test]
+fn open_passes_an_fd_and_stats_flow() {
+    // MR4 seam: Open must (a) verify the caller's ino identity,
+    // (b) answer Gone for a replaced incarnation, (c) on Allow
+    // hand a readable fd for the CURRENT bytes via SCM_RIGHTS.
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("s.bin");
+    std::fs::write(&file, b"HOSTBYTES").unwrap();
+    let oracle = dir.path().join("open.sock");
+    let hub = OracleHub::clone(&fuse_server::ORACLE_HUB);
+    let state = Arc::new(ServerState::new());
+    {
+        use std::os::unix::fs::MetadataExt;
+        let md = std::fs::metadata(&file).unwrap();
+        state.add("s", &file, md.len() as usize, "*");
+        hub.serve("s", md.dev(), md.ino(), 0o400);
+    }
+    let st = Arc::clone(&state);
+    let p = oracle.clone();
+    std::thread::spawn(move || {
+        let _ = run_oracle_server(&p, st, hub);
+    });
+    for _ in 0..200 {
+        if oracle.exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    // Stat: live identity.
+    let mut c = std::os::unix::net::UnixStream::connect(&oracle).unwrap();
+    writeln!(c, "{}", serde_json::to_string(&OracleRequest::Stat { name: "s".into() }).unwrap()).unwrap();
+    c.flush().unwrap();
+    let mut line = String::new();
+    std::io::BufRead::read_line(&mut std::io::BufReader::new(c.try_clone().unwrap()), &mut line).unwrap();
+    let r: OracleReply = serde_json::from_str(line.trim()).unwrap();
+    let (kdev, kino, size) = match r {
+        OracleReply::StatOk { kdev, kino, size, regular: true, .. } => (kdev, kino, size),
+        other => panic!("stat: {other:?}"),
+    };
+    assert_eq!(size, 9);
+
+    // Open with the right identity: fd arrives with the reply.
+    use std::os::unix::io::{AsRawFd, FromRawFd};
+    let mut c = std::os::unix::net::UnixStream::connect(&oracle).unwrap();
+    writeln!(c, "{}", serde_json::to_string(&OracleRequest::Open {
+        name: "s".into(), pid: 4242, kdev, kino,
+    }).unwrap()).unwrap();
+    c.flush().unwrap();
+    let mut buf = vec![0u8; 4096];
+    let mut cmsg = nix::cmsg_space!(libc::cmsghdr, std::os::unix::io::RawFd);
+    let mut iov = [std::io::IoSliceMut::new(&mut buf)];
+    let msg = {
+        let raw = c.as_raw_fd();
+        nix::sys::socket::recvmsg::<()>(
+            raw, &mut iov, Some(&mut cmsg), nix::sys::socket::MsgFlags::empty(),
+        ).unwrap()
+    };
+    let mut fd = None;
+    for cm in msg.cmsgs().unwrap() {
+        if let nix::sys::socket::ControlMessageOwned::ScmRights(fds) = cm {
+            fd = fds.first().copied();
+        }
+    }
+    let n = msg.bytes;
+    let reply: OracleReply =
+        serde_json::from_str(String::from_utf8_lossy(&buf[..n]).trim()).unwrap();
+    assert!(matches!(reply, OracleReply::Allow), "open: {reply:?}");
+    let fd = fd.expect("fd ancillary");
+    // SAFETY: descriptor received via SCM_RIGHTS; owned here on.
+    let mut f = unsafe { std::fs::File::from_raw_fd(fd) };
+    let mut got = String::new();
+    f.read_to_string(&mut got).unwrap();
+    assert_eq!(got, "HOSTBYTES");
+
+    // Open with a WRONG identity: the incarnation check answers Stale.
+    let mut c = std::os::unix::net::UnixStream::connect(&oracle).unwrap();
+    writeln!(c, "{}", serde_json::to_string(&OracleRequest::Open {
+        name: "s".into(), pid: 4243, kdev, kino: kino.wrapping_add(1),
+    }).unwrap()).unwrap();
+    c.flush().unwrap();
+    let mut line = String::new();
+    std::io::BufRead::read_line(&mut std::io::BufReader::new(c), &mut line).unwrap();
+    let r: OracleReply = serde_json::from_str(line.trim()).unwrap();
+    assert!(matches!(r, OracleReply::Stale), "replaced incarnation: {r:?}");
+}
+
 
 #[test]
 fn star_hash_ask_is_allowed_and_serves_offsets() {
