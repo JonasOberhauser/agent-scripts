@@ -53,7 +53,7 @@ mod tests {
             secrets: vec![SecretStatus {
                 name: "a".into(),
                 access_count: 2,
-                allowed_hash: "deadbeef".into(),
+                allowed_hashes: vec![HashEntryStatus { hash: "deadbeef".into(), by: None }],
                 size: 42,
                 unlimited: false,
             }],

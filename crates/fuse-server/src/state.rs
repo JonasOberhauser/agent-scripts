@@ -512,12 +512,14 @@ impl ServerState {
             fuse_protocol::SecretStatus {
                 name: name.clone(),
                 access_count: rec.access_count,
-                allowed_hash: rec
+                allowed_hashes: rec
                     .allowed_hashes
                     .iter()
-                    .map(|ph| ph.render())
-                    .collect::<Vec<_>>()
-                    .join(" | "),
+                    .map(|ph| fuse_protocol::HashEntryStatus {
+                        hash: ph.hash.clone(),
+                        by: ph.by.clone(),
+                    })
+                    .collect(),
                 size: rec.size,
                 unlimited: rec.unlimited_reads,
             }

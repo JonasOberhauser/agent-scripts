@@ -20,16 +20,34 @@ pub fn print_response(resp: &Response, out: &mut dyn Console) {
                     &secrets.iter().map(|s| s.name.clone()).collect::<Vec<_>>(),
                 );
                 out.print_line(&format!("{:<24} {:>8} {:>8}  HASH", "NAME", "READS", "SIZE"));
+                // One row per permitted hash (review on #45): the
+                // first shares the secret's row, the rest continue
+                // aligned under the HASH column as `by -- hash`.
+                const HASH_COL: usize = 44;
                 for (s, name) in secrets.iter().zip(&collapsed) {
-                    let hash = if s.allowed_hash == crate::PENDING_ONLY_HASH {
-                        "(manual approval only)"
-                    } else {
-                        &s.allowed_hash
-                    };
-                    out.print_line(&format!(
-                        "{:<24} {:>8} {:>8}  {}",
-                        name, s.access_count, s.size, hash
-                    ));
+                    let lead = format!(
+                        "{:<24} {:>8} {:>8}  ",
+                        name, s.access_count, s.size
+                    );
+                    if s.allowed_hashes.is_empty() {
+                        out.print_line(&format!("{lead}-"));
+                        continue;
+                    }
+                    for (i, h) in s.allowed_hashes.iter().enumerate() {
+                        let rendered = if h.hash == crate::PENDING_ONLY_HASH {
+                            "(manual approval only)".to_string()
+                        } else {
+                            match &h.by {
+                                Some(by) => format!("{by} -- {}", h.hash),
+                                None => h.hash.clone(),
+                            }
+                        };
+                        if i == 0 {
+                            out.print_line(&format!("{lead}{rendered}"));
+                        } else {
+                            out.print_line(&format!("{:width$}{rendered}", "", width = HASH_COL));
+                        }
+                    }
                 }
             }
         }
@@ -429,6 +447,55 @@ mod tests {
     }
 
     #[test]
+    fn status_renders_one_row_per_hash() {
+        // Review mockup on #45:
+        //   bar/secret.txt     6    167    blah -- hash1
+        //                                  bloo -- hash2
+        let resp = Response::Status {
+            secrets: vec![
+                crate::protocol::SecretStatus {
+                    name: "var/home/jonas/bar/secret.txt".into(),
+                    access_count: 6,
+                    allowed_hashes: vec![
+                        crate::protocol::HashEntryStatus {
+                            hash: "hash1".into(),
+                            by: Some("blah".into()),
+                        },
+                        crate::protocol::HashEntryStatus {
+                            hash: "hash2".into(),
+                            by: Some("bloo".into()),
+                        },
+                    ],
+                    size: 167,
+                    unlimited: false,
+                },
+                crate::protocol::SecretStatus {
+                    name: "var/home/jonas/foo/secret2.txt".into(),
+                    access_count: 0,
+                    allowed_hashes: vec![crate::protocol::HashEntryStatus {
+                        hash: crate::PENDING_ONLY_HASH.into(),
+                        by: None,
+                    }],
+                    size: 9,
+                    unlimited: false,
+                },
+            ],
+        };
+        let mut cap = Cap(Vec::new());
+        print_response(&resp, &mut cap);
+        let rows: Vec<String> = cap.0;
+        assert!(rows.len() >= 4, "header + 2 + 1 rows: {rows:?}");
+        assert!(rows[1].contains(".../bar/secret.txt") && rows[1].contains("blah -- hash1"),
+            "first row carries name + first hash: {:?}", rows[1]);
+        let cont = &rows[2];
+        assert!(cont.trim() == "bloo -- hash2", "continuation carries only the hash row: {cont:?}");
+        assert!(cont.starts_with(" "), "aligned under the HASH column");
+        assert_eq!(cont.find("bloo"), Some(44), "HASH column start: {cont:?}");
+        assert!(rows[3].contains(".../foo/secret2.txt") && rows[3].contains("(manual approval only)"),
+            "single-entry secret stays on one row: {:?}", rows[3]);
+    }
+
+    #[test]
     fn status_renders_collapsed_names() {
         use crate::protocol::SecretStatus;
         let resp = Response::Status {
@@ -436,14 +503,20 @@ mod tests {
                 SecretStatus {
                     name: "var/home/jonas/secrets/agent/github.netrc".into(),
                     access_count: 0,
-                    allowed_hash: crate::PENDING_ONLY_HASH.into(),
+                    allowed_hashes: vec![crate::protocol::HashEntryStatus {
+                        hash: crate::PENDING_ONLY_HASH.into(),
+                        by: None,
+                    }],
                     size: 167,
                     unlimited: false,
                 },
                 SecretStatus {
                     name: "var/home/jonas/secrets/zai.key".into(),
                     access_count: 1,
-                    allowed_hash: crate::PENDING_ONLY_HASH.into(),
+                    allowed_hashes: vec![crate::protocol::HashEntryStatus {
+                        hash: crate::PENDING_ONLY_HASH.into(),
+                        by: None,
+                    }],
                     size: 50,
                     unlimited: false,
                 },
