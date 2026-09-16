@@ -504,6 +504,9 @@ fn e2e_source_mode_is_passed_through() {
     use std::os::unix::fs::PermissionsExt as _;
     let src = split.source_path("s");
     std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o600)).unwrap();
+    // Attr freshness is TTL-bounded (1s) by design: the kernel serves
+    // its cached attrs until they expire.
+    std::thread::sleep(Duration::from_millis(1200));
     let md = std::fs::metadata(split.path("s")).unwrap();
     assert_eq!(md.permissions().mode() & 0o777, 0o400, "source mode passes through, masked read-only");
 }
