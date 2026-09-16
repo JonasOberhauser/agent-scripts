@@ -5,11 +5,26 @@ use serde::{Deserialize, Serialize};
 pub struct SecretStatus {
     pub name: String,
     pub access_count: u64,
-    pub allowed_hash: String,
+    /// One entry per permitted hash (issue #34 MR2/MR3): the hash and
+    /// the process that obtained it, when known. Status renders one
+    /// row per entry (review on #45) — so the wire carries the
+    /// STRUCTURE, not a pre-joined display string. Breaking wire
+    /// change: minor version bumped, mixed vintages fail the
+    /// handshake instead of the parse.
+    pub allowed_hashes: Vec<HashEntryStatus>,
     pub size: usize,
     /// Set by `grant-forever`: the allowed package may read without
     /// per-read approval.
     pub unlimited: bool,
+}
+
+/// One permitted hash with provenance, as reported by `status`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HashEntryStatus {
+    pub hash: String,
+    /// The process that obtained this hash (grant-forever fills it);
+    /// None when permitted anonymously (add/rotate).
+    pub by: Option<String>,
 }
 
 /// One entry in a `list-mounts` response.

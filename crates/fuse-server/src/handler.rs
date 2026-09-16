@@ -143,7 +143,7 @@ mod tests {
             Response::Status { secrets } => {
                 let a = secrets.iter().find(|e| e.name == "a.yaml").unwrap();
                 assert_eq!(a.access_count, 1);
-                assert_eq!(a.allowed_hash, "hash_a");
+                assert_eq!(a.allowed_hashes.iter().map(|h| h.hash.as_str()).collect::<Vec<_>>(), vec!["hash_a"]);
                 assert_eq!(a.size, 3);
             }
             _ => panic!("expected Status"),
