@@ -68,6 +68,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "autocfg"
+version = "1.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
+
+[[package]]
 name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -351,7 +357,7 @@ checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
 
 [[package]]
 name = "fuse-client"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "clap",
  "crossterm",
@@ -372,12 +378,13 @@ dependencies = [
 
 [[package]]
 name = "fuse-mount"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "clap",
  "fuse-protocol",
  "fuser",
  "libc",
+ "nix",
  "serde_json",
  "tempfile",
  "tracing",
@@ -386,7 +393,7 @@ dependencies = [
 
 [[package]]
 name = "fuse-protocol"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "libc",
  "serde",
@@ -398,13 +405,14 @@ dependencies = [
 
 [[package]]
 name = "fuse-server"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "clap",
  "dashmap",
  "fuse-protocol",
  "fuser",
  "libc",
+ "nix",
  "serde_json",
  "servyi-servatui",
  "tempfile",
@@ -468,7 +476,7 @@ dependencies = [
 
 [[package]]
 name = "hashd"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "fuse-protocol",
  "tempfile",
@@ -602,6 +610,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "88904434abc2901f197fe8cc55f0445e7ded921dba5911dad2e2b39b48e663c4"
 
 [[package]]
+name = "memoffset"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
+dependencies = [
+ "autocfg",
+]
+
+[[package]]
 name = "mio"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -632,6 +649,7 @@ dependencies = [
  "cfg-if",
  "cfg_aliases",
  "libc",
+ "memoffset",
 ]
 
 [[package]]
@@ -789,7 +807,7 @@ checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
 
 [[package]]
 name = "run-agent"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "clap",
  "fuse-protocol",

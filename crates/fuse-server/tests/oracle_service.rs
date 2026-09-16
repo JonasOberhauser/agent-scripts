@@ -45,7 +45,7 @@ fn ask(path: &std::path::Path, name: &str, pid: u32, offset: u64, size: u32) -> 
 #[test]
 fn star_hash_ask_is_allowed_and_serves_offsets() {
     let (path, state, _t) = oracle_env();
-    state.add("s", b"0123456789".to_vec(), "*");
+    state.add("s", "/tmp/host/s", 10, "*");
     assert_eq!(ask(&path, "s", 10, 2, 3), OracleReply::Allow);
     assert_eq!(state.status()[0].access_count, 1, "allow records the read");
 }
@@ -62,7 +62,7 @@ fn unknown_secret_denies_enoent() {
 #[test]
 fn second_pid_pends_then_grant_allows() {
     let (path, state, _t) = oracle_env();
-    state.add("s", b"SECRETSECRET".to_vec(), "*");
+    state.add("s", "/tmp/host/s", 12, "*");
     assert_eq!(ask(&path, "s", 10, 0, 6), OracleReply::Allow);
     // The same pid streaming FORWARD: allowed (multi-chunk read).
     assert_eq!(ask(&path, "s", 10, 6, 6), OracleReply::Allow);
@@ -87,7 +87,7 @@ fn second_pid_pends_then_grant_allows() {
 fn pending_expiry_denies_with_eacces() {
     let (path, state, _t) = oracle_env();
     *state.pending_timeout.lock().unwrap() = Duration::from_millis(300);
-    state.add("s", b"X".to_vec(), "*");
+    state.add("s", "/tmp/host/s", 1, "*");
     assert_eq!(ask(&path, "s", 10, 0, 1), OracleReply::Allow);
     match ask(&path, "s", 20, 0, 1) {
         OracleReply::Deny { errno, reason } => {
@@ -104,7 +104,7 @@ fn pending_expiry_denies_with_eacces() {
 #[test]
 fn deny_unblocks_the_reader_immediately_with_eperm() {
     let (path, state, _t) = oracle_env();
-    state.add("s", b"X".to_vec(), "some_hash");
+    state.add("s", "/tmp/host/s", 1, "some_hash");
     // Long enough that a non-short-circuiting loop fails the time bound.
     *state.pending_timeout.lock().unwrap() = Duration::from_secs(15);
     let p = path.clone();
@@ -137,7 +137,7 @@ fn deny_unblocks_the_reader_immediately_with_eperm() {
 #[test]
 fn wrong_hash_pends_and_carries_the_hash_error() {
     let (path, state, _t) = oracle_env();
-    state.add("s", b"X".to_vec(), "some_hash");
+    state.add("s", "/tmp/host/s", 1, "some_hash");
     // The ask blocks while the pending waits: run it on a thread so the
     // pending entry can be inspected before it expires.
     let p = path.clone();
@@ -180,7 +180,7 @@ fn control_channel_replays_snapshot_and_pushes_updates() {
     let state = Arc::new(ServerState::new());
     *state.pending_timeout.lock().unwrap() = Duration::from_secs(2);
     let hub = OracleHub::new();
-    hub.upsert("seed", b"OLD", 0o400);
+    hub.serve("seed", 52, 11, 0o400);
     let s2 = Arc::clone(&state);
     let hub2 = hub.clone();
     let moved = path.clone();
@@ -205,13 +205,13 @@ fn control_channel_replays_snapshot_and_pushes_updates() {
     let cmd: OracleCommand = serde_json::from_str(line.trim()).unwrap();
     assert_eq!(
         cmd,
-        OracleCommand::Upsert { name: "seed".into(), content: b"OLD".to_vec(), mode: 0o400 }
+        OracleCommand::Serve { name: "seed".into(), kdev: 52, kino: 11, mode: 0o400 }
     );
 
     // Live push through the hub.
-    hub.upsert("seed", b"NEW", 0o600);
+    hub.serve("seed", 52, 12, 0o600);
     line.clear();
     reader.read_line(&mut line).unwrap();
     let cmd: OracleCommand = serde_json::from_str(line.trim()).unwrap();
-    assert_eq!(cmd, OracleCommand::Upsert { name: "seed".into(), content: b"NEW".to_vec(), mode: 0o600 });
+    assert_eq!(cmd, OracleCommand::Serve { name: "seed".into(), kdev: 52, kino: 12, mode: 0o600 });
 }

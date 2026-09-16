@@ -16,7 +16,7 @@ mod tests {
     fn add_secret_round_trip() {
         let cmd = Command::AddSecret {
             name: "token".into(),
-            content: vec![1, 2, 3],
+            path: "/tmp/s.bin".into(),
             hash: "abc123".into(),
             mode: 0o600,
         };

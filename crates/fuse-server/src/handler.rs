@@ -17,12 +17,13 @@ pub fn handle_command(cmd: Command, state: &ServerState, hub: &crate::oracle_ser
             Response::Status { secrets: state.status() }
         }
 
-        Command::AddSecret { name, content, hash, mode } => {
-            state.add_with_mode(&name, content.clone(), hash, mode);
-            // The data daemon serves the bytes; the policy daemon keeps
-            // only the metadata it adjudicates against.
-            hub.upsert(&name, &content, mode & 0o777);
-            Response::Ok
+        Command::AddSecret { name, path, hash, mode } => {
+            // MR4: register by stat — the policy daemon holds the host
+            // PATH and identity, never bytes (see register_secret).
+            match register_secret(state, hub, &name, &path, &hash, mode) {
+                Ok(()) => Response::Ok,
+                Err(e) => Response::Error { message: e },
+            }
         }
 
         Command::RemoveSecret { name } => {
@@ -94,6 +95,32 @@ pub fn handle_command(cmd: Command, state: &ServerState, hub: &crate::oracle_ser
     }
 }
 
+/// Stat-register a secret (MR4): canonicalize the path, record its
+/// host identity, tell the data daemon to serve the name. No client,
+/// no server code path ever reads the content.
+fn register_secret(
+    state: &ServerState,
+    hub: &crate::oracle_service::OracleHub,
+    name: &str,
+    path: &str,
+    hash: &str,
+    mode: u32,
+) -> Result<(), String> {
+    let host = std::fs::canonicalize(path)
+        .map_err(|e| format!("cannot resolve {path}: {e}"))?;
+    let md = std::fs::metadata(&host)
+        .map_err(|e| format!("cannot stat {}: {e}", host.display()))?;
+    if !md.is_file() {
+        return Err(format!("{} is not a regular file", host.display()));
+    }
+    let (kdev, kino) = {
+        use std::os::unix::fs::MetadataExt;
+        (md.dev(), md.ino())
+    };
+    state.add_with_mode(name, host, md.len() as usize, hash, mode & 0o777);
+    hub.serve(name, kdev, kino, mode & 0o777);
+    Ok(())
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -104,8 +131,8 @@ mod tests {
 
     fn seeded() -> ServerState {
         let s = ServerState::new();
-        s.add("a.yaml", b"AAA".to_vec(), "hash_a");
-        s.add("b.yaml", b"BBB".to_vec(), "hash_b");
+        s.add("a.yaml", "/tmp/host/a.yaml", 3, "hash_a");
+        s.add("b.yaml", "/tmp/host/b.yaml", 3, "hash_b");
         s
     }
 
@@ -153,15 +180,17 @@ mod tests {
     #[test]
     fn add_then_remove() {
         let s = ServerState::new();
+        let src = std::env::temp_dir().join("mr4-new.bin");
+        std::fs::write(&src, b"DATA").unwrap();
         let resp = handle_command(
-            Command::AddSecret { name: "new".into(), content: vec![9], hash: "h".into(), mode: 0o600 },
+            Command::AddSecret { name: "new".into(), path: src.to_str().unwrap().into(), hash: "h".into(), mode: 0o600 },
             &s,
             &hub(),
         );
         assert_eq!(resp, Response::Ok);
 
         // grant-forever round trip on a pending with a package hash
-        s.add("k", b"V".to_vec(), "h");
+        s.add("k", "/tmp/host/k", 1, "h");
         let _ = handle_command(Command::GrantForever { id: 1 }, &s, &hub()); // unknown id -> error, no panic
         let id = {
             s.create_pending("k", 7, Some("pkg"), "mismatch", None);

@@ -11,8 +11,6 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use clap::Parser;
-use fuse_protocol::io::SystemIo as _;
-use fuse_protocol::RealSystemIo;
 use tracing::{error, info, warn};
 
 use fuse_server::{OracleHub, ServerState};
@@ -151,13 +149,25 @@ fn main() {
     state.pending_timeout = std::sync::Mutex::new(Duration::from_secs(cli.pending_timeout));
     state.log_path = cli.log_path.to_string_lossy().to_string();
     let hub = OracleHub::clone(&fuse_server::ORACLE_HUB);
-    let io = RealSystemIo::new();
     for spec in &cli.secret {
-        match parse_secret(spec, &io) {
-            Ok((name, content, hash)) => {
-                info!("Registering secret '{name}' ({} bytes -> data daemon)", content.len());
-                state.add_with_mode(&name, content.clone(), &hash, 0o400);
-                hub.upsert(&name, &content, 0o400);
+        match parse_secret(spec) {
+            Ok((name, host, hash)) => {
+                // MR4: register by stat — identity + size, never bytes.
+                let md = match std::fs::metadata(&host) {
+                    Ok(md) => md,
+                    Err(e) => {
+                        error!("cannot stat {}: {e}", host.display());
+                        std::process::exit(1);
+                    }
+                };
+                use std::os::unix::fs::MetadataExt;
+                info!(
+                    "Registering secret '{name}' ({} bytes, host inode {})",
+                    md.len(),
+                    md.ino()
+                );
+                state.add_with_mode(&name, host.clone(), md.len() as usize, &hash, 0o400);
+                hub.serve(&name, md.dev(), md.ino(), 0o400);
             }
             Err(e) => {
                 error!("Bad --secret '{spec}': {e}");
@@ -186,15 +196,14 @@ fn main() {
     }
 }
 
-fn parse_secret(spec: &str, io: &RealSystemIo) -> Result<(String, Vec<u8>, String), String> {
+fn parse_secret(spec: &str) -> Result<(String, std::path::PathBuf, String), String> {
     let parts: Vec<&str> = spec.splitn(3, ':').collect();
     if parts.len() != 3 {
         return Err("expected NAME:FILE:HASH".into());
     }
     let name = parts[0].to_string();
-    let content = io
-        .read_file(std::path::Path::new(parts[1]))
-        .map_err(|e| e.0)?;
+    let host = std::fs::canonicalize(parts[1])
+        .map_err(|e| format!("cannot resolve {}: {e}", parts[1]))?;
     let hash = parts[2].to_string();
-    Ok((name, content, hash))
+    Ok((name, host, hash))
 }
