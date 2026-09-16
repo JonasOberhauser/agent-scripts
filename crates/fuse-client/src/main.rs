@@ -145,6 +145,7 @@ fn main() {
                 Box::new(talk),
                 panel_error,
             )
+            .with_collapsed_names(collapsed_names.clone())
             .with_log_window(Box::new(move |line: &str| {
                 panel_sink.lock().unwrap().push(line.to_string());
             }));

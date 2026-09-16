@@ -474,10 +474,47 @@ fn small_shell_hint() -> String {
 /// Who is requesting WHAT: the process plus the secret it wants
 /// (issue #19 — the panel used to show only the requester).  The
 /// secret renders COLLAPSED to its first point of difference against
-/// the other served names (issue #34) when a rendering is available.
+/// the other served names (issue #34) — the SAME rendering the
+/// status table prints (same function, same name set).
 fn requester_and_secret(req: &PendingAccessInfo, collapsed: Option<&str>) -> String {
     let secret = collapsed.unwrap_or(&req.secret_name);
     format!("{} → {}", requester(req), secret)
+}
+
+/// Fit `owner → secret` into `max` columns.  When the secret must
+/// lose width, it loses it from the FRONT — a collapsed name's
+/// identity lives in its suffix (`.../x/x1/bar.txt`), so a tail-cut
+/// (what plain truncation does) would eat the basename and make the
+/// row disagree with the status table even further.
+fn fit_requester_and_secret(req: &PendingAccessInfo, collapsed: Option<&str>, max: usize) -> String {
+    let whole = requester_and_secret(req, collapsed);
+    if whole.width() <= max {
+        let mut out = whole;
+        out.push_str(&" ".repeat(max - out.width()));
+        return out;
+    }
+    let secret = collapsed.unwrap_or(&req.secret_name);
+    let owner = requester(req);
+    // 3 columns for " → ".
+    let secret_budget = max.saturating_sub(owner.width().saturating_add(3) + 1);
+    if secret_budget < 4 {
+        // Degenerate narrow shell: the owner alone (tail-truncated)
+        // is the best that fits.
+        return truncate_pad(&owner, max);
+    }
+    // Keep the last secret_budget-1 columns of the secret, prefix …
+    let keep = secret_budget - 1;
+    let mut start = secret.len();
+    let mut width = 0;
+    for (i, ch) in secret.char_indices().rev() {
+        let ch_w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if width + ch_w > keep {
+            break;
+        }
+        start = i;
+        width += ch_w;
+    }
+    format!("{owner} → …{}", &secret[start..])
 }
 
 /// Hover (#25): the button under the mouse renders with the same
@@ -533,7 +570,7 @@ fn grid_row_line_styled_collapsed(
             let name_max = (width as usize).saturating_sub(4 + 1 + buttons_w);
             spans.push(Span::raw(format!(
                 "{} ",
-                truncate_pad(&requester_and_secret(req, collapsed), name_max)
+                fit_requester_and_secret(req, collapsed, name_max)
             )));
         }
         GridRow::All => {}
@@ -847,6 +884,15 @@ impl PendingPanelLayer {
             last_poll: None,
             seen: std::collections::HashSet::new(),
         }
+    }
+
+    /// Share the collapsed-name snapshot the panel worker fills.
+    /// Without this the panel renders raw names — the map it creates
+    /// in `new` is a private default nobody writes (bug: panel showed
+    /// full paths while status collapsed).
+    pub(crate) fn with_collapsed_names(mut self, collapsed: CollapsedNames) -> Self {
+        self.collapsed = collapsed;
+        self
     }
 
     /// Attach a writer into the shell's log window.
@@ -1803,6 +1849,72 @@ mod tests {
 
     /// Non-ASCII process names must not panic (byte-slicing on a char
     /// boundary) and must respect DISPLAY width, not char count.
+    fn pending_for(secret: &str) -> PendingAccessInfo {
+        PendingAccessInfo {
+            id: 7,
+            secret_name: secret.into(),
+            process_name: Some("goose".into()),
+            pid: 4242,
+            pid_hash: None,
+            pid_hash_error: None,
+            reason: "read request".into(),
+            expires_at: 0,
+        }
+    }
+
+    #[test]
+    fn panel_shares_the_snapshot_and_renders_the_status_form() {
+        // The user-visible contract: whatever the status table prints,
+        // the pending panel shows for the same secret. Two parts: the
+        // panel's map IS the worker-filled shared snapshot (it used to
+        // be a private default nobody wrote — raw paths in the panel),
+        // and the row renders that shared form verbatim when it fits.
+        let names = vec![
+            "var/home/jonas/secrets/agent/github.netrc".to_string(),
+            "var/home/jonas/secrets/zai.key".to_string(),
+        ];
+        let rendered = fuse_protocol::collapse_paths(&names);
+        let shared: CollapsedNames = Default::default();
+        shared
+            .lock()
+            .unwrap()
+            .extend(names.iter().cloned().zip(rendered.iter().cloned()));
+
+        let pending: PendingIds = Arc::new(Mutex::new(Vec::new()));
+        let talk = DirectTalk::new("/nonexistent.sock", Default::default(), no_error());
+        let panel = PendingPanelLayer::new(pending, Box::new(talk), no_error())
+            .with_collapsed_names(Arc::clone(&shared));
+        // part 1: the panel consults the shared snapshot
+        assert_eq!(
+            panel.collapsed.lock().unwrap().get("var/home/jonas/secrets/agent/github.netrc"),
+            Some(&".../agent/github.netrc".to_string()),
+            "shared map holds exactly the status rendering"
+        );
+        // part 2: the row shows that form, never the raw path
+        let req = pending_for("var/home/jonas/secrets/agent/github.netrc");
+        let line = grid_row_line_styled_collapsed(
+            GridRow::Request(&req),
+            90,
+            None,
+            false,
+            panel.collapsed.lock().unwrap().get(&req.secret_name).map(String::as_str),
+        );
+        let text: String = line.spans.iter().map(|s| s.content.clone()).collect();
+        assert!(text.contains(".../agent/github.netrc"), "status form: {text:?}");
+        assert!(!text.contains("var/home"), "no raw path leak: {text:?}");
+    }
+
+    #[test]
+    fn narrow_panels_keep_the_distinguishing_suffix() {
+        // Front-truncation: the basename (identity) survives; the
+        // elided front is where the redundancy lives.
+        let req = pending_for("var/home/jonas/secrets/agent/github.netrc");
+        let secret = ".../agent/github.netrc";
+        let fitted = fit_requester_and_secret(&req, Some(secret), 28);
+        assert!(fitted.ends_with("github.netrc"), "suffix survives: {fitted:?}");
+        assert!(fitted.contains('…'), "elided front is marked: {fitted:?}");
+    }
+
     #[test]
     fn truncate_pad_is_char_safe_and_width_aware() {
         use unicode_width::UnicodeWidthStr;
