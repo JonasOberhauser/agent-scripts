@@ -472,9 +472,12 @@ fn small_shell_hint() -> String {
 }
 
 /// Who is requesting WHAT: the process plus the secret it wants
-/// (issue #19 — the panel used to show only the requester).
-fn requester_and_secret(req: &PendingAccessInfo) -> String {
-    format!("{} → {}", requester(req), req.secret_name)
+/// (issue #19 — the panel used to show only the requester).  The
+/// secret renders COLLAPSED to its first point of difference against
+/// the other served names (issue #34) when a rendering is available.
+fn requester_and_secret(req: &PendingAccessInfo, collapsed: Option<&str>) -> String {
+    let secret = collapsed.unwrap_or(&req.secret_name);
+    format!("{} → {}", requester(req), secret)
 }
 
 /// Hover (#25): the button under the mouse renders with the same
@@ -484,6 +487,7 @@ fn grid_row_line_hover(
     width: u16,
     sel_here: Option<Sel>,
     hovered: Option<&Button>,
+    collapsed: Option<&str>,
 ) -> Line<'static> {
     let sel_here = match hovered {
         Some(Button::GrantForever { .. }) => Some(Sel::Forever),
@@ -491,9 +495,10 @@ fn grid_row_line_hover(
         Some(Button::Deny { .. }) | Some(Button::DenyAll) => Some(Sel::Deny),
         None => sel_here,
     };
-    grid_row_line(row, width, sel_here)
+    grid_row_line_styled_collapsed(row, width, sel_here, false, collapsed)
 }
 
+#[cfg(test)]
 fn grid_row_line(row: GridRow, width: u16, sel_here: Option<Sel>) -> Line<'static> {
     grid_row_line_styled(row, width, sel_here, false)
 }
@@ -503,6 +508,16 @@ fn grid_row_line_styled(
     width: u16,
     sel_here: Option<Sel>,
     disabled: bool,
+) -> Line<'static> {
+    grid_row_line_styled_collapsed(row, width, sel_here, disabled, None)
+}
+
+fn grid_row_line_styled_collapsed(
+    row: GridRow,
+    width: u16,
+    sel_here: Option<Sel>,
+    disabled: bool,
+    collapsed: Option<&str>,
 ) -> Line<'static> {
     let all = matches!(row, GridRow::All);
     let (deny_l, grant_l) = if all { ("[deny all]", "[grant all]") } else { ("[deny]", "[grant]") };
@@ -518,7 +533,7 @@ fn grid_row_line_styled(
             let name_max = (width as usize).saturating_sub(4 + 1 + buttons_w);
             spans.push(Span::raw(format!(
                 "{} ",
-                truncate_pad(&requester_and_secret(req), name_max)
+                truncate_pad(&requester_and_secret(req, collapsed), name_max)
             )));
         }
         GridRow::All => {}
@@ -585,6 +600,7 @@ fn service(
     socket: &Path,
     pending: &PendingIds,
     secrets: &SecretNames,
+    collapsed: &CollapsedNames,
     error: &LastError,
     log: &LogSink,
     req: PanelRequest,
@@ -596,9 +612,17 @@ fn service(
                 Err(e) => tracing::warn!("pending poll failed: {e}"),
             }
             // The same tick refreshes the secret-name snapshot that
-            // feeds reset/remove/rotate completion.
+            // feeds reset/remove/rotate completion — and the display
+            // rendering: names collapse to their first points of
+            // difference (issue #34).
             match poll_secret_names(socket) {
-                Ok(names) => *secrets.lock().unwrap() = names,
+                Ok(names) => {
+                    *secrets.lock().unwrap() = names.clone();
+                    let rendered = fuse_protocol::collapse_paths(&names);
+                    let mut c = collapsed.lock().unwrap();
+                    c.clear();
+                    c.extend(names.into_iter().zip(rendered));
+                }
                 Err(e) => tracing::warn!("secret-name poll failed: {e}"),
             }
         }
@@ -639,6 +663,7 @@ fn service(
 pub(crate) struct DirectTalk {
     socket: PathBuf,
     secrets: SecretNames,
+    collapsed: CollapsedNames,
     error: LastError,
     log: LogSink,
 }
@@ -650,14 +675,20 @@ impl DirectTalk {
         secrets: SecretNames,
         error: LastError,
     ) -> Self {
-        Self { socket: socket.into(), secrets, error, log: empty_sink() }
+        Self {
+            socket: socket.into(),
+            secrets,
+            collapsed: Default::default(),
+            error,
+            log: empty_sink(),
+        }
     }
 }
 
 #[cfg(test)]
 impl ServerTalk for DirectTalk {
     fn request(&self, snapshot: &PendingIds, req: PanelRequest) {
-        service(&self.socket, snapshot, &self.secrets, &self.error, &self.log, req);
+        service(&self.socket, snapshot, &self.secrets, &self.collapsed, &self.error, &self.log, req);
     }
 }
 
@@ -674,6 +705,7 @@ pub(crate) fn spawn_worker(
     socket: PathBuf,
     snapshot: PendingIds,
     secrets: SecretNames,
+    collapsed: CollapsedNames,
     error: LastError,
     log: LogSink,
 ) -> WorkerTalk {
@@ -681,9 +713,9 @@ pub(crate) fn spawn_worker(
     std::thread::spawn(move || {
         for req in rx {
             let follow_up = matches!(req, PanelRequest::Action { .. });
-            service(&socket, &snapshot, &secrets, &error, &log, req);
+            service(&socket, &snapshot, &secrets, &collapsed, &error, &log, req);
             if follow_up {
-                service(&socket, &snapshot, &secrets, &error, &log, PanelRequest::Poll);
+                service(&socket, &snapshot, &secrets, &collapsed, &error, &log, PanelRequest::Poll);
             }
         }
     });
@@ -758,10 +790,18 @@ impl ButtonGrid {
 /// Writer into the shell's log window.
 pub(crate) type LogWindow = Box<dyn Fn(&str)>;
 
+/// Display snapshot: full secret name -> collapsed rendering
+/// (issue #34), refreshed by the worker poll alongside the names.
+pub(crate) type CollapsedNames =
+    std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>;
+
 pub(crate) struct PendingPanelLayer {
     pending: PendingIds,
     error: LastError,
     talk: Box<dyn ServerTalk>,
+    /// Secret names (issue #34 path-shaped) collapsed to their first
+    /// points of difference for display: full name -> rendered.
+    collapsed: CollapsedNames,
     /// Writes a line into the shell's log window (the builtin TUI's
     /// log area).  Optional: absent in tests that only assert layout.
     log_window: Option<LogWindow>,
@@ -795,6 +835,7 @@ impl PendingPanelLayer {
             error,
             pending,
             talk,
+            collapsed: Default::default(),
             log_window: None,
             hover: std::cell::Cell::new(None),
             owner: std::cell::Cell::new(Owner::Keyboard),
@@ -977,13 +1018,20 @@ impl DisplayLayer for PendingPanelLayer {
                     // nor hover may suggest it is still pressable.
                     let disabled = self.in_flight.borrow().contains_key(&req.id);
                     if disabled {
-                        grid_row_line_styled(GridRow::Request(req), row.width, None, true)
+                        grid_row_line_styled_collapsed(
+                            GridRow::Request(req),
+                            row.width,
+                            None,
+                            true,
+                            self.collapsed.lock().unwrap().get(&req.secret_name).map(String::as_str),
+                        )
                     } else {
                         grid_row_line_hover(
                             GridRow::Request(req),
                             row.width,
                             sel_here,
                             hovered.as_ref(),
+                            self.collapsed.lock().unwrap().get(&req.secret_name).map(String::as_str),
                         )
                     }
                 }
@@ -1027,7 +1075,7 @@ impl DisplayLayer for PendingPanelLayer {
         let all_line = if all_disabled {
             grid_row_line_styled(GridRow::All, all_row.width, None, true)
         } else {
-            grid_row_line_hover(GridRow::All, all_row.width, sel_here, all_hovered.as_ref())
+            grid_row_line_hover(GridRow::All, all_row.width, sel_here, all_hovered.as_ref(), None)
         };
         widgets.push(WidgetEntry {
             name: PANEL_NAME,
@@ -2138,7 +2186,7 @@ mod tests {
 
         let pending: PendingIds = Arc::new(Mutex::new(Vec::new()));
         let secrets: SecretNames = Arc::new(Mutex::new(Vec::new()));
-        let talk = spawn_worker(sock.clone(), pending.clone(), secrets.clone(), no_error(), empty_sink());
+        let talk = spawn_worker(sock.clone(), pending.clone(), secrets.clone(), Default::default(), no_error(), empty_sink());
         talk.request(
             &pending,
             PanelRequest::Action {
@@ -2187,6 +2235,7 @@ mod tests {
                 PANEL_WIDTH,
                 None,
                 Some(&button),
+                None,
             );
             assert!(
                 line.spans
@@ -2196,7 +2245,7 @@ mod tests {
             );
             let _ = sel;
         }
-        let line = grid_row_line_hover(GridRow::All, PANEL_WIDTH, None, Some(&Button::GrantAll));
+        let line = grid_row_line_hover(GridRow::All, PANEL_WIDTH, None, Some(&Button::GrantAll), None);
         assert!(
             line.spans
                 .iter()
@@ -2209,7 +2258,7 @@ mod tests {
     #[test]
     fn hover_absent_leaves_selection_untouched() {
         let line =
-            grid_row_line_hover(GridRow::Request(&pending_info(31)), PANEL_WIDTH, None, None);
+            grid_row_line_hover(GridRow::Request(&pending_info(31)), PANEL_WIDTH, None, None, None);
         assert!(
             !line.spans
                 .iter()
@@ -2658,7 +2707,7 @@ mod tests {
         let secrets: SecretNames = Arc::new(Mutex::new(Vec::new()));
         let error: LastError = no_error();
         let log: LogSink = empty_sink();
-        let talk = spawn_worker(sock.clone(), pending.clone(), secrets.clone(), error.clone(), log.clone());
+        let talk = spawn_worker(sock.clone(), pending.clone(), secrets.clone(), Default::default(), error.clone(), log.clone());
         talk.request(
             &pending,
             PanelRequest::Action {
