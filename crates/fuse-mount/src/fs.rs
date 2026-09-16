@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -26,157 +26,243 @@ struct Content {
     mode: u32,
 }
 
-#[derive(Default)]
-struct StoreInner {
-    next_ino: u64,
-    by_name: HashMap<String, u64>,
-    by_ino: HashMap<u64, (String, Content)>,
+/// One node of the mount tree: a served file (with its bytes) or an
+/// implicit directory (with its children).
+#[derive(Clone)]
+enum Node {
+    File(Content),
+    Dir { children: std::collections::BTreeMap<String, u64> },
 }
 
-// Directories are a DERIVED VIEW, not entities (review): the store
-// keeps bookkeeping for files only — a directory is exactly "some
-// served name lives under this path", its inode is DERIVED from the
-// path (hash, top bit set: disjoint from the small file-inode
-// counters), and it needs no lifecycle, no allocator, and no state
-// that can drift from the name set.
+struct StoreInner {
+    /// ONE increment-only counter for every node, files and
+    /// directories alike.  The only invariants the FUSE ABI puts on
+    /// inodes are: root is FUSE_ROOT_ID (1), live inodes identify at
+    /// most one node each, and a number stays bound to its node while
+    /// the kernel may still reference it.  A monotone counter satisfies
+    /// all three trivially — numbers never repeat, so a path deleted
+    /// and re-created gets a fresh inode and stale kernel references
+    /// can never conflate nodes.
+    next_ino: u64,
+    by_path: HashMap<PathBuf, u64>,
+    by_ino: HashMap<u64, (PathBuf, Node)>,
+}
 
-/// Content store: name⇄inode bookkeeping plus the bytes.
+impl Default for StoreInner {
+    fn default() -> Self {
+        let mut s = Self {
+            next_ino: ROOT_INO,
+            by_path: HashMap::new(),
+            by_ino: HashMap::new(),
+        };
+        s.by_path.insert(PathBuf::new(), ROOT_INO);
+        s.by_ino.insert(
+            ROOT_INO,
+            (PathBuf::new(), Node::Dir { children: Default::default() }),
+        );
+        s
+    }
+}
+
+/// Content store: the mount tree.  Files and directories are ordinary
+/// entries in the same two maps and the same counter — no separate
+/// machinery for either kind.
 #[derive(Clone, Default)]
 pub struct Store(Arc<Mutex<StoreInner>>);
 
 impl Store {
     pub fn upsert(&self, name: &str, bytes: Vec<u8>, mode: u32) {
         let mut s = self.0.lock().unwrap();
-        if let Some(&ino) = s.by_name.get(name) {
-            s.by_ino.insert(ino, (name.to_string(), Content { bytes, mode }));
-        } else {
-            s.next_ino += 1;
-            let ino = s.next_ino + ROOT_INO;
-            s.by_name.insert(name.to_string(), ino);
-            s.by_ino.insert(ino, (name.to_string(), Content { bytes, mode }));
+        let path = PathBuf::from(name);
+        let comps: Vec<std::ffi::OsString> =
+            path.components().map(|c| c.as_os_str().to_os_string()).collect();
+        if comps.is_empty() {
+            return;
+        }
+        // Walk (and materialize) the parent chain of implicit dirs.
+        let mut prefix = PathBuf::new();
+        let mut parent = ROOT_INO;
+        for comp in comps.iter().take(comps.len() - 1) {
+            prefix.push(comp);
+            let existing = s.by_path.get(&prefix).copied();
+            parent = match existing {
+                Some(ino) => match &s.by_ino[&ino].1 {
+                    Node::Dir { .. } => ino,
+                    // A served FILE occupies the directory position —
+                    // possible only via raw AddSecret with
+                    // non-normalized names.  Fail safe: keep the
+                    // shallower file, skip this name, say so.
+                    Node::File(_) => {
+                        warn!("cannot serve \"{name}\": \"{}\" is already a file",
+                              prefix.display());
+                        return;
+                    }
+                },
+                None => {
+                    s.next_ino += 1;
+                    let ino = s.next_ino;
+                    s.by_path.insert(prefix.clone(), ino);
+                    s.by_ino.insert(
+                        ino,
+                        (prefix.clone(), Node::Dir { children: Default::default() }),
+                    );
+                    let Node::Dir { children } = &mut s.by_ino.get_mut(&parent).unwrap().1
+                    else {
+                        unreachable!("parent chain is directories by construction");
+                    };
+                    children.insert(comp.to_string_lossy().into_owned(), ino);
+                    ino
+                }
+            };
+        }
+        let file_label = comps.last().unwrap().to_string_lossy().into_owned();
+        match s.by_path.get(&path).copied() {
+            Some(ino) => {
+                // Live path: replace the content, KEEP the inode —
+                // open fds and kernel caches stay coherent.
+                s.by_ino.get_mut(&ino).unwrap().1 = Node::File(Content { bytes, mode });
+            }
+            None => {
+                s.next_ino += 1;
+                let ino = s.next_ino;
+                s.by_path.insert(path.clone(), ino);
+                s.by_ino.insert(ino, (path, Node::File(Content { bytes, mode })));
+                let Node::Dir { children } = &mut s.by_ino.get_mut(&parent).unwrap().1
+                else {
+                    unreachable!("parent chain is directories by construction");
+                };
+                children.insert(file_label, ino);
+            }
         }
     }
 
     pub fn remove(&self, name: &str) {
         let mut s = self.0.lock().unwrap();
-        if let Some(ino) = s.by_name.remove(name) {
-            s.by_ino.remove(&ino);
+        let path = PathBuf::from(name);
+        let Some(ino) = s.by_path.get(&path).copied() else {
+            return;
+        };
+        if !matches!(s.by_ino[&ino].1, Node::File(_)) {
+            return;
         }
-    }
-
-    /// Inode of the implicit directory at `path` — a pure function of
-    /// the path. Top bit set keeps it disjoint from file inodes
-    /// (ROOT_INO + small counters).
-    fn dir_ino(path: &Path) -> u64 {
-        use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        path.hash(&mut h);
-        h.finish() | (1 << 63)
-    }
-
-    /// Every directory path currently implied by the served names —
-    /// the PROPER prefixes of the flat name set (the names themselves
-    /// are files), derived on demand.
-    fn live_dir_paths(&self) -> Vec<PathBuf> {
-        let s = self.0.lock().unwrap();
-        let mut set = std::collections::BTreeSet::new();
-        for name in s.by_name.keys() {
-            let comps: Vec<_> = Path::new(name).components().collect();
-            let mut p = PathBuf::new();
-            for comp in comps.iter().take(comps.len().saturating_sub(1)) {
-                p.push(comp);
-                set.insert(p.clone());
+        let mut child_label = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        s.by_path.remove(&path);
+        s.by_ino.remove(&ino);
+        // Unlink from the parent, then prune childless ancestors so
+        // implicit directories vanish with their last name.
+        let mut parent_path = path;
+        loop {
+            if !parent_path.pop() {
+                break;
             }
-        }
-        set.into_iter().collect()
-    }
-
-    /// Path of a directory inode, None for non-directories. Derived:
-    /// the (small) implied-prefix set is searched for the path that
-    /// hashes to `ino` — no reverse map to maintain.
-    fn dir_path(&self, ino: u64) -> Option<PathBuf> {
-        self.live_dir_paths().into_iter().find(|p| Self::dir_ino(p) == ino)
-    }
-
-    /// Resolve one lookup step under `prefix` (empty = root): a served
-    /// file, an implicit directory, or nothing. Component semantics
-    /// come from the OS path library — `join` builds the child path,
-    /// `strip_prefix` decides what lives under it.
-    fn child_of(&self, prefix: &Path, name: &OsStr) -> Option<Child> {
-        let full = prefix.join(name);
-        let key = full.to_string_lossy().into_owned();
-        let s = self.0.lock().unwrap();
-        if let Some(&ino) = s.by_name.get(&key) {
-            return Some(Child::File(ino));
-        }
-        // The directory exists iff some served name lives strictly
-        // under it (a non-empty remainder after prefix stripping).
-        let is_dir = s.by_name.keys().any(|n| {
-            Path::new(n)
-                .strip_prefix(&full)
-                .is_ok_and(|rest| !rest.as_os_str().is_empty())
-        });
-        drop(s);
-        if is_dir {
-            Some(Child::Dir(Self::dir_ino(&full)))
-        } else {
-            None
-        }
-    }
-
-    /// Entries of the directory at `prefix` (empty = root): distinct
-    /// next components with their kinds, sorted by name (readdir order
-    /// stability). Derived component-wise via the OS path library.
-    fn dir_children(&self, prefix: &Path) -> Vec<(u64, bool, String)> {
-        let s = self.0.lock().unwrap();
-        // component -> (is_dir, file ino when !is_dir); collected
-        // under the lock, dir inodes allocated after the release.
-        let mut comps: std::collections::BTreeMap<String, (bool, Option<u64>)> =
-            Default::default();
-        for name in s.by_name.keys() {
-            let Ok(rest) = Path::new(name).strip_prefix(prefix) else {
-                continue;
+            let Some(pino) = s.by_path.get(&parent_path).copied() else {
+                break;
             };
-            let Some(first) = rest.components().next() else {
-                continue;
+            let now_empty = {
+                let Node::Dir { children } = &mut s.by_ino.get_mut(&pino).unwrap().1 else {
+                    break;
+                };
+                children.remove(&child_label);
+                children.is_empty() && pino != ROOT_INO
             };
-            let is_dir = rest.components().nth(1).is_some();
-            let label = first.as_os_str().to_string_lossy().into_owned();
-            if is_dir {
-                comps.insert(label, (true, None));
-            } else {
-                comps.insert(label, (false, Some(s.by_name[name])));
+            if !now_empty {
+                break;
             }
+            s.by_path.remove(&parent_path);
+            s.by_ino.remove(&pino);
+            child_label = parent_path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
         }
-        let resolved: Vec<_> = comps.into_iter().map(|(c, v)| (c, v.0, v.1)).collect();
-        drop(s);
-        resolved
-            .into_iter()
-            .map(|(c, is_dir, file_ino)| {
-                let full = prefix.join(&c);
-                let ino = if is_dir { Self::dir_ino(&full) } else { file_ino.unwrap() };
-                (ino, is_dir, c)
-            })
-            .collect()
     }
 
-    fn lookup(&self, ino: u64) -> Option<(String, Content)> {
-        self.0.lock().unwrap().by_ino.get(&ino).cloned()
+    /// One lookup step: the child of directory `parent` named `name`,
+    /// as (inode, is_dir).  O(1) — the parent's children map knows.
+    fn child(&self, parent: u64, name: &OsStr) -> Option<(u64, bool)> {
+        let s = self.0.lock().unwrap();
+        let Node::Dir { children } = &s.by_ino.get(&parent)?.1 else {
+            return None;
+        };
+        let &ino = children.get(&name.to_string_lossy().into_owned())?;
+        let is_dir = matches!(s.by_ino.get(&ino)?.1, Node::Dir { .. });
+        Some((ino, is_dir))
     }
 
+    /// Entries of a directory for readdir: (inode, is_dir, name) in
+    /// BTreeMap order (readdir order stability).
+    fn dir_children(&self, dir: u64) -> Option<Vec<(u64, bool, String)>> {
+        let s = self.0.lock().unwrap();
+        let Node::Dir { children } = &s.by_ino.get(&dir)?.1 else {
+            return None;
+        };
+        Some(
+            children
+                .iter()
+                .map(|(name, &ino)| {
+                    let is_dir = matches!(s.by_ino[&ino].1, Node::Dir { .. });
+                    (ino, is_dir, name.clone())
+                })
+                .collect(),
+        )
+    }
+
+    fn is_dir(&self, ino: u64) -> bool {
+        matches!(
+            self.0.lock().unwrap().by_ino.get(&ino).map(|(_, n)| n),
+            Some(Node::Dir { .. })
+        )
+    }
+
+    /// The parent directory of `ino` (None for root / unknown).
+    fn parent_of(&self, ino: u64) -> Option<u64> {
+        let s = self.0.lock().unwrap();
+        let (path, node) = s.by_ino.get(&ino)?;
+        if !matches!(node, Node::Dir { .. }) || path.as_os_str().is_empty() {
+            return None;
+        }
+        let mut parent = path.clone();
+        parent.pop();
+        s.by_path.get(&parent).copied()
+    }
+
+    /// A served file by inode: its full (path-shaped) name for policy
+    /// asks, and its content.
+    fn file(&self, ino: u64) -> Option<(String, Content)> {
+        let s = self.0.lock().unwrap();
+        let (path, node) = s.by_ino.get(&ino)?;
+        match node {
+            Node::File(c) => Some((path.to_string_lossy().into_owned(), c.clone())),
+            Node::Dir { .. } => None,
+        }
+    }
+
+    /// Every served FILE as (inode, full name, mode, size) — sorted by
+    /// name.  Directories are not listed.
     fn listing(&self) -> Vec<(u64, String, u32, usize)> {
         let s = self.0.lock().unwrap();
         let mut v: Vec<_> = s
             .by_ino
             .iter()
-            .map(|(ino, (name, c))| (*ino, name.clone(), c.mode, c.bytes.len()))
+            .filter_map(|(ino, (path, node))| match node {
+                Node::File(c) => Some((
+                    *ino,
+                    path.to_string_lossy().into_owned(),
+                    c.mode,
+                    c.bytes.len(),
+                )),
+                Node::Dir { .. } => None,
+            })
             .collect();
         v.sort_by(|a, b| a.1.cmp(&b.1));
         v
     }
 
     fn read(&self, ino: u64, offset: usize, size: usize) -> Option<Vec<u8>> {
-        let (_, c) = self.lookup(ino)?;
+        let (_, c) = self.file(ino)?;
         let data = &c.bytes;
         if offset >= data.len() {
             return Some(Vec::new());
@@ -202,13 +288,6 @@ pub fn ask_policy(socket: &str, name: &str, pid: u32, offset: u64, size: u32) ->
     let mut line = String::new();
     reader.read_line(&mut line).map_err(|e| e.to_string())?;
     serde_json::from_str(line.trim()).map_err(|e| e.to_string())
-}
-
-/// One resolved path component: a served file or an implicit
-/// directory (issue #34 path-shaped names).
-enum Child {
-    File(u64),
-    Dir(u64),
 }
 
 pub struct FusedFs {
@@ -276,20 +355,9 @@ impl Filesystem for FusedFs {
     fn destroy(&mut self) {}
 
     fn lookup(&mut self, req: &Request<'_>, parent: u64, name: &std::ffi::OsStr, reply: ReplyEntry) {
-        let prefix = if parent == ROOT_INO {
-            PathBuf::new()
-        } else {
-            match self.store.dir_path(parent) {
-                Some(p) => p,
-                None => {
-                    reply.error(libc::ENOENT);
-                    return;
-                }
-            }
-        };
-        match self.store.child_of(&prefix, name) {
-            Some(Child::File(ino)) => {
-                if let Some((_, c)) = self.store.lookup(ino) {
+        match self.store.child(parent, name) {
+            Some((ino, false)) => {
+                if let Some((_, c)) = self.store.file(ino) {
                     let attr =
                         self.file_attr(ino, c.bytes.len() as u64, req.uid(), req.gid(), c.mode);
                     reply.entry(&TTL, &attr, 0);
@@ -297,7 +365,7 @@ impl Filesystem for FusedFs {
                     reply.error(libc::ENOENT);
                 }
             }
-            Some(Child::Dir(ino)) => {
+            Some((ino, true)) => {
                 reply.entry(&TTL, &self.dir_attr(ino, req.uid(), req.gid()), 0);
             }
             None => reply.error(libc::ENOENT),
@@ -309,18 +377,13 @@ impl Filesystem for FusedFs {
             reply.attr(&TTL, &self.dir_attr(ino, req.uid(), req.gid()));
             return;
         }
-        match self.store.lookup(ino) {
-            Some((_, c)) => {
-                let attr = self.file_attr(ino, c.bytes.len() as u64, req.uid(), req.gid(), c.mode);
-                reply.attr(&TTL, &attr);
-            }
-            None => {
-                if self.store.dir_path(ino).is_some() {
-                    reply.attr(&TTL, &self.dir_attr(ino, req.uid(), req.gid()));
-                } else {
-                    reply.error(libc::ENOENT);
-                }
-            }
+        if let Some((_, c)) = self.store.file(ino) {
+            let attr = self.file_attr(ino, c.bytes.len() as u64, req.uid(), req.gid(), c.mode);
+            reply.attr(&TTL, &attr);
+        } else if self.store.is_dir(ino) {
+            reply.attr(&TTL, &self.dir_attr(ino, req.uid(), req.gid()));
+        } else {
+            reply.error(libc::ENOENT);
         }
     }
 
@@ -339,7 +402,7 @@ impl Filesystem for FusedFs {
         _lock_owner: Option<u64>,
         reply: ReplyData,
     ) {
-        let Some((name, _)) = self.store.lookup(ino) else {
+        let Some((name, _)) = self.store.file(ino) else {
             reply.error(libc::ENOENT);
             return;
         };
@@ -378,24 +441,18 @@ impl Filesystem for FusedFs {
         offset: i64,
         mut reply: ReplyDirectory,
     ) {
-        let prefix = if ino == ROOT_INO {
-            PathBuf::new()
-        } else {
-            match self.store.dir_path(ino) {
-                Some(p) => p,
-                None => {
-                    reply.error(libc::ENOENT);
-                    return;
-                }
-            }
-        };
         // FUSE readdir contract: each entry carries the offset the NEXT
         // readdir call should start from — strictly increasing, never 0,
         // or the kernel re-reads from the start forever.
-        let children = self.store.dir_children(&prefix);
+        let Some(children) = self.store.dir_children(ino) else {
+            reply.error(libc::ENOENT);
+            return;
+        };
+        let dot_ino = ino;
+        let dotdot_ino = self.store.parent_of(ino).unwrap_or(ino);
         let all: Vec<(u64, FileType, String)> = vec![
-            (ROOT_INO, FileType::Directory, ".".into()),
-            (ROOT_INO, FileType::Directory, "..".into()),
+            (dot_ino, FileType::Directory, ".".into()),
+            (dotdot_ino, FileType::Directory, "..".into()),
         ]
         .into_iter()
         .chain(children.into_iter().map(|(i, is_dir, n)| {
@@ -518,49 +575,10 @@ pub fn run_control_loop(store: Store, oracle_socket: String) {
     }
 }
 
-
-    #[test]
-    fn dir_inode_is_a_pure_function_of_the_path() {
-        // Review: directories are a derived view — no allocator state.
-        // The inode is derived from the path (stable within the mount,
-        // top bit set so it can never collide with the small file
-        // inode counters).
-        let a = Store::dir_ino(Path::new("home/u"));
-        assert_eq!(a, Store::dir_ino(Path::new("home/u")));
-        assert_ne!(a, Store::dir_ino(Path::new("home/v")));
-        assert!(a & (1 << 63) != 0, "dir inodes live in the high range");
-    }
-
-    #[test]
-    fn dir_paths_derive_from_the_served_name_set() {
-        // The implied directory set is exactly the prefixes of the
-        // served names — materializing on insert, vanishing on
-        // remove, with no state of its own to drift.
-        let s = Store::default();
-        s.upsert("home/u/a.json", b"A".to_vec(), 0o400);
-        s.upsert("home/u/keys/t.json", b"T".to_vec(), 0o400);
-        assert_eq!(
-            s.live_dir_paths(),
-            vec![
-                PathBuf::from("home"),
-                PathBuf::from("home/u"),
-                PathBuf::from("home/u/keys"),
-            ]
-        );
-        s.remove("home/u/keys/t.json");
-        assert_eq!(
-            s.live_dir_paths(),
-            vec![PathBuf::from("home"), PathBuf::from("home/u")]
-        );
-        // and every implied dir answers via its derived inode
-        let u_ino = Store::dir_ino(Path::new("home/u"));
-        assert_eq!(s.dir_path(u_ino), Some(PathBuf::from("home/u")));
-        let gone = Store::dir_ino(Path::new("home/u/keys"));
-        assert_eq!(s.dir_path(gone), None, "vanished with its last name");
-    }
-
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn control_line_upsert_and_remove_apply() {
         let s = Store::default();
@@ -577,38 +595,78 @@ mod tests {
     #[test]
     fn implicit_directories_materialize_from_path_names() {
         // Issue #34: names are normalized host paths; directories
-        // derive from the components.
+        // derive from the components. Lookup goes parent-ino ->
+        // children map: one step per component, exactly like the
+        // kernel walks.
         let s = Store::default();
         s.upsert("home/u/auth.json", b"A".to_vec(), 0o400);
         s.upsert("home/u/keys/token", b"T".to_vec(), 0o400);
         s.upsert("other.txt", b"O".to_vec(), 0o400);
 
-        let root = s.dir_children(Path::new(""));
+        let root = s.dir_children(ROOT_INO).unwrap();
         let names: Vec<&str> = root.iter().map(|(_, _, n)| n.as_str()).collect();
         assert_eq!(names, ["home", "other.txt"], "root: one dir + one file");
         assert!(root[0].1, "home is a directory");
         assert!(!root[1].1, "other.txt is a file");
 
-        let home = s.dir_children(Path::new("home"));
-        assert_eq!(home.iter().map(|(_, _, n)| n.clone()).collect::<Vec<_>>(), ["u"]);
-        let u = s.dir_children(Path::new("home/u"));
-        let names: Vec<&str> = u.iter().map(|(_, _, n)| n.as_str()).collect();
+        let home = s.child(ROOT_INO, OsStr::new("home")).unwrap();
+        assert!(home.1);
+        let u = s.child(home.0, OsStr::new("u")).unwrap();
+        let u_children = s.dir_children(u.0).unwrap();
+        let names: Vec<&str> = u_children.iter().map(|(_, _, n)| n.as_str()).collect();
         assert_eq!(names, ["auth.json", "keys"], "mixed dir+file under u");
 
         // resolution matches the listing
-        assert!(matches!(s.child_of(Path::new(""), OsStr::new("home")), Some(Child::Dir(_))));
-        assert!(matches!(s.child_of(Path::new("home/u"), OsStr::new("auth.json")), Some(Child::File(_))));
-        assert!(matches!(s.child_of(Path::new("home/u/keys"), OsStr::new("token")), Some(Child::File(_))));
-        assert!(s.child_of(Path::new("home"), OsStr::new("auth.json")).is_none(), "no such sibling");
+        let auth = s.child(u.0, OsStr::new("auth.json")).unwrap();
+        assert!(!auth.1);
+        let keys = s.child(u.0, OsStr::new("keys")).unwrap();
+        assert!(keys.1);
+        assert!(s.child(keys.0, OsStr::new("token")).is_some());
+        assert!(s.child(home.0, OsStr::new("auth.json")).is_none(), "no such sibling");
+        // the file answers by inode with its full path-shaped name
+        let (name, c) = s.file(auth.0).unwrap();
+        assert_eq!(name, "home/u/auth.json");
+        assert_eq!(c.bytes, b"A".to_vec());
+        // and the dir reports its parent
+        assert_eq!(s.parent_of(u.0), Some(home.0));
     }
 
     #[test]
     fn directories_vanish_when_their_last_name_leaves() {
         let s = Store::default();
         s.upsert("a/b/c.txt", b"C".to_vec(), 0o400);
-        assert!(matches!(s.child_of(Path::new("a"), OsStr::new("b")), Some(Child::Dir(_))));
+        let a = s.child(ROOT_INO, OsStr::new("a")).unwrap();
+        assert!(s.child(a.0, OsStr::new("b")).is_some());
         s.remove("a/b/c.txt");
-        assert!(s.child_of(Path::new(""), OsStr::new("a")).is_none(), "empty trees disappear");
+        assert!(s.child(ROOT_INO, OsStr::new("a")).is_none(), "empty trees disappear");
+    }
+
+    #[test]
+    fn recreated_paths_get_fresh_inodes_and_live_ones_stay_unique() {
+        // The FUSE inode contract: live numbers identify at most one
+        // node each; a deleted-and-recreated path is a NEW node and
+        // must get a NEW number (the counter never repeats, so stale
+        // kernel references can never conflate nodes).
+        let s = Store::default();
+        s.upsert("k/a.txt", b"1".to_vec(), 0o400);
+        let k1 = s.child(ROOT_INO, OsStr::new("k")).unwrap();
+        let a1 = s.child(k1.0, OsStr::new("a.txt")).unwrap();
+        s.remove("k/a.txt");
+        s.upsert("k/a.txt", b"2".to_vec(), 0o400);
+        let k2 = s.child(ROOT_INO, OsStr::new("k")).unwrap();
+        let a2 = s.child(k2.0, OsStr::new("a.txt")).unwrap();
+        assert_ne!(a1.0, a2.0, "recreated file: fresh inode");
+        assert_ne!(k1.0, k2.0, "recreated (pruned + re-materialized) dir: fresh inode");
+
+        // live uniqueness across files and directories alike:
+        // listing() covers every live file, the vec adds the dirs
+        s.upsert("k/b.txt", b"3".to_vec(), 0o400);
+        let mut live: Vec<u64> = vec![ROOT_INO, k2.0];
+        live.extend(s.listing().iter().map(|(ino, _, _, _)| *ino));
+        let mut sorted = live.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(live.len(), sorted.len(), "every live inode is distinct");
     }
 
     #[test]
@@ -654,37 +712,33 @@ mod tests {
         assert!(has(&s), "store must be untouched by garbage");
     }
 
-
-    use super::*;
-
-    fn store_with(name: &str, bytes: &[u8], mode: u32) -> Store {
+    fn root_file(name: &str, bytes: &[u8], mode: u32) -> (Store, u64) {
         let s = Store::default();
         s.upsert(name, bytes.to_vec(), mode);
-        s
+        let ino = s.child(ROOT_INO, OsStr::new(name)).expect("served").0;
+        (s, ino)
     }
 
     #[test]
-    fn upsert_assigns_stable_inode_and_replace_keeps_it() {
-        let s = store_with("a", b"one", 0o400);
-        let ino1 = s.0.lock().unwrap().by_name["a"];
+    fn replace_keeps_the_inode_of_a_live_file() {
+        let (s, ino1) = root_file("a", b"one", 0o400);
         s.upsert("a", b"longer bytes".to_vec(), 0o400);
-        let ino2 = s.0.lock().unwrap().by_name["a"];
-        assert_eq!(ino1, ino2, "replacement keeps the inode");
+        let ino2 = s.child(ROOT_INO, OsStr::new("a")).expect("still served").0;
+        assert_eq!(ino1, ino2, "replacement keeps the inode (open fds keep reading)");
         assert_eq!(s.read(ino1, 0, 64).unwrap(), b"longer bytes");
     }
 
     #[test]
-    fn remove_makes_lookup_fail() {
-        let s = store_with("a", b"x", 0o400);
-        let ino = s.0.lock().unwrap().by_name["a"];
+    fn remove_makes_the_inode_unreachable() {
+        let (s, ino) = root_file("a", b"x", 0o400);
         s.remove("a");
-        assert!(s.lookup(ino).is_none());
+        assert!(s.file(ino).is_none());
+        assert!(s.child(ROOT_INO, OsStr::new("a")).is_none());
     }
 
     #[test]
     fn read_clamps_offset_and_size() {
-        let s = store_with("a", b"0123456789", 0o400);
-        let ino = s.0.lock().unwrap().by_name["a"];
+        let (s, ino) = root_file("a", b"0123456789", 0o400);
         assert_eq!(s.read(ino, 2, 3).unwrap(), b"234");
         assert_eq!(s.read(ino, 9, 100).unwrap(), b"9");
         assert_eq!(s.read(ino, 10, 5).unwrap(), b"");
@@ -712,7 +766,8 @@ mod tests {
             };
             assert_eq!((name.as_str(), pid, offset, size), ("s.yaml", 7, 1, 4));
             conn.write_all(
-                format!("{}\n", serde_json::to_string(&OracleReply::Allow).unwrap()).as_bytes(),
+                format!("{}
+", serde_json::to_string(&OracleReply::Allow).unwrap()).as_bytes(),
             )
             .unwrap();
         });
