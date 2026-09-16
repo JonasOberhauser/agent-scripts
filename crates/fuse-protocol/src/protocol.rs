@@ -67,9 +67,85 @@ pub struct StateSecretEntry {
 
 // ── Commands (client → server) ─────────────────────────────────
 
-/// Default permission bits for secrets whose sender does not carry the
-/// mode field (conservative read-only).  Shared by the client-facing
-/// `AddSecret` and the oracle `Upsert` wire formats.
+/// Collapse a set of path-shaped secret names to their first points
+/// of difference (issue #34) — implemented as a prefix tree: each
+/// edge is exactly one path component, and the rendering follows
+/// directly from the tree shape:
+///
+/// - a component whose parent node has MULTIPLE children is written
+///   (it is one of the disambiguating alternatives — the "first
+///   point of difference"),
+/// - the final component (the file name) is always written,
+/// - every maximal chain of remaining single-child nodes collapses
+///   into one `...`.
+///
+///   [foo/bar/x/x1/bar.txt, foo/bar/y/y1/y2/bar.txt, foo/bar/baz.txt]
+///   -> .../x/.../bar.txt, .../y/.../bar.txt, .../baz.txt
+#[derive(Default)]
+struct CollapseTrie {
+    /// `terminal` marks a served name ending at this node (a name may
+    /// also be a prefix of another name).
+    terminal: bool,
+    children: std::collections::BTreeMap<String, CollapseTrie>,
+}
+
+impl CollapseTrie {
+    fn insert(&mut self, comps: &[&str]) {
+        let mut node = self;
+        for (i, c) in comps.iter().enumerate() {
+            node = node.children.entry(c.to_string()).or_default();
+            if i == comps.len() - 1 {
+                node.terminal = true;
+            }
+        }
+    }
+
+    /// Render one component sequence against the tree.
+    fn render(&self, comps: &[&str]) -> String {
+        let mut node = self;
+        let mut pieces: Vec<String> = Vec::new();
+        let mut elided = false;
+        for (i, c) in comps.iter().enumerate() {
+            let parent_branches = node.children.len() > 1;
+            node = node.children.get(*c).expect("inserted before render");
+            let write = i == comps.len() - 1 || parent_branches;
+            if write {
+                if elided {
+                    pieces.push("...".into());
+                    elided = false;
+                }
+                pieces.push((*c).to_string());
+            } else {
+                elided = true;
+            }
+        }
+        if elided {
+            // The sequence ended on an elided chain — cannot happen
+            // for rendered names (the last component is always
+            // written), kept for completeness.
+            pieces.push("...".into());
+        }
+        pieces.join("/")
+    }
+}
+
+pub fn collapse_paths(paths: &[String]) -> Vec<String> {
+    // Dedup, keep order.
+    let mut set: Vec<String> = Vec::new();
+    for p in paths {
+        if !set.contains(p) {
+            set.push(p.clone());
+        }
+    }
+    let comps: Vec<Vec<&str>> = set.iter().map(|p| p.split('/').collect()).collect();
+
+    let mut trie = CollapseTrie::default();
+    for c in &comps {
+        trie.insert(c);
+    }
+    comps.iter().map(|c| trie.render(c)).collect()
+}
+
 /// Whether a server version and a client version speak the same
 /// protocol: major and minor must match; the patch component is
 /// ignored by design (AGENTS.md) so patch releases never force a
@@ -87,6 +163,9 @@ pub fn versions_compatible(server: &str, client: &str) -> bool {
     }
 }
 
+/// Default permission bits for secrets whose sender does not carry the
+/// mode field (conservative read-only).  Shared by the client-facing
+/// `AddSecret` and the oracle `Upsert` wire formats.
 pub fn default_secret_mode() -> u32 {
     0o400
 }
@@ -163,6 +242,64 @@ pub enum Response {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn collapse_to_first_points_of_difference_issue_example_1() {
+        let got = collapse_paths(&[
+            "foo/bar/x/x1/bar.txt".to_string(),
+            "foo/bar/y/y1/y2/bar.txt".to_string(),
+            "foo/bar/baz.txt".to_string(),
+        ]);
+        assert_eq!(
+            got,
+            vec![
+                ".../x/.../bar.txt".to_string(),
+                ".../y/.../bar.txt".to_string(),
+                ".../baz.txt".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn collapse_to_first_points_of_difference_issue_example_2() {
+        let got = collapse_paths(&[
+            "foo/bar/x/x1/bar.txt".to_string(),
+            "foo/bar/y/y1/y2/bar.txt".to_string(),
+            "foo/bar/x/x2/bar.txt".to_string(),
+        ]);
+        assert_eq!(
+            got,
+            vec![
+                ".../x/x1/bar.txt".to_string(),
+                ".../y/.../bar.txt".to_string(),
+                ".../x/x2/bar.txt".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn collapse_handles_names_nested_under_names() {
+        // The trie marks terminals mid-tree: a served name that is
+        // also a prefix of another renders both distinguishably.
+        let got = collapse_paths(&["a/b".to_string(), "a/b/c.txt".to_string()]);
+        assert_eq!(got, vec![".../b".to_string(), ".../c.txt".to_string()]);
+    }
+
+    #[test]
+    fn collapse_degenerate_cases() {
+        // single short path: itself
+        assert_eq!(collapse_paths(&["a.txt".into()]), vec!["a.txt".to_string()]);
+        // single long path: elided prefix + basename
+        assert_eq!(
+            collapse_paths(&["a/b/c/d.txt".into()]),
+            vec![".../d.txt".to_string()]
+        );
+        // no common prefix: nothing elided at the front
+        assert_eq!(
+            collapse_paths(&["a/x.txt".into(), "b/y.txt".into()]),
+            vec!["a/x.txt".to_string(), "b/y.txt".to_string()]
+        );
+    }
+
     use super::*;
 
     #[test]

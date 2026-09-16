@@ -14,8 +14,13 @@ pub fn print_response(resp: &Response, out: &mut dyn Console) {
             if secrets.is_empty() {
                 out.print_line("No secrets configured.");
             } else {
+                // Issue #34: display names collapse to their first
+                // points of difference against the listed set.
+                let collapsed = crate::protocol::collapse_paths(
+                    &secrets.iter().map(|s| s.name.clone()).collect::<Vec<_>>(),
+                );
                 out.print_line(&format!("{:<24} {:>8} {:>8}  HASH", "NAME", "READS", "SIZE"));
-                for s in secrets {
+                for (s, name) in secrets.iter().zip(&collapsed) {
                     let hash = if s.allowed_hash == crate::PENDING_ONLY_HASH {
                         "(manual approval only)"
                     } else {
@@ -23,7 +28,7 @@ pub fn print_response(resp: &Response, out: &mut dyn Console) {
                     };
                     out.print_line(&format!(
                         "{:<24} {:>8} {:>8}  {}",
-                        s.name, s.access_count, s.size, hash
+                        name, s.access_count, s.size, hash
                     ));
                 }
             }
@@ -409,6 +414,53 @@ mod tests {
 
     fn names(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Console that captures printed lines, for render assertions.
+    struct Cap(Vec<String>);
+
+    impl servyi_servatui::Console for Cap {
+        fn print_line(&mut self, s: &str) {
+            self.0.push(s.to_string());
+        }
+        fn print_error(&mut self, s: &str) {
+            self.0.push(format!("ERR: {s}"));
+        }
+    }
+
+    #[test]
+    fn status_renders_collapsed_names() {
+        use crate::protocol::SecretStatus;
+        let resp = Response::Status {
+            secrets: vec![
+                SecretStatus {
+                    name: "var/home/jonas/secrets/agent/github.netrc".into(),
+                    access_count: 0,
+                    allowed_hash: crate::PENDING_ONLY_HASH.into(),
+                    size: 167,
+                    unlimited: false,
+                },
+                SecretStatus {
+                    name: "var/home/jonas/secrets/zai.key".into(),
+                    access_count: 1,
+                    allowed_hash: crate::PENDING_ONLY_HASH.into(),
+                    size: 50,
+                    unlimited: false,
+                },
+            ],
+        };
+        let mut cap = Cap(Vec::new());
+        print_response(&resp, &mut cap);
+        let joined = cap.0.join("\n");
+        assert!(
+            joined.contains(".../agent/github.netrc"),
+            "first point of difference renders, no middle elision when the \
+             divergent run meets the basename: {joined}"
+        );
+        assert!(
+            joined.contains(".../zai.key"),
+            "basename-only difference collapses harder: {joined}"
+        );
     }
 
     #[test]
