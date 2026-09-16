@@ -148,6 +148,9 @@ impl Split {
         }
         for (name, content, hash) in secrets {
             let f = secret_dir.path().join(name);
+            // Path-shaped names (issue #34) carry directories — the
+            // source tree must exist before the write.
+            std::fs::create_dir_all(f.parent().unwrap()).unwrap();
             std::fs::write(&f, content).unwrap();
             policy.arg("--secret").arg(format!(
                 "{name}:{}:{hash}",
@@ -332,6 +335,19 @@ fn e2e_nonexistent_file_enoent() {
     let split = Split::new("enoent", &[("s", b"X", "*")]);
     let err = std::fs::read(split.path("nope")).unwrap_err();
     assert_eq!(err.raw_os_error(), Some(libc::ENOENT));
+}
+
+#[test]
+fn e2e_path_shaped_names_serve_a_directory_tree() {
+    // Issue #34: names are normalized host paths; the mount must show
+    // the intermediate directories and serve the file at the nested
+    // path — full stack: add -> oracle -> fused tree -> read.
+    if !fuse_available() { return; }
+    let _g = serial();
+    let split = Split::new("paths", &[("a/b/c.txt", b"NESTED", "*")]);
+    assert!(split.path("a").is_dir(), "implicit directory materializes");
+    assert!(split.path("a/b").is_dir());
+    assert_eq!(std::fs::read(split.path("a/b/c.txt")).unwrap(), b"NESTED");
 }
 
 #[test]
