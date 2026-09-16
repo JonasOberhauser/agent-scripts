@@ -5,6 +5,26 @@ use std::time::{Duration, Instant};
 use dashmap::DashMap;
 use tracing::error;
 
+/// One permitted reader hash, with provenance (issue #34 MR3): the
+/// name of the process that obtained it, when known — filled in on
+/// grant-forever from the pending request it answered; explicit
+/// adds/rotates carry no attribution yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PermittedHash {
+    pub hash: String,
+    pub by: Option<String>,
+}
+
+impl PermittedHash {
+    /// Display form: `hash` or `hash (by NAME)`.
+    pub fn render(&self) -> String {
+        match &self.by {
+            Some(by) => format!("{} (by {})", self.hash, by),
+            None => self.hash.clone(),
+        }
+    }
+}
+
 /// One secret file tracked by the gatekeeper.
 #[derive(Debug, Clone)]
 pub struct SecretRecord {
@@ -13,8 +33,9 @@ pub struct SecretRecord {
     pub size: usize,
     /// ALL permitted reader hashes (issue #34 MR2): several
     /// containers/packages may be pre-approved for the same file.
-    /// "*" is the wildcard entry (any reader).
-    pub allowed_hashes: Vec<String>,
+    /// "*" is the wildcard entry (any reader). Each entry records
+    /// which process obtained it when known (MR3).
+    pub allowed_hashes: Vec<PermittedHash>,
     pub access_count: u64,
     pub reading_pid: Option<u32>,
     pub read_progress: usize,
@@ -146,8 +167,8 @@ impl ServerState {
             // MR2: the incoming hash JOINS the permitted set — a second
             // container pinning a different reader package must not
             // evict the first one's approval.
-            if !rec.allowed_hashes.iter().any(|h| h == &hash) {
-                rec.allowed_hashes.push(hash.clone());
+            if !rec.allowed_hashes.iter().any(|ph| ph.hash == hash) {
+                rec.allowed_hashes.push(PermittedHash { hash: hash.clone(), by: None });
             }
             // Plain overwrite (no change detection, see MR1): refresh
             // only the adjudication facts.
@@ -159,7 +180,7 @@ impl ServerState {
             name,
             Arc::new(Mutex::new(SecretRecord {
                 size: content.len(),
-                allowed_hashes: vec![hash],
+                allowed_hashes: vec![PermittedHash { hash, by: None }],
                 access_count: 0,
                 reading_pid: None,
                 read_progress: 0,
@@ -203,10 +224,11 @@ impl ServerState {
         }
 
         let hash_ok = match pid_hash {
-            Some(h) => {
-                rec.allowed_hashes.iter().any(|allowed| allowed == "*" || allowed == h)
-            }
-            None => rec.allowed_hashes.iter().any(|allowed| allowed == "*"),
+            Some(h) => rec
+                .allowed_hashes
+                .iter()
+                .any(|ph| ph.hash == "*" || ph.hash == h),
+            None => rec.allowed_hashes.iter().any(|ph| ph.hash == "*"),
         };
 
         if hash_ok {
@@ -218,7 +240,12 @@ impl ServerState {
         } else {
             ReadOutcome::HashMismatch {
                 got: pid_hash.unwrap_or("<unknown>").to_string(),
-                expected: rec.allowed_hashes.join(" | "),
+                expected: rec
+                    .allowed_hashes
+                    .iter()
+                    .map(|ph| ph.render())
+                    .collect::<Vec<_>>()
+                    .join(" | "),
             }
         }
     }
@@ -262,7 +289,7 @@ impl ServerState {
             let rec_arc = Arc::clone(entry.value());
             drop(entry);
             let mut rec = lock_secret(&rec_arc, name);
-            rec.allowed_hashes = vec![new_hash.to_string()];
+            rec.allowed_hashes = vec![PermittedHash { hash: new_hash.to_string(), by: None }];
             true
         } else {
             false
@@ -358,7 +385,7 @@ impl ServerState {
     /// becomes the secret's allowed hash and the read limit is lifted.
     /// The waiting reader is served like a normal grant.
     pub fn grant_pending_forever(&self, id: u64) -> Result<(), String> {
-        let (secret_name, package_hash) = {
+        let (secret_name, package_hash, process_name) = {
             let entry = self
                 .pending
                 .get(&id)
@@ -377,7 +404,7 @@ impl ServerState {
                          nothing to whitelist"
                     ),
                 })?;
-            (entry.secret_name.clone(), hash)
+            (entry.secret_name.clone(), hash, entry.process_name.clone())
         };
         if let Some(rec_arc) = self.secrets.get(&secret_name).map(|e| Arc::clone(e.value())) {
             let mut rec = lock_secret(&rec_arc, &secret_name);
@@ -385,8 +412,22 @@ impl ServerState {
                 "grant-forever {id}: whitelisting package {} for '{secret_name}' (unlimited reads)",
                 &package_hash[..package_hash.len().min(12)]
             );
-            if !rec.allowed_hashes.iter().any(|h| h == &package_hash) {
-                rec.allowed_hashes.push(package_hash.clone());
+            match rec
+                .allowed_hashes
+                .iter_mut()
+                .find(|ph| ph.hash == package_hash)
+            {
+                // Already permitted — MR3: attribute it now if it was
+                // anonymous (the pending request names the process).
+                Some(ph) => {
+                    if ph.by.is_none() {
+                        ph.by = process_name.clone();
+                    }
+                }
+                None => rec.allowed_hashes.push(PermittedHash {
+                    hash: package_hash.clone(),
+                    by: process_name.clone(),
+                }),
             }
             rec.unlimited_reads = true;
         } else {
@@ -471,7 +512,12 @@ impl ServerState {
             fuse_protocol::SecretStatus {
                 name: name.clone(),
                 access_count: rec.access_count,
-                allowed_hash: rec.allowed_hashes.join(" | "),
+                allowed_hash: rec
+                    .allowed_hashes
+                    .iter()
+                    .map(|ph| ph.render())
+                    .collect::<Vec<_>>()
+                    .join(" | "),
                 size: rec.size,
                 unlimited: rec.unlimited_reads,
             }
@@ -511,6 +557,31 @@ mod tests {
     }
 
     // ── idempotent re-add: persistence of user approvals ──────────
+
+    #[test]
+    fn grant_forever_records_the_process_that_obtained_the_hash() {
+        // Issue #34 MR3: permitted hashes carry provenance — the name
+        // of the process whose pending request earned them.
+        let s = sample_state();
+        let id = s.create_pending(
+            "secrets.yaml",
+            4242,
+            Some("sha256-reader-pkg"),
+            "hash mismatch",
+            Some("goose"),
+        );
+        s.grant_pending_forever(id).expect("grant-forever succeeds");
+        let entry = s.secrets.get("secrets.yaml").unwrap();
+        let rec = lock_secret(entry.value(), "secrets.yaml");
+        let ph = rec
+            .allowed_hashes
+            .iter()
+            .find(|ph| ph.hash == "sha256-reader-pkg")
+            .expect("hash permitted by grant-forever");
+        assert_eq!(ph.by.as_deref(), Some("goose"), "provenance recorded");
+        // and it renders attributed everywhere (status/denials)
+        assert!(ph.render().contains("(by goose)"));
+    }
 
     #[test]
     fn re_add_with_a_new_hash_joins_the_permitted_set() {
