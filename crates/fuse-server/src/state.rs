@@ -115,16 +115,20 @@ impl ServerState {
 
     /// Add with permission bits snapshotted from the source file.
     ///
-    /// Idempotent for unchanged content: re-adding the same name with
-    /// the same content is a full NO-OP — `allowed_hash` (possibly
-    /// rotated at runtime via `rotate_hash`), `unlimited_reads`
-    /// (grant-forever), and read state all survive, so a re-run of
-    /// run-agent (stable names) or a state-file restore cannot
-    /// silently reset what a user already approved. Changed content
-    /// updates the record but still preserves `allowed_hash` and
-    /// `unlimited_reads` (they pin the READER package, not the bytes);
-    /// `rotate_hash` / `reset` remain the explicit paths for policy
-    /// changes.
+    /// Plain overwrite (issue #34 MR1) with NO change detection: a
+    /// re-add of an existing name refreshes the adjudication facts
+    /// (size, mode — the bytes themselves live in the data daemon and
+    /// follow the oracle upsert) and touches NOTHING else. Approval
+    /// settings (`allowed_hash`, possibly rotated at runtime,
+    /// `unlimited_reads`) and read state are set at creation and only
+    /// ever changed by their explicit commands (`rotate_hash`,
+    /// `reset`) — a re-run of run-agent or a state-file restore can
+    /// never silently reset what a user already approved. There is
+    /// deliberately no unchanged/changed branching: content change
+    /// detection was tried and retracted (review on #43) — a length
+    /// heuristic is a guess, and anything stronger would plant a
+    /// secret-derived fingerprint in the policy daemon, against the
+    /// "holds NO secret bytes" rule.
     pub fn add_with_mode(
         &self,
         name: impl Into<String>,
@@ -135,19 +139,7 @@ impl ServerState {
         let name = name.into();
         if let Some(existing) = self.secrets.get(&name) {
             let mut rec = lock_secret(existing.value(), &name);
-            if rec.size == content.len() {
-                // Same size — treat as unchanged content: the bytes
-                // live in the data daemon; the upsert there is
-                // content-addressed by the caller, so equal size from
-                // the same source file means unchanged.
-                return;
-            }
-            // Content changed: refresh size/read state, keep the
-            // approval settings.
             rec.size = content.len();
-            rec.access_count = 0;
-            rec.read_progress = 0;
-            rec.reading_pid = None;
             rec.mode = mode & 0o777;
             return;
         }
@@ -539,18 +531,28 @@ mod tests {
     }
 
     #[test]
-    fn re_add_with_changed_content_resets_reads_but_keeps_hash_setting() {
-        // New bytes (size changed) start a fresh read cycle; the hash
-        // pins the READER package and carries over.
+    fn re_add_with_changed_content_never_resets_anything() {
+        // Plain overwrite: even when the bytes differ (size changes),
+        // approval and read state survive untouched — resets are the
+        // explicit `reset` command, never a side effect of re-adding
+        // (change detection was retracted in review on #43).
         let s = sample_state();
         assert!(s.rotate_hash("secrets.yaml", "sha256-newpackage"));
         s.attempt_read("secrets.yaml", 100, Some("sha256-newpackage"), 0, 1024); // consumed
         s.add("secrets.yaml", b"DIFFERENT-LONGER-CONTENT".to_vec(), "abc123");
         let (access, _pid, progress) = get_rec(&s, "secrets.yaml");
-        assert_eq!(access, 0, "changed content starts a fresh read cycle");
+        assert_eq!(access, 1, "read state must NOT reset on re-add");
+        assert!(progress > 0);
+        {
+            let entry = s.secrets.get("secrets.yaml").unwrap();
+            let rec = lock_secret(entry.value(), "secrets.yaml");
+            assert_eq!(rec.size, b"DIFFERENT-LONGER-CONTENT".len(), "size refreshes");
+        }
+        // explicit reset is the only way to a fresh cycle
+        s.reset(Some("secrets.yaml"));
+        let (access, _pid, progress) = get_rec(&s, "secrets.yaml");
+        assert_eq!(access, 0);
         assert_eq!(progress, 0);
-        let out = s.attempt_read("secrets.yaml", 200, Some("sha256-newpackage"), 0, 1024);
-        assert_eq!(out, ReadOutcome::Granted, "rotated hash carries over to new content");
     }
 
     #[test]
