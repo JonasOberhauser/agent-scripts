@@ -93,6 +93,11 @@ struct Split {
     oracle: PathBuf,
     procs: Vec<Child>,
     _dirs: Vec<tempfile::TempDir>,
+    /// MR4: the SOURCE files must outlive the split — transparent
+    /// reads open the host file at read time, so dropping the tempdir
+    /// (as the snapshot-era harness did, bytes having been copied at
+    /// add) would delete the secret out from under the mount.
+    _secret_dir: tempfile::TempDir,
 }
 
 impl Drop for Split {
@@ -190,7 +195,7 @@ impl Split {
             );
         }
 
-        Split { mount, socket, oracle, procs: vec![policy, data], _dirs: dirs }
+        Split { mount, socket, oracle, procs: vec![policy, data], _dirs: dirs, _secret_dir: secret_dir }
     }
 
     fn path(&self, name: &str) -> PathBuf {
