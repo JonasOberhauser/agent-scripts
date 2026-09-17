@@ -207,9 +207,13 @@ pub enum Command {
     /// Add a new secret to the mount.  `mode` is the permission bits of
     /// the source file (masked read-only by the server); older clients
     /// that do not send it get the conservative 0400 default.
+    /// MR4: the client sends the source PATH — bytes never cross the
+    /// wire in either direction. The policy daemon stats the file
+    /// (identity, size, mode) and registers it; content reaches
+    /// readers only as fds passed to the data daemon at open time.
     AddSecret {
         name: String,
-        content: Vec<u8>,
+        path: String,
         hash: String,
         #[serde(default = "default_secret_mode")]
         mode: u32,

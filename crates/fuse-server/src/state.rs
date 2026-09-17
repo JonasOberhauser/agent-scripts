@@ -28,8 +28,13 @@ impl PermittedHash {
 /// One secret file tracked by the gatekeeper.
 #[derive(Debug, Clone)]
 pub struct SecretRecord {
-    /// Content lives in the data daemon (`fused`); the policy daemon
-    /// tracks only the size it adjudicates offsets against.
+    /// The TRUE host file behind the name (MR4): the policy daemon
+    /// opens THIS for readers — it never holds content, only this
+    /// address. Kept canonical from AddSecret.
+    pub host_path: std::path::PathBuf,
+    /// Size as last observed (add/open); adjudication clamps offsets
+    /// against it. Refreshed from the opened fd's own stat — attrs are
+    /// live by design, this is only the stale-guard between opens.
     pub size: usize,
     /// ALL permitted reader hashes (issue #34 MR2): several
     /// containers/packages may be pre-approved for the same file.
@@ -133,8 +138,28 @@ impl ServerState {
     }
 
     /// Add with the conservative default presentation (owner-read-only).
-    pub fn add(&self, name: impl Into<String>, content: Vec<u8>, allowed_hash: impl Into<String>) {
-        self.add_with_mode(name, content, allowed_hash, 0o400);
+    pub fn add(
+        &self,
+        name: impl Into<String>,
+        host_path: impl Into<std::path::PathBuf>,
+        size: usize,
+        allowed_hash: impl Into<String>,
+    ) {
+        self.add_with_mode(name, host_path, size, allowed_hash, 0o400);
+    }
+
+    /// The host file behind a name (MR4 open path).
+    pub fn host_path(&self, name: &str) -> Option<std::path::PathBuf> {
+        self.secrets
+            .get(name)
+            .map(|e| lock_secret(e.value(), name).host_path.clone())
+    }
+
+    /// Refresh the adjudication size from a live observation (Open).
+    pub fn observe_size(&self, name: &str, size: usize) {
+        if let Some(entry) = self.secrets.get(name) {
+            lock_secret(entry.value(), name).size = size;
+        }
     }
 
     /// Add with permission bits snapshotted from the source file.
@@ -156,7 +181,8 @@ impl ServerState {
     pub fn add_with_mode(
         &self,
         name: impl Into<String>,
-        content: Vec<u8>,
+        host_path: impl Into<std::path::PathBuf>,
+        size: usize,
         allowed_hash: impl Into<String>,
         mode: u32,
     ) {
@@ -172,14 +198,16 @@ impl ServerState {
             }
             // Plain overwrite (no change detection, see MR1): refresh
             // only the adjudication facts.
-            rec.size = content.len();
+            rec.size = size;
             rec.mode = mode & 0o777;
+            rec.host_path = host_path.into();
             return;
         }
         self.secrets.insert(
             name,
             Arc::new(Mutex::new(SecretRecord {
-                size: content.len(),
+                host_path: host_path.into(),
+                size,
                 allowed_hashes: vec![PermittedHash { hash, by: None }],
                 access_count: 0,
                 reading_pid: None,
@@ -548,7 +576,7 @@ mod tests {
 
     fn sample_state() -> ServerState {
         let s = ServerState::new();
-        s.add("secrets.yaml", b"TOPSECRET".to_vec(), "abc123");
+        s.add("secrets.yaml", "/tmp/host/secrets.yaml", 9, "abc123");
         s
     }
 
@@ -590,7 +618,7 @@ mod tests {
         // Issue #34 MR2: a second container pinning a different reader
         // package must not evict the first approval.
         let s = sample_state(); // "secrets.yaml" permitted for "abc123"
-        s.add("secrets.yaml", b"TOPSECRET".to_vec(), "sha256-other");
+        s.add("secrets.yaml", "/tmp/host/secrets.yaml", 9, "sha256-other");
         assert_eq!(
             s.attempt_read("secrets.yaml", 100, Some("abc123"), 0, 1024),
             ReadOutcome::Granted,
@@ -609,7 +637,7 @@ mod tests {
     #[test]
     fn rotate_replaces_the_whole_set() {
         let s = sample_state();
-        s.add("secrets.yaml", b"TOPSECRET".to_vec(), "sha256-other");
+        s.add("secrets.yaml", "/tmp/host/secrets.yaml", 9, "sha256-other");
         assert!(s.rotate_hash("secrets.yaml", "sha256-final"));
         assert_ne!(
             s.attempt_read("secrets.yaml", 100, Some("abc123"), 0, 1024),
@@ -625,7 +653,7 @@ mod tests {
     #[test]
     fn mismatch_message_lists_all_permitted_hashes() {
         let s = sample_state();
-        s.add("secrets.yaml", b"TOPSECRET".to_vec(), "sha256-other");
+        s.add("secrets.yaml", "/tmp/host/secrets.yaml", 9, "sha256-other");
         match s.attempt_read("secrets.yaml", 100, Some("wrong"), 0, 1024) {
             ReadOutcome::HashMismatch { expected, .. } => {
                 assert!(expected.contains("abc123") && expected.contains("sha256-other"),
@@ -641,7 +669,7 @@ mod tests {
         // not reset a hash the user rotated at runtime.
         let s = sample_state();
         assert!(s.rotate_hash("secrets.yaml", "sha256-newpackage"));
-        s.add("secrets.yaml", b"TOPSECRET".to_vec(), "abc123"); // re-add, same content size
+        s.add("secrets.yaml", "/tmp/host/secrets.yaml", 9, "abc123"); // re-add, same content size
         let out = s.attempt_read("secrets.yaml", 100, Some("sha256-newpackage"), 0, 1024);
         assert_eq!(out, ReadOutcome::Granted, "rotated hash must survive re-add");
         let out = s.attempt_read("secrets.yaml", 101, Some("abc123"), 0, 1024);
@@ -659,7 +687,7 @@ mod tests {
         lock_secret(entry.value(), "secrets.yaml").unlimited_reads = true;
         drop(entry);
         s.attempt_read("secrets.yaml", 100, Some("abc123"), 0, 1024); // consumed once
-        s.add("secrets.yaml", b"TOPSECRET".to_vec(), "abc123"); // re-add, unchanged
+        s.add("secrets.yaml", "/tmp/host/secrets.yaml", 9, "abc123"); // re-add, unchanged
         let (access, _pid, progress) = get_rec(&s, "secrets.yaml");
         assert_eq!(access, 1, "read state must survive an unchanged re-add");
         assert!(progress > 0);
@@ -679,7 +707,7 @@ mod tests {
         let s = sample_state();
         assert!(s.rotate_hash("secrets.yaml", "sha256-newpackage"));
         s.attempt_read("secrets.yaml", 100, Some("sha256-newpackage"), 0, 1024); // consumed
-        s.add("secrets.yaml", b"DIFFERENT-LONGER-CONTENT".to_vec(), "abc123");
+        s.add("secrets.yaml", "/tmp/host/secrets.yaml", 24, "abc123");
         let (access, _pid, progress) = get_rec(&s, "secrets.yaml");
         assert_eq!(access, 1, "read state must NOT reset on re-add");
         assert!(progress > 0);
@@ -733,7 +761,7 @@ mod tests {
         // the allowed hash and reads are unlimited; other hashes still
         // pend/deny.
         let s = ServerState::new();
-        s.add("k", b"V".to_vec(), "old_hash");
+        s.add("k", "/tmp/host/k", 1, "old_hash");
         s.create_pending("k", 7, Some("pkg_hash_abc"), "hash mismatch", None);
         let id = s.pending.iter().next().unwrap().id;
         assert!(s.grant_pending_forever(id).is_ok());
@@ -757,7 +785,7 @@ mod tests {
         // — the forward-only gate applies to streaming reads, not to
         // unlimited secrets.
         let s = ServerState::new();
-        s.add("k", b"VAL".to_vec(), "h");
+        s.add("k", "/tmp/host/k", 3, "h");
         s.create_pending("k", 7, Some("pkg"), "mismatch", None);
         let id = s.pending.iter().next().unwrap().id;
         s.grant_pending_forever(id).unwrap();
@@ -775,7 +803,7 @@ mod tests {
     #[test]
     fn grant_forever_without_package_hash_errors() {
         let s = ServerState::new();
-        s.add("k", b"V".to_vec(), "h");
+        s.add("k", "/tmp/host/k", 1, "h");
         s.create_pending("k", 7, None, "hash unknown", None);
         let id = s.pending.iter().next().unwrap().id;
         let err = s.grant_pending_forever(id).unwrap_err();
@@ -792,7 +820,7 @@ mod tests {
     #[test]
     fn grant_forever_names_the_recorded_inspection_failure() {
         let s = ServerState::new();
-        s.add("k", b"V".to_vec(), "h");
+        s.add("k", "/tmp/host/k", 1, "h");
         s.create_pending_with_hash_error(
             "k",
             42,
@@ -820,7 +848,7 @@ mod tests {
     #[test]
     fn list_pending_carries_the_hash_error() {
         let s = ServerState::new();
-        s.add("k", b"V".to_vec(), "h");
+        s.add("k", "/tmp/host/k", 1, "h");
         s.create_pending_with_hash_error(
             "k",
             42,
@@ -844,7 +872,7 @@ mod tests {
         // permitted accesses — every read pends — and grant-forever can
         // still whitelist the observed package afterwards.
         let s = ServerState::new();
-        s.add("k", b"V".to_vec(), fuse_protocol::PENDING_ONLY_HASH);
+        s.add("k", "/tmp/host/k", 1, fuse_protocol::PENDING_ONLY_HASH);
 
         assert!(matches!(
             s.attempt_read("k", 1, Some("any_package"), 0, 1),
@@ -877,7 +905,7 @@ mod tests {
     #[test]
     fn reset_all_clears_everyone() {
         let s = sample_state();
-        s.add("other", b"x".to_vec(), "h");
+        s.add("other", "/tmp/host/other", 1, "h");
         s.attempt_read("secrets.yaml", 100, Some("abc123"), 0, 1024);
         assert_eq!(s.reset(None), 2);
     }
@@ -979,7 +1007,7 @@ mod tests {
     #[test]
     fn wildcard_allows_known_hash() {
         let s = ServerState::new();
-        s.add("s", b"DATA".to_vec(), "*");
+        s.add("s", "/tmp/host/s", 4, "*");
         let out = s.attempt_read("s", 100, Some("any_hash_value"), 0, 1024);
         assert!(matches!(out, ReadOutcome::Granted));
     }
@@ -987,7 +1015,7 @@ mod tests {
     #[test]
     fn wildcard_allows_unknown_hash() {
         let s = ServerState::new();
-        s.add("s", b"DATA".to_vec(), "*");
+        s.add("s", "/tmp/host/s", 4, "*");
         let out = s.attempt_read("s", 100, None, 0, 1024);
         assert!(matches!(out, ReadOutcome::Granted));
     }
@@ -995,7 +1023,7 @@ mod tests {
     #[test]
     fn wildcard_still_enforces_one_read() {
         let s = ServerState::new();
-        s.add("s", b"DATA".to_vec(), "*");
+        s.add("s", "/tmp/host/s", 4, "*");
         s.attempt_read("s", 100, None, 0, 1024);
         let out = s.attempt_read("s", 200, None, 0, 1024);
         assert_eq!(out, ReadOutcome::AlreadyAccessed);
@@ -1004,7 +1032,7 @@ mod tests {
     #[test]
     fn wildcard_still_enforces_forward_only() {
         let s = ServerState::new();
-        s.add("s", b"0123456789".to_vec(), "*");
+        s.add("s", "/tmp/host/s", 10, "*");
         s.attempt_read("s", 42, None, 0, 4);
         let out = s.attempt_read("s", 42, None, 0, 4);
         assert_eq!(out, ReadOutcome::AlreadyAccessed);

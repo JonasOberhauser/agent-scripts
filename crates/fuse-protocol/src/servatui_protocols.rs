@@ -191,20 +191,21 @@ fn parse_add(args: &str) -> Result<Command, String> {
     if parts.len() < 3 {
         return Err("Usage: add NAME FILE HASH".into());
     }
-    let content = std::fs::read(parts[1])
-        .map_err(|e| format!("Error reading file: {e}"))?;
-    // Snapshot the source file's permission bits so the FUSE view can
-    // present them (masked read-only server-side).  Un-stat-able files
-    // fall back to the conservative 0400.
-    let mode = std::fs::metadata(parts[1])
-        .map(|m| {
-            use std::os::unix::fs::PermissionsExt;
-            m.permissions().mode() & 0o777
-        })
-        .unwrap_or(0o400);
+    // MR4: only the PATH crosses the wire — the file must exist and
+    // be stat-able (mode snapshot for the read-only FUSE view), but no
+    // client ever reads secret bytes.
+    let md = std::fs::metadata(parts[1])
+        .map_err(|e| format!("Error stating file: {e}"))?;
+    if !md.is_file() {
+        return Err(format!("{} is not a regular file", parts[1]));
+    }
+    let mode = {
+        use std::os::unix::fs::PermissionsExt;
+        md.permissions().mode() & 0o777
+    };
     Ok(Command::AddSecret {
         name: parts[0].to_string(),
-        content,
+        path: parts[1].to_string(),
         hash: parts[2].to_string(),
         mode,
     })

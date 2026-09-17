@@ -9,16 +9,47 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Host filesystem identity halves (MR4): a device number and an
+/// inode number, each meaningless alone. Newtypes so they cannot be
+/// swapped at call sites — serde-transparent, the wire JSON is the
+/// bare numbers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct KDev(pub u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Kino(pub u64);
+
 /// fused → policy daemon.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum OracleRequest {
+    /// Live identity + attributes of a secret, by name, for
+    /// LOOKUP/GETATTR (MR4 transparent reads): no adjudication —
+    /// metadata visibility is unchanged. The observed (kdev, kino)
+    /// lets fused detect host incarnation changes and allocate a new
+    /// fuse inode; attrs are always live, never cached in the record.
+    Stat { name: String },
+    /// Open a secret for reading (adjudicated): `kdev`/`kino` are the
+    /// pair fused recorded for the inode the kernel presented — the
+    /// policy daemon opens the host file and verifies the descriptor's
+    /// OWN identity against them (atomic open+verify). On Allow the
+    /// reply carries the host fd as SCM_RIGHTS ancillary data on this
+    /// socket; fused replies fh = that fd number and serves reads by
+    /// pread. Policy denial → Deny; incarnation replaced → Stale
+    /// (fused answers ESTALE, kernel re-resolves); gone/not regular →
+    /// Gone (ENOENT).
+    Open { name: String, pid: u32, kdev: KDev, kino: Kino },
     /// A reader wants `size` bytes of `name` at `offset`. The policy
     /// daemon answers synchronously — including waiting out a pending
     /// until grant/expiry — then replies Allow or Deny.
+    /// (Legacy path, pre-MR4; fused no longer sends it — reads are
+    /// preads on adjudicated fds — but the semantics are the
+    /// adjudication core Open reuses.)
     Ask { name: String, pid: u32, offset: u64, size: u32 },
     /// First message of a persistent CONTROL connection: the policy
-    /// daemon pushes Upsert/Remove commands to it as secrets change.
+    /// daemon pushes Serve/Remove commands to it as secrets change.
     /// `version` is the data daemon's protocol VERSION — wire-optional
     /// (older `fused` sends a bare `hello`), used only to LOG mixed
     /// vintages loudly instead of failing silently across them.
@@ -40,9 +71,15 @@ pub enum OracleCommand {
     /// report: an alive mount listing only `.` and `..`).  Older
     /// senders therefore keep working; the conservative 0o400 default
     /// matches the client-facing AddSecret contract.
-    Upsert {
+    /// Serve this secret in the mount from now on (MR4): the name
+    /// enters the frozen tree with its CURRENT host identity — fused
+    /// allocates its fuse inode from (kdev, kino) and refreshes it on
+    /// every stat/open. No content: bytes live only in fds passed at
+    /// Open. `mode` is wire-optional as before (older senders).
+    Serve {
         name: String,
-        content: Vec<u8>,
+        kdev: KDev,
+        kino: Kino,
         #[serde(default = "crate::protocol::default_secret_mode")]
         mode: u32,
     },
@@ -54,8 +91,24 @@ pub enum OracleCommand {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum OracleReply {
-    /// The read may be served.
+    /// The open may proceed: an fd for the host file arrives as
+    /// SCM_RIGHTS ancillary data attached to this reply line.
     Allow,
+    /// Live identity + attrs by name (reply to Stat). `regular` is
+    /// false when the path exists but is not a regular file.
+    StatOk {
+        kdev: KDev,
+        kino: Kino,
+        size: u64,
+        mode: u32,
+        regular: bool,
+    },
+    /// The name is not served (Stat) or its path no longer exists
+    /// (Open) → ENOENT.
+    Gone,
+    /// The host incarnation changed since the caller's inode was
+    /// recorded → ESTALE; the kernel re-resolves.
+    Stale,
     /// The read must fail; the FUSE errno is the policy daemon's call
     /// (EACCES for denials, ENOENT when the policy no longer knows the
     /// secret).
@@ -67,16 +120,14 @@ pub enum OracleReply {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn upsert_without_mode_parses_with_conservative_default() {
-        // Wire backward compatibility (PR #37 field report): policy
-        // daemons that predate mode passthrough send no `mode`; a
-        // required field made their upserts silently invisible to a
-        // newer fused. It must parse, defaulting to read-only.
-        let old = r#"{"type":"upsert","name":"s.yaml","content":[104,105]}"#;
-        let cmd: OracleCommand = serde_json::from_str(old).expect("old-format upsert must parse");
+    fn serve_without_mode_parses_with_conservative_default() {
+        // Wire-optional mode (older senders keep working; the
+        // conservative 0o400 default matches the client contract).
+        let back: OracleCommand =
+            serde_json::from_str(r#"{"type":"serve","name":"s.yaml","kdev":52,"kino":9}"#).unwrap();
         assert_eq!(
-            cmd,
-            OracleCommand::Upsert { name: "s.yaml".into(), content: b"hi".to_vec(), mode: 0o400 }
+            back,
+            OracleCommand::Serve { name: "s.yaml".into(), kdev: KDev(52), kino: Kino(9), mode: 0o400 }
         );
     }
 
@@ -93,9 +144,10 @@ mod tests {
                 size: 128,
             })
             .unwrap(),
-            serde_json::to_string(&OracleCommand::Upsert {
+            serde_json::to_string(&OracleCommand::Serve {
                 name: "s.yaml".into(),
-                content: b"BYTES".to_vec(),
+                kdev: KDev(52),
+                kino: Kino(9),
                 mode: 0o400,
             })
             .unwrap(),
@@ -119,7 +171,7 @@ mod tests {
         let back: OracleCommand = serde_json::from_str(&msgs[1]).unwrap();
         assert_eq!(
             back,
-            OracleCommand::Upsert { name: "s.yaml".into(), content: b"BYTES".to_vec(), mode: 0o400 }
+            OracleCommand::Serve { name: "s.yaml".into(), kdev: KDev(52), kino: Kino(9), mode: 0o400 }
         );
         let back: OracleCommand = serde_json::from_str(&msgs[2]).unwrap();
         assert_eq!(back, OracleCommand::Remove { name: "s.yaml".into() });

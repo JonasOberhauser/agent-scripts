@@ -93,6 +93,11 @@ struct Split {
     oracle: PathBuf,
     procs: Vec<Child>,
     _dirs: Vec<tempfile::TempDir>,
+    /// MR4: the SOURCE files must outlive the split — transparent
+    /// reads open the host file at read time, so dropping the tempdir
+    /// (as the snapshot-era harness did, bytes having been copied at
+    /// add) would delete the secret out from under the mount.
+    _secret_dir: tempfile::TempDir,
 }
 
 impl Drop for Split {
@@ -142,7 +147,7 @@ impl Split {
             .arg("--socket").arg(&socket)
             .arg("--oracle-socket").arg(&oracle)
             .arg("--pending-timeout").arg("5")
-            .env("RUST_LOG", "error");
+            .env("RUST_LOG", "fuse_mount=info,fuse_server=info");
         if let Some(sock) = hashd_sock {
             policy.env("FUSE_HASHD_SOCK", sock);
         }
@@ -190,18 +195,49 @@ impl Split {
             );
         }
 
-        Split { mount, socket, oracle, procs: vec![policy, data], _dirs: dirs }
+        Split { mount, socket, oracle, procs: vec![policy, data], _dirs: dirs, _secret_dir: secret_dir }
     }
 
     fn path(&self, name: &str) -> PathBuf {
         self.mount.join(name)
     }
 
+    /// The host-side source file behind a served name (MR4 tests:
+    /// transparent reads observe it live).
+    fn source_path(&self, name: &str) -> PathBuf {
+        self._secret_dir.path().join(name)
+    }
+
+    /// std::fs::read with daemon logs attached to any failure —
+    /// mount-layer bugs must be diagnosable from the CI output, not
+    /// guessed at (#41 lesson).
+    fn read(&self, rel: &str) -> std::io::Result<Vec<u8>> {
+        std::fs::read(self.path(rel))
+    }
+
+    fn dump_logs(&self, what: &str) -> String {
+        let mut s = format!("--- {what} ---\n");
+        for name in ["server.log", "fused.log"] {
+            let p = self._dirs.iter().find_map(|d| {
+                let p = d.path().join(name);
+                p.exists().then_some(p)
+            });
+            if let Some(p) = p {
+                if let Ok(t) = std::fs::read_to_string(&p) {
+                    let lines: Vec<&str> = t.lines().collect();
+                    let start = lines.len().saturating_sub(25);
+                    s.push_str(&format!("== {name} ==\n{}\n", lines[start..].join("\n")));
+                }
+            }
+        }
+        s
+    }
+
     fn client(&self, args: &[&str]) -> std::process::Output {
         Command::new(bin("fuse-client"))
             .arg("--socket").arg(&self.socket)
             .args(args)
-            .env("RUST_LOG", "error")
+            .env("RUST_LOG", "fuse_mount=info,fuse_server=info")
             .output()
             .expect("run fuse-client")
     }
@@ -317,7 +353,10 @@ fn e2e_read_secret() {
     if !fuse_available() { return; }
     let _g = serial();
     let split = Split::new("read", &[("s", b"TOPSECRET", "*")]);
-    assert_eq!(std::fs::read(split.path("s")).unwrap(), b"TOPSECRET");
+    match split.read("s") {
+        Ok(b) => assert_eq!(b, b"TOPSECRET"),
+        Err(e) => panic!("read through the mount failed: {e}\n{}", split.dump_logs("read failure")),
+    }
 }
 
 #[test]
@@ -398,6 +437,94 @@ fn e2e_one_read_per_secret_without_reset() {
 }
 
 #[test]
+fn e2e_host_edit_is_visible_on_next_open() {
+    // THE MR4 property: content is read from the host at open time —
+    // a source edit after the mount is up serves fresh bytes to the
+    // next open (snapshot semantics would serve the stale copy).
+    if !fuse_available() { return; }
+    let _g = serial();
+    let split = Split::new("fresh", &[("s", b"OLD-BYTES", "*")]);
+    assert_eq!(split.read("s").unwrap(), b"OLD-BYTES");
+    std::fs::write(split.source_path("s"), b"NEW-BYTES").unwrap();
+    let out = split.client(&["reset", "--name", "s"]);
+    assert!(out.status.success(), "reset failed: {}", write_out(&out));
+    match split.read("s") {
+        Ok(b) => assert_eq!(b, b"NEW-BYTES", "fresh bytes must serve"),
+        Err(e) => panic!("read after host edit failed: {e}\n{}", split.dump_logs("freshness failure")),
+    }
+}
+
+#[test]
+fn e2e_ghost_opens_to_enoent() {
+    // Frozen tree + live host: deleting the source leaves the name
+    // listed (structure is frozen) but its OPEN must fail ENOENT —
+    // never stale bytes.
+    if !fuse_available() { return; }
+    let _g = serial();
+    let split = Split::new("ghost", &[("s", b"G", "*")]);
+    assert_eq!(split.read("s").unwrap(), b"G");
+    std::fs::remove_file(split.source_path("s")).unwrap();
+    let out = split.client(&["reset", "--name", "s"]);
+    assert!(out.status.success());
+    let err = split.read("s").unwrap_err();
+    assert_eq!(err.raw_os_error(), Some(libc::ENOENT), "ghost: {err}");
+}
+
+#[test]
+fn e2e_atomic_replace_serves_fresh_bytes_and_a_new_inode() {
+    // The standard safe-write flow (temp + rename-over) lands a NEW
+    // incarnation at the same path: the mount must serve the new
+    // bytes on the next open, under a new inode number.
+    if !fuse_available() { return; }
+    let _g = serial();
+    let split = Split::new("atomic", &[("s", b"V1-CONTENT", "*")]);
+    let ino1 = {
+        let md = std::fs::metadata(split.path("s")).unwrap();
+        std::os::unix::fs::MetadataExt::ino(&md)
+    };
+    assert_eq!(split.read("s").unwrap(), b"V1-CONTENT");
+    let tmp = split.source_path("s.tmp");
+    std::fs::write(&tmp, b"V2-CONTENT").unwrap();
+    std::fs::rename(&tmp, split.source_path("s")).unwrap();
+    let out = split.client(&["reset", "--name", "s"]);
+    assert!(out.status.success());
+    match split.read("s") {
+        Ok(b) => assert_eq!(b, b"V2-CONTENT", "replaced incarnation serves fresh"),
+        Err(e) => panic!("read after replace failed: {e}\n{}", split.dump_logs("replace failure")),
+    }
+    // TTL lets the kernel re-lookup and observe the new fino.
+    std::thread::sleep(Duration::from_millis(1200));
+    let ino2 = {
+        let md = std::fs::metadata(split.path("s")).unwrap();
+        std::os::unix::fs::MetadataExt::ino(&md)
+    };
+    assert_ne!(ino1, ino2, "a replaced incarnation is a new inode");
+}
+
+#[test]
+fn e2e_open_fd_pins_its_incarnation_across_a_host_rewrite() {
+    // Accepted MR4 semantics (AGENTS.md): an already-adjudicated open
+    // keeps reading ITS incarnation — a rename-over does not swap
+    // bytes under a live descriptor.
+    if !fuse_available() { return; }
+    let _g = serial();
+    let split = Split::new("pin", &[("s", b"AAAAAAAAAA", "*")]);
+    use std::io::{Read as _, Seek, SeekFrom};
+    let mut f = std::fs::File::open(split.path("s")).unwrap();
+    let mut half = vec![0u8; 5];
+    f.read_exact(&mut half).unwrap();
+    // Rewrite the source wholesale while the fd is open.
+    let tmp = split.source_path("s.tmp");
+    std::fs::write(&tmp, b"BBBBBBBBBB").unwrap();
+    std::fs::rename(&tmp, split.source_path("s")).unwrap();
+    let mut rest = String::new();
+    f.seek(SeekFrom::Start(5)).unwrap();
+    f.read_to_string(&mut rest).unwrap();
+    assert_eq!(half, b"AAAAA");
+    assert_eq!(rest, "AAAAA", "the open fd keeps its own incarnation");
+}
+
+#[test]
 fn e2e_reset_allows_reread() {
     if !fuse_available() { return; }
     let _g = serial();
@@ -460,9 +587,16 @@ fn e2e_source_mode_is_passed_through() {
     // mode through the socket (`add` with mode) covers the passthrough:
     // covered by e2e_dynamic_add_visible.
     let split = Split::new("mode", &[("s", b"X", "*")]);
-    let md = std::fs::metadata(split.path("s")).unwrap();
+    // MR4: attrs are LIVE — the view follows the source's mode,
+    // masked read-only. A 0o600 source presents as 0o400.
     use std::os::unix::fs::PermissionsExt as _;
-    assert_eq!(md.permissions().mode() & 0o777, 0o400, "default view is owner-read-only");
+    let src = split.source_path("s");
+    std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o600)).unwrap();
+    // Attr freshness is TTL-bounded (1s) by design: the kernel serves
+    // its cached attrs until they expire.
+    std::thread::sleep(Duration::from_millis(1200));
+    let md = std::fs::metadata(split.path("s")).unwrap();
+    assert_eq!(md.permissions().mode() & 0o777, 0o400, "source mode passes through, masked read-only");
 }
 
 #[test]
@@ -565,17 +699,19 @@ fn e2e_pending_does_not_block_other_reads() {
     // Budget spent on "s": another read PENDS for up to 5s. Meanwhile a
     // different secret must serve fine (mount stays responsive).
     let other_path = split.path("other");
-    let reader = std::thread::spawn(move || std::fs::read(split_path_s(&split, "s")));
-    let _split = (); // keep borrow structure simple
+    let s_path = split.path("s");
+    let reader = std::thread::spawn(move || std::fs::read(s_path));
     std::thread::sleep(Duration::from_millis(200));
-    assert_eq!(std::fs::read(&other_path).unwrap(), b"O", "unrelated secret must serve during a pending");
+    match std::fs::read(&other_path) {
+        Ok(b) => assert_eq!(b, b"O", "unrelated secret must serve during a pending"),
+        Err(e) => panic!(
+            "read during pending failed: {e}\n{}",
+            split.dump_logs("pending-concurrency failure")
+        ),
+    }
     let _ = reader.join();
 }
 
-// helper so the pending read above can own its path
-fn split_path_s(split: &Split, name: &str) -> PathBuf {
-    split.path(name)
-}
 
 #[test]
 fn e2e_hash_mismatch_denied() {

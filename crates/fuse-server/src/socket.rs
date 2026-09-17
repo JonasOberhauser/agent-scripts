@@ -49,7 +49,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("test.sock");
         let state = Arc::new(ServerState::new());
-        state.add("s.yaml", b"DATA".to_vec(), "h1");
+        state.add("s.yaml", "/tmp/host/s.yaml", 4, "h1");
 
         let sock2 = sock.clone();
         let state2 = Arc::clone(&state);
@@ -121,7 +121,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("poll.sock");
         let state = Arc::new(ServerState::new());
-        state.add("s.yaml", b"DATA".to_vec(), "h1");
+        state.add("s.yaml", "/tmp/host/s.yaml", 4, "h1");
         let id_a =
             state.create_pending("s.yaml", 42, Some("h42"), "read request", Some("checker"));
         let id_b = state.create_pending("s.yaml", 43, None, "read request", None);

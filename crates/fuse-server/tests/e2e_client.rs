@@ -47,7 +47,7 @@ fn e2e_client_binary_against_server() {
     // Start socket server with one pre-loaded secret
     let state = Arc::new({
         let s = ServerState::new();
-        s.add("existing.yaml", b"DATA1".to_vec(), "hash1");
+        s.add("existing.yaml", "/tmp/host/existing.yaml", 5, "hash1");
         s
     });
 
@@ -169,7 +169,7 @@ fn grant_forever_retries_hashd_after_remediation() {
 
     let state = Arc::new({
         let s = ServerState::new();
-        s.add("netrc", b"SEKRIT".to_vec(), "wrong_hash");
+        s.add("netrc", "/tmp/host/netrc", 6, "wrong_hash");
         s
     });
 

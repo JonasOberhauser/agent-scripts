@@ -20,7 +20,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use fuse_protocol::oracle::{OracleCommand, OracleReply, OracleRequest};
 use fuse_protocol::PendingAccessInfo;
@@ -65,10 +65,14 @@ impl OracleHub {
         });
     }
 
-    pub fn upsert(&self, name: &str, content: &[u8], mode: u32) {
-        self.broadcast(&OracleCommand::Upsert {
+    /// Announce a secret in the frozen mount tree with its CURRENT
+    /// host identity (MR4): no content — bytes only ever travel as
+    /// fds at open time.
+    pub fn serve(&self, name: &str, kdev: fuse_protocol::KDev, kino: fuse_protocol::Kino, mode: u32) {
+        self.broadcast(&OracleCommand::Serve {
             name: name.to_string(),
-            content: content.to_vec(),
+            kdev,
+            kino,
             mode,
         });
     }
@@ -119,6 +123,132 @@ fn process_name(pid: u32) -> Option<String> {
 
 /// Adjudicate one Ask end-to-end, including blocking on a pending until
 /// it is granted or expires.
+/// Stat a secret's host file by name (MR4): live identity + attrs,
+/// no adjudication — metadata visibility is unchanged from the
+/// snapshot era.
+fn stat_secret(state: &ServerState, name: &str) -> OracleReply {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let Some(host) = state.host_path(name) else {
+        return OracleReply::Gone;
+    };
+    match std::fs::metadata(&host) {
+        Ok(md) => OracleReply::StatOk {
+            kdev: fuse_protocol::KDev(md.dev()),
+            kino: fuse_protocol::Kino(md.ino()),
+            size: md.len(),
+            mode: md.permissions().mode() & 0o7777,
+            regular: md.is_file(),
+        },
+        Err(_) => OracleReply::Gone,
+    }
+}
+
+/// Write `line` to the stream with `fds` attached as SCM_RIGHTS.
+/// Extracted so the failure path is observable (PR #48 review: the
+/// lost-fd case used to be silent, hanging the reader).
+fn send_reply_with_fd(
+    stream: &std::os::unix::net::UnixStream,
+    line: &str,
+    fds: &[std::os::unix::io::RawFd],
+) -> Result<(), String> {
+    use std::os::unix::io::AsRawFd;
+    let iov = [std::io::IoSlice::new(line.as_bytes())];
+    let cmsg = nix::sys::socket::ControlMessage::ScmRights(fds);
+    nix::sys::socket::sendmsg::<()>(
+        stream.as_raw_fd(),
+        &iov,
+        &[cmsg],
+        nix::sys::socket::MsgFlags::empty(),
+        None,
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Adjudicated open (MR4): verify the incarnation, run the one-read +
+/// hash policy (the same adjudication Ask uses, at open time), and on
+/// Allow hand the host fd to fused as SCM_RIGHTS ancillary data on
+/// the reply line — the policy daemon NEVER reads content, it only
+/// opens and passes descriptors.
+fn open_secret(
+    state: &ServerState,
+    name: &str,
+    pid: u32,
+    kdev: fuse_protocol::KDev,
+    kino: fuse_protocol::Kino,
+    stream: &mut std::os::unix::net::UnixStream,
+) {
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::io::AsRawFd;
+
+    let reply_line = |r: &OracleReply| -> String {
+        serde_json::to_string(r).unwrap()
+    };
+
+    let Some(host) = state.host_path(name) else {
+        let _ = writeln!(stream, "{}", reply_line(&OracleReply::Gone));
+        let _ = stream.flush();
+        return;
+    };
+    let Ok(file) = std::fs::File::open(&host) else {
+        let _ = writeln!(stream, "{}", reply_line(&OracleReply::Gone));
+        let _ = stream.flush();
+        return;
+    };
+    // The descriptor's OWN identity — atomic open+verify (no TOCTOU
+    // between a path stat and the open).
+    let Ok(md) = file.metadata() else {
+        let _ = writeln!(stream, "{}", reply_line(&OracleReply::Gone));
+        let _ = stream.flush();
+        return;
+    };
+    if !md.is_file() {
+        let _ = writeln!(stream, "{}", reply_line(&OracleReply::Gone));
+        let _ = stream.flush();
+        return;
+    }
+    if fuse_protocol::KDev(md.dev()) != kdev || fuse_protocol::Kino(md.ino()) != kino {
+        // Host incarnation changed since the caller's inode was
+        // recorded: the file it asked about no longer exists. ESTALE
+        // makes the kernel re-resolve and pick up the new incarnation.
+        let _ = writeln!(stream, "{}", reply_line(&OracleReply::Stale));
+        let _ = stream.flush();
+        return;
+    }
+    // Live size refreshes the adjudication record.
+    state.observe_size(name, md.len() as usize);
+    match adjudicate(state, name, pid, 0, md.len() as usize) {
+        OracleReply::Allow => {
+            // SAFETY: nix sendmsg writes the reply line with the fd as
+            // SCM_RIGHTS ancillary data; the kernel duplicates the
+            // descriptor into the receiving process.
+            let fds = [file.as_raw_fd()];
+            let line = reply_line(&OracleReply::Allow);
+            if let Err(e) = send_reply_with_fd(stream, &line, &fds) {
+                // The reader would otherwise wait on silence until its
+                // open deadline. Say why it failed, then answer with a
+                // plain Error line so it fails fast instead.
+                error!("open {name}: fd pass to data daemon failed: {e}");
+                let _ = writeln!(
+                    stream,
+                    "{}",
+                    reply_line(&OracleReply::Error {
+                        message: "fd pass failed".into()
+                    })
+                );
+                let _ = stream.flush();
+                return;
+            }
+            let _ = stream.flush();
+            // Our copy closes on drop; fused holds its own now.
+        }
+        other => {
+            let _ = writeln!(stream, "{}", reply_line(&other));
+            let _ = stream.flush();
+        }
+    }
+}
+
 fn adjudicate(state: &ServerState, name: &str, pid: u32, offset: usize, size: usize) -> OracleReply {
     let (pid_hash, hash_error) = compute_pid_hash(pid);
     match state.attempt_read(name, pid, pid_hash.as_deref(), offset, size) {
@@ -221,7 +351,7 @@ fn handle_conn(state: &Arc<ServerState>, hub: &OracleHub, conn: UnixStream) {
         hub.controls.lock().unwrap().push(stream);
         return;
     }
-    // Otherwise: one or more asks on this connection.
+    // Otherwise: one or more requests on this connection.
     let mut line = first;
     loop {
         match serde_json::from_str::<OracleRequest>(line.trim()) {
@@ -229,6 +359,14 @@ fn handle_conn(state: &Arc<ServerState>, hub: &OracleHub, conn: UnixStream) {
                 let reply = adjudicate(state, &name, pid, offset as usize, size as usize);
                 let _ = writeln!(stream, "{}", serde_json::to_string(&reply).unwrap());
                 let _ = stream.flush();
+            }
+            Ok(OracleRequest::Stat { name }) => {
+                let reply = stat_secret(state, &name);
+                let _ = writeln!(stream, "{}", serde_json::to_string(&reply).unwrap());
+                let _ = stream.flush();
+            }
+            Ok(OracleRequest::Open { name, pid, kdev, kino }) => {
+                open_secret(state, &name, pid, kdev, kino, &mut stream);
             }
             _ => {
                 let _ = writeln!(

@@ -62,9 +62,11 @@ fn typed_client_round_trips_every_command() {
     ok("version", Command::GetVersion);
     ok("logpath", Command::GetLogPath);
     ok("reset-all", Command::Reset { name: None });
+    let src = dir.path().join("c1.bin");
+    std::fs::write(&src, b"CONTRACT").unwrap();
     ok("add", Command::AddSecret {
         name: "t".into(),
-        content: vec![1],
+        path: src.to_str().unwrap().into(),
         hash: "h".into(),
         mode: 0o400,
     });
