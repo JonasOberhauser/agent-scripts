@@ -147,6 +147,23 @@ fn main() {
     let mut state = ServerState::new();
     state.pending_timeout = std::sync::Mutex::new(Duration::from_secs(cli.pending_timeout));
     state.log_path = cli.log_path.to_string_lossy().to_string();
+    // MR5: arm persistence and LOAD BEFORE ANY SOCKET ACCEPTS — a
+    // grant decided against unloaded state is the bug class this
+    // exists to kill. (CLI secrets load after; adds JOIN their hash
+    // sets per the overwrite semantics, so nothing loaded is lost.)
+    state.policy_path = Some(fuse_server::policy_store::policy_path());
+    {
+        use fuse_server::policy_store;
+        let hub = OracleHub::clone(&fuse_server::ORACLE_HUB);
+        let report = policy_store::load(&state, &hub);
+        info!(
+            "  policy store:    {} restored, {} ghosts{}",
+            report.restored,
+            report.ghosts,
+            if report.corrupted { " — CORRUPT FILE RENAMED ASIDE, STARTED FRESH" } else { "" }
+        );
+    }
+
     let hub = OracleHub::clone(&fuse_server::ORACLE_HUB);
     for spec in &cli.secret {
         match parse_secret(spec) {

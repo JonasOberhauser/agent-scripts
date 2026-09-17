@@ -1,5 +1,6 @@
 pub mod handler;
 pub mod oracle_service;
+pub mod policy_store;
 pub mod protocols;
 pub mod socket;
 pub mod state;

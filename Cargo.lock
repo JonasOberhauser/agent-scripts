@@ -413,6 +413,7 @@ dependencies = [
  "fuser",
  "libc",
  "nix",
+ "serde",
  "serde_json",
  "servyi-servatui",
  "tempfile",
