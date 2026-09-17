@@ -181,7 +181,11 @@ fn open_passes_an_fd_and_stats_flow() {
         use std::os::unix::fs::MetadataExt;
         let md = std::fs::metadata(&file).unwrap();
         state.add("s", &file, md.len() as usize, "*");
-        hub.serve("s", fuse_protocol::KDev(md.dev()), fuse_protocol::Kino(md.ino()), 0o400);
+        hub.serve(
+            "s",
+            Some(fuse_protocol::HostIdentity { kdev: fuse_protocol::KDev(md.dev()), kino: fuse_protocol::Kino(md.ino()) }),
+            0o400,
+        );
     }
     let st = Arc::clone(&state);
     let p = oracle.clone();
@@ -392,7 +396,7 @@ fn control_channel_replays_snapshot_and_pushes_updates() {
     let state = Arc::new(ServerState::new());
     *state.pending_timeout.lock().unwrap() = Duration::from_secs(2);
     let hub = OracleHub::new();
-    hub.serve("seed", fuse_protocol::KDev(52), fuse_protocol::Kino(11), 0o400);
+    hub.serve("seed", Some(fuse_protocol::HostIdentity { kdev: fuse_protocol::KDev(52), kino: fuse_protocol::Kino(11) }), 0o400);
     let s2 = Arc::clone(&state);
     let hub2 = hub.clone();
     let moved = path.clone();
@@ -417,13 +421,13 @@ fn control_channel_replays_snapshot_and_pushes_updates() {
     let cmd: OracleCommand = serde_json::from_str(line.trim()).unwrap();
     assert_eq!(
         cmd,
-        OracleCommand::Serve { name: "seed".into(), kdev: fuse_protocol::KDev(52), kino: fuse_protocol::Kino(11), mode: 0o400 }
+        OracleCommand::Serve { name: "seed".into(), identity: Some(fuse_protocol::HostIdentity { kdev: fuse_protocol::KDev(52), kino: fuse_protocol::Kino(11) }), mode: 0o400 }
     );
 
     // Live push through the hub.
-    hub.serve("seed", fuse_protocol::KDev(52), fuse_protocol::Kino(12), 0o600);
+    hub.serve("seed", Some(fuse_protocol::HostIdentity { kdev: fuse_protocol::KDev(52), kino: fuse_protocol::Kino(12) }), 0o600);
     line.clear();
     reader.read_line(&mut line).unwrap();
     let cmd: OracleCommand = serde_json::from_str(line.trim()).unwrap();
-    assert_eq!(cmd, OracleCommand::Serve { name: "seed".into(), kdev: fuse_protocol::KDev(52), kino: fuse_protocol::Kino(12), mode: 0o600 });
+    assert_eq!(cmd, OracleCommand::Serve { name: "seed".into(), identity: Some(fuse_protocol::HostIdentity { kdev: fuse_protocol::KDev(52), kino: fuse_protocol::Kino(12) }), mode: 0o600 });
 }

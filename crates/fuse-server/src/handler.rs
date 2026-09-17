@@ -113,12 +113,15 @@ fn register_secret(
     if !md.is_file() {
         return Err(format!("{} is not a regular file", host.display()));
     }
-    let (kdev, kino) = {
+    let identity = {
         use std::os::unix::fs::MetadataExt;
-        (fuse_protocol::KDev(md.dev()), fuse_protocol::Kino(md.ino()))
+        fuse_protocol::HostIdentity {
+            kdev: fuse_protocol::KDev(md.dev()),
+            kino: fuse_protocol::Kino(md.ino()),
+        }
     };
     state.add_with_mode(name, host, md.len() as usize, hash, mode & 0o777);
-    hub.serve(name, kdev, kino, mode & 0o777);
+    hub.serve(name, Some(identity), mode & 0o777);
     Ok(())
 }
 #[cfg(test)]

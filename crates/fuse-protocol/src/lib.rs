@@ -2,7 +2,7 @@ pub mod error;
 pub mod hashd;
 pub mod io;
 pub mod oracle;
-pub use oracle::{KDev, Kino};
+pub use oracle::{HostIdentity, KDev, Kino};
 pub mod protocol;
 pub mod real_io;
 pub mod servatui_protocols;

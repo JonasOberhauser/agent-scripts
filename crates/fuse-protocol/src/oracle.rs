@@ -21,6 +21,17 @@ pub struct KDev(pub u64);
 #[serde(transparent)]
 pub struct Kino(pub u64);
 
+/// A host file's identity: (device, inode) of one live incarnation.
+/// Absence is expressed with `Option` — never with an in-band
+/// sentinel like (0, 0): a ghost (policy loaded, host file missing)
+/// simply has NO identity until the first stat-on-lookup discovers
+/// one (review: C idioms don't belong in this codebase).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostIdentity {
+    pub kdev: KDev,
+    pub kino: Kino,
+}
+
 /// fused → policy daemon.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -78,8 +89,15 @@ pub enum OracleCommand {
     /// Open. `mode` is wire-optional as before (older senders).
     Serve {
         name: String,
-        kdev: KDev,
-        kino: Kino,
+        /// The CURRENT host identity when the sender just stat'ed a
+        /// live file (a free pre-warm so a freshly served tree lists
+        /// with valid inos). `None` when there is none to know yet —
+        /// e.g. a policy-store ghost whose host file is missing; the
+        /// first stat-on-lookup discovers it. readdir only primes the
+        /// dcache; lookup is authoritative, so no identity is REQUIRED
+        /// before lookup.
+        #[serde(default)]
+        identity: Option<HostIdentity>,
         #[serde(default = "crate::protocol::default_secret_mode")]
         mode: u32,
     },
@@ -119,20 +137,35 @@ pub enum OracleReply {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
-    fn serve_without_mode_parses_with_conservative_default() {
-        // Wire-optional mode (older senders keep working; the
-        // conservative 0o400 default matches the client contract).
-        let back: OracleCommand =
-            serde_json::from_str(r#"{"type":"serve","name":"s.yaml","kdev":52,"kino":9}"#).unwrap();
+    fn serve_without_identity_parses_as_none() {
+        // A policy-store ghost announces the NAME with no identity —
+        // the wire must express absence as a missing field (parsed to
+        // None), never as an in-band (0,0) sentinel.
+        let line = r#"{"type":"serve","name":"g/one.json","mode":384}"#;
+        let cmd: OracleCommand = serde_json::from_str(line).expect("identity-free serve parses");
         assert_eq!(
-            back,
-            OracleCommand::Serve { name: "s.yaml".into(), kdev: KDev(52), kino: Kino(9), mode: 0o400 }
+            cmd,
+            OracleCommand::Serve { name: "g/one.json".into(), identity: None, mode: 0o600 }
         );
     }
 
 
-    use super::*;
+    #[test]
+    fn serve_without_mode_parses_with_conservative_default() {
+        // Wire-optional mode (older senders keep working; the
+        // conservative 0o400 default matches the client contract).
+        let back: OracleCommand = serde_json::from_str(
+            r#"{"type":"serve","name":"s.yaml","identity":{"kdev":52,"kino":9}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            back,
+            OracleCommand::Serve { name: "s.yaml".into(), identity: Some(HostIdentity { kdev: KDev(52), kino: Kino(9) }), mode: 0o400 }
+        );
+    }
 
     #[test]
     fn round_trips_every_message() {
@@ -146,8 +179,7 @@ mod tests {
             .unwrap(),
             serde_json::to_string(&OracleCommand::Serve {
                 name: "s.yaml".into(),
-                kdev: KDev(52),
-                kino: Kino(9),
+                identity: Some(HostIdentity { kdev: KDev(52), kino: Kino(9) }),
                 mode: 0o400,
             })
             .unwrap(),
@@ -171,7 +203,7 @@ mod tests {
         let back: OracleCommand = serde_json::from_str(&msgs[1]).unwrap();
         assert_eq!(
             back,
-            OracleCommand::Serve { name: "s.yaml".into(), kdev: KDev(52), kino: Kino(9), mode: 0o400 }
+            OracleCommand::Serve { name: "s.yaml".into(), identity: Some(HostIdentity { kdev: KDev(52), kino: Kino(9) }), mode: 0o400 }
         );
         let back: OracleCommand = serde_json::from_str(&msgs[2]).unwrap();
         assert_eq!(back, OracleCommand::Remove { name: "s.yaml".into() });

@@ -126,14 +126,22 @@ pub fn load(state: &ServerState, hub: &OracleHub) -> LoadReport {
         // A live host file re-registers with its CURRENT identity
         // (the MR4 stat path); a missing one becomes a ghost with
         // identity (0,0). Either way the loaded POLICY lands intact.
-        let (size, kdev, kino) = match std::fs::metadata(&s.host_path) {
+        // A live host file re-registers with its CURRENT identity
+        // (the MR4 stat path); a missing one is a GHOST: announced
+        // with NO identity — absence is Option, not an in-band (0,0)
+        // sentinel — until the first stat-on-lookup discovers it.
+        let (size, identity) = match std::fs::metadata(&s.host_path) {
             Ok(md) if md.is_file() => {
                 use std::os::unix::fs::MetadataExt;
-                (md.len() as usize, fuse_protocol::KDev(md.dev()), fuse_protocol::Kino(md.ino()))
+                let id = fuse_protocol::HostIdentity {
+                    kdev: fuse_protocol::KDev(md.dev()),
+                    kino: fuse_protocol::Kino(md.ino()),
+                };
+                (md.len() as usize, Some(id))
             }
-            _ => (0, fuse_protocol::KDev(0), fuse_protocol::Kino(0)),
+            _ => (0, None),
         };
-        let ghost = kino == fuse_protocol::Kino(0);
+        let ghost = identity.is_none();
         if ghost {
             report.ghosts += 1;
         } else {
@@ -156,7 +164,7 @@ pub fn load(state: &ServerState, hub: &OracleHub) -> LoadReport {
                 unlimited_reads: s.unlimited,
             })),
         );
-        hub.serve(&s.name, kdev, kino, s.mode);
+        hub.serve(&s.name, identity, s.mode);
     }
     report
 }
