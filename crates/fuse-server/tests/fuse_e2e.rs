@@ -437,6 +437,94 @@ fn e2e_one_read_per_secret_without_reset() {
 }
 
 #[test]
+fn e2e_host_edit_is_visible_on_next_open() {
+    // THE MR4 property: content is read from the host at open time —
+    // a source edit after the mount is up serves fresh bytes to the
+    // next open (snapshot semantics would serve the stale copy).
+    if !fuse_available() { return; }
+    let _g = serial();
+    let split = Split::new("fresh", &[("s", b"OLD-BYTES", "*")]);
+    assert_eq!(split.read("s").unwrap(), b"OLD-BYTES");
+    std::fs::write(split.source_path("s"), b"NEW-BYTES").unwrap();
+    let out = split.client(&["reset", "--name", "s"]);
+    assert!(out.status.success(), "reset failed: {}", write_out(&out));
+    match split.read("s") {
+        Ok(b) => assert_eq!(b, b"NEW-BYTES", "fresh bytes must serve"),
+        Err(e) => panic!("read after host edit failed: {e}\n{}", split.dump_logs("freshness failure")),
+    }
+}
+
+#[test]
+fn e2e_ghost_opens_to_enoent() {
+    // Frozen tree + live host: deleting the source leaves the name
+    // listed (structure is frozen) but its OPEN must fail ENOENT —
+    // never stale bytes.
+    if !fuse_available() { return; }
+    let _g = serial();
+    let split = Split::new("ghost", &[("s", b"G", "*")]);
+    assert_eq!(split.read("s").unwrap(), b"G");
+    std::fs::remove_file(split.source_path("s")).unwrap();
+    let out = split.client(&["reset", "--name", "s"]);
+    assert!(out.status.success());
+    let err = split.read("s").unwrap_err();
+    assert_eq!(err.raw_os_error(), Some(libc::ENOENT), "ghost: {err}");
+}
+
+#[test]
+fn e2e_atomic_replace_serves_fresh_bytes_and_a_new_inode() {
+    // The standard safe-write flow (temp + rename-over) lands a NEW
+    // incarnation at the same path: the mount must serve the new
+    // bytes on the next open, under a new inode number.
+    if !fuse_available() { return; }
+    let _g = serial();
+    let split = Split::new("atomic", &[("s", b"V1-CONTENT", "*")]);
+    let ino1 = {
+        let md = std::fs::metadata(split.path("s")).unwrap();
+        std::os::unix::fs::MetadataExt::ino(&md)
+    };
+    assert_eq!(split.read("s").unwrap(), b"V1-CONTENT");
+    let tmp = split.source_path("s.tmp");
+    std::fs::write(&tmp, b"V2-CONTENT").unwrap();
+    std::fs::rename(&tmp, split.source_path("s")).unwrap();
+    let out = split.client(&["reset", "--name", "s"]);
+    assert!(out.status.success());
+    match split.read("s") {
+        Ok(b) => assert_eq!(b, b"V2-CONTENT", "replaced incarnation serves fresh"),
+        Err(e) => panic!("read after replace failed: {e}\n{}", split.dump_logs("replace failure")),
+    }
+    // TTL lets the kernel re-lookup and observe the new fino.
+    std::thread::sleep(Duration::from_millis(1200));
+    let ino2 = {
+        let md = std::fs::metadata(split.path("s")).unwrap();
+        std::os::unix::fs::MetadataExt::ino(&md)
+    };
+    assert_ne!(ino1, ino2, "a replaced incarnation is a new inode");
+}
+
+#[test]
+fn e2e_open_fd_pins_its_incarnation_across_a_host_rewrite() {
+    // Accepted MR4 semantics (AGENTS.md): an already-adjudicated open
+    // keeps reading ITS incarnation — a rename-over does not swap
+    // bytes under a live descriptor.
+    if !fuse_available() { return; }
+    let _g = serial();
+    let split = Split::new("pin", &[("s", b"AAAAAAAAAA", "*")]);
+    use std::io::{Read as _, Seek, SeekFrom};
+    let mut f = std::fs::File::open(split.path("s")).unwrap();
+    let mut half = vec![0u8; 5];
+    f.read_exact(&mut half).unwrap();
+    // Rewrite the source wholesale while the fd is open.
+    let tmp = split.source_path("s.tmp");
+    std::fs::write(&tmp, b"BBBBBBBBBB").unwrap();
+    std::fs::rename(&tmp, split.source_path("s")).unwrap();
+    let mut rest = String::new();
+    f.seek(SeekFrom::Start(5)).unwrap();
+    f.read_to_string(&mut rest).unwrap();
+    assert_eq!(half, b"AAAAA");
+    assert_eq!(rest, "AAAAA", "the open fd keeps its own incarnation");
+}
+
+#[test]
 fn e2e_reset_allows_reread() {
     if !fuse_available() { return; }
     let _g = serial();
