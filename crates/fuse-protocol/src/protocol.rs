@@ -65,7 +65,6 @@ pub struct ServerStateFile {
     pub server_binary: String,
     pub mount_point: String,
     pub socket: String,
-    pub allow_other: bool,
     pub log_level: String,
     pub pending_timeout: u64,
     pub runtime_wrapper: Option<String>,

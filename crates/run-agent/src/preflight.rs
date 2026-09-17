@@ -102,7 +102,6 @@ fn check_source<S: SystemIo>(io: &S, s: &crate::orchestrator::LoadedSecret) -> C
 /// - `Transport endpoint is not connected` — dead mount answering
 ///   instantly; a dead mount only hangs (exit 124) when the daemon is
 ///   stuck alive
-/// - `Permission denied` — e.g. root-owned mount from a --sudo run
 ///
 /// The failure detail therefore carries stat's stderr verbatim plus a
 /// listing of the mount root, instead of guessing one cause.

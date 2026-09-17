@@ -1131,6 +1131,5 @@ mod tests {
         mock.spawn_independent("flatpak-spawn", &["--host", "sudo", "-n", "fuse-server"], None).unwrap();
         assert!(mock.spawn_contains(0, &["sudo", "-n"]));
         assert!(mock.spawn_contains(0, &["fuse-server"]));
-        assert!(!mock.spawn_contains(0, &["--allow-other"]));
     }
 }

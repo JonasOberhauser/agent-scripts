@@ -23,12 +23,6 @@ struct Cli {
     oracle_socket: String,
     #[arg(long, default_value = "info")]
     log_level: String,
-    /// Let uids OTHER than the mount owner access the mount (FUSE
-    /// allow_other). Only effective for users when /etc/fuse.conf sets
-    /// `user_allow_other`; mounting as root (the --sudo flow) skips
-    /// that requirement.
-    #[arg(long)]
-    allow_other: bool,
 }
 
 fn main() {
@@ -64,10 +58,7 @@ fn main() {
         cli.oracle_socket
     );
     let fuser_fs = fs::FusedFs::new(store, &cli.oracle_socket);
-    let mut options = vec![fuser::MountOption::FSName("gatekeeper".into())];
-    if cli.allow_other {
-        options.push(fuser::MountOption::AllowOther);
-    }
+    let options = vec![fuser::MountOption::FSName("gatekeeper".into())];
     match fuser::mount2(fuser_fs, &cli.mount_point, &options) {
         Ok(()) => info!("FUSE unmounted cleanly."),
         Err(e) => {

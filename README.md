@@ -110,8 +110,7 @@ mkdir -p fuse_mnt
 ./target/release/fuse-server \
     --mount-point fuse_mnt \
     --socket /tmp/fuse-gatekeeper.sock \
-    --secret secrets.yaml:/path/to/secrets.yaml:9f86d081884c7d65... \
-    --allow-other
+    --secret secrets.yaml:/path/to/secrets.yaml:9f86d081884c7d65...
 ```
 
 Format: `--secret <NAME>:<FILE_PATH>:<SHA256_OF_ALLOWED_BINARY>`
@@ -209,8 +208,6 @@ Options:
       --socket <PATH>               Unix socket [default: /tmp/fuse-gatekeeper.sock]
                                     [env: FUSE_GATEKEEPER_SOCKET]
       --mount-point <PATH>          FUSE mount point [default: /tmp/fuse-gatekeeper-mnt]
-      --sudo                        Run fuse-server under sudo (implies --allow-other)
-      --allow-other                 Let other UIDs read the mount (rootful runtimes)
       --pidns-host                  Share the host PID namespace (needed for real
                                     binary-hash verification)
       --runtime <RUNTIME>           Container runtime: auto, docker or podman [default: auto]
