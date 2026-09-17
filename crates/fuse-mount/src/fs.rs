@@ -373,11 +373,23 @@ pub fn stat_secret(socket: &str, name: &str) -> Result<OracleReply, String> {
         socket,
         &serde_json::to_string(&OracleRequest::Stat { name: name.into() }).unwrap(),
     )?;
+    // Metadata has no pending machinery to wait out — bound it tight.
+    s.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+        .map_err(|e| e.to_string())?;
     let mut line = String::new();
     let mut r = BufReader::new(s);
     r.read_line(&mut line).map_err(|e| e.to_string())?;
     serde_json::from_str(line.trim()).map_err(|e| e.to_string())
 }
+
+/// How long an open may wait for the policy daemon's reply.  Pendings
+/// legitimately block an open for human-scale times (until grant or
+/// expiry), so this is deliberately generous — but finite: a reply
+/// that never comes (server thread died between reading the request
+/// and answering, fd pass failed silently) must hang the reader no
+/// longer than this, then surface as EIO.  Mirrors the 3600 s the
+/// pre-MR4 `ask` path used.
+const OPEN_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3600);
 
 /// Adjudicated open: on Allow the reply line arrives with the host fd
 /// as SCM_RIGHTS ancillary data — returned as an owned descriptor.
@@ -388,6 +400,18 @@ pub fn open_secret(
     kdev: u64,
     kino: u64,
 ) -> Result<(OracleReply, Option<std::os::fd::OwnedFd>), String> {
+    open_secret_timeout(socket, name, pid, kdev, kino, OPEN_REPLY_TIMEOUT)
+}
+
+/// The test seam for [`open_secret`]: an explicit reply deadline.
+fn open_secret_timeout(
+    socket: &str,
+    name: &str,
+    pid: u32,
+    kdev: u64,
+    kino: u64,
+    timeout: std::time::Duration,
+) -> Result<(OracleReply, Option<std::os::fd::OwnedFd>), String> {
     use std::os::fd::OwnedFd;
     use std::os::unix::io::{AsRawFd, FromRawFd};
 
@@ -395,6 +419,7 @@ pub fn open_secret(
         socket,
         &serde_json::to_string(&OracleRequest::Open { name: name.into(), pid, kdev, kino }).unwrap(),
     )?;
+    s.set_read_timeout(Some(timeout)).map_err(|e| e.to_string())?;
 
     let mut buf = vec![0u8; 4096];
     let mut cmsg_buf = nix::cmsg_space!(libc::cmsghdr, std::os::unix::io::RawFd);
@@ -921,5 +946,79 @@ mod tests {
             }
             seen.push(f);
         }
+    }
+
+    fn tmp_listener(tag: &str) -> std::os::unix::net::UnixListener {
+        let dir = std::env::temp_dir().join(format!("fused-open-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("o.sock");
+        let _ = std::fs::remove_file(&path);
+        std::os::unix::net::UnixListener::bind(&path).unwrap()
+    }
+
+    #[test]
+    fn open_secret_does_not_hang_when_no_reply_ever_comes() {
+        // PR #48 review finding, reproduced: a reply that never comes
+        // — the server thread dies between reading the request and
+        // answering, or the SCM_RIGHTS sendmsg fails silently — used
+        // to block the reader's open FOREVER (no read timeout on the
+        // connection). A listener that accepts and reads but never
+        // answers must yield an error within the deadline instead.
+        let listener = tmp_listener("hang");
+        let path = listener.local_addr().unwrap().as_pathname().unwrap().to_path_buf();
+        // Accept, swallow the request, then never answer and never
+        // close — the worst case.
+        std::thread::spawn(move || {
+            if let Ok((mut conn, _)) = listener.accept() {
+                let mut line = String::new();
+                let _ = std::io::BufRead::read_line(
+                    &mut std::io::BufReader::new(&mut conn),
+                    &mut line,
+                );
+                std::thread::sleep(std::time::Duration::from_secs(300));
+            }
+        });
+        let start = std::time::Instant::now();
+        let r = open_secret_timeout(
+            path.to_str().unwrap(),
+            "s.yaml",
+            7,
+            1,
+            2,
+            std::time::Duration::from_millis(200),
+        );
+        assert!(r.is_err(), "a lost reply must surface as an error, got: {r:?}");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "the error must arrive at the deadline, not hang"
+        );
+    }
+
+    #[test]
+    fn open_secret_maps_eof_to_error_not_hang() {
+        // The server closes after reading without answering (crashed
+        // mid-adjudication): the empty reply must be an error, never a
+        // hang — the production caller maps it to EIO.
+        let listener = tmp_listener("eof");
+        let path = listener.local_addr().unwrap().as_pathname().unwrap().to_path_buf();
+        std::thread::spawn(move || {
+            if let Ok((mut conn, _)) = listener.accept() {
+                let mut line = String::new();
+                let _ = std::io::BufRead::read_line(
+                    &mut std::io::BufReader::new(&mut conn),
+                    &mut line,
+                );
+                drop(conn);
+            }
+        });
+        let r = open_secret_timeout(
+            path.to_str().unwrap(),
+            "s.yaml",
+            7,
+            1,
+            2,
+            std::time::Duration::from_secs(5),
+        );
+        assert!(r.is_err(), "EOF with no reply line must be an error, got: {r:?}");
     }
 }

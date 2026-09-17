@@ -38,17 +38,19 @@ The workspace has six crates: `fuse-protocol`, `fuse-server`, `fuse-client`, `ru
 
 ## Architecture
 
-- **fuse-server**: POLICY daemon — trust decisions (one-read, package hashes via hashd, pendings, grants), the servatui command socket, and the oracle endpoint the data daemon connects to. Holds NO secret bytes. Mounts
+- **fuse-server**: POLICY daemon — trust decisions (one-read, package hashes via hashd, pendings, grants), the servatui command socket, and the oracle endpoint the data daemon connects to. Holds NO secret bytes — secrets register by host PATH, and content reaches readers only as descriptors handed to the data daemon at open time (transparent reads). Mounts
   at `/tmp/fuse-gatekeeper-mnt`, listens on `/tmp/fuse-gatekeeper.sock`. Enforces
-  one-read-per-secret with binary-hash verification and forward-only multi-chunk
-  reads.
-- **run-agent** (orchestrator): Spawns/reuses the fuse-server, loads secrets via
-  socket, launches a podman/docker container with symlinks pointing into `/fuse`.
+  one adjudicated OPEN per read cycle: binary-hash verification, pendings and the
+  one-read counter all run at open; the open is answered with a host fd passed
+  as SCM_RIGHTS.
+- **run-agent** (orchestrator): Spawns/reuses the fuse-server, registers secret
+  host paths via socket, launches a podman/docker container with symlinks pointing
+  into `/fuse`.
 - **fuse-client**: CLI to send CRUD commands (status, reset, add, remove) to the
   socket server.
 - **fuse-protocol**: Shared types, `SystemIo` trait, `RealSystemIo` /
   `MockSystemIo` implementations.
-- **fuse-mount** (`fused`): DATA daemon — holds the secret bytes and the FUSE mount; every read asks the policy daemon over the oracle socket. Either half alone is useless; the mount survives policy restarts.
+- **fuse-mount** (`fused`): DATA daemon — holds the FUSE mount; every OPEN is adjudicated by the policy daemon, which answers with a host fd (SCM_RIGHTS); reads are plain preads of that descriptor and store NO content. Either half alone is useless; the mount survives policy restarts.
 - **hashd**: optional socket-activated helper (`pid → sha256 of its loaded
   package`) so the unprivileged fuse-server can hash readers for
   grant-forever; needs CAP_CHECKPOINT_RESTORE in the initial user
@@ -61,7 +63,11 @@ The workspace has six crates: `fuse-protocol`, `fuse-server`, `fuse-client`, `ru
 
 Goal: **containment** — a confused, overly eager actor inside the agent
 container must not spread secrets to the outside world. The gate
-provides one-read semantics, package identity (`map_files` inodes,
+provides one-read semantics (one adjudicated OPEN per read cycle;
+within an open, reads are re-preads of the same descriptor — same-bytes
+re-reads carry no new information, but an in-place host rewrite of the
+same inode DOES stream new bytes into an already-adjudicated open:
+accepted), package identity (`map_files` inodes,
 fail-closed), pendings with manual grants, and grant-forever as a
 convenience tier.
 

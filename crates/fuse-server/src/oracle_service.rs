@@ -20,7 +20,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use fuse_protocol::oracle::{OracleCommand, OracleReply, OracleRequest};
 use fuse_protocol::PendingAccessInfo;
@@ -143,6 +143,28 @@ fn stat_secret(state: &ServerState, name: &str) -> OracleReply {
     }
 }
 
+/// Write `line` to the stream with `fds` attached as SCM_RIGHTS.
+/// Extracted so the failure path is observable (PR #48 review: the
+/// lost-fd case used to be silent, hanging the reader).
+fn send_reply_with_fd(
+    stream: &std::os::unix::net::UnixStream,
+    line: &str,
+    fds: &[std::os::unix::io::RawFd],
+) -> Result<(), String> {
+    use std::os::unix::io::AsRawFd;
+    let iov = [std::io::IoSlice::new(line.as_bytes())];
+    let cmsg = nix::sys::socket::ControlMessage::ScmRights(fds);
+    nix::sys::socket::sendmsg::<()>(
+        stream.as_raw_fd(),
+        &iov,
+        &[cmsg],
+        nix::sys::socket::MsgFlags::empty(),
+        None,
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// Adjudicated open (MR4): verify the incarnation, run the one-read +
 /// hash policy (the same adjudication Ask uses, at open time), and on
 /// Allow hand the host fd to fused as SCM_RIGHTS ancillary data on
@@ -202,11 +224,21 @@ fn open_secret(
             // descriptor into the receiving process.
             let fds = [file.as_raw_fd()];
             let line = reply_line(&OracleReply::Allow);
-            let iov = [std::io::IoSlice::new(line.as_bytes())];
-            let cmsg = nix::sys::socket::ControlMessage::ScmRights(&fds);
-            let _: usize =
-                nix::sys::socket::sendmsg::<()>(stream.as_raw_fd(), &iov, &[cmsg], nix::sys::socket::MsgFlags::empty(), None)
-                    .unwrap_or(0);
+            if let Err(e) = send_reply_with_fd(stream, &line, &fds) {
+                // The reader would otherwise wait on silence until its
+                // open deadline. Say why it failed, then answer with a
+                // plain Error line so it fails fast instead.
+                error!("open {name}: fd pass to data daemon failed: {e}");
+                let _ = writeln!(
+                    stream,
+                    "{}",
+                    reply_line(&OracleReply::Error {
+                        message: "fd pass failed".into()
+                    })
+                );
+                let _ = stream.flush();
+                return;
+            }
             let _ = stream.flush();
             // Our copy closes on drop; fused holds its own now.
         }

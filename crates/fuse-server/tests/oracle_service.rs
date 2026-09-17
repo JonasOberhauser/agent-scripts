@@ -43,6 +43,130 @@ fn ask(path: &std::path::Path, name: &str, pid: u32, offset: u64, size: u32) -> 
 }
 
 #[test]
+fn failed_fd_pass_does_not_wedge_the_oracle() {
+    // PR #48 review: the reader disconnects between sending Open and
+    // the SCM_RIGHTS pass. The sendmsg failure used to be SILENT
+    // (unwrap_or(0)) — now it is logged and a plain Error reply is
+    // attempted, and above all the oracle keeps serving: a later open
+    // still adjudicates and hands over the fd.
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("s.bin");
+    std::fs::write(&file, b"HOSTBYTES").unwrap();
+    let oracle = dir.path().join("wedge.sock");
+    let hub = OracleHub::clone(&fuse_server::ORACLE_HUB);
+    let state = Arc::new(ServerState::new());
+    {
+        let len = std::fs::metadata(&file).unwrap().len() as usize;
+        state.add("s", &file, len, "*");
+        let _ = hub; // (serving not needed for direct opens)
+    }
+    let st = Arc::clone(&state);
+    let p = oracle.clone();
+    std::thread::spawn(move || {
+        let _ = run_oracle_server(&p, st, hub);
+    });
+    for _ in 0..200 {
+        if oracle.exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    // Identity from a Stat round trip.
+    let (kdev, kino) = {
+        let mut c = std::os::unix::net::UnixStream::connect(&oracle).unwrap();
+        writeln!(
+            c,
+            "{}",
+            serde_json::to_string(&OracleRequest::Stat { name: "s".into() }).unwrap()
+        )
+        .unwrap();
+        c.flush().unwrap();
+        let mut line = String::new();
+        std::io::BufRead::read_line(&mut std::io::BufReader::new(c), &mut line).unwrap();
+        match serde_json::from_str::<OracleReply>(line.trim()).unwrap() {
+            OracleReply::StatOk { kdev, kino, .. } => (kdev, kino),
+            other => panic!("stat: {other:?}"),
+        }
+    };
+
+    // The vanishing reader: send Open, then drop the connection
+    // before the reply/fd can be written.
+    {
+        let mut c = std::os::unix::net::UnixStream::connect(&oracle).unwrap();
+        writeln!(
+            c,
+            "{}",
+            serde_json::to_string(&OracleRequest::Open {
+                name: "s".into(),
+                pid: 1111,
+                kdev,
+                kino,
+            })
+            .unwrap()
+        )
+        .unwrap();
+        c.flush().unwrap();
+        drop(c);
+    }
+    // Let the server thread hit the dead peer.
+    std::thread::sleep(Duration::from_millis(300));
+    // The vanishing reader's open was ADJUDICATED (and consumed the
+    // one-read cycle) before its fd pass failed — re-arm for the
+    // follow-up, as an operator would.
+    state.reset(Some("s"));
+
+    // The oracle still serves a fresh open: Allow + fd.
+    use std::os::unix::io::{AsRawFd, FromRawFd};
+    let mut c = std::os::unix::net::UnixStream::connect(&oracle).unwrap();
+    writeln!(
+        c,
+        "{}",
+        serde_json::to_string(&OracleRequest::Open {
+            name: "s".into(),
+            pid: 2222,
+            kdev,
+            kino,
+        })
+        .unwrap()
+    )
+    .unwrap();
+    c.flush().unwrap();
+    let mut buf = vec![0u8; 4096];
+    let mut cmsg = nix::cmsg_space!(libc::cmsghdr, std::os::unix::io::RawFd);
+    let mut fd = None;
+    let n;
+    {
+        let mut iov = [std::io::IoSliceMut::new(&mut buf)];
+        let raw = c.as_raw_fd();
+        let msg = nix::sys::socket::recvmsg::<()>(
+            raw,
+            &mut iov,
+            Some(&mut cmsg),
+            nix::sys::socket::MsgFlags::empty(),
+        )
+        .unwrap();
+        for cm in msg.cmsgs().unwrap() {
+            if let nix::sys::socket::ControlMessageOwned::ScmRights(fds) = cm {
+                fd = fds.first().copied();
+            }
+        }
+        n = msg.bytes;
+    }
+    let reply: OracleReply =
+        serde_json::from_str(String::from_utf8_lossy(&buf[..n]).trim()).unwrap();
+    assert!(matches!(reply, OracleReply::Allow), "later opens still serve: {reply:?}");
+    let fd = fd.expect("the fd must still arrive");
+    // and it is the live host content
+    let mut got = String::new();
+    // SAFETY: recvmsg created this descriptor for us; taking ownership
+    // as a File closes it (and the passed copy) on drop.
+    let mut f = unsafe { std::fs::File::from_raw_fd(fd) };
+    std::io::Read::read_to_string(&mut f, &mut got).unwrap();
+    assert_eq!(got, "HOSTBYTES");
+}
+
+#[test]
 fn open_passes_an_fd_and_stats_flow() {
     // MR4 seam: Open must (a) verify the caller's ino identity,
     // (b) answer Gone for a replaced incarnation, (c) on Allow
