@@ -163,6 +163,7 @@ impl Split {
             ));
         }
         let policy = policy
+            .env("FUSE_GATEKEEPER_POLICY", dirs[1].path().join("policy.json"))
             .stdout(server_log.try_clone().unwrap()).stderr(server_log)
             .spawn()
             .expect("spawn fuse-server (policy)");
