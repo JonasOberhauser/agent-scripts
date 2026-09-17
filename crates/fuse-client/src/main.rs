@@ -253,7 +253,6 @@ fn start_server_from_state(app: &App, state: &ServerStateFile, log_path: Option<
         "--mount-point".into(), state.mount_point.clone(),
         "--socket".into(), state.socket.clone(),
     ];
-    if state.allow_other { cmd_args.push("--allow-other".into()); }
     cmd_args.push("--log-level".into());
     cmd_args.push(state.log_level.clone());
     cmd_args.push("--pending-timeout".into());

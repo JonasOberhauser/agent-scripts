@@ -193,14 +193,6 @@ pub struct AgentConfig {
     pub socket_path: PathBuf,
     /// FUSE mount point (shared across projects).
     pub mount_point: PathBuf,
-    /// Run fuse-server under `sudo` (needed for `allow_other` without
-    /// editing `/etc/fuse.conf`).
-    pub use_sudo: bool,
-    /// Pass `--allow-other` to the fuse-server so users other than the
-    /// mount owner can access the FUSE filesystem.  **Not needed** with
-    /// rootless podman, where the container's root maps to the host user
-    /// that created the mount.
-    pub allow_other: bool,
     /// Pass `--pidns=host` to the container so its processes share the
     /// host's PID namespace.  This allows the FUSE server (on the host)
     /// to read `/proc/{pid}/exe` and verify the binary hash.
@@ -240,8 +232,6 @@ impl AgentConfig {
             auto_confirm: false,
             socket_path: PathBuf::from(DEFAULT_SOCKET),
             mount_point: PathBuf::from(DEFAULT_MOUNT_POINT),
-            use_sudo: false,
-            allow_other: false,
             pidns_host: false,
             runtime: Runtime::Auto,
             runtime_wrapper: None,
@@ -441,8 +431,6 @@ mod tests {
             auto_confirm: false,
             socket_path: PathBuf::from(fuse_protocol::DEFAULT_SOCKET),
             mount_point: PathBuf::from(fuse_protocol::DEFAULT_MOUNT_POINT),
-            use_sudo: false,
-            allow_other: false,
             pidns_host: false,
             runtime: Runtime::Auto,
             runtime_wrapper: None,
@@ -495,8 +483,6 @@ mod tests {
             auto_confirm: false,
             socket_path: PathBuf::from(fuse_protocol::DEFAULT_SOCKET),
             mount_point: PathBuf::from(fuse_protocol::DEFAULT_MOUNT_POINT),
-            use_sudo: false,
-            allow_other: false,
             pidns_host: true,
             runtime: Runtime::Auto,
             runtime_wrapper: None,
@@ -530,8 +516,6 @@ mod tests {
             auto_confirm: false,
             socket_path: PathBuf::from(fuse_protocol::DEFAULT_SOCKET),
             mount_point: PathBuf::from(fuse_protocol::DEFAULT_MOUNT_POINT),
-            use_sudo: false,
-            allow_other: false,
             pidns_host: false,
             runtime: Runtime::Auto,
             runtime_wrapper: None,

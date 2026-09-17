@@ -199,7 +199,7 @@ fn ensure_mount_point<S: SystemIo>(
                  cleared.\n\
                  Recover manually with:\n  \
                  fusermount -uz {m} && rm -rf {m}\n  \
-                 (root-owned: sudo umount -l {m} && sudo rm -rf {m})\n\
+                 (root-owned: inspect with `mount | grep {m}`)\n\
                  or run: fuse-client restart",
                 mount_point.display(),
                 m = mount_point.display(),
@@ -308,15 +308,12 @@ where
                 info!("No fuse-server found — spawning a new one.");
             }
 
-            // Clean up stale socket file (e.g., root-owned from a previous
-            // --sudo run, or leftover from a crashed server).
+            // Clean up stale socket file (leftover from a crashed
+            // server).
             if io.file_exists(socket) {
                 info!("Removing stale socket at {}", socket.display());
                 io.remove_path(socket).map_err(|e| format!(
-                    "Cannot remove stale socket {}: {e}.\n\
-                     If it is root-owned from a previous --sudo run:\n  \
-                     flatpak-spawn --host sudo rm -f {}",
-                    socket.display(),
+                    "Cannot remove stale socket {}: {e}.",
                     socket.display(),
                 ))?;
             }
@@ -377,9 +374,6 @@ where
                 "--mount-point", mount,
                 "--socket", sock,
             ];
-            if config.allow_other {
-                fuse_args.push("--allow-other");
-            }
             fuse_args.push("--log-level");
             let log_level_str = config.log_level.clone();
             fuse_args.push(&log_level_str);
@@ -394,30 +388,6 @@ where
             let log_str = log_path.to_str()
                 .ok_or_else(|| format!("log path is not valid UTF-8: {}", log_path.display()))?;
 
-            // If using sudo, pre-authenticate interactively (with terminal
-            // access) so the detached daemon can use `sudo -n` without one.
-            if config.use_sudo {
-                let mut auth_parts: Vec<String> = Vec::new();
-                if let Some(w) = &config.runtime_wrapper {
-                    let (prog, prefix) = crate::config::split_wrapper(w);
-                    auth_parts.push(prog);
-                    auth_parts.extend(prefix);
-                }
-                auth_parts.push("sudo".into());
-                auth_parts.push("-v".into());
-
-                let auth_prog = auth_parts[0].clone();
-                let auth_args: Vec<&str> = auth_parts[1..].iter().map(|s| s.as_str()).collect();
-
-                info!("Pre-authenticating sudo (enter your password if prompted)...");
-                let exit = io
-                    .run_interactive(&auth_prog, &auth_args)
-                    .map_err(|e| format!("sudo pre-authentication failed: {e}"))?;
-                if exit != 0 {
-                    return Err(format!("sudo pre-authentication returned exit code {exit}"));
-                }
-            }
-
             // Build the full argv.  The fuse-server must run in the same
             // mount namespace as the container, so when a runtime wrapper
             // (e.g. `flatpak-spawn --host`) is set we prepend it here too.
@@ -426,10 +396,6 @@ where
                 let (prog, prefix) = crate::config::split_wrapper(w);
                 cmd_parts.push(prog);
                 cmd_parts.extend(prefix);
-            }
-            if config.use_sudo {
-                cmd_parts.push("sudo".into());
-                cmd_parts.push("-n".into());
             }
             cmd_parts.push(server_bin.to_string());
             cmd_parts.extend(args.iter().map(|s| s.to_string()));
@@ -442,9 +408,8 @@ where
                 .map_err(|e| format!("spawn fuse-server: {e}"))?;
             spawned_server_pid = pid;
             info!(
-                "fuse-server spawned as independent daemon (pid {pid}, wrapper={}, sudo={}).",
+                "fuse-server spawned as independent daemon (pid {pid}, wrapper={}).",
                 config.runtime_wrapper.is_some(),
-                config.use_sudo,
             );
 
             // Wait for socket.
@@ -1144,7 +1109,6 @@ fn write_state_file<S: SystemIo>(
         server_binary: config.fuse_server_path.to_string_lossy().to_string(),
         mount_point: config.mount_point.to_string_lossy().to_string(),
         socket: config.socket_path.to_string_lossy().to_string(),
-        allow_other: config.allow_other,
         log_level: config.log_level.clone(),
         pending_timeout: 300,
         runtime_wrapper: config.runtime_wrapper.clone(),
@@ -1199,8 +1163,6 @@ mod tests {
             auto_confirm: false,
             socket_path: PathBuf::from("/tmp/fgk.sock"),
             mount_point: PathBuf::from("/tmp/fgk-mnt"),
-            use_sudo: false,
-            allow_other: false,
             pidns_host: false,
             runtime: Runtime::Auto,
             runtime_wrapper: None,
@@ -1952,95 +1914,7 @@ mod tests {
 
     // ── spawn argv validation ────────────────────────────────────
 
-    #[test]
-    fn spawn_command_no_allow_other_by_default() {
-        let mut mock = base_mock()
-            .with_file("/home/user/secrets.yaml", b"DATA");
-
-        let cfg = test_config();
-        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(String::new()), false);
-        assert!(result.is_ok());
-        assert!(!mock.spawned.is_empty(), "should have spawned fuse-server");
-        assert!(
-            !mock.spawn_contains(0, &["--allow-other"]),
-            "should NOT pass --allow-other by default"
-        );
-    }
-
-    #[test]
-    fn spawn_command_includes_allow_other_when_sudo() {
-        let mut cfg = test_config();
-        cfg.use_sudo = true;
-        cfg.allow_other = true; // mirrors main.rs: allow_other = cli.allow_other || cli.sudo
-
-        let mut mock = base_mock()
-            .with_file("/home/user/secrets.yaml", b"DATA");
-
-        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(String::new()), false);
-        assert!(result.is_ok());
-        assert!(
-            mock.spawn_contains(0, &["--allow-other"]),
-            "--sudo should imply --allow-other"
-        );
-    }
-
-    #[test]
-    fn spawn_command_explicit_allow_other() {
-        let mut cfg = test_config();
-        cfg.allow_other = true;
-
-        let mut mock = base_mock()
-            .with_file("/home/user/secrets.yaml", b"DATA");
-
-        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(String::new()), false);
-        assert!(result.is_ok());
-        assert!(
-            mock.spawn_contains(0, &["--allow-other"]),
-            "--allow-other should be passed through"
-        );
-    }
-
-    #[test]
-    fn spawn_command_uses_sudo_n_when_sudo() {
-        let mut cfg = test_config();
-        cfg.use_sudo = true;
-        cfg.allow_other = true;
-
-        let mut mock = base_mock()
-            .with_file("/home/user/secrets.yaml", b"DATA");
-
-        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(String::new()), false);
-        assert!(result.is_ok());
-        assert!(!mock.spawned.is_empty());
-        // Without wrapper: prog="sudo", args=["-n", "fuse-server", ...]
-        // With wrapper:    prog="flatpak-spawn", args=["--host", "sudo", "-n", ...]
-        let (prog, args) = &mock.spawned[0];
-        let has_sudo = prog == "sudo" || args.contains(&"sudo".to_string());
-        let has_n = args.contains(&"-n".to_string());
-        assert!(has_sudo && has_n, "should use sudo -n: prog={prog}, args={args:?}");
-    }
-
-    #[test]
-    fn sudo_preauth_called_when_sudo() {
-        let mut cfg = test_config();
-        cfg.use_sudo = true;
-
-        let mut mock = base_mock()
-            .with_file("/home/user/secrets.yaml", b"DATA");
-
-        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(String::new()), false);
-        assert!(result.is_ok());
-
-        let calls = mock.interactive_calls.borrow();
-        let has_sudo_v = calls.iter().any(|(prog, args)| {
-              prog == "sudo" && args.iter().any(|a| a == "-v")
-        });
-        assert!(
-            has_sudo_v,
-            "should have called 'sudo -v' for pre-authentication, got: {calls:?}"
-        );
-    }
-
+                
     #[test]
     fn no_preauth_when_not_sudo() {
         let cfg = test_config();
