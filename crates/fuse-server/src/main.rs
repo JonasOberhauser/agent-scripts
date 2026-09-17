@@ -99,10 +99,16 @@ fn main() {
         match fused {
             Some(fused) => {
                 info!("  mount-point:     {} (spawning supervised data daemon)", mp.display());
-                let child = std::process::Command::new(&fused)
-                    .arg("--mount-point").arg(mp)
-                    .arg("--oracle-socket").arg(&cli.oracle_socket)
-                    .spawn();
+                let mut cmd = std::process::Command::new(&fused);
+                cmd.arg("--mount-point").arg(mp)
+                    .arg("--oracle-socket").arg(&cli.oracle_socket);
+                if cli.allow_other {
+                    // Forwarded to the data daemon, which owns the
+                    // mount (the flag was silently dropped here since
+                    // the #28 split — found while reviewing MR4).
+                    cmd.arg("--allow-other");
+                }
+                let child = cmd.spawn();
                 match child {
                     Ok(c) => {
                         SUPERVISED_FUSED.lock().unwrap().replace(c);
@@ -124,7 +130,6 @@ fn main() {
             }
         }
     }
-    let _ = cli.allow_other;
 
     stale_socket(&cli.socket);
     stale_socket(&cli.oracle_socket);
