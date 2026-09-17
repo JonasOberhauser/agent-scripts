@@ -115,7 +115,7 @@ fn register_secret(
     }
     let (kdev, kino) = {
         use std::os::unix::fs::MetadataExt;
-        (md.dev(), md.ino())
+        (fuse_protocol::KDev(md.dev()), fuse_protocol::Kino(md.ino()))
     };
     state.add_with_mode(name, host, md.len() as usize, hash, mode & 0o777);
     hub.serve(name, kdev, kino, mode & 0o777);

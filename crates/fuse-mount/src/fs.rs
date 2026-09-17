@@ -32,7 +32,15 @@ use fuser::{
 };
 use tracing::warn;
 
-const ROOT_INO: u64 = 1;
+/// The fuse inode number (review: newtype pattern). Opaque to the
+/// kernel and to the container — only ever minted here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct FuseIno(u64);
+
+impl FuseIno {
+    const ROOT: FuseIno = FuseIno(1);
+}
+
 const TTL: Duration = Duration::from_secs(1);
 
 /// One frozen-tree node. Files carry their CURRENT fuse inode and the
@@ -40,7 +48,7 @@ const TTL: Duration = Duration::from_secs(1);
 /// host listing is never consulted — no scouring).
 enum Node {
     File {
-        fino: u64,
+        fino: FuseIno,
         mode: u32,
     },
     Dir {
@@ -48,13 +56,15 @@ enum Node {
     },
 }
 
-/// Per-fino state: the host identity this inode was minted for (used
-/// only to DETECT incarnation change — stat now, compare) and the
-/// path any by-ino request needs as its address.
+/// The HOST identity a fuse inode was minted for (review: the struct
+/// is the identity record, not the ino — the ino is the KEY): the
+/// (device, inode) pair observed when it was minted, kept only to
+/// DETECT incarnation change (stat now, compare), plus the path any
+/// by-ino request needs as its address.
 #[derive(Clone)]
-struct Fino {
-    kdev: u64,
-    kino: u64,
+struct HostIdentity {
+    kdev: fuse_protocol::oracle::KDev,
+    kino: fuse_protocol::oracle::Kino,
     path: PathBuf,
 }
 
@@ -67,7 +77,7 @@ struct StoreInner {
     next_fino: u64,
     /// The frozen tree, keyed by outer path ("" = root).
     tree: BTreeMap<PathBuf, Node>,
-    finos: HashMap<u64, Fino>,
+    identities: HashMap<FuseIno, HostIdentity>,
 }
 
 impl Default for StoreInner {
@@ -79,9 +89,9 @@ impl Default for StoreInner {
 impl StoreInner {
     fn new() -> Self {
         Self {
-            next_fino: ROOT_INO,
+            next_fino: FuseIno::ROOT.0,
             tree: BTreeMap::from([(PathBuf::new(), Node::Dir { children: BTreeMap::new() })]),
-            finos: HashMap::new(),
+            identities: HashMap::new(),
         }
     }
 }
@@ -90,11 +100,23 @@ impl StoreInner {
 /// Numbers never repeat; a replaced incarnation gets a NEW number and
 /// the old one keeps its entry (so by-ino access can distinguish
 /// STALE from never-existed).
-fn mint_fino(s: &mut StoreInner, path: &Path, kdev: u64, kino: u64) -> u64 {
+fn mint_fino(
+    s: &mut StoreInner,
+    path: &Path,
+    kdev: fuse_protocol::oracle::KDev,
+    kino: fuse_protocol::oracle::Kino,
+) -> FuseIno {
     s.next_fino += 1;
-    let fino = s.next_fino;
-    debug_assert!(!s.finos.contains_key(&fino), "fino {fino} already exists");
-    s.finos.insert(fino, Fino { kdev, kino, path: path.to_path_buf() });
+    let fino = FuseIno(s.next_fino);
+    debug_assert!(
+        !s.identities.contains_key(&fino),
+        "fino {:?} already exists",
+        fino
+    );
+    s.identities.insert(
+        fino,
+        HostIdentity { kdev, kino, path: path.to_path_buf() },
+    );
     fino
 }
 
@@ -105,7 +127,7 @@ impl Store {
     /// A secret enters the frozen tree (MR4 Serve): no content — the
     /// current fino follows the host identity, allocating a fresh one
     /// when the incarnation changed since last Serve/stat.
-    pub fn serve(&self, name: &str, kdev: u64, kino: u64, mode: u32) {
+    pub fn serve(&self, name: &str, kdev: fuse_protocol::oracle::KDev, kino: fuse_protocol::oracle::Kino, mode: u32) {
         let mut s = self.0.lock().unwrap();
         let path = PathBuf::from(name);
         let comps: Vec<String> = path
@@ -150,8 +172,8 @@ impl Store {
                 // identity mints a new one — the old entry stays for
                 // ESTALE detection.
                 let same = {
-                    let f = &s.finos[fino];
-                    f.kdev == kdev && f.kino == kino
+                    let id = &s.identities[fino];
+                    id.kdev == kdev && id.kino == kino
                 };
                 if !same {
                     let nf = mint_fino(&mut s, &path, kdev, kino);
@@ -185,7 +207,7 @@ impl Store {
             return;
         }
         if let Some(Node::File { fino, .. }) = s.tree.remove(&path) {
-            s.finos.remove(&fino);
+            s.identities.remove(&fino);
         }
         while let Some(label) = path.file_name().map(|n| n.to_string_lossy().into_owned()) {
             if !path.pop() {
@@ -207,13 +229,13 @@ impl Store {
         }
     }
 
-    /// Resolve one lookup step under `parent` (ROOT_INO = root).
-    fn child(&self, parent: u64, label: &OsStr) -> Option<(u64, bool)> {
+    /// Resolve one lookup step under `parent` (FuseIno::ROOT = root).
+    fn child(&self, parent: FuseIno, label: &OsStr) -> Option<(FuseIno, bool)> {
         let label = label.to_string_lossy().into_owned();
-        let base: PathBuf = if parent == ROOT_INO {
+        let base: PathBuf = if parent == FuseIno::ROOT {
             PathBuf::new()
         } else {
-            self.0.lock().unwrap().finos.get(&parent)?.path.clone()
+            self.0.lock().unwrap().identities.get(&parent)?.path.clone()
         };
         let child = base.join(&label);
         let is_dir = {
@@ -235,23 +257,28 @@ impl Store {
     }
 
     /// The fino table entry (identity + address) for by-ino requests.
-    fn fino(&self, ino: u64) -> Option<Fino> {
-        self.0.lock().unwrap().finos.get(&ino).cloned()
+    fn host_identity(&self, ino: FuseIno) -> Option<HostIdentity> {
+        self.0.lock().unwrap().identities.get(&ino).cloned()
     }
 
     /// Observe a fresh host identity for a path (from Stat at
     /// lookup/getattr): same incarnation keeps the fino; a changed one
     /// mints a new number (the caller then answers ESTALE for the old
     /// ino and the new number for fresh lookups).
-    fn observe(&self, path: &Path, kdev: u64, kino: u64) -> Option<u64> {
+    fn observe(
+        &self,
+        path: &Path,
+        kdev: fuse_protocol::oracle::KDev,
+        kino: fuse_protocol::oracle::Kino,
+    ) -> Option<FuseIno> {
         let mut s = self.0.lock().unwrap();
         let current = match s.tree.get(path)? {
             Node::File { fino, .. } => *fino,
             _ => return None,
         };
         {
-            let f = s.finos.get(&current)?;
-            if f.kdev == kdev && f.kino == kino {
+            let id = s.identities.get(&current)?;
+            if id.kdev == kdev && id.kino == kino {
                 return Some(current);
             }
         }
@@ -274,13 +301,13 @@ impl Store {
     /// Directory listing for readdir: (fino, is_dir, label) sorted.
     /// Dir children get their fino minted on demand — a freshly
     /// served tree must list completely without prior lookups.
-    fn dir_children(&self, dir: u64) -> Option<Vec<(u64, bool, String)>> {
+    fn dir_children(&self, dir: FuseIno) -> Option<Vec<(FuseIno, bool, String)>> {
         let (path, labels): (PathBuf, Vec<(String, bool)>) = {
             let s = self.0.lock().unwrap();
-            let path: &Path = if dir == ROOT_INO {
+            let path: &Path = if dir == FuseIno::ROOT {
                 Path::new("")
             } else {
-                &s.finos.get(&dir)?.path
+                &s.identities.get(&dir)?.path
             };
             let Node::Dir { children } = s.tree.get(path)? else {
                 return None;
@@ -312,38 +339,38 @@ impl Store {
 
     /// The (structural) fino of a directory path, minting it if this
     /// is its first observation.
-    fn ensure_dir_fino(&self, path: &Path) -> Option<u64> {
+    fn ensure_dir_fino(&self, path: &Path) -> Option<FuseIno> {
         let mut s = self.0.lock().unwrap();
         if !matches!(s.tree.get(path), Some(Node::Dir { .. })) {
             return None;
         }
-        if let Some((fino, _)) = s.finos.iter().find(|(_, f)| f.path == path) {
+        if let Some((fino, _)) = s.identities.iter().find(|(_, id)| id.path == path) {
             return Some(*fino);
         }
-        Some(mint_fino(&mut s, path, 0, 0))
+        Some(mint_fino(&mut s, path, fuse_protocol::oracle::KDev(0), fuse_protocol::oracle::Kino(0)))
     }
 
     /// Parent directory ino for readdir's `..`.
-    fn parent_of(&self, ino: u64) -> Option<u64> {
-        if ino == ROOT_INO {
-            return Some(ROOT_INO);
+    fn parent_of(&self, ino: FuseIno) -> Option<FuseIno> {
+        if ino == FuseIno::ROOT {
+            return Some(FuseIno::ROOT);
         }
         let s = self.0.lock().unwrap();
-        let path = &s.finos.get(&ino)?.path;
+        let path = &s.identities.get(&ino)?.path;
         let mut parent = path.clone();
         parent.pop();
         if parent.as_os_str().is_empty() {
-            return Some(ROOT_INO);
+            return Some(FuseIno::ROOT);
         }
         if let Some(Node::File { .. }) = s.tree.get(&parent) {
             return None;
         }
         // a dir's parent is a dir: reuse its fino if minted
-        s.finos
+        s.identities
             .iter()
-            .find(|(_, f)| f.path == parent)
+            .find(|(_, id)| id.path == parent)
             .map(|(fino, _)| *fino)
-            .or(Some(ROOT_INO))
+            .or(Some(FuseIno::ROOT))
     }
 
     /// Count of served files (statfs).
@@ -397,8 +424,8 @@ pub fn open_secret(
     socket: &str,
     name: &str,
     pid: u32,
-    kdev: u64,
-    kino: u64,
+    kdev: fuse_protocol::oracle::KDev,
+    kino: fuse_protocol::oracle::Kino,
 ) -> Result<(OracleReply, Option<std::os::fd::OwnedFd>), String> {
     open_secret_timeout(socket, name, pid, kdev, kino, OPEN_REPLY_TIMEOUT)
 }
@@ -408,8 +435,8 @@ fn open_secret_timeout(
     socket: &str,
     name: &str,
     pid: u32,
-    kdev: u64,
-    kino: u64,
+    kdev: fuse_protocol::oracle::KDev,
+    kino: fuse_protocol::oracle::Kino,
     timeout: std::time::Duration,
 ) -> Result<(OracleReply, Option<std::os::fd::OwnedFd>), String> {
     use std::os::fd::OwnedFd;
@@ -513,32 +540,32 @@ impl Filesystem for FusedFs {
     fn destroy(&mut self) {}
 
     fn lookup(&mut self, req: &Request<'_>, parent: u64, name: &std::ffi::OsStr, reply: ReplyEntry) {
-        let Some((fino, is_dir)) = self.store.child(parent, name) else {
+        let Some((fino, is_dir)) = self.store.child(FuseIno(parent), name) else {
             tracing::info!("lookup {:?}: no such tree child", name);
             reply.error(libc::ENOENT);
             return;
         };
         if is_dir {
-            reply.entry(&TTL, &self.dir_attr(fino, req.uid(), req.gid()), 0);
+            reply.entry(&TTL, &self.dir_attr(fino.0, req.uid(), req.gid()), 0);
             return;
         }
         // Files: live stat decides identity AND attrs.
-        let Some(f) = self.store.fino(fino) else {
+        let Some(id) = self.store.host_identity(fino) else {
             reply.error(libc::ENOENT);
             return;
         };
-        let name = f.path.to_string_lossy().into_owned();
+        let name = id.path.to_string_lossy().into_owned();
         match stat_secret(&self.oracle, &name) {
             Ok(OracleReply::StatOk { kdev, kino, size, mode, regular: true }) => {
                 // Keep the fino for the same incarnation; a changed
                 // host file mints a new number — fresh lookups (like
                 // this one) answer the NEW identity.
                 tracing::info!(
-                    "lookup {:?}: stat ok dev={kdev} ino={kino} size={size} mode={mode:o} (recorded dev={} ino={})",
-                    name, f.kdev, f.kino
+                    "lookup {:?}: stat ok dev={:?} ino={:?} size={size} mode={mode:o} (recorded {:?}/{:?})",
+                    name, kdev, kino, id.kdev, id.kino
                 );
-                if let Some(nf) = self.store.observe(&f.path, kdev, kino) {
-                    let attr = self.file_attr(nf, size, req.uid(), req.gid(), mode);
+                if let Some(nf) = self.store.observe(&id.path, kdev, kino) {
+                    let attr = self.file_attr(nf.0, size, req.uid(), req.gid(), mode);
                     reply.entry(&TTL, &attr, 0);
                 } else {
                     reply.error(libc::ENOENT);
@@ -558,15 +585,15 @@ impl Filesystem for FusedFs {
     }
 
     fn getattr(&mut self, req: &Request<'_>, ino: u64, fh: Option<u64>, reply: ReplyAttr) {
-        if ino == ROOT_INO {
+        if ino == FuseIno::ROOT.0 {
             reply.attr(&TTL, &self.dir_attr(ino, req.uid(), req.gid()));
             return;
         }
-        let Some(f) = self.store.fino(ino) else {
+        let Some(id) = self.store.host_identity(FuseIno(ino)) else {
             reply.error(libc::ENOENT);
             return;
         };
-        if self.store.mode_of(&f.path).is_some() {
+        if self.store.mode_of(&id.path).is_some() {
             // A file. fstat after open is authoritative: the fd pins
             // its own incarnation.
             if let Some(fh) = fh {
@@ -586,10 +613,10 @@ impl Filesystem for FusedFs {
                 }
             }
             // Path stat: live attrs + incarnation check.
-            let name = f.path.to_string_lossy().into_owned();
+            let name = id.path.to_string_lossy().into_owned();
             match stat_secret(&self.oracle, &name) {
                 Ok(OracleReply::StatOk { kdev, kino, size, mode, regular: true }) => {
-                    if kdev != f.kdev || kino != f.kino {
+                    if kdev != id.kdev || kino != id.kino {
                         // The file this ino was minted for is gone:
                         // ESTALE makes the kernel re-resolve.
                         reply.error(libc::ESTALE);
@@ -613,17 +640,20 @@ impl Filesystem for FusedFs {
             reply.error(libc::EACCES);
             return;
         }
-        let Some(f) = self.store.fino(ino) else {
+        let Some(id) = self.store.host_identity(FuseIno(ino)) else {
             reply.error(libc::ENOENT);
             return;
         };
-        if self.store.mode_of(&f.path).is_none() {
+        if self.store.mode_of(&id.path).is_none() {
             reply.error(libc::EISDIR);
             return;
         }
-        let name = f.path.to_string_lossy().into_owned();
-        tracing::info!("open {name}: ino={ino} pid={} recorded dev={} ino={}", req.pid(), f.kdev, f.kino);
-        match open_secret(&self.oracle, &name, req.pid(), f.kdev, f.kino) {
+        let name = id.path.to_string_lossy().into_owned();
+        tracing::info!(
+            "open {name}: ino={ino} pid={} recorded dev={:?} ino={:?}",
+            req.pid(), id.kdev, id.kino
+        );
+        match open_secret(&self.oracle, &name, req.pid(), id.kdev, id.kino) {
             Ok((OracleReply::Allow, Some(fd))) => {
                 use std::os::fd::AsRawFd;
                 // fh = the fd number: the kernel fd table is the map.
@@ -710,18 +740,18 @@ impl Filesystem for FusedFs {
         offset: i64,
         mut reply: ReplyDirectory,
     ) {
-        let Some(children) = self.store.dir_children(ino) else {
+        let Some(children) = self.store.dir_children(FuseIno(ino)) else {
             reply.error(libc::ENOENT);
             return;
         };
-        let parent = self.store.parent_of(ino).unwrap_or(ROOT_INO);
+        let parent = self.store.parent_of(FuseIno(ino)).unwrap_or(FuseIno::ROOT);
         let all: Vec<(u64, FileType, String)> = vec![
             (ino, FileType::Directory, ".".into()),
-            (parent, FileType::Directory, "..".into()),
+            (parent.0, FileType::Directory, "..".into()),
         ]
         .into_iter()
         .chain(children.into_iter().map(|(i, d, n)| {
-            (i, if d { FileType::Directory } else { FileType::RegularFile }, n)
+            (i.0, if d { FileType::Directory } else { FileType::RegularFile }, n)
         }))
         .collect();
         for (idx, (e_ino, kind, name)) in all.into_iter().enumerate() {
@@ -848,10 +878,10 @@ mod tests {
     #[test]
     fn serve_shapes_the_frozen_tree() {
         let s = Store::default();
-        s.serve("home/u/auth.json", 52, 1, 0o400);
-        s.serve("home/u/keys/token", 52, 2, 0o400);
-        s.serve("other.txt", 52, 3, 0o400);
-        let root = s.dir_children(ROOT_INO).unwrap();
+        s.serve("home/u/auth.json", fuse_protocol::oracle::KDev(52), fuse_protocol::oracle::Kino(1), 0o400);
+        s.serve("home/u/keys/token", fuse_protocol::oracle::KDev(52), fuse_protocol::oracle::Kino(2), 0o400);
+        s.serve("other.txt", fuse_protocol::oracle::KDev(52), fuse_protocol::oracle::Kino(3), 0o400);
+        let root = s.dir_children(FuseIno::ROOT).unwrap();
         let names: Vec<&str> = root.iter().map(|(_, _, n)| n.as_str()).collect();
         assert_eq!(names, ["home", "other.txt"]);
         let home = s.dir_children(root[0].0).unwrap();
@@ -861,26 +891,26 @@ mod tests {
     #[test]
     fn new_incarnation_mints_a_new_fino_the_old_stays_for_estale() {
         let s = Store::default();
-        s.serve("a/x", 52, 100, 0o400);
-        let (f1, is_dir) = s.child(ROOT_INO, OsStr::new("a")).unwrap();
+        s.serve("a/x", fuse_protocol::oracle::KDev(52), fuse_protocol::oracle::Kino(100), 0o400);
+        let (f1, is_dir) = s.child(FuseIno::ROOT, OsStr::new("a")).unwrap();
         assert!(is_dir);
         let (x1, _) = s.child(f1, OsStr::new("x")).unwrap();
         // host file replaced: same path, new identity
-        s.serve("a/x", 52, 999, 0o400);
+        s.serve("a/x", fuse_protocol::oracle::KDev(52), fuse_protocol::oracle::Kino(999), 0o400);
         let (x2, _) = s.child(f1, OsStr::new("x")).unwrap();
         assert_ne!(x1, x2, "a new incarnation is a new inode");
         // the OLD fino still resolves (its identity no longer matches
         // the current one — by-ino access answers ESTALE from that)
-        let old = s.fino(x1).expect("old fino retained for ESTALE");
-        assert_eq!(old.kino, 100);
+        let old = s.host_identity(x1).expect("old identity retained for ESTALE");
+        assert_eq!(old.kino, fuse_protocol::oracle::Kino(100));
     }
 
     #[test]
     fn same_incarnation_keeps_its_fino() {
         let s = Store::default();
-        s.serve("a/x", 52, 100, 0o400);
-        s.serve("a/x", 52, 100, 0o400);
-        let d = s.child(ROOT_INO, OsStr::new("a")).unwrap().0;
+        s.serve("a/x", fuse_protocol::oracle::KDev(52), fuse_protocol::oracle::Kino(100), 0o400);
+        s.serve("a/x", fuse_protocol::oracle::KDev(52), fuse_protocol::oracle::Kino(100), 0o400);
+        let d = s.child(FuseIno::ROOT, OsStr::new("a")).unwrap().0;
         let x1 = s.child(d, OsStr::new("x")).unwrap().0;
         let x2 = s.child(d, OsStr::new("x")).unwrap().0;
         assert_eq!(x1, x2, "no churn without an incarnation change");
@@ -889,11 +919,11 @@ mod tests {
     #[test]
     fn observe_refreshes_identity_on_lookup() {
         let s = Store::default();
-        s.serve("a/x", 52, 100, 0o400);
-        let d = s.child(ROOT_INO, OsStr::new("a")).unwrap().0;
+        s.serve("a/x", fuse_protocol::oracle::KDev(52), fuse_protocol::oracle::Kino(100), 0o400);
+        let d = s.child(FuseIno::ROOT, OsStr::new("a")).unwrap().0;
         let x1 = s.child(d, OsStr::new("x")).unwrap().0;
         // lookup observed a replaced file: new fino for the path
-        let x2 = s.observe(Path::new("a/x"), 52, 777).unwrap();
+        let x2 = s.observe(Path::new("a/x"), fuse_protocol::oracle::KDev(52), fuse_protocol::oracle::Kino(777)).unwrap();
         assert_ne!(x1, x2);
         let x3 = s.child(d, OsStr::new("x")).unwrap().0;
         assert_eq!(x2, x3, "the tree now answers the new identity");
@@ -902,10 +932,10 @@ mod tests {
     #[test]
     fn remove_prunes_the_tree_and_childless_ancestors() {
         let s = Store::default();
-        s.serve("a/b/c.txt", 52, 7, 0o400);
-        assert!(s.dir_children(ROOT_INO).unwrap()[0].1);
+        s.serve("a/b/c.txt", fuse_protocol::oracle::KDev(52), fuse_protocol::oracle::Kino(7), 0o400);
+        assert!(s.dir_children(FuseIno::ROOT).unwrap()[0].1);
         s.remove("a/b/c.txt");
-        assert!(s.dir_children(ROOT_INO).unwrap().is_empty(), "empty trees vanish");
+        assert!(s.dir_children(FuseIno::ROOT).unwrap().is_empty(), "empty trees vanish");
     }
 
     #[test]
@@ -915,11 +945,11 @@ mod tests {
             &s,
             r#"{"type":"serve","name":"a","kdev":52,"kino":5,"mode":420}"#
         ));
-        let (fino, is_dir) = s.child(ROOT_INO, OsStr::new("a")).unwrap();
+        let (fino, is_dir) = s.child(FuseIno::ROOT, OsStr::new("a")).unwrap();
         assert!(!is_dir);
-        assert_eq!(s.fino(fino).unwrap().kino, 5);
+        assert_eq!(s.host_identity(fino).unwrap().kino, fuse_protocol::oracle::Kino(5));
         assert!(apply_control_line(&s, r#"{"type":"remove","name":"a"}"#));
-        assert!(s.child(ROOT_INO, OsStr::new("a")).is_none());
+        assert!(s.child(FuseIno::ROOT, OsStr::new("a")).is_none());
     }
 
     #[test]
@@ -935,14 +965,14 @@ mod tests {
     #[test]
     fn finos_are_unique_and_monotone() {
         let s = Store::default();
-        let mut seen: Vec<u64> = Vec::new();
+        let mut seen: Vec<FuseIno> = Vec::new();
         for i in 0..6u64 {
             let name = format!("f{i}.txt");
-            s.serve(&name, 52, 100 + i, 0o400);
-            let f = s.child(ROOT_INO, OsStr::new(&name)).unwrap().0;
-            assert!(!seen.contains(&f), "fino {f} repeated");
+            s.serve(&name, fuse_protocol::oracle::KDev(52), fuse_protocol::oracle::Kino(100 + i), 0o400);
+            let f = s.child(FuseIno::ROOT, OsStr::new(&name)).unwrap().0;
+            assert!(!seen.contains(&f), "fino repeated: {f:?}");
             if let Some(&max) = seen.iter().max() {
-                assert!(f > max);
+                assert!(f.0 > max.0);
             }
             seen.push(f);
         }
@@ -983,8 +1013,8 @@ mod tests {
             path.to_str().unwrap(),
             "s.yaml",
             7,
-            1,
-            2,
+            fuse_protocol::oracle::KDev(1),
+            fuse_protocol::oracle::Kino(2),
             std::time::Duration::from_millis(200),
         );
         assert!(r.is_err(), "a lost reply must surface as an error, got: {r:?}");
@@ -1015,8 +1045,8 @@ mod tests {
             path.to_str().unwrap(),
             "s.yaml",
             7,
-            1,
-            2,
+            fuse_protocol::oracle::KDev(1),
+            fuse_protocol::oracle::Kino(2),
             std::time::Duration::from_secs(5),
         );
         assert!(r.is_err(), "EOF with no reply line must be an error, got: {r:?}");

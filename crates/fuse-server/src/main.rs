@@ -172,7 +172,7 @@ fn main() {
                     md.ino()
                 );
                 state.add_with_mode(&name, host.clone(), md.len() as usize, &hash, 0o400);
-                hub.serve(&name, md.dev(), md.ino(), 0o400);
+                hub.serve(&name, fuse_protocol::KDev(md.dev()), fuse_protocol::Kino(md.ino()), 0o400);
             }
             Err(e) => {
                 error!("Bad --secret '{spec}': {e}");

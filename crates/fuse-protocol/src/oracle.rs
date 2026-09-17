@@ -9,6 +9,18 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Host filesystem identity halves (MR4): a device number and an
+/// inode number, each meaningless alone. Newtypes so they cannot be
+/// swapped at call sites — serde-transparent, the wire JSON is the
+/// bare numbers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct KDev(pub u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Kino(pub u64);
+
 /// fused → policy daemon.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -28,7 +40,7 @@ pub enum OracleRequest {
     /// pread. Policy denial → Deny; incarnation replaced → Stale
     /// (fused answers ESTALE, kernel re-resolves); gone/not regular →
     /// Gone (ENOENT).
-    Open { name: String, pid: u32, kdev: u64, kino: u64 },
+    Open { name: String, pid: u32, kdev: KDev, kino: Kino },
     /// A reader wants `size` bytes of `name` at `offset`. The policy
     /// daemon answers synchronously — including waiting out a pending
     /// until grant/expiry — then replies Allow or Deny.
@@ -66,8 +78,8 @@ pub enum OracleCommand {
     /// Open. `mode` is wire-optional as before (older senders).
     Serve {
         name: String,
-        kdev: u64,
-        kino: u64,
+        kdev: KDev,
+        kino: Kino,
         #[serde(default = "crate::protocol::default_secret_mode")]
         mode: u32,
     },
@@ -85,8 +97,8 @@ pub enum OracleReply {
     /// Live identity + attrs by name (reply to Stat). `regular` is
     /// false when the path exists but is not a regular file.
     StatOk {
-        kdev: u64,
-        kino: u64,
+        kdev: KDev,
+        kino: Kino,
         size: u64,
         mode: u32,
         regular: bool,
@@ -115,7 +127,7 @@ mod tests {
             serde_json::from_str(r#"{"type":"serve","name":"s.yaml","kdev":52,"kino":9}"#).unwrap();
         assert_eq!(
             back,
-            OracleCommand::Serve { name: "s.yaml".into(), kdev: 52, kino: 9, mode: 0o400 }
+            OracleCommand::Serve { name: "s.yaml".into(), kdev: KDev(52), kino: Kino(9), mode: 0o400 }
         );
     }
 
@@ -134,8 +146,8 @@ mod tests {
             .unwrap(),
             serde_json::to_string(&OracleCommand::Serve {
                 name: "s.yaml".into(),
-                kdev: 52,
-                kino: 9,
+                kdev: KDev(52),
+                kino: Kino(9),
                 mode: 0o400,
             })
             .unwrap(),
@@ -159,7 +171,7 @@ mod tests {
         let back: OracleCommand = serde_json::from_str(&msgs[1]).unwrap();
         assert_eq!(
             back,
-            OracleCommand::Serve { name: "s.yaml".into(), kdev: 52, kino: 9, mode: 0o400 }
+            OracleCommand::Serve { name: "s.yaml".into(), kdev: KDev(52), kino: Kino(9), mode: 0o400 }
         );
         let back: OracleCommand = serde_json::from_str(&msgs[2]).unwrap();
         assert_eq!(back, OracleCommand::Remove { name: "s.yaml".into() });

@@ -68,7 +68,7 @@ impl OracleHub {
     /// Announce a secret in the frozen mount tree with its CURRENT
     /// host identity (MR4): no content — bytes only ever travel as
     /// fds at open time.
-    pub fn serve(&self, name: &str, kdev: u64, kino: u64, mode: u32) {
+    pub fn serve(&self, name: &str, kdev: fuse_protocol::KDev, kino: fuse_protocol::Kino, mode: u32) {
         self.broadcast(&OracleCommand::Serve {
             name: name.to_string(),
             kdev,
@@ -133,8 +133,8 @@ fn stat_secret(state: &ServerState, name: &str) -> OracleReply {
     };
     match std::fs::metadata(&host) {
         Ok(md) => OracleReply::StatOk {
-            kdev: md.dev(),
-            kino: md.ino(),
+            kdev: fuse_protocol::KDev(md.dev()),
+            kino: fuse_protocol::Kino(md.ino()),
             size: md.len(),
             mode: md.permissions().mode() & 0o7777,
             regular: md.is_file(),
@@ -174,8 +174,8 @@ fn open_secret(
     state: &ServerState,
     name: &str,
     pid: u32,
-    kdev: u64,
-    kino: u64,
+    kdev: fuse_protocol::KDev,
+    kino: fuse_protocol::Kino,
     stream: &mut std::os::unix::net::UnixStream,
 ) {
     use std::os::unix::fs::MetadataExt;
@@ -207,7 +207,7 @@ fn open_secret(
         let _ = stream.flush();
         return;
     }
-    if md.dev() != kdev || md.ino() != kino {
+    if fuse_protocol::KDev(md.dev()) != kdev || fuse_protocol::Kino(md.ino()) != kino {
         // Host incarnation changed since the caller's inode was
         // recorded: the file it asked about no longer exists. ESTALE
         // makes the kernel re-resolve and pick up the new incarnation.
