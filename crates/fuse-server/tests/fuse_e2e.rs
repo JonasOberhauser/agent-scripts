@@ -658,7 +658,14 @@ fn e2e_readdir_lists_secrets() {
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
-    assert!(names.contains(&"a".to_string()) && names.contains(&"b".to_string()));
+    // Issue #47: the container lists the ANONYMIZED forms; the clear
+    // names must NOT appear (that is the leak being closed).
+    let ia = split.inner("a");
+    let ib = split.inner("b");
+    assert!(names.contains(&ia), "{ia} in {names:?}");
+    assert!(names.contains(&ib), "{ib} in {names:?}");
+    assert!(!names.contains(&"a".to_string()) && !names.contains(&"b".to_string()),
+        "clear host names must never appear inside the container: {names:?}");
 }
 
 #[test]
