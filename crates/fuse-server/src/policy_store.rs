@@ -31,6 +31,10 @@ use crate::oracle_service::OracleHub;
 #[derive(Serialize, Deserialize)]
 struct PolicyFile {
     version: String,
+    /// Per-install anonymization salt (issue #47), hex. Absent in
+    /// pre-#47 files: minted on first save after the load.
+    #[serde(default)]
+    salt: String,
     secrets: Vec<PolicySecret>,
 }
 
@@ -93,6 +97,7 @@ pub fn load(state: &mut ServerState, hub: &OracleHub) -> LoadReport {
         Ok(d) => d,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             tracing::info!("policy store {}: no file — fresh start", path.display());
+            mint_salt_if_needed(state);
             return LoadReport::default();
         }
         Err(e) => {
@@ -144,6 +149,12 @@ pub fn load(state: &mut ServerState, hub: &OracleHub) -> LoadReport {
             fuse_protocol::VERSION
         );
     }
+    // Anonymization salt (issue #47): from the store when present
+    // (stable container-view names across restarts); minted on the
+    // first #47 boot — pre-#47 stores have no salt, and their inner
+    // names did not exist yet, so nothing rotates that mattered.
+    state.anon_salt = hex_to_bytes(&file.salt);
+    mint_salt_if_needed(state);
     let mut report = LoadReport::default();
     for s in file.secrets {
         // A live host file re-registers with its CURRENT identity
@@ -180,7 +191,8 @@ pub fn load(state: &mut ServerState, hub: &OracleHub) -> LoadReport {
                 unlimited_reads: s.unlimited,
             })),
         );
-        hub.serve(&s.name, s.mode);
+        let inner = fuse_protocol::anonymize_path(&state.anon_salt, &s.name);
+        hub.serve(&s.name, &inner, s.mode);
     }
     report
 }
@@ -215,6 +227,7 @@ pub(crate) fn persist_locked(state: &ServerState) {
     };
     let mut file = PolicyFile {
         version: fuse_protocol::VERSION.to_string(),
+        salt: bytes_to_hex(&state.anon_salt),
         secrets: Vec::new(),
     };
     for entry in state.secrets.iter() {
@@ -246,6 +259,33 @@ pub(crate) fn persist_locked(state: &ServerState) {
             path.display()
         );
     }
+}
+
+/// The anonymization salt must NEVER be empty: an empty salt quietly
+/// turns every container-view name into an UNSALTED hash —
+/// dictionary-reversible for common path segments (the exact leak
+/// #47 exists to close). Mint on any path that reaches state without
+/// one (fresh boot, corrupt-aside, store-without-salt).
+fn mint_salt_if_needed(state: &mut ServerState) {
+    if state.anon_salt.is_empty() {
+        let salt = fuse_protocol::new_salt();
+        tracing::info!("policy store: minted a fresh anonymization salt (issue #47)");
+        // Write it NOW: registration derives inner names from it, and
+        // the first registration persist must carry the same salt the
+        // mount is serving under.
+        state.anon_salt = salt;
+        persist(state);
+    }
+}
+
+fn hex_to_bytes(h: &str) -> Vec<u8> {
+    (0..h.len() / 2)
+        .filter_map(|i| u8::from_str_radix(&h[i * 2..i * 2 + 2], 16).ok())
+        .collect()
+}
+
+fn bytes_to_hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
 fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {

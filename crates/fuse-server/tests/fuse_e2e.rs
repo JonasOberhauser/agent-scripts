@@ -180,9 +180,19 @@ impl Split {
             .expect("spawn fused (data daemon)");
 
         wait_mount(&mount, &dirs);
-        // Wait until the content snapshot has landed in the data daemon.
+        // Wait until the content snapshot has landed in the data
+        // daemon. The container view is anonymized (issue #47): the
+        // salt lands in the policy store at the server's first
+        // registration persist — poll for it, then wait on the INNER
+        // name the mount actually serves.
+        for _ in 0..200 {
+            if dirs[1].path().join("policy.json").exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
         for (name, _, _) in secrets {
-            let target = mount.join(name);
+            let target = mount.join(inner_name_of(dirs[1].path(), name));
             let deadline = Instant::now() + Duration::from_secs(10);
             while Instant::now() < deadline {
                 if target.exists() {
@@ -199,8 +209,15 @@ impl Split {
         Split { mount, socket, oracle, procs: vec![policy, data], _dirs: dirs, _secret_dir: secret_dir }
     }
 
+    /// Resolve a secret's mount path by its OUTER (clear) name: the
+    /// container view serves the anonymized form (issue #47), derived
+    /// from the salt in this split's own policy store.
     fn path(&self, name: &str) -> PathBuf {
-        self.mount.join(name)
+        self.mount.join(self.inner(name))
+    }
+
+    fn inner(&self, name: &str) -> String {
+        inner_name_of(self._dirs[1].path(), name)
     }
 
     /// The host-side source file behind a served name (MR4 tests:
@@ -308,6 +325,22 @@ fn probe_env() -> String {
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_default();
     format!("{id}\n{caps}\n")
+}
+
+
+// Resolve a secret's container-view (anonymized) name from a split's
+// policy store — the salt lands there at the server's first
+// registration persist.
+fn inner_name_of(store: &Path, name: &str) -> String {
+    let txt = std::fs::read_to_string(store.join("policy.json"))
+        .expect("policy store written at first registration");
+    let v: serde_json::Value = serde_json::from_str(&txt).unwrap();
+    let hex = v["salt"].as_str().unwrap_or_default();
+    let salt: Vec<u8> = (0..hex.len() / 2)
+        .filter_map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok())
+        .collect();
+    assert!(!salt.is_empty(), "salt persisted before the mount serves");
+    fuse_protocol::anonymize_path(&salt, name)
 }
 
 /// Whether the kernel has a FUSE mount ON this exact path: statfs(2)
@@ -625,7 +658,14 @@ fn e2e_readdir_lists_secrets() {
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
-    assert!(names.contains(&"a".to_string()) && names.contains(&"b".to_string()));
+    // Issue #47: the container lists the ANONYMIZED forms; the clear
+    // names must NOT appear (that is the leak being closed).
+    let ia = split.inner("a");
+    let ib = split.inner("b");
+    assert!(names.contains(&ia), "{ia} in {names:?}");
+    assert!(names.contains(&ib), "{ib} in {names:?}");
+    assert!(!names.contains(&"a".to_string()) && !names.contains(&"b".to_string()),
+        "clear host names must never appear inside the container: {names:?}");
 }
 
 #[test]

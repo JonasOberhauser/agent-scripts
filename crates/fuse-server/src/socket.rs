@@ -85,7 +85,10 @@ mod tests {
         let app = make_app(&sock);
         let args = format!("new.yaml {} abc", secret_file.display());
         let lines = app.run_cli_command("add", &args).unwrap();
-        assert!(lines.iter().any(|l| l == "OK"));
+        assert!(
+            lines.iter().any(|l| l.starts_with("added")),
+            "add answers Added (with the container-view name): {lines:?}"
+        );
 
         assert!(state.secrets.contains_key("new.yaml"));
     }

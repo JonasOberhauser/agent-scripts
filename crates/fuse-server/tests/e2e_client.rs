@@ -84,7 +84,10 @@ fn e2e_client_binary_against_server() {
         "--hash", "abc123",
     ]);
     assert_eq!(code, 0, "add-secret failed: {stderr}");
-    assert!(stdout.contains("OK"), "add-secret should print OK: {stdout}");
+    assert!(
+        stdout.contains("added") && stdout.contains("/fuse/"),
+        "add-secret reports the container-view name: {stdout}"
+    );
 
     // ── 3. Status: should now show both secrets ──
     let (stdout, stderr, code) = run_client(&socket, &["status"]);

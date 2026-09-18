@@ -51,7 +51,8 @@ mod tests {
     fn response_status_round_trip() {
         let resp = Response::Status {
             secrets: vec![SecretStatus {
-                name: "a".into(),
+                inner: String::new(),
+            name: "a".into(),
                 access_count: 2,
                 allowed_hashes: vec![HashEntryStatus { hash: "deadbeef".into(), by: None }],
                 size: 42,

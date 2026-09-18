@@ -63,7 +63,12 @@ The workspace has six crates: `fuse-protocol`, `fuse-server`, `fuse-client`, `ru
 
 Goal: **containment** — a confused, overly eager actor inside the agent
 container must not spread secrets to the outside world. The gate
-provides one-read semantics (one adjudicated OPEN per read cycle;
+provides anonymized container-view names (issue #47: the container
+sees only per-install salted hashes of the path components — the salt
+comes from `/dev/urandom`, is persisted in the policy store, and the
+server refuses rather than degrade to a guessable one; host-side
+status, grants and pendings stay in clear names),
+one-read semantics (one adjudicated OPEN per read cycle;
 within an open, reads are re-preads of the same descriptor — same-bytes
 re-reads carry no new information, but an in-place host rewrite of the
 same inode DOES stream new bytes into an already-adjudicated open:
@@ -73,6 +78,10 @@ convenience tier.
 
 Limits every contributor must know:
 
+- the container still sees the anonymized tree's STRUCTURE (depth,
+  fan-out, file sizes and modes) — only component labels are hidden;
+  losing the policy store (corrupt-aside fresh start) loses the salt
+  and rotates every inner name until the next run-agent re-links.
 - grant-forever authorizes a package **class**, not the verified
   instance: whoever can later execute the same executable + libraries
   inherits the access.

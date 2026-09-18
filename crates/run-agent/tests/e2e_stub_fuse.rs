@@ -64,11 +64,31 @@ int main(int argc, char **argv) {
     if (listen(fd, 16) < 0) return 4;
     fcntl(fd, F_SETFL, O_NONBLOCK);
 
-    /* Accept and hold the socket for up to 60s so no detached stub
-     * outlives the test session. */
+    /* Speak the MINIMAL command contract (a contract double, not a
+     * void): one request line per connection, and `add NAME ...`
+     * answers Added{inner} — the anonymized container-view name
+     * (#47). Everything else answers Ok. The inner form is stub-side
+     * deterministic ("stub-<name>") so the tier can ASSERT that
+     * run-agent's container wiring (symlinks, preflight) follows the
+     * server-reported name instead of the outer form. */
     for (int t = 0; t < 600; t++) {
         int c = accept(fd, NULL, NULL);
-        if (c >= 0) close(c);
+        if (c >= 0) {
+            char buf[4096]; ssize_t n = read(c, buf, sizeof(buf) - 1);
+            if (n > 0) {
+                buf[n] = 0;
+                char name[512] = {0};
+                if (sscanf(buf, "add %511s", name) == 1) {
+                    char out[1024];
+                    int m = snprintf(out, sizeof(out),
+                        "{\"type\":\"added\",\"inner\":\"stub-%s\"}\n", name);
+                    write(c, out, m);
+                } else {
+                    write(c, "{\"type\":\"ok\"}\n", 16);
+                }
+            }
+            close(c);
+        }
         usleep(100000);
     }
     return 0;
@@ -361,6 +381,54 @@ fn fully_qualified_missing_image_handled_diagnosably() {
 // container creation) runs for real in seconds.  Creation outcome
 // depends on the machine: on restricted runtimes it fails diagnosably
 // ("Failed to create container"), on capable ones the container exists.
+
+#[test]
+#[ignore = "needs real podman; run with --ignored on a capable host"]
+fn secret_wiring_follows_the_server_reported_inner_name() {
+    // The gap that let #47 ship half-wired: every tier tested one
+    // half against a double for the other. This one closes the loop
+    // at the seam level — the stub now ANSWERS Added{inner} (a
+    // contract double, not a connection-closing void), the harness
+    // pre-creates the INNER name in the fake mount, and the run must
+    // succeed: preflight stats the server-reported path, not the
+    // outer form (which does not exist in the mount dir).
+    assert!(
+        Command::new("podman")
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false),
+        "refusing to skip: this test needs a real podman on PATH"
+    );
+    let dir = tempfile::tempdir().expect("tempdir");
+    let seam = Seam::new(&dir, "inner");
+
+    let host_secret = seam.ws.join("secrets.yaml");
+    std::fs::write(&host_secret, b"DATA").expect("write host secret");
+    // ONLY the inner form exists in the mount — the outer name is
+    // absent on purpose: preflight stat'ing it would fail the run.
+    std::fs::write(seam.mount_point.join("stub-secrets.yaml"), b"DATA")
+        .expect("pre-create the INNER mount entry");
+
+    let out = seam.run_with(
+        Some("agentbox"),
+        60,
+        &[
+            "--secret",
+            &format!("{}:/root/secrets.yaml", host_secret.display()),
+        ],
+        None,
+    );
+    let _ = std::io::stderr().write_all(out.combined.as_bytes());
+    assert!(
+        !out.combined.contains("never visible in the FUSE mount"),
+        "preflight stat'ed the OUTER form — the #47 half-wiring is back:\n{}",
+        out.combined
+    );
+}
 
 #[test]
 #[ignore = "needs real podman with registry egress; run with --ignored on a capable host"]
