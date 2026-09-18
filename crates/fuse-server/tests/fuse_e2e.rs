@@ -218,7 +218,7 @@ impl Split {
 
     fn dump_logs(&self, what: &str) -> String {
         let mut s = format!("--- {what} ---\n");
-        for name in ["server.log", "fused.log"] {
+        for name in ["server.log", "server2.log", "fused.log"] {
             let p = self._dirs.iter().find_map(|d| {
                 let p = d.path().join(name);
                 p.exists().then_some(p)
@@ -448,8 +448,8 @@ fn e2e_grants_survive_a_policy_daemon_kill() {
     cmd.arg("--socket").arg(&split.socket)
         .arg("--oracle-socket").arg(&split.oracle)
         .arg("--pending-timeout").arg("5")
-        .arg("--secret").arg(format!("s:{}", split.source_path("s").display()))
-        .arg("*")
+        .arg("--secret")
+        .arg(format!("s:{}:*", split.source_path("s").display()))
         .env("FUSE_GATEKEEPER_POLICY", split._dirs[1].path().join("policy.json"))
         .stdout(std::process::Stdio::from(server_log2.try_clone().unwrap()))
         .stderr(server_log2);
