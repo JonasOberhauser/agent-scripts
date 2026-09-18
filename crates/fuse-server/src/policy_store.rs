@@ -97,6 +97,7 @@ pub fn load(state: &mut ServerState, hub: &OracleHub) -> LoadReport {
         Ok(d) => d,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             tracing::info!("policy store {}: no file — fresh start", path.display());
+            mint_salt_if_needed(state);
             return LoadReport::default();
         }
         Err(e) => {
@@ -153,10 +154,7 @@ pub fn load(state: &mut ServerState, hub: &OracleHub) -> LoadReport {
     // first #47 boot — pre-#47 stores have no salt, and their inner
     // names did not exist yet, so nothing rotates that mattered.
     state.anon_salt = hex_to_bytes(&file.salt);
-    if state.anon_salt.is_empty() {
-        state.anon_salt = fuse_protocol::new_salt();
-        tracing::info!("policy store: minted a fresh anonymization salt (issue #47)");
-    }
+    mint_salt_if_needed(state);
     let mut report = LoadReport::default();
     for s in file.secrets {
         // A live host file re-registers with its CURRENT identity
@@ -260,6 +258,23 @@ pub(crate) fn persist_locked(state: &ServerState) {
              and will be lost on restart",
             path.display()
         );
+    }
+}
+
+/// The anonymization salt must NEVER be empty: an empty salt quietly
+/// turns every container-view name into an UNSALTED hash —
+/// dictionary-reversible for common path segments (the exact leak
+/// #47 exists to close). Mint on any path that reaches state without
+/// one (fresh boot, corrupt-aside, store-without-salt).
+fn mint_salt_if_needed(state: &mut ServerState) {
+    if state.anon_salt.is_empty() {
+        let salt = fuse_protocol::new_salt();
+        tracing::info!("policy store: minted a fresh anonymization salt (issue #47)");
+        // Write it NOW: registration derives inner names from it, and
+        // the first registration persist must carry the same salt the
+        // mount is serving under.
+        state.anon_salt = salt;
+        persist(state);
     }
 }
 
