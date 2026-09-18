@@ -370,9 +370,17 @@ where
             let sock = socket
                 .to_str()
                 .ok_or_else(|| format!("socket path is not valid UTF-8: {}", socket.display()))?;
+            // The oracle socket is DERIVED from the cmd socket (sibling
+            // path) instead of the global default: two stacks — a test
+            // harness and a live gatekeeper, or any second project —
+            // must never collide on one rendezvous (field-reported:
+            // the e2e_empty_os tier collided with a live stack and
+            // every spawn died as "Another server is running").
+            let oracle_sock = format!("{sock}-oracle");
             let mut fuse_args: Vec<&str> = vec![
                 "--mount-point", mount,
                 "--socket", sock,
+                "--oracle-socket", &oracle_sock,
             ];
             fuse_args.push("--log-level");
             let log_level_str = config.log_level.clone();
@@ -1345,6 +1353,34 @@ mod tests {
         let n = secret_name(Path::new("/home/u/.ssh/id_ed25519"));
         assert!(n.contains('/'), "nested: {n}");
         assert!(n.ends_with("id_ed25519"));
+    }
+
+    #[test]
+    fn oracle_socket_is_derived_from_the_cmd_socket() {
+        // Field report: every spawned server bound the GLOBAL default
+        // oracle socket, so any second stack (a test harness vs a live
+        // gatekeeper) collided and died as "Another server is
+        // running". The oracle rendezvous must be per-stack: a sibling
+        // of the cmd socket, which is already per-stack.
+        let mut mock = base_mock().with_file("/home/user/secrets.yaml", b"DATA");
+        let cfg = test_config();
+        let _ = run_agent(&mut mock, &cfg, &|_, _| Ok(String::new()), false);
+        let oracle_args: Vec<String> = mock
+            .spawned
+            .iter()
+            .flat_map(|(_, a)| a.iter().map(|s| s.to_string()))
+            .collect();
+        let sock = oracle_args.iter().position(|a| a == "--socket");
+        assert!(sock.is_some(), "spawn passes --socket");
+        let cmd_sock = oracle_args[sock.unwrap() + 1].clone();
+        let oracle = oracle_args.iter().position(|a| a == "--oracle-socket");
+        assert!(oracle.is_some(), "spawn passes --oracle-socket: {oracle_args:?}");
+        let oracle_val = &oracle_args[oracle.unwrap() + 1];
+        assert_eq!(
+            *oracle_val,
+            format!("{cmd_sock}-oracle"),
+            "derived as a sibling of the cmd socket"
+        );
     }
 
     #[test]
