@@ -1120,6 +1120,10 @@ fn write_state_file<S: SystemIo>(
         log_level: config.log_level.clone(),
         pending_timeout: 300,
         runtime_wrapper: config.runtime_wrapper.clone(),
+        oracle_socket: config
+            .oracle_socket
+            .as_deref()
+            .map(|p| p.to_string_lossy().into_owned()),
         secrets: loaded
             .iter()
             .map(|s| fuse_protocol::StateSecretEntry {
@@ -1706,6 +1710,39 @@ mod tests {
             !mock.files.contains_key("/tmp/fgk-mnt"),
             "the blocking file must have been removed"
         );
+    }
+
+    #[test]
+    fn state_file_carries_the_oracle_rendezvous() {
+        // The restart chain's only channel for the override: a stack
+        // spawned with --oracle-socket must record it, or fuse-client
+        // restart respawns on the global default and the surviving
+        // data daemon never reconnects (#59 review).
+        let mut mock = base_mock().with_file("/home/user/secrets.yaml", b"DATA");
+        let mut cfg = test_config();
+        cfg.oracle_socket = Some(std::path::PathBuf::from("/tmp/.tmpT/oracle.sock"));
+        let loaded = vec![LoadedSecret {
+            fuse_name: "i-form".into(),
+            container: PathBuf::from("/root/.config/app/auth.json"),
+            host_path: PathBuf::from("/home/user/secrets.yaml"),
+        }];
+        write_state_file(&cfg, &loaded, &mut mock, 4242);
+        let written = mock
+            .files
+            .get(fuse_protocol::state_file().to_str().unwrap())
+            .expect("state file written");
+        let text = String::from_utf8(written.clone()).unwrap();
+        let f: fuse_protocol::ServerStateFile = serde_json::from_str(&text).unwrap();
+        assert_eq!(f.oracle_socket.as_deref(), Some("/tmp/.tmpT/oracle.sock"));
+        // and unset means the global default, not a wrong path
+        cfg.oracle_socket = None;
+        write_state_file(&cfg, &loaded, &mut mock, 4242);
+        let text = String::from_utf8(
+            mock.files.get(fuse_protocol::state_file().to_str().unwrap()).unwrap().clone(),
+        )
+        .unwrap();
+        let f: fuse_protocol::ServerStateFile = serde_json::from_str(&text).unwrap();
+        assert_eq!(f.oracle_socket, None);
     }
 
     // ── out-of-sync stack: automatic rebuild (PR #37 review) ──────

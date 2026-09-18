@@ -253,6 +253,13 @@ fn start_server_from_state(app: &App, state: &ServerStateFile, log_path: Option<
         "--mount-point".into(), state.mount_point.clone(),
         "--socket".into(), state.socket.clone(),
     ];
+    if let Some(oracle) = &state.oracle_socket {
+        // The surviving data daemon retries THIS rendezvous; respawning
+        // on the global default would orphan it (an alive mount that
+        // never syncs again).
+        cmd_args.push("--oracle-socket".into());
+        cmd_args.push(oracle.clone());
+    }
     cmd_args.push("--log-level".into());
     cmd_args.push(state.log_level.clone());
     cmd_args.push("--pending-timeout".into());

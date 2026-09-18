@@ -1,5 +1,32 @@
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn state_file_round_trips_the_oracle_rendezvous() {
+        // #59 review finding: a stack running with an --oracle-socket
+        // override must come back on the SAME rendezvous when
+        // fuse-client restart respawns it — the surviving data daemon
+        // retries that socket forever. The state file is the only
+        // channel that carries it across the restart.
+        let state = r#"{"version":"0.30.0","server_pid":7,"server_binary":"/x/fuse-server","mount_point":"/m","socket":"/s","log_level":"info","pending_timeout":300,"runtime_wrapper":null,"oracle_socket":"/tmp/.tmpABC/oracle.sock","secrets":[]}"#;
+        let f: ServerStateFile = serde_json::from_str(state).unwrap();
+        assert_eq!(f.oracle_socket.as_deref(), Some("/tmp/.tmpABC/oracle.sock"));
+        // and it survives its own serialization
+        let back: ServerStateFile =
+            serde_json::from_str(&serde_json::to_string(&f).unwrap()).unwrap();
+        assert_eq!(back.oracle_socket, f.oracle_socket);
+    }
+
+    #[test]
+    fn state_file_without_oracle_means_the_global_default() {
+        // Pre-field state files (and the single-stack production
+        // default) parse to None — exactly what they always meant.
+        let old = r#"{"version":"0.28.0","server_pid":7,"server_binary":"/x/fuse-server","mount_point":"/m","socket":"/s","log_level":"info","pending_timeout":300,"runtime_wrapper":null,"secrets":[]}"#;
+        let f: ServerStateFile = serde_json::from_str(old).unwrap();
+        assert_eq!(f.oracle_socket, None);
+    }
+
+
     use fuse_protocol::*;
 
     #[test]
