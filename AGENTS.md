@@ -85,6 +85,25 @@ Limits every contributor must know:
 - Package hashing is file-backed identity; anonymous executable pages
   (JIT) are outside the hash by construction.
 
+**Persistence (MR5)** — approvals, permitted hashes with provenance,
+and one-read access state live in the daemon-owned policy store
+(`$FUSE_GATEKEEPER_POLICY`, else `$XDG_STATE_HOME/gatekeeper/policy.json`,
+`0600`): loaded once at startup before any socket accepts,
+write-through on every mutation (never a shutdown flush — `kill -9`
+has no hook). Operational consequences:
+
+- **Killing the daemons no longer resets approvals** — what used to be
+  an implicit reset (kill the gatekeeper, budgets come back) is gone;
+  access state persists. Treat "restart to clear a grant" as dead.
+- The CLI is the editor, restart is the reload; hand-edits are the
+  stop-daemon → edit → start escape hatch, never concurrent.
+- Corruption fails SAFE: unparsable stores are renamed aside and the
+  daemon starts fresh (affected reads pend again); UNREADABLE stores
+  refuse to arm persistence — nothing overwrites a store the daemon
+  could not read until a human looks.
+- Host files missing at load become ghosts: policy intact, opens
+  ENOENT until the file returns or a re-add joins the hash set.
+
 Do not weaken these properties without updating this section.
 
 ## Testing Philosophy

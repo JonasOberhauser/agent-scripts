@@ -155,7 +155,7 @@ fn main() {
     {
         use fuse_server::policy_store;
         let hub = OracleHub::clone(&fuse_server::ORACLE_HUB);
-        let report = policy_store::load(&state, &hub);
+        let report = policy_store::load(&mut state, &hub);
         info!(
             "  policy store:    {} restored, {} ghosts{}",
             report.restored,

@@ -74,11 +74,18 @@ pub fn policy_path() -> PathBuf {
 /// - unparsable file → renamed aside (`.corrupt-<ts>`) and a FRESH
 ///   start, loudly: losing grants fails SAFE (reads pend again);
 ///   never resurrect half-parsed ones
+/// - UNREADABLE file (any non-`NotFound` error: wrong owner from a
+///   pre-#49 sudo era, EISDIR, …) → PERSISTENCE REFUSES TO ARM: the
+///   daemon serves fresh but never writes, so the first mutation
+///   cannot rename OVER a store we could not read — the evidence and
+///   any recoverable grants survive until a human looks. Review
+///   finding on #57: arming after an unreadable load silently
+///   destroyed the file.
 /// - host file missing → the secret loads as a GHOST: policy (hashes,
 ///   provenance, budget) survives, the name is served with identity
 ///   (0,0), opens answer ENOENT until the file returns or run-agent
 ///   re-adds (plain overwrite joins the hash set — nothing lost)
-pub fn load(state: &ServerState, hub: &OracleHub) -> LoadReport {
+pub fn load(state: &mut ServerState, hub: &OracleHub) -> LoadReport {
     let path = state
         .policy_path
         .clone()
@@ -90,8 +97,12 @@ pub fn load(state: &ServerState, hub: &OracleHub) -> LoadReport {
             return LoadReport::default();
         }
         Err(e) => {
-            tracing::error!("policy store {}: unreadable ({e}) — fresh start", path.display());
-            return LoadReport::default();
+            tracing::error!(
+                "policy store {}: unreadable ({e}) — starting FRESH with persistence                  DISARMED: nothing will overwrite a store this daemon cannot read.                  Fix the file (ownership?) and restart to re-arm.",
+                path.display()
+            );
+            state.policy_path = None;
+            return LoadReport { unreadable: true, ..Default::default() };
         }
     };
     let file: PolicyFile = match serde_json::from_slice(&data) {
@@ -168,6 +179,9 @@ pub struct LoadReport {
     pub restored: usize,
     pub ghosts: usize,
     pub corrupted: bool,
+    /// The store existed but could not be read: persistence refused
+    /// to arm — nothing will overwrite it.
+    pub unreadable: bool,
 }
 
 /// Write the policy atomically: temp file in the same directory,
@@ -270,8 +284,8 @@ mod policy_tests {
             let _ = s.attempt_read("s", 100, Some("sha256-a"), 0, 1024);
         }
         // daemon dies; a fresh state loads
-        let s2 = armed_state(&p);
-        let report = crate::policy_store::load(&s2, &OracleHub::new());
+        let mut s2 = armed_state(&p);
+        let report = crate::policy_store::load(&mut s2, &OracleHub::new());
         assert_eq!(report.restored, 1);
         let rec = s2.secrets.get("s").unwrap();
         let r = lock_secret(rec.value(), "s");
@@ -293,8 +307,8 @@ mod policy_tests {
             s.add("ghost/s", "/nonexistent/host/file", 5, "*");
             assert!(s.rotate_hash("ghost/s", "sha256-x"));
         }
-        let s2 = armed_state(&p);
-        let report = crate::policy_store::load(&s2, &OracleHub::new());
+        let mut s2 = armed_state(&p);
+        let report = crate::policy_store::load(&mut s2, &OracleHub::new());
         assert_eq!(report.ghosts, 1, "missing host file loads as ghost");
         let rec = s2.secrets.get("ghost/s").expect("policy survived");
         let r = lock_secret(rec.value(), "ghost/s");
@@ -305,8 +319,8 @@ mod policy_tests {
     fn corrupt_file_renamed_aside_and_starts_fresh() {
         let (p, _d) = temp_store("corrupt");
         std::fs::write(&p, b"{ this is not json").unwrap();
-        let s = armed_state(&p);
-        let report = crate::policy_store::load(&s, &OracleHub::new());
+        let mut s = armed_state(&p);
+        let report = crate::policy_store::load(&mut s, &OracleHub::new());
         assert!(report.corrupted);
         assert!(s.secrets.is_empty(), "fresh start, never half-resurrected");
         let aside = std::fs::read_dir(p.parent().unwrap()).unwrap()
@@ -326,9 +340,33 @@ mod policy_tests {
             .expect("write-through produced parsable JSON");
         assert!(parsed["secrets"][0]["name"] == "w", "mutation is IN the file");
         s.remove("w");
-        let s2 = armed_state(&p);
-        let report = crate::policy_store::load(&s2, &OracleHub::new());
+        let mut s2 = armed_state(&p);
+        let report = crate::policy_store::load(&mut s2, &OracleHub::new());
         assert_eq!(report.restored, 0, "removal persisted too");
+    }
+
+    #[test]
+    fn unreadable_store_refuses_to_arm_and_is_never_overwritten() {
+        // Review finding on #57: an unreadable store (wrong owner,
+        // EISDIR, …) used to fresh-start WITH persistence armed, so
+        // the first mutation renamed OVER it — grants and evidence
+        // gone. Now persistence refuses to arm: the file must survive
+        // untouched until a human looks.
+        // The store path is a DIRECTORY: read() fails with EISDIR
+        // regardless of privileges (deterministic for root and
+        // non-root alike).
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("policy.json");
+        std::fs::create_dir_all(&p).unwrap();
+        let mut s = ServerState::new();
+        s.policy_path = Some(p.clone());
+        let report = crate::policy_store::load(&mut s, &OracleHub::new());
+        assert!(report.unreadable);
+        assert!(s.policy_path.is_none(), "persistence disarmed");
+        // A mutation succeeds in memory but must NOT touch the store.
+        s.add("x", "/tmp/host/x", 1, "h");
+        assert!(s.secrets.contains_key("x"));
+        assert!(p.is_dir(), "the unreadable store was not overwritten (rename would have replaced it with a file)");
     }
 
     #[test]
