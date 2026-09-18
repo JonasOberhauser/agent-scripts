@@ -199,8 +199,23 @@ impl Split {
         Split { mount, socket, oracle, procs: vec![policy, data], _dirs: dirs, _secret_dir: secret_dir }
     }
 
+    /// Resolve a secret's mount path by its OUTER (clear) name: the
+    /// container view serves the anonymized form (issue #47), derived
+    /// from the salt in this split's own policy store.
     fn path(&self, name: &str) -> PathBuf {
-        self.mount.join(name)
+        self.mount.join(self.inner(name))
+    }
+
+    fn inner(&self, name: &str) -> String {
+        let store = self._dirs[1].path().join("policy.json");
+        let txt = std::fs::read_to_string(&store)
+            .expect("policy store written at first registration");
+        let v: serde_json::Value = serde_json::from_str(&txt).unwrap();
+        let salt_hex = v["salt"].as_str().unwrap_or_default();
+        let salt: Vec<u8> = (0..salt_hex.len() / 2)
+            .filter_map(|i| u8::from_str_radix(&salt_hex[i * 2..i * 2 + 2], 16).ok())
+            .collect();
+        fuse_protocol::anonymize_path(&salt, name)
     }
 
     /// The host-side source file behind a served name (MR4 tests:

@@ -131,6 +131,10 @@ pub struct ServerState {
     /// practice. ALWAYS acquired BEFORE any record lock; `persist`
     /// never runs under a record guard.
     pub(crate) persist_lock: Mutex<()>,
+    /// Per-install anonymization salt (issue #47): loaded from (or
+    /// minted into) the policy store; stable across restarts, so the
+    /// container-view names derived from it are stable too.
+    pub anon_salt: Vec<u8>,
 }
 
 impl Default for ServerState {
@@ -143,6 +147,7 @@ impl Default for ServerState {
             log_path: String::new(),
             policy_path: None,
             persist_lock: Mutex::new(()),
+            anon_salt: Vec::new(),
         }
     }
 }
@@ -590,6 +595,7 @@ impl ServerState {
         entries.iter().map(|(name, rec_arc)| {
             let rec = lock_secret(rec_arc, name);
             fuse_protocol::SecretStatus {
+                inner: fuse_protocol::anonymize_path(&self.anon_salt, name),
                 name: name.clone(),
                 access_count: rec.access_count,
                 allowed_hashes: rec

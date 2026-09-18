@@ -185,7 +185,8 @@ fn main() {
                     md.ino()
                 );
                 state.add_with_mode(&name, host.clone(), md.len() as usize, &hash, 0o400);
-                hub.serve(&name, 0o400);
+                let inner = fuse_protocol::anonymize_path(&state.anon_salt, &name);
+                hub.serve(&name, &inner, 0o400);
             }
             Err(e) => {
                 error!("Bad --secret '{spec}': {e}");

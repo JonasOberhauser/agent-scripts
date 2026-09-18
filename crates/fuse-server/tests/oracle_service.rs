@@ -180,7 +180,7 @@ fn open_passes_an_fd_and_stats_flow() {
     {
         let md = std::fs::metadata(&file).unwrap();
         state.add("s", &file, md.len() as usize, "*");
-        hub.serve("s", 0o400);
+        hub.serve("s", "x1", 0o400);
     }
     let st = Arc::clone(&state);
     let p = oracle.clone();
@@ -391,7 +391,7 @@ fn control_channel_replays_snapshot_and_pushes_updates() {
     let state = Arc::new(ServerState::new());
     *state.pending_timeout.lock().unwrap() = Duration::from_secs(2);
     let hub = OracleHub::new();
-    hub.serve("seed", 0o400);
+    hub.serve("seed", "d1", 0o400);
     let s2 = Arc::clone(&state);
     let hub2 = hub.clone();
     let moved = path.clone();
@@ -416,13 +416,13 @@ fn control_channel_replays_snapshot_and_pushes_updates() {
     let cmd: OracleCommand = serde_json::from_str(line.trim()).unwrap();
     assert_eq!(
         cmd,
-        OracleCommand::Serve { name: "seed".into(), mode: 0o400 }
+        OracleCommand::Serve { name: "seed".into(), inner: "d1".into(), mode: 0o400 }
     );
 
     // Live push through the hub.
-    hub.serve("seed", 0o600);
+    hub.serve("seed", "d2", 0o600);
     line.clear();
     reader.read_line(&mut line).unwrap();
     let cmd: OracleCommand = serde_json::from_str(line.trim()).unwrap();
-    assert_eq!(cmd, OracleCommand::Serve { name: "seed".into(), mode: 0o600 });
+    assert_eq!(cmd, OracleCommand::Serve { name: "seed".into(), inner: "d2".into(), mode: 0o600 });
 }
