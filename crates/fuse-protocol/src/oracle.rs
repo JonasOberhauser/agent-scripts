@@ -246,6 +246,24 @@ mod tests {
     }
 
     #[test]
+    fn serve_wire_change_forces_version_bump() {
+        // The inner field (0.31) is REQUIRED: a 0.30 sender's line must
+        // NOT parse into this vintage — that refusal is what makes the
+        // Hello version check meaningful. The bump to 0.31.0 was
+        // originally forgotten (claimed in the commit message, never
+        // edited): both sides reported 0.30.0, the handshake waved a
+        // mixed pair through, and only the loud per-line warning caught
+        // it in the field. This test pins the bump: if you change the
+        // Serve shape again without a version change, this fails only
+        // if the parse refuses — keep them coupled.
+        let line = r#"{"type":"serve","name":"s","mode":384}"#;
+        assert!(
+            serde_json::from_str::<OracleCommand>(line).is_err(),
+            "a Serve line without `inner` must not parse in 0.31"
+        );
+    }
+
+    #[test]
     fn bare_hello_from_an_old_data_daemon_still_parses() {
         // Pre-version daemons send {"type":"hello"} — the field is
         // wire-optional so they interoperate; the server just cannot
