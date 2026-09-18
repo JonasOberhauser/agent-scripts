@@ -9,7 +9,7 @@ mod pending_layer;
 #[derive(Parser)]
 #[command(name = "fuse-client", about = "Send CRUD commands to the fuse-server")]
 struct Cli {
-    #[arg(short, long, env = "FUSE_GATEKEEPER_SOCKET", default_value = "/tmp/fuse-gatekeeper.sock")]
+    #[arg(short, long, env = fuse_protocol::ENV_CMD_SOCKET, default_value = fuse_protocol::DEFAULT_CMD_SOCKET)]
     socket: PathBuf,
     #[command(subcommand)]
     command: Option<Commands>,
@@ -44,7 +44,7 @@ fn main() {
     // Panel actions log to a file next to the state file: the TUI's
     // alternate screen hides stderr, and truncated title messages are
     // not a debugging interface.
-    let log_path = std::env::var("FUSE_GATEKEEPER_STATE")
+    let log_path = std::env::var(fuse_protocol::ENV_STATE_FILE)
         .ok()
         .map(|p| {
             std::path::Path::new(&p)
@@ -237,7 +237,7 @@ fn check_version_or_restart(app: &App) {
         let mut s = String::new();
         let _ = std::io::stdin().read_line(&mut s);
         let t = s.trim();
-        if t.is_empty() { "/tmp/fuse-gatekeeper.log".to_string() } else { t.to_string() }
+        if t.is_empty() { fuse_protocol::DEFAULT_LOG_PATH.to_string() } else { t.to_string() }
     });
 
     restart_server(app, Some(&log_path));
@@ -296,7 +296,7 @@ fn start_server_from_state(app: &App, state: &ServerStateFile, log_path: Option<
     let _ = std::fs::create_dir_all(&state.mount_point);
 
     eprintln!("Starting server (v{})...", CLIENT_VERSION);
-    let effective_log = log_path.unwrap_or("/tmp/fuse-gatekeeper.log");
+    let effective_log = log_path.unwrap_or(fuse_protocol::DEFAULT_LOG_PATH);
     let log_path_buf = std::path::PathBuf::from(effective_log);
     let log_file = std::fs::OpenOptions::new()
         .create(true).truncate(true).write(true)

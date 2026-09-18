@@ -425,6 +425,55 @@ fn e2e_re_add_unchanged_content_preserves_state_end_to_end() {
 }
 
 #[test]
+fn e2e_grants_survive_a_policy_daemon_kill() {
+    // MR5's marquee property, end to end: kill -9 the policy daemon,
+    // restart it on the same sockets + policy store, and the spent
+    // one-read budget SURVIVES (fail-safe: no free re-reads after a
+    // kill). Then reset — the explicit policy path — and read again.
+    if !fuse_available() { return; }
+    let _g = serial();
+    let mut split = Split::new("mr5", &[("s", b"KEEP", "*")]);
+    assert_eq!(split.read("s").unwrap(), b"KEEP");
+
+    // kill -9 the policy daemon; the mount stays (split design).
+    split.procs[0].kill().unwrap();
+    split.procs[0].wait().unwrap();
+
+    // Respawn on the same sockets + the SAME policy store path the
+    // harness armed via FUSE_GATEKEEPER_POLICY.
+    let server_log2 = std::fs::OpenOptions::new()
+        .create(true).append(true)
+        .open(split._dirs[1].path().join("server2.log")).unwrap();
+    let mut cmd = std::process::Command::new(bin("fuse-server"));
+    cmd.arg("--socket").arg(&split.socket)
+        .arg("--oracle-socket").arg(&split.oracle)
+        .arg("--secret").arg(format!("s:{}", split.source_path("s").display()))
+        .arg("*")
+        .env("FUSE_GATEKEEPER_POLICY", split._dirs[1].path().join("policy.json"))
+        .stdout(std::process::Stdio::from(server_log2.try_clone().unwrap()))
+        .stderr(server_log2);
+    let mut child = cmd.spawn().expect("respawn fuse-server");
+    for _ in 0..200 {
+        if split.socket.exists() { break; }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Budget spent BEFORE the kill must still be spent AFTER it.
+    let err = split.read("s").unwrap_err();
+    assert_eq!(err.raw_os_error(), Some(libc::EACCES), "spent budget survives kill -9: {err}");
+
+    // The explicit path clears it, and the fresh read works.
+    let out = split.client(&["reset", "--name", "s"]);
+    assert!(out.status.success(), "reset failed: {}", write_out(&out));
+    match split.read("s") {
+        Ok(b) => assert_eq!(b, b"KEEP"),
+        Err(e) => panic!("post-reset read failed: {e}\n{}", split.dump_logs("mr5 failure")),
+    }
+    child.kill().unwrap();
+    let _ = child.wait();
+}
+
+#[test]
 fn e2e_one_read_per_secret_without_reset() {
     if !fuse_available() { return; }
     let _g = serial();

@@ -173,13 +173,21 @@ impl Store {
             // incarnation change is discovered LAZILY by the next
             // stat (lookup is authoritative; open verifies against
             // the recorded identity regardless).
-            Some(_) => {
+            Some(Node::File { .. }) => {
                 let Node::File { mode: m, .. } = s.tree.get_mut(&path).unwrap() else {
-                    unreachable!("matched a file above");
+                    unreachable!("checked File above");
                 };
                 *m = mode;
             }
-            _ => {
+            Some(Node::Dir { .. }) => {
+                // A directory already occupies the file's path (e.g.
+                // "a/b" served, then "a"): refuse loudly, keep the
+                // deeper structure — NEVER panic (review blocker on
+                // #57: a data-daemon crash kills the mount).
+                warn!("cannot serve \"{name}\": a directory already occupies that path");
+                return;
+            }
+            None => {
                 let fino = mint_fino(&mut s, &path, None);
                 s.tree.insert(path.clone(), Node::File { fino, mode });
             }
@@ -999,6 +1007,23 @@ mod tests {
         assert!(s.dir_children(FuseIno::ROOT).unwrap()[0].1);
         s.remove("a/b/c.txt");
         assert!(s.dir_children(FuseIno::ROOT).unwrap().is_empty(), "empty trees vanish");
+    }
+
+    #[test]
+    fn serve_file_where_a_directory_exists_never_panics() {
+        // Review blocker on #57: serving "a/b" then "a" (a DIRECTORY
+        // already occupying the file's path) hit an unreachable!()
+        // and crashed the data daemon — the mount dies with it.
+        // Reaching it needs no hand-editing: two add-secret calls do.
+        let s = Store::default();
+        s.serve("a/b", 0o400);
+        // Must NOT panic; the conflict is refused loudly, the tree
+        // keeps the deeper structure.
+        s.serve("a", 0o400);
+        let d = s.child(FuseIno::ROOT, OsStr::new("a")).unwrap();
+        assert!(d.1, "the directory keeps its place");
+        let f = s.child(d.0, OsStr::new("b"));
+        assert!(f.is_some(), "the existing file is untouched");
     }
 
     #[test]

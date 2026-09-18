@@ -55,7 +55,7 @@ struct PolicyHash {
 
 /// Resolved persistence location (see module docs).
 pub fn policy_path() -> PathBuf {
-    if let Some(p) = std::env::var_os("FUSE_GATEKEEPER_POLICY") {
+    if let Some(p) = std::env::var_os(fuse_protocol::ENV_POLICY_FILE) {
         return PathBuf::from(p);
     }
     let base = std::env::var_os("XDG_STATE_HOME")
@@ -74,16 +74,15 @@ pub fn policy_path() -> PathBuf {
 /// - unparsable file → renamed aside (`.corrupt-<ts>`) and a FRESH
 ///   start, loudly: losing grants fails SAFE (reads pend again);
 ///   never resurrect half-parsed ones
-/// - UNREADABLE file (any non-`NotFound` error: wrong owner from a
-///   pre-#49 sudo era, EISDIR, …) → PERSISTENCE REFUSES TO ARM: the
-///   daemon serves fresh but never writes, so the first mutation
-///   cannot rename OVER a store we could not read — the evidence and
-///   any recoverable grants survive until a human looks. Review
-///   finding on #57: arming after an unreadable load silently
-///   destroyed the file.
+/// - UNREADABLE file (any non-`NotFound` error: wrong owner, EISDIR,
+///   …) → PERSISTENCE REFUSES TO ARM: the daemon serves fresh but
+///   never writes, so the first mutation cannot rename OVER a store
+///   we could not read — evidence and recoverable grants survive
+///   until a human looks. (Review #57: arming after an unreadable
+///   load used to silently destroy the file.)
 /// - host file missing → the secret loads as a GHOST: policy (hashes,
 ///   provenance, budget) survives, the name is served with identity
-///   (0,0), opens answer ENOENT until the file returns or run-agent
+///   no identity, opens answer ENOENT until the file returns or run-agent
 ///   re-adds (plain overwrite joins the hash set — nothing lost)
 pub fn load(state: &mut ServerState, hub: &OracleHub) -> LoadReport {
     let path = state
@@ -105,6 +104,19 @@ pub fn load(state: &mut ServerState, hub: &OracleHub) -> LoadReport {
             return LoadReport { unreadable: true, ..Default::default() };
         }
     };
+    // A policy store is small (names + hashes). Anything huge is
+    // damage (truncation-into-sparse, a dd typo): classify as
+    // corrupt rather than attempt a multi-GB parse.
+    const MAX_POLICY_BYTES: usize = 8 << 20;
+    if data.len() > MAX_POLICY_BYTES {
+        tracing::error!(
+            "policy store {}: {} bytes exceeds the {} sanity bound — treating as corrupt",
+            path.display(),
+            data.len(),
+            MAX_POLICY_BYTES
+        );
+        return LoadReport { corrupted: true, ..Default::default() };
+    }
     let file: PolicyFile = match serde_json::from_slice(&data) {
         Ok(f) => f,
         Err(e) => {
@@ -136,7 +148,7 @@ pub fn load(state: &mut ServerState, hub: &OracleHub) -> LoadReport {
     for s in file.secrets {
         // A live host file re-registers with its CURRENT identity
         // (the MR4 stat path); a missing one becomes a ghost with
-        // identity (0,0). Either way the loaded POLICY lands intact.
+        // no identity. Either way the loaded POLICY lands intact.
         // A live host file re-registers with its CURRENT identity
         // (the MR4 stat path); a missing one is a GHOST: announced
         // with NO identity — absence is Option, not an in-band (0,0)
@@ -190,6 +202,14 @@ pub struct LoadReport {
 /// operation would turn a full disk into "you may not approve
 /// anything".
 pub fn persist(state: &ServerState) {
+    let _pl = state.persist_lock.lock().unwrap();
+    persist_locked(state);
+}
+
+/// Snapshot + atomic write, assuming the caller holds the mutation
+/// lock (every mutating method does — mutation then persistence in
+/// program order, snapshots totally ordered).
+pub(crate) fn persist_locked(state: &ServerState) {
     let Some(path) = state.policy_path.clone() else {
         return; // persistence not armed (tests, harnesses)
     };
@@ -231,22 +251,24 @@ pub fn persist(state: &ServerState) {
 fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     let dir = path.parent().unwrap_or(std::path::Path::new("."));
     std::fs::create_dir_all(dir)?;
-    let tmp = dir.join(format!(
-        ".{}.tmp-{}",
-        path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
-        std::process::id()
-    ));
-    {
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-        }
+    // Exclusive-create, 0600 FROM THE FIRST BYTE (review: the old
+    // path wrote content world-readable and chmod'ed afterwards), and
+    // collision-proof (tempfile owns exclusivity — the hand-rolled
+    // pid-suffixed name collided between same-process threads).
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+    tmp.write_all(bytes)?;
+    tmp.as_file().sync_all()?;
+    // persist() renames over the target; on any failure the temp is
+    // dropped (unlinked) — no leaked `.tmp-*` litter (review).
+    tmp.persist(path)
+        .map_err(|e| e.error)?;
+    // Directory fsync: durability of the rename by construction
+    // instead of per-filesystem arguments (review). Some filesystems
+    // reject directory fsync — that refusal is not an error here.
+    if let Ok(d) = std::fs::File::open(dir) {
+        let _ = d.sync_all();
     }
-    std::fs::rename(&tmp, path)
+    Ok(())
 }
 
 // ── MR5: policy persistence ────────────────────────────────────
@@ -367,6 +389,77 @@ mod policy_tests {
         s.add("x", "/tmp/host/x", 1, "h");
         assert!(s.secrets.contains_key("x"));
         assert!(p.is_dir(), "the unreadable store was not overwritten (rename would have replaced it with a file)");
+    }
+
+    #[test]
+    fn re_add_of_an_existing_name_persists_the_joined_hash() {
+        // Review blocker on #57: the existing-name branch of
+        // add_with_mode mutated memory (joined hash, new host_path)
+        // and returned WITHOUT persisting — kill the daemon and the
+        // second container's approval is gone: exactly the
+        // "grants survive kill -9" headline failing on re-add.
+        let (p, d) = temp_store("readd");
+        let host = d.path().join("h.bin");
+        std::fs::write(&host, b"X").unwrap();
+        {
+            // Production shape: ONE daemon process — first add, then
+            // the re-add whose hash JOINS the set (MR2), same state.
+            let s = armed_state(&p);
+            s.add("s", &host, 1, "hash-a");
+            s.add("s", &host, 1, "hash-b");
+        }
+        let mut s2 = armed_state(&p);
+        crate::policy_store::load(&mut s2, &OracleHub::new());
+        let rec = s2.secrets.get("s").unwrap();
+        let r = lock_secret(rec.value(), "s");
+        let hashes: Vec<&str> = r.allowed_hashes.iter().map(|h| h.hash.as_str()).collect();
+        assert!(
+            hashes.contains(&"hash-a") && hashes.contains(&"hash-b"),
+            "re-add join must DURABLY survive: {hashes:?}"
+        );
+    }
+
+    #[test]
+    fn concurrent_mutations_all_survive_persistence() {
+        // Review blocker on #57: persist() was unsynchronized —
+        // concurrent mutators could interleave snapshots so a stale
+        // one lands LAST, silently reverting an already-durable
+        // mutation (resurrecting a spent budget: fail-OPEN). Hammer
+        // it: N threads mutate DISTINCT secrets; every final state
+        // must be present after reload.
+        let (p, _d) = temp_store("stress");
+        // ONE daemon state shared by the mutator threads — the lock
+        // under test serializes mutation+persist store-wide.
+        let shared = std::sync::Arc::new(armed_state(&p));
+
+        const THREADS: usize = 8;
+        const ROTATIONS: usize = 40;
+        let mut handles = Vec::new();
+        for t in 0..THREADS {
+            let s = std::sync::Arc::clone(&shared);
+            handles.push(std::thread::spawn(move || {
+                let name = format!("t{t}");
+                s.add(&name, "/tmp/host/x", 1, "h0");
+                for i in 1..=ROTATIONS {
+                    s.rotate_hash(&name, &format!("h{i}"));
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        let mut s2 = armed_state(&p);
+        crate::policy_store::load(&mut s2, &OracleHub::new());
+        for t in 0..THREADS {
+            let name = format!("t{t}");
+            let rec = s2.secrets.get(&name).expect("{name} lost entirely");
+            let r = lock_secret(rec.value(), &name);
+            assert_eq!(
+                r.allowed_hashes[0].hash,
+                format!("h{ROTATIONS}"),
+                "{name}: last rotation reverted (stale snapshot landed last)"
+            );
+        }
     }
 
     #[test]

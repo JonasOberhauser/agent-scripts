@@ -122,6 +122,15 @@ pub struct ServerState {
     /// (the default — unit tests and e2e harnesses stay hermetic).
     /// The real daemon arms it at startup before sockets accept.
     pub policy_path: Option<std::path::PathBuf>,
+    /// Serializes mutation+persist store-wide (review blocker on
+    /// #57): without it, two mutators could interleave snapshots and
+    /// land a STALE one last — silently reverting an already-durable
+    /// mutation (resurrecting a spent one-read budget: fail-OPEN) —
+    /// and same-process temp files collided mid-write. Mutations are
+    /// rare, human-scale events; this lock is uncontended in
+    /// practice. ALWAYS acquired BEFORE any record lock; `persist`
+    /// never runs under a record guard.
+    pub(crate) persist_lock: Mutex<()>,
 }
 
 impl Default for ServerState {
@@ -133,6 +142,7 @@ impl Default for ServerState {
             pending_timeout: Mutex::new(Duration::from_secs(300)),
             log_path: String::new(),
             policy_path: None,
+            persist_lock: Mutex::new(()),
         }
     }
 }
@@ -193,6 +203,11 @@ impl ServerState {
     ) {
         let name = name.into();
         let hash = allowed_hash.into();
+        // Mutations and their persistence are serialized store-wide:
+        // the snapshot must follow the mutation in program order, and
+        // concurrent write_atomic calls must never interleave
+        // (review blocker on #57).
+        let _pl = self.persist_lock.lock().unwrap();
         if let Some(existing) = self.secrets.get(&name) {
             let mut rec = lock_secret(existing.value(), &name);
             // MR2: the incoming hash JOINS the permitted set — a second
@@ -202,10 +217,15 @@ impl ServerState {
                 rec.allowed_hashes.push(PermittedHash { hash: hash.clone(), by: None });
             }
             // Plain overwrite (no change detection, see MR1): refresh
-            // only the adjudication facts.
+            // only the adjudication facts. This branch PERSISTS —
+            // review blocker on #57: it used to return without
+            // write-through, so a joined hash died with the process.
             rec.size = size;
             rec.mode = mode & 0o777;
             rec.host_path = host_path.into();
+            drop(rec);
+            drop(existing);
+            crate::policy_store::persist_locked(self);
             return;
         }
         self.secrets.insert(
@@ -221,13 +241,14 @@ impl ServerState {
                 unlimited_reads: false,
             })),
         );
-        crate::policy_store::persist(self);
+        crate::policy_store::persist_locked(self);
     }
 
     pub fn remove(&self, name: &str) -> bool {
+        let _pl = self.persist_lock.lock().unwrap();
         let existed = self.secrets.remove(name).is_some();
         if existed {
-            crate::policy_store::persist(self);
+            crate::policy_store::persist_locked(self);
         }
         existed
     }
@@ -254,8 +275,9 @@ impl ServerState {
             }
             let end = offset.saturating_add(size).min(rec.size);
             rec.read_progress = rec.read_progress.max(end);
-            drop(rec); // persist re-locks every record — never under the guard
-            crate::policy_store::persist(self);
+            drop(rec);
+            let _pl = self.persist_lock.lock().unwrap();
+            crate::policy_store::persist_locked(self);
             return ReadOutcome::Granted;
         }
 
@@ -276,8 +298,9 @@ impl ServerState {
             rec.reading_pid = Some(pid);
             let end = offset.saturating_add(size).min(rec.size);
             rec.read_progress = end;
-            drop(rec); // never persist under the record guard
-            crate::policy_store::persist(self);
+            drop(rec);
+            let _pl = self.persist_lock.lock().unwrap();
+            crate::policy_store::persist_locked(self);
             ReadOutcome::Granted
         } else {
             ReadOutcome::HashMismatch {
@@ -293,6 +316,7 @@ impl ServerState {
     }
 
     pub fn reset(&self, name: Option<&str>) -> usize {
+        let _pl = self.persist_lock.lock().unwrap();
         let count = match name {
             Some(n) => {
                 if let Some(entry) = self.secrets.get(n) {
@@ -322,13 +346,16 @@ impl ServerState {
                 count
             }
         };
-        crate::policy_store::persist(self);
+        if count > 0 {
+            crate::policy_store::persist_locked(self);
+        }
         count
     }
 
     /// Replace the permitted-hash set with a single hash — the
     /// explicit policy path (`rotate`); re-adds APPEND instead.
     pub fn rotate_hash(&self, name: &str, new_hash: &str) -> bool {
+        let _pl = self.persist_lock.lock().unwrap();
         let rotated = if let Some(entry) = self.secrets.get(name) {
             let rec_arc = Arc::clone(entry.value());
             drop(entry);
@@ -338,7 +365,9 @@ impl ServerState {
         } else {
             false
         };
-        crate::policy_store::persist(self);
+        if rotated {
+            crate::policy_store::persist_locked(self);
+        }
         rotated
     }
 
@@ -431,6 +460,7 @@ impl ServerState {
     /// becomes the secret's allowed hash and the read limit is lifted.
     /// The waiting reader is served like a normal grant.
     pub fn grant_pending_forever(&self, id: u64) -> Result<(), String> {
+        let _pl = self.persist_lock.lock().unwrap();
         let (secret_name, package_hash, process_name) = {
             let entry = self
                 .pending
@@ -483,7 +513,7 @@ impl ServerState {
         if !self.grant_pending(id) {
             return Err(format!("pending access {id} not found or expired"));
         }
-        crate::policy_store::persist(self);
+        crate::policy_store::persist_locked(self);
         Ok(())
     }
 
@@ -537,6 +567,7 @@ impl ServerState {
     /// served regardless of hash — record the access (forward-only
     /// progress by offset/size) and confirm the secret still exists.
     pub fn granted_read(&self, name: &str, pid: u32, offset: usize, size: usize) -> bool {
+        let _pl = self.persist_lock.lock().unwrap();
         let Some(entry) = self.secrets.get(name) else { return false; };
         let rec_arc = Arc::clone(entry.value());
         drop(entry);
@@ -546,7 +577,7 @@ impl ServerState {
         let end = offset.saturating_add(size).min(rec.size);
         rec.read_progress = rec.read_progress.max(end);
         drop(rec); // never persist under the record guard
-        crate::policy_store::persist(self);
+        crate::policy_store::persist_locked(self);
         true
     }
 

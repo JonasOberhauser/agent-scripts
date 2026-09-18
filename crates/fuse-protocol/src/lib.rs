@@ -52,10 +52,28 @@ pub const DEFAULT_LOG_PATH: &str = "/tmp/fuse-gatekeeper.log";
 /// State file written by the orchestrator, read by fuse-client for restarts.
 pub const STATE_FILE: &str = "/tmp/fuse-gatekeeper-state.json";
 
-/// State file path, overridable via the `FUSE_GATEKEEPER_STATE` environment
-/// variable (e.g. for E2E tests that must not clobber a live state file).
+// ── environment variables ───────────────────────────────────────
+// ONE registry: env-var names are interface, and interface strings
+// must not be duplicated per-call-site (the `FUSE_GATEKEEPER_STATE`
+// name was read verbatim in two files before this existed; a rename
+// would have needed a coordinated edit with nothing failing on a
+// miss — the --allow-other lesson at the literal level).
+
+/// Override for [`state_file`] (orchestrator-written, client-read).
+pub const ENV_STATE_FILE: &str = "FUSE_GATEKEEPER_STATE";
+/// Override for the policy daemon's persistent grant store (MR5).
+pub const ENV_POLICY_FILE: &str = "FUSE_GATEKEEPER_POLICY";
+/// clap env binding for the command-socket flag (fuse-client).
+pub const ENV_CMD_SOCKET: &str = "FUSE_GATEKEEPER_SOCKET";
+/// Default command socket (also fuse-server's `--socket` default).
+pub const DEFAULT_CMD_SOCKET: &str = "/tmp/fuse-gatekeeper.sock";
+/// Where `fuse-server` reaches the privileged hashd socket.
+pub const ENV_HASHD_SOCK: &str = "FUSE_HASHD_SOCK";
+
+/// State file path, overridable via [`ENV_STATE_FILE`] (e.g. for
+/// E2E tests that must not clobber a live state file).
 pub fn state_file() -> std::path::PathBuf {
-    std::env::var_os("FUSE_GATEKEEPER_STATE")
+    std::env::var_os(ENV_STATE_FILE)
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::path::PathBuf::from(STATE_FILE))
 }

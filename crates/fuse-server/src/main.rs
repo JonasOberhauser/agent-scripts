@@ -22,7 +22,7 @@ struct Cli {
     /// mounting is the data daemon's job now.
     #[arg(short, long)]
     mount_point: Option<PathBuf>,
-    #[arg(short, long, default_value = "/tmp/fuse-gatekeeper.sock")]
+    #[arg(short, long, default_value = fuse_protocol::DEFAULT_CMD_SOCKET)]
     socket: PathBuf,
     #[arg(long, value_name = "NAME:FILE:HASH")]
     secret: Vec<String>,
@@ -32,7 +32,7 @@ struct Cli {
     log_level: String,
     #[arg(long, default_value_t = 300)]
     pending_timeout: u64,
-    #[arg(long, default_value = "/tmp/fuse-gatekeeper.log")]
+    #[arg(long, default_value = fuse_protocol::DEFAULT_LOG_PATH)]
     log_path: PathBuf,
     /// Socket where the data daemon (fused) connects for adjudication
     /// and content updates.
@@ -160,7 +160,9 @@ fn main() {
             "  policy store:    {} restored, {} ghosts{}",
             report.restored,
             report.ghosts,
-            if report.corrupted { " — CORRUPT FILE RENAMED ASIDE, STARTED FRESH" } else { "" }
+            if report.corrupted { " — CORRUPT FILE RENAMED ASIDE, STARTED FRESH" }
+            else if report.unreadable { " — UNREADABLE, PERSISTENCE DISARMED (nothing will overwrite it)" }
+            else { "" }
         );
     }
 
