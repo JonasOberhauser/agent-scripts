@@ -192,7 +192,7 @@ impl Split {
             std::thread::sleep(Duration::from_millis(50));
         }
         for (name, _, _) in secrets {
-            let target = mount.join(inner_name_of(&dirs[1].path(), name));
+            let target = mount.join(inner_name_of(dirs[1].path(), name));
             let deadline = Instant::now() + Duration::from_secs(10);
             while Instant::now() < deadline {
                 if target.exists() {
@@ -217,7 +217,7 @@ impl Split {
     }
 
     fn inner(&self, name: &str) -> String {
-        inner_name_of(&self._dirs[1].path(), name)
+        inner_name_of(self._dirs[1].path(), name)
     }
 
     /// The host-side source file behind a served name (MR4 tests:
@@ -327,12 +327,10 @@ fn probe_env() -> String {
     format!("{id}\n{caps}\n")
 }
 
-/// Whether the kernel has a FUSE mount ON this exact path: statfs(2)
-/// reports FUSE_SUPER_MAGIC for the filesystem covering the path — a
 
-/// Resolve a secret's container-view (anonymized) name from a split's
-/// policy store — the salt lands there at the server's first
-/// registration persist.
+// Resolve a secret's container-view (anonymized) name from a split's
+// policy store — the salt lands there at the server's first
+// registration persist.
 fn inner_name_of(store: &Path, name: &str) -> String {
     let txt = std::fs::read_to_string(store.join("policy.json"))
         .expect("policy store written at first registration");
@@ -345,6 +343,8 @@ fn inner_name_of(store: &Path, name: &str) -> String {
     fuse_protocol::anonymize_path(&salt, name)
 }
 
+/// Whether the kernel has a FUSE mount ON this exact path: statfs(2)
+/// reports FUSE_SUPER_MAGIC for the filesystem covering the path — a
 /// kernel-standardized ABI answer with no mounts-table format to
 /// parse (field order/escaping bugs cannot happen here). An unmounted
 /// mountpoint reports its parent filesystem instead (e.g. tmpfs).
