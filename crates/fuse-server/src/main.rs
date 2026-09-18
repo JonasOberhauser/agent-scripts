@@ -183,11 +183,7 @@ fn main() {
                     md.ino()
                 );
                 state.add_with_mode(&name, host.clone(), md.len() as usize, &hash, 0o400);
-                let id = fuse_protocol::HostIdentity {
-                    kdev: fuse_protocol::KDev(md.dev()),
-                    kino: fuse_protocol::Kino(md.ino()),
-                };
-                hub.serve(&name, Some(id), 0o400);
+                hub.serve(&name, 0o400);
             }
             Err(e) => {
                 error!("Bad --secret '{spec}': {e}");

@@ -32,6 +32,14 @@ pub struct HostIdentity {
     pub kino: Kino,
 }
 
+/// Identity crosses this wire exactly where it has a job: DOWN in
+/// `StatOk` (the fresh observation — fused's only source of a current
+/// identity) and UP in `Open` (the fino's recorded identity, verified
+/// against the descriptor the server actually opens). `Serve` carries
+/// STRUCTURE only: a name entering the tree; readdir needs an ino
+/// NUMBER, not an identity, and the first lookup's Stat supplies one
+/// regardless.
+///
 /// fused → policy daemon.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -89,15 +97,6 @@ pub enum OracleCommand {
     /// Open. `mode` is wire-optional as before (older senders).
     Serve {
         name: String,
-        /// The CURRENT host identity when the sender just stat'ed a
-        /// live file (a free pre-warm so a freshly served tree lists
-        /// with valid inos). `None` when there is none to know yet —
-        /// e.g. a policy-store ghost whose host file is missing; the
-        /// first stat-on-lookup discovers it. readdir only primes the
-        /// dcache; lookup is authoritative, so no identity is REQUIRED
-        /// before lookup.
-        #[serde(default)]
-        identity: Option<HostIdentity>,
         #[serde(default = "crate::protocol::default_secret_mode")]
         mode: u32,
     },
@@ -140,16 +139,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn serve_without_identity_parses_as_none() {
-        // A policy-store ghost announces the NAME with no identity —
-        // the wire must express absence as a missing field (parsed to
-        // None), never as an in-band (0,0) sentinel.
+    fn serve_carries_structure_only() {
+        // Serve announces a NAME for the tree; identity crosses the
+        // wire only where it has a job (StatOk down, Open up). The
+        // shape is name (+ optional mode) — nothing else.
         let line = r#"{"type":"serve","name":"g/one.json","mode":384}"#;
-        let cmd: OracleCommand = serde_json::from_str(line).expect("identity-free serve parses");
-        assert_eq!(
-            cmd,
-            OracleCommand::Serve { name: "g/one.json".into(), identity: None, mode: 0o600 }
-        );
+        let cmd: OracleCommand = serde_json::from_str(line).expect("serve parses");
+        assert_eq!(cmd, OracleCommand::Serve { name: "g/one.json".into(), mode: 0o600 });
     }
 
 
@@ -163,7 +159,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             back,
-            OracleCommand::Serve { name: "s.yaml".into(), identity: Some(HostIdentity { kdev: KDev(52), kino: Kino(9) }), mode: 0o400 }
+            OracleCommand::Serve { name: "s.yaml".into(), mode: 0o400 }
         );
     }
 
@@ -179,7 +175,6 @@ mod tests {
             .unwrap(),
             serde_json::to_string(&OracleCommand::Serve {
                 name: "s.yaml".into(),
-                identity: Some(HostIdentity { kdev: KDev(52), kino: Kino(9) }),
                 mode: 0o400,
             })
             .unwrap(),
@@ -203,7 +198,7 @@ mod tests {
         let back: OracleCommand = serde_json::from_str(&msgs[1]).unwrap();
         assert_eq!(
             back,
-            OracleCommand::Serve { name: "s.yaml".into(), identity: Some(HostIdentity { kdev: KDev(52), kino: Kino(9) }), mode: 0o400 }
+            OracleCommand::Serve { name: "s.yaml".into(), mode: 0o400 }
         );
         let back: OracleCommand = serde_json::from_str(&msgs[2]).unwrap();
         assert_eq!(back, OracleCommand::Remove { name: "s.yaml".into() });

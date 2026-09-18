@@ -68,8 +68,8 @@ impl OracleHub {
     /// Announce a secret in the frozen mount tree with its CURRENT
     /// host identity (MR4): no content — bytes only ever travel as
     /// fds at open time.
-    pub fn serve(&self, name: &str, identity: Option<fuse_protocol::HostIdentity>, mode: u32) {
-        self.broadcast(&OracleCommand::Serve { name: name.to_string(), identity, mode });
+    pub fn serve(&self, name: &str, mode: u32) {
+        self.broadcast(&OracleCommand::Serve { name: name.to_string(), mode });
     }
 
     pub fn remove(&self, name: &str) {

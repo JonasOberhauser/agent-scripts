@@ -129,7 +129,7 @@ impl Store {
     /// A secret enters the frozen tree (MR4 Serve): no content — the
     /// current fino follows the host identity, allocating a fresh one
     /// when the incarnation changed since last Serve/stat.
-    pub fn serve(&self, name: &str, identity: Option<fuse_protocol::oracle::HostIdentity>, mode: u32) {
+    pub fn serve(&self, name: &str, mode: u32) {
         let mut s = self.0.lock().unwrap();
         let path = PathBuf::from(name);
         let comps: Vec<String> = path
@@ -169,24 +169,18 @@ impl Store {
             }
         }
         match s.tree.get(&path) {
-            Some(Node::File { fino, .. }) => {
-                // Same incarnation keeps its fino (no churn); a new
-                // identity mints a new one — the old entry stays for
-                // ESTALE detection.
-                let same = s.identities[fino].identity == identity;
-                if !same {
-                    let nf = mint_fino(&mut s, &path, identity);
-                    let Node::File { fino, .. } = s.tree.get_mut(&path).unwrap() else {
-                        unreachable!()
-                    };
-                    *fino = nf;
-                }
-                if let Node::File { mode: m, .. } = s.tree.get_mut(&path).unwrap() {
-                    *m = mode;
-                }
+            // Structure only: refresh the mode, leave the fino alone —
+            // incarnation change is discovered LAZILY by the next
+            // stat (lookup is authoritative; open verifies against
+            // the recorded identity regardless).
+            Some(_) => {
+                let Node::File { mode: m, .. } = s.tree.get_mut(&path).unwrap() else {
+                    unreachable!("matched a file above");
+                };
+                *m = mode;
             }
             _ => {
-                let fino = mint_fino(&mut s, &path, identity);
+                let fino = mint_fino(&mut s, &path, None);
                 s.tree.insert(path.clone(), Node::File { fino, mode });
             }
         }
@@ -821,8 +815,8 @@ fn apply_control_line(store: &Store, line: &str) -> bool {
         return false;
     }
     match serde_json::from_str::<OracleCommand>(line.trim()) {
-        Ok(OracleCommand::Serve { name, identity, mode }) => {
-            store.serve(&name, identity, mode);
+        Ok(OracleCommand::Serve { name, mode }) => {
+            store.serve(&name, mode);
             true
         }
         Ok(OracleCommand::Remove { name }) => {
@@ -885,9 +879,9 @@ mod tests {
     #[test]
     fn serve_shapes_the_frozen_tree() {
         let s = Store::default();
-        s.serve("home/u/auth.json", Some(fuse_protocol::oracle::HostIdentity { kdev: fuse_protocol::oracle::KDev(52), kino: fuse_protocol::oracle::Kino(1) }), 0o400);
-        s.serve("home/u/keys/token", Some(fuse_protocol::oracle::HostIdentity { kdev: fuse_protocol::oracle::KDev(52), kino: fuse_protocol::oracle::Kino(2) }), 0o400);
-        s.serve("other.txt", Some(fuse_protocol::oracle::HostIdentity { kdev: fuse_protocol::oracle::KDev(52), kino: fuse_protocol::oracle::Kino(3) }), 0o400);
+        s.serve("home/u/auth.json", 0o400);
+        s.serve("home/u/keys/token", 0o400);
+        s.serve("other.txt", 0o400);
         let root = s.dir_children(FuseIno::ROOT).unwrap();
         let names: Vec<&str> = root.iter().map(|(_, _, n)| n.as_str()).collect();
         assert_eq!(names, ["home", "other.txt"]);
@@ -898,25 +892,53 @@ mod tests {
     #[test]
     fn new_incarnation_mints_a_new_fino_the_old_stays_for_estale() {
         let s = Store::default();
-        s.serve("a/x", Some(fuse_protocol::oracle::HostIdentity { kdev: fuse_protocol::oracle::KDev(52), kino: fuse_protocol::oracle::Kino(100) }), 0o400);
+        s.serve("a/x", 0o400);
         let (f1, is_dir) = s.child(FuseIno::ROOT, OsStr::new("a")).unwrap();
         assert!(is_dir);
         let (x1, _) = s.child(f1, OsStr::new("x")).unwrap();
-        // host file replaced: same path, new identity
-        s.serve("a/x", Some(fuse_protocol::oracle::HostIdentity { kdev: fuse_protocol::oracle::KDev(52), kino: fuse_protocol::oracle::Kino(999) }), 0o400);
-        let (x2, _) = s.child(f1, OsStr::new("x")).unwrap();
+        // Bind an identity the way the first lookup's stat does…
+        let bound = s
+            .observe(
+                Path::new("a/x"),
+                fuse_protocol::oracle::HostIdentity {
+                    kdev: fuse_protocol::oracle::KDev(52),
+                    kino: fuse_protocol::oracle::Kino(100),
+                },
+            )
+            .unwrap();
+        // The readdir-primed fino was never identity-bound, so the
+        // FIRST stat mints a fresh one — the harmless one-mint-per-
+        // secret cost of Serve carrying no identity.
+        assert_ne!(bound, x1, "first stat binds identity with a fresh fino");
+        let (bound_now, _) = s.child(f1, OsStr::new("x")).unwrap();
+        assert_eq!(bound, bound_now);
+        // …then the host file is replaced: the NEXT stat observes a new
+        // identity (Serve is structure-only — it never knew)
+        let x2 = s
+            .observe(
+                Path::new("a/x"),
+                fuse_protocol::oracle::HostIdentity {
+                    kdev: fuse_protocol::oracle::KDev(52),
+                    kino: fuse_protocol::oracle::Kino(999),
+                },
+            )
+            .unwrap();
+        let (x2b, _) = s.child(f1, OsStr::new("x")).unwrap();
+        assert_eq!(x2, x2b);
         assert_ne!(x1, x2, "a new incarnation is a new inode");
-        // the OLD fino still resolves (its identity no longer matches
-        // the current one — by-ino access answers ESTALE from that)
-        let old = s.fino_record(x1).expect("old identity retained for ESTALE");
-        assert_eq!(old.identity, Some(fuse_protocol::oracle::HostIdentity { kdev: fuse_protocol::oracle::KDev(52), kino: fuse_protocol::oracle::Kino(100) }));
+        // both superseded finos stay queryable: the identity-bound one
+        // carries the old incarnation (by-ino access answers ESTALE
+        // from that), the never-bound primed one keeps its None.
+        let old_bound = s.fino_record(bound).expect("old bound fino retained for ESTALE");
+        assert_eq!(old_bound.identity, Some(fuse_protocol::oracle::HostIdentity { kdev: fuse_protocol::oracle::KDev(52), kino: fuse_protocol::oracle::Kino(100) }));
+        assert_eq!(s.fino_record(x1).unwrap().identity, None);
     }
 
     #[test]
     fn same_incarnation_keeps_its_fino() {
         let s = Store::default();
-        s.serve("a/x", Some(fuse_protocol::oracle::HostIdentity { kdev: fuse_protocol::oracle::KDev(52), kino: fuse_protocol::oracle::Kino(100) }), 0o400);
-        s.serve("a/x", Some(fuse_protocol::oracle::HostIdentity { kdev: fuse_protocol::oracle::KDev(52), kino: fuse_protocol::oracle::Kino(100) }), 0o400);
+        s.serve("a/x", 0o400);
+        s.serve("a/x", 0o400);
         let d = s.child(FuseIno::ROOT, OsStr::new("a")).unwrap().0;
         let x1 = s.child(d, OsStr::new("x")).unwrap().0;
         let x2 = s.child(d, OsStr::new("x")).unwrap().0;
@@ -926,7 +948,7 @@ mod tests {
     #[test]
     fn observe_refreshes_identity_on_lookup() {
         let s = Store::default();
-        s.serve("a/x", Some(fuse_protocol::oracle::HostIdentity { kdev: fuse_protocol::oracle::KDev(52), kino: fuse_protocol::oracle::Kino(100) }), 0o400);
+        s.serve("a/x", 0o400);
         let d = s.child(FuseIno::ROOT, OsStr::new("a")).unwrap().0;
         let x1 = s.child(d, OsStr::new("x")).unwrap().0;
         // lookup observed a replaced file: new fino for the path
@@ -944,7 +966,7 @@ mod tests {
         // first stat-on-lookup discovers the real identity, minting a
         // fresh fino while the old one is retained for ESTALE.
         let s = Store::default();
-        s.serve("g/one.json", None, 0o400);
+        s.serve("g/one.json", 0o400);
         let d = s.child(FuseIno::ROOT, OsStr::new("g")).unwrap().0;
         let ghost = s.child(d, OsStr::new("one.json")).unwrap().0;
         assert_eq!(s.fino_record(ghost).unwrap().identity, None);
@@ -973,7 +995,7 @@ mod tests {
     #[test]
     fn remove_prunes_the_tree_and_childless_ancestors() {
         let s = Store::default();
-        s.serve("a/b/c.txt", Some(fuse_protocol::oracle::HostIdentity { kdev: fuse_protocol::oracle::KDev(52), kino: fuse_protocol::oracle::Kino(7) }), 0o400);
+        s.serve("a/b/c.txt", 0o400);
         assert!(s.dir_children(FuseIno::ROOT).unwrap()[0].1);
         s.remove("a/b/c.txt");
         assert!(s.dir_children(FuseIno::ROOT).unwrap().is_empty(), "empty trees vanish");
@@ -984,11 +1006,11 @@ mod tests {
         let s = Store::default();
         assert!(apply_control_line(
             &s,
-            r#"{"type":"serve","name":"a","identity":{"kdev":52,"kino":5},"mode":420}"#
+            r#"{"type":"serve","name":"a","mode":420}"#
         ));
         let (fino, is_dir) = s.child(FuseIno::ROOT, OsStr::new("a")).unwrap();
         assert!(!is_dir);
-        assert!(matches!(s.fino_record(fino).unwrap().identity, Some(fuse_protocol::oracle::HostIdentity { kino: fuse_protocol::oracle::Kino(5), .. })));
+        assert_eq!(s.fino_record(fino).unwrap().identity, None, "identity arrives via Stat, never Serve");
         assert!(apply_control_line(&s, r#"{"type":"remove","name":"a"}"#));
         assert!(s.child(FuseIno::ROOT, OsStr::new("a")).is_none());
     }
@@ -1009,14 +1031,7 @@ mod tests {
         let mut seen: Vec<FuseIno> = Vec::new();
         for i in 0..6u64 {
             let name = format!("f{i}.txt");
-            s.serve(
-                &name,
-                Some(fuse_protocol::oracle::HostIdentity {
-                    kdev: fuse_protocol::oracle::KDev(52),
-                    kino: fuse_protocol::oracle::Kino(100 + i),
-                }),
-                0o400,
-            );
+            s.serve(&name, 0o400);
             let f = s.child(FuseIno::ROOT, OsStr::new(&name)).unwrap().0;
             assert!(!seen.contains(&f), "fino repeated: {f:?}");
             if let Some(&max) = seen.iter().max() {

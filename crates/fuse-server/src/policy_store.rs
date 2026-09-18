@@ -130,18 +130,11 @@ pub fn load(state: &ServerState, hub: &OracleHub) -> LoadReport {
         // (the MR4 stat path); a missing one is a GHOST: announced
         // with NO identity — absence is Option, not an in-band (0,0)
         // sentinel — until the first stat-on-lookup discovers it.
-        let (size, identity) = match std::fs::metadata(&s.host_path) {
-            Ok(md) if md.is_file() => {
-                use std::os::unix::fs::MetadataExt;
-                let id = fuse_protocol::HostIdentity {
-                    kdev: fuse_protocol::KDev(md.dev()),
-                    kino: fuse_protocol::Kino(md.ino()),
-                };
-                (md.len() as usize, Some(id))
-            }
-            _ => (0, None),
+        let (size, live) = match std::fs::metadata(&s.host_path) {
+            Ok(md) if md.is_file() => (md.len() as usize, true),
+            _ => (0, false),
         };
-        let ghost = identity.is_none();
+        let ghost = !live;
         if ghost {
             report.ghosts += 1;
         } else {
@@ -164,7 +157,7 @@ pub fn load(state: &ServerState, hub: &OracleHub) -> LoadReport {
                 unlimited_reads: s.unlimited,
             })),
         );
-        hub.serve(&s.name, identity, s.mode);
+        hub.serve(&s.name, s.mode);
     }
     report
 }

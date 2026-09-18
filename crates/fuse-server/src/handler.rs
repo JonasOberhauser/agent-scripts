@@ -113,15 +113,10 @@ fn register_secret(
     if !md.is_file() {
         return Err(format!("{} is not a regular file", host.display()));
     }
-    let identity = {
-        use std::os::unix::fs::MetadataExt;
-        fuse_protocol::HostIdentity {
-            kdev: fuse_protocol::KDev(md.dev()),
-            kino: fuse_protocol::Kino(md.ino()),
-        }
-    };
     state.add_with_mode(name, host, md.len() as usize, hash, mode & 0o777);
-    hub.serve(name, Some(identity), mode & 0o777);
+    // Serve carries structure only — the identity's wire crossings
+    // are StatOk (down) and Open (up), each with a job.
+    hub.serve(name, mode & 0o777);
     Ok(())
 }
 #[cfg(test)]
