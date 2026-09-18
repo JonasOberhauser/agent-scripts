@@ -52,7 +52,14 @@ enum Node {
         mode: u32,
     },
     Dir {
+        /// Child labels keyed by the OUTER (host) name.
         children: BTreeMap<String, ()>,
+        /// Issue #47: per-directory label bijection. The CONTAINER
+        /// speaks only `inner` labels (anonymized, stable); policy
+        /// and display speak outer. outer→inner renders readdir;
+        /// inner→outer resolves lookup.
+        inner_by_outer: BTreeMap<String, String>,
+        outer_by_inner: BTreeMap<String, String>,
     },
 }
 
@@ -93,7 +100,14 @@ impl StoreInner {
     fn new() -> Self {
         Self {
             next_fino: FuseIno::ROOT.0,
-            tree: BTreeMap::from([(PathBuf::new(), Node::Dir { children: BTreeMap::new() })]),
+            tree: BTreeMap::from([(
+                PathBuf::new(),
+                Node::Dir {
+                    children: BTreeMap::new(),
+                    inner_by_outer: BTreeMap::new(),
+                    outer_by_inner: BTreeMap::new(),
+                },
+            )]),
             identities: HashMap::new(),
         }
     }
@@ -129,7 +143,7 @@ impl Store {
     /// A secret enters the frozen tree (MR4 Serve): no content — the
     /// current fino follows the host identity, allocating a fresh one
     /// when the incarnation changed since last Serve/stat.
-    pub fn serve(&self, name: &str, mode: u32) {
+    pub fn serve(&self, name: &str, inner: &str, mode: u32) {
         let mut s = self.0.lock().unwrap();
         let path = PathBuf::from(name);
         let comps: Vec<String> = path
@@ -137,7 +151,19 @@ impl Store {
             .map(|c| c.as_os_str().to_string_lossy().into_owned())
             .filter(|c| !c.is_empty())
             .collect();
+        let icomps: Vec<String> = Path::new(inner)
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .filter(|c| !c.is_empty())
+            .collect();
         if comps.is_empty() {
+            return;
+        }
+        if icomps.len() != comps.len() {
+            warn!(
+                "cannot serve \"{name}\": inner form \"{inner}\" does not parallel the \
+                 outer path — refusing rather than serve a half-anonymized tree"
+            );
             return;
         }
         // Materialize parent directories (structural; identity unused).
@@ -145,10 +171,23 @@ impl Store {
         // (possible only via non-normalized raw adds) — fail safe and
         // say so, like the old upsert did.
         let mut prefix = PathBuf::new();
-        for comp in comps.iter().take(comps.len() - 1) {
+        for (i, comp) in comps.iter().enumerate().take(comps.len() - 1) {
+            let icomp = &icomps[i];
             match s.tree.get_mut(&prefix) {
-                Some(Node::Dir { children }) => {
+                Some(Node::Dir { children, inner_by_outer, outer_by_inner }) => {
                     children.insert(comp.clone(), ());
+                    inner_by_outer.insert(comp.clone(), icomp.clone());
+                    if let Some(old) =
+                        outer_by_inner.insert(icomp.clone(), comp.clone())
+                    {
+                        if &old != comp {
+                            warn!(
+                                "anonymized label \"{icomp}\" collides between \"{old}\" and \
+                                 \"{comp}\" — refusing the second name"
+                            );
+                            return;
+                        }
+                    }
                 }
                 Some(Node::File { .. }) => {
                     warn!("cannot serve \"{name}\": \"{}\" is already a file", prefix.display());
@@ -164,7 +203,14 @@ impl Store {
                     return;
                 }
                 None => {
-                    s.tree.insert(prefix.clone(), Node::Dir { children: BTreeMap::new() });
+                    s.tree.insert(
+                        prefix.clone(),
+                        Node::Dir {
+                            children: BTreeMap::new(),
+                            inner_by_outer: BTreeMap::new(),
+                            outer_by_inner: BTreeMap::new(),
+                        },
+                    );
                 }
             }
         }
@@ -193,9 +239,23 @@ impl Store {
             }
         }
         // Link the file's own label into its parent directory (the
-        // walk above linked only the intermediate dirs).
-        if let Some(Node::Dir { children }) = s.tree.get_mut(&prefix) {
-            children.insert(comps[comps.len() - 1].clone(), ());
+        // walk above linked only the intermediate dirs) — both label
+        // forms, so lookup and readdir agree (issue #47).
+        let last = &comps[comps.len() - 1];
+        let ilast = &icomps[icomps.len() - 1];
+        if let Some(Node::Dir { children, inner_by_outer, outer_by_inner }) = s.tree.get_mut(&prefix) {
+            if let Some(old) = outer_by_inner.get(ilast) {
+                if old != last {
+                    warn!(
+                        "anonymized label \"{ilast}\" collides between \"{old}\" and \
+                         \"{last}\" — refusing the second name (never alias two secrets)"
+                    );
+                    return;
+                }
+            }
+            children.insert(last.clone(), ());
+            inner_by_outer.insert(last.clone(), ilast.clone());
+            outer_by_inner.insert(ilast.clone(), last.clone());
         }
     }
 
@@ -215,9 +275,14 @@ impl Store {
                 break;
             }
             let now_empty = {
-                let Some(Node::Dir { children }) = s.tree.get_mut(&path) else {
+                let Some(Node::Dir { children, inner_by_outer, outer_by_inner }) =
+                    s.tree.get_mut(&path)
+                else {
                     break;
                 };
+                if let Some(inner) = inner_by_outer.remove(&label) {
+                    outer_by_inner.remove(&inner);
+                }
                 children.remove(&label);
                 children.is_empty() && !path.as_os_str().is_empty()
             };
@@ -232,13 +297,23 @@ impl Store {
 
     /// Resolve one lookup step under `parent` (FuseIno::ROOT = root).
     fn child(&self, parent: FuseIno, label: &OsStr) -> Option<(FuseIno, bool)> {
+        // The container speaks INNER labels (issue #47): resolve
+        // through the directory's bijection to the outer label the
+        // tree is keyed by.
         let label = label.to_string_lossy().into_owned();
         let base: PathBuf = if parent == FuseIno::ROOT {
             PathBuf::new()
         } else {
             self.0.lock().unwrap().identities.get(&parent)?.path.clone()
         };
-        let child = base.join(&label);
+        let outer_label = {
+            let s = self.0.lock().unwrap();
+            let Node::Dir { outer_by_inner, .. } = s.tree.get(&base)? else {
+                return None;
+            };
+            outer_by_inner.get(&label)?.clone()
+        };
+        let child = base.join(&outer_label);
         let is_dir = {
             let s = self.0.lock().unwrap();
             match s.tree.get(&child)? {
@@ -299,28 +374,34 @@ impl Store {
     /// Dir children get their fino minted on demand — a freshly
     /// served tree must list completely without prior lookups.
     fn dir_children(&self, dir: FuseIno) -> Option<Vec<(FuseIno, bool, String)>> {
-        let (path, labels): (PathBuf, Vec<(String, bool)>) = {
+        let (path, labels): (PathBuf, Vec<(String, String, bool)>) = {
             let s = self.0.lock().unwrap();
             let path: &Path = if dir == FuseIno::ROOT {
                 Path::new("")
             } else {
                 &s.identities.get(&dir)?.path
             };
-            let Node::Dir { children } = s.tree.get(path)? else {
+            let Node::Dir { children, inner_by_outer, .. } = s.tree.get(path)? else {
                 return None;
             };
+            // The container sees INNER labels only (issue #47); the
+            // outer keys stay for tree resolution.
             let labels = children
                 .keys()
                 .map(|k| {
                     let is_dir = matches!(s.tree.get(&path.join(k)), Some(Node::Dir { .. }));
-                    (k.clone(), is_dir)
+                    let inner = inner_by_outer
+                        .get(k)
+                        .cloned()
+                        .unwrap_or_else(|| k.clone());
+                    (k.clone(), inner, is_dir)
                 })
                 .collect();
             (path.to_path_buf(), labels)
         };
         let mut out = Vec::new();
-        for (label, is_dir) in labels {
-            let child = path.join(&label);
+        for (outer, inner, is_dir) in labels {
+            let child = path.join(&outer);
             let fino = if is_dir {
                 self.ensure_dir_fino(&child)?
             } else {
@@ -329,7 +410,7 @@ impl Store {
                     _ => return None,
                 }
             };
-            out.push((fino, is_dir, label));
+            out.push((fino, is_dir, inner));
         }
         Some(out)
     }
@@ -823,8 +904,8 @@ fn apply_control_line(store: &Store, line: &str) -> bool {
         return false;
     }
     match serde_json::from_str::<OracleCommand>(line.trim()) {
-        Ok(OracleCommand::Serve { name, mode }) => {
-            store.serve(&name, mode);
+        Ok(OracleCommand::Serve { name, inner, mode }) => {
+            store.serve(&name, &inner, mode);
             true
         }
         Ok(OracleCommand::Remove { name }) => {
@@ -887,9 +968,9 @@ mod tests {
     #[test]
     fn serve_shapes_the_frozen_tree() {
         let s = Store::default();
-        s.serve("home/u/auth.json", 0o400);
-        s.serve("home/u/keys/token", 0o400);
-        s.serve("other.txt", 0o400);
+        s.serve("home/u/auth.json", "home/u/auth.json", 0o400);
+        s.serve("home/u/keys/token", "home/u/keys/token", 0o400);
+        s.serve("other.txt", "other.txt", 0o400);
         let root = s.dir_children(FuseIno::ROOT).unwrap();
         let names: Vec<&str> = root.iter().map(|(_, _, n)| n.as_str()).collect();
         assert_eq!(names, ["home", "other.txt"]);
@@ -900,7 +981,7 @@ mod tests {
     #[test]
     fn new_incarnation_mints_a_new_fino_the_old_stays_for_estale() {
         let s = Store::default();
-        s.serve("a/x", 0o400);
+        s.serve("a/x", "a/x", 0o400);
         let (f1, is_dir) = s.child(FuseIno::ROOT, OsStr::new("a")).unwrap();
         assert!(is_dir);
         let (x1, _) = s.child(f1, OsStr::new("x")).unwrap();
@@ -945,8 +1026,8 @@ mod tests {
     #[test]
     fn same_incarnation_keeps_its_fino() {
         let s = Store::default();
-        s.serve("a/x", 0o400);
-        s.serve("a/x", 0o400);
+        s.serve("a/x", "a/x", 0o400);
+        s.serve("a/x", "a/x", 0o400);
         let d = s.child(FuseIno::ROOT, OsStr::new("a")).unwrap().0;
         let x1 = s.child(d, OsStr::new("x")).unwrap().0;
         let x2 = s.child(d, OsStr::new("x")).unwrap().0;
@@ -956,7 +1037,7 @@ mod tests {
     #[test]
     fn observe_refreshes_identity_on_lookup() {
         let s = Store::default();
-        s.serve("a/x", 0o400);
+        s.serve("a/x", "a/x", 0o400);
         let d = s.child(FuseIno::ROOT, OsStr::new("a")).unwrap().0;
         let x1 = s.child(d, OsStr::new("x")).unwrap().0;
         // lookup observed a replaced file: new fino for the path
@@ -974,7 +1055,7 @@ mod tests {
         // first stat-on-lookup discovers the real identity, minting a
         // fresh fino while the old one is retained for ESTALE.
         let s = Store::default();
-        s.serve("g/one.json", 0o400);
+        s.serve("g/one.json", "g/one.json", 0o400);
         let d = s.child(FuseIno::ROOT, OsStr::new("g")).unwrap().0;
         let ghost = s.child(d, OsStr::new("one.json")).unwrap().0;
         assert_eq!(s.fino_record(ghost).unwrap().identity, None);
@@ -1003,7 +1084,7 @@ mod tests {
     #[test]
     fn remove_prunes_the_tree_and_childless_ancestors() {
         let s = Store::default();
-        s.serve("a/b/c.txt", 0o400);
+        s.serve("a/b/c.txt", "a/b/c.txt", 0o400);
         assert!(s.dir_children(FuseIno::ROOT).unwrap()[0].1);
         s.remove("a/b/c.txt");
         assert!(s.dir_children(FuseIno::ROOT).unwrap().is_empty(), "empty trees vanish");
@@ -1016,10 +1097,10 @@ mod tests {
         // and crashed the data daemon — the mount dies with it.
         // Reaching it needs no hand-editing: two add-secret calls do.
         let s = Store::default();
-        s.serve("a/b", 0o400);
+        s.serve("a/b", "a/b", 0o400);
         // Must NOT panic; the conflict is refused loudly, the tree
         // keeps the deeper structure.
-        s.serve("a", 0o400);
+        s.serve("a", "a", 0o400);
         let d = s.child(FuseIno::ROOT, OsStr::new("a")).unwrap();
         assert!(d.1, "the directory keeps its place");
         let f = s.child(d.0, OsStr::new("b"));
@@ -1031,13 +1112,53 @@ mod tests {
         let s = Store::default();
         assert!(apply_control_line(
             &s,
-            r#"{"type":"serve","name":"a","mode":420}"#
+            r#"{"type":"serve","name":"a","inner":"x1","mode":420}"#
         ));
-        let (fino, is_dir) = s.child(FuseIno::ROOT, OsStr::new("a")).unwrap();
+        let (fino, is_dir) = s.child(FuseIno::ROOT, OsStr::new("x1")).unwrap(); // lookup speaks INNER
         assert!(!is_dir);
         assert_eq!(s.fino_record(fino).unwrap().identity, None, "identity arrives via Stat, never Serve");
         assert!(apply_control_line(&s, r#"{"type":"remove","name":"a"}"#));
-        assert!(s.child(FuseIno::ROOT, OsStr::new("a")).is_none());
+        assert!(s.child(FuseIno::ROOT, OsStr::new("x1")).is_none());
+    }
+
+    #[test]
+    fn container_speaks_inner_labels_only() {
+        // Issue #47: lookup and readdir in the container see the
+        // anonymized form; the outer names never cross the mount.
+        let s = Store::default();
+        s.serve("var/home/jonas/git.netrc", "ab12/cd34/ef56/789a", 0o400);
+        // lookup by INNER
+        let (d, is_dir) = s.child(FuseIno::ROOT, OsStr::new("ab12")).unwrap();
+        assert!(is_dir);
+        let (d2, _) = s.child(d, OsStr::new("cd34")).unwrap();
+        let (d3, _) = s.child(d2, OsStr::new("ef56")).unwrap();
+        let (_f, is_dir) = s.child(d3, OsStr::new("789a")).unwrap();
+        assert!(!is_dir);
+        // outer label does NOT resolve
+        assert!(s.child(FuseIno::ROOT, OsStr::new("var")).is_none());
+        // readdir renders INNER labels
+        let root = s.dir_children(FuseIno::ROOT).unwrap();
+        assert_eq!(root[0].2, "ab12", "readdir renders the anonymized form");
+    }
+
+    #[test]
+    fn mismatched_inner_shape_is_refused() {
+        let s = Store::default();
+        s.serve("a/b", "only-one-component", 0o400);
+        assert!(s.dir_children(FuseIno::ROOT).unwrap().is_empty(),
+            "half-anonymized trees never serve");
+    }
+
+    #[test]
+    fn inner_label_collision_is_refused() {
+        // Same anonymized label for two different outers at one
+        // directory level: the second name is refused, the first
+        // keeps its mapping — never alias two secrets.
+        let s = Store::default();
+        s.serve("one", "dupe", 0o400);
+        s.serve("two", "dupe", 0o400);
+        let root = s.dir_children(FuseIno::ROOT).unwrap();
+        assert_eq!(root.len(), 1, "collision refused, no aliasing: {root:?}");
     }
 
     #[test]
@@ -1056,7 +1177,7 @@ mod tests {
         let mut seen: Vec<FuseIno> = Vec::new();
         for i in 0..6u64 {
             let name = format!("f{i}.txt");
-            s.serve(&name, 0o400);
+            s.serve(&name, &name, 0o400);
             let f = s.child(FuseIno::ROOT, OsStr::new(&name)).unwrap().0;
             assert!(!seen.contains(&f), "fino repeated: {f:?}");
             if let Some(&max) = seen.iter().max() {

@@ -9,6 +9,9 @@ use crate::protocol::{Command, PendingAccessInfo, Response};
 pub fn print_response(resp: &Response, out: &mut dyn Console) {
     match resp {
         Response::Ok => out.print_line("OK"),
+        Response::Added { inner } => {
+            out.print_line(&format!("added — container view: /fuse/{inner}"))
+        }
         Response::Error { message } => out.print_error(message),
         Response::Status { secrets } => {
             if secrets.is_empty() {
@@ -19,15 +22,18 @@ pub fn print_response(resp: &Response, out: &mut dyn Console) {
                 let collapsed = crate::protocol::collapse_paths(
                     &secrets.iter().map(|s| s.name.clone()).collect::<Vec<_>>(),
                 );
-                out.print_line(&format!("{:<24} {:>8} {:>8}  HASH", "NAME", "READS", "SIZE"));
+                out.print_line(&format!(
+                    "{:<24} {:<18} {:>8} {:>8}  HASH",
+                    "NAME", "AS /fuse/…", "READS", "SIZE"
+                ));
                 // One row per permitted hash (review on #45): the
                 // first shares the secret's row, the rest continue
                 // aligned under the HASH column as `by -- hash`.
-                const HASH_COL: usize = 44;
+                const HASH_COL: usize = 62;
                 for (s, name) in secrets.iter().zip(&collapsed) {
                     let lead = format!(
-                        "{:<24} {:>8} {:>8}  ",
-                        name, s.access_count, s.size
+                        "{:<24} {:<18} {:>8} {:>8}  ",
+                        name, s.inner, s.access_count, s.size
                     );
                     if s.allowed_hashes.is_empty() {
                         out.print_line(&format!("{lead}-"));
@@ -455,6 +461,7 @@ mod tests {
         let resp = Response::Status {
             secrets: vec![
                 crate::protocol::SecretStatus {
+                    inner: "i1/i2/i3/i4".into(),
                     name: "var/home/jonas/bar/secret.txt".into(),
                     access_count: 6,
                     allowed_hashes: vec![
@@ -471,7 +478,8 @@ mod tests {
                     unlimited: false,
                 },
                 crate::protocol::SecretStatus {
-                    name: "var/home/jonas/foo/secret2.txt".into(),
+                    inner: "i0".into(),
+            name: "var/home/jonas/foo/secret2.txt".into(),
                     access_count: 0,
                     allowed_hashes: vec![crate::protocol::HashEntryStatus {
                         hash: crate::PENDING_ONLY_HASH.into(),
@@ -491,7 +499,7 @@ mod tests {
         let cont = &rows[2];
         assert!(cont.trim() == "bloo -- hash2", "continuation carries only the hash row: {cont:?}");
         assert!(cont.starts_with(" "), "aligned under the HASH column");
-        assert_eq!(cont.find("bloo"), Some(44), "HASH column start: {cont:?}");
+        assert_eq!(cont.find("bloo"), Some(62), "HASH column start: {cont:?}");
         assert!(rows[3].contains(".../foo/secret2.txt") && rows[3].contains("(manual approval only)"),
             "single-entry secret stays on one row: {:?}", rows[3]);
     }
@@ -502,7 +510,8 @@ mod tests {
         let resp = Response::Status {
             secrets: vec![
                 SecretStatus {
-                    name: "var/home/jonas/secrets/agent/github.netrc".into(),
+                    inner: "i0".into(),
+            name: "var/home/jonas/secrets/agent/github.netrc".into(),
                     access_count: 0,
                     allowed_hashes: vec![crate::protocol::HashEntryStatus {
                         hash: crate::PENDING_ONLY_HASH.into(),
@@ -512,7 +521,8 @@ mod tests {
                     unlimited: false,
                 },
                 SecretStatus {
-                    name: "var/home/jonas/secrets/zai.key".into(),
+                    inner: "i0".into(),
+            name: "var/home/jonas/secrets/zai.key".into(),
                     access_count: 1,
                     allowed_hashes: vec![crate::protocol::HashEntryStatus {
                         hash: crate::PENDING_ONLY_HASH.into(),

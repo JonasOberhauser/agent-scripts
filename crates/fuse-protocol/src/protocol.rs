@@ -12,6 +12,10 @@ pub struct SecretStatus {
     /// change: minor version bumped, mixed vintages fail the
     /// handshake instead of the parse.
     pub allowed_hashes: Vec<HashEntryStatus>,
+    /// The container-view (anonymized) name for this secret (issue
+    /// #47) — shown beside the clear name so bind-mounts and
+    /// container configs can reference the stable inner form.
+    pub inner: String,
     pub size: usize,
     /// Set by `grant-forever`: the allowed package may read without
     /// per-read approval.
@@ -167,6 +171,48 @@ pub fn collapse_paths(paths: &[String]) -> Vec<String> {
     comps.iter().map(|c| trie.render(c)).collect()
 }
 
+/// Deterministically anonymize one path component (issue #47):
+/// first 12 hex of sha256(salt || component) — unguessable without
+/// the per-install salt, stable across restarts because the salt is
+/// persisted with the grant store. Twelve hex = 48 bits per
+/// component; with the handful of components a real tree holds, the
+/// collision probability is negligible (and detectable at serve
+/// time — the server refuses a colliding anonymized name rather than
+/// alias two secrets).
+pub fn anonymize(salt: &[u8], component: &str) -> String {
+    use sha2::{Digest as _, Sha256};
+    let mut h = Sha256::new();
+    h.update(salt);
+    h.update(component.as_bytes());
+    let d = h.finalize();
+    d.iter().take(6).map(|b| format!("{b:02x}")).collect()
+}
+
+/// A fresh per-install salt (32 random bytes, hex) — generated once
+/// when the policy store first persists, then stable for the life of
+/// the store.
+pub fn new_salt() -> Vec<u8> {
+    // A salt must come from the OS entropy source — hashing time/pid/
+    // addresses is NOT enough and quietly degrades every anonymized
+    // name in the mount. Refuse rather than degrade.
+    let mut buf = [0u8; 32];
+    let mut f = std::fs::File::open("/dev/urandom")
+        .expect("/dev/urandom for the anonymization salt");
+    use std::io::Read as _;
+    f.read_exact(&mut buf)
+        .expect("32 bytes from /dev/urandom");
+    buf.to_vec()
+}
+
+/// The container-view form of a full path: same components, each
+/// anonymized under the salt.
+pub fn anonymize_path(salt: &[u8], name: &str) -> String {
+    name.split('/')
+        .map(|c| anonymize(salt, c))
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 /// Whether a server version and a client version speak the same
 /// protocol: major and minor must match; the patch component is
 /// ignored by design (AGENTS.md) so patch releases never force a
@@ -254,6 +300,9 @@ pub enum Command {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Response {
+    /// AddSecret succeeded; `inner` is the anonymized container-view
+    /// name (issue #47) the mount serves the secret under.
+    Added { inner: String },
     Ok,
     Error { message: String },
     Status { secrets: Vec<SecretStatus> },
@@ -267,6 +316,20 @@ pub enum Response {
 
 #[cfg(test)]
 mod tests {
+
+#[test]
+fn anonymize_is_deterministic_salt_sensitive_and_shaped() {
+    let a = anonymize(b"salt", "git.netrc");
+    let b = anonymize(b"salt", "git.netrc");
+    assert_eq!(a, b, "same salt + component -> same name (stability)");
+    assert_eq!(a.len(), 12, "12 hex chars");
+    assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+    assert_ne!(a, anonymize(b"other", "git.netrc"), "salt changes the name");
+    assert_ne!(anonymize(b"salt", "a"), anonymize(b"salt", "b"));
+    assert_eq!(anonymize_path(b"s", "x/y/z.txt").split('/').count(), 3, "structure preserved");
+}
+
+
     #[test]
     fn collapse_to_first_points_of_difference_issue_example_1() {
         let got = collapse_paths(&[

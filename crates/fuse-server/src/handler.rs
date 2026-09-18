@@ -21,7 +21,7 @@ pub fn handle_command(cmd: Command, state: &ServerState, hub: &crate::oracle_ser
             // MR4: register by stat — the policy daemon holds the host
             // PATH and identity, never bytes (see register_secret).
             match register_secret(state, hub, &name, &path, &hash, mode) {
-                Ok(()) => Response::Ok,
+                Ok(inner) => Response::Added { inner },
                 Err(e) => Response::Error { message: e },
             }
         }
@@ -105,7 +105,7 @@ fn register_secret(
     path: &str,
     hash: &str,
     mode: u32,
-) -> Result<(), String> {
+) -> Result<String, String> {
     let host = std::fs::canonicalize(path)
         .map_err(|e| format!("cannot resolve {path}: {e}"))?;
     let md = std::fs::metadata(&host)
@@ -115,9 +115,11 @@ fn register_secret(
     }
     state.add_with_mode(name, host, md.len() as usize, hash, mode & 0o777);
     // Serve carries structure only — the identity's wire crossings
-    // are StatOk (down) and Open (up), each with a job.
-    hub.serve(name, mode & 0o777);
-    Ok(())
+    // are StatOk (down) and Open (up), each with a job — plus the
+    // anonymized container-view path (issue #47).
+    let inner = fuse_protocol::anonymize_path(&state.anon_salt, name);
+    hub.serve(name, &inner, mode & 0o777);
+    Ok(inner)
 }
 #[cfg(test)]
 mod tests {
@@ -185,7 +187,7 @@ mod tests {
             &s,
             &hub(),
         );
-        assert_eq!(resp, Response::Ok);
+        assert!(matches!(resp, Response::Added { .. }));
 
         // grant-forever round trip on a pending with a package hash
         s.add("k", "/tmp/host/k", 1, "h");

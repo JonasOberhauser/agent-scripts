@@ -95,8 +95,14 @@ pub enum OracleCommand {
     /// allocates its fuse inode from (kdev, kino) and refreshes it on
     /// every stat/open. No content: bytes live only in fds passed at
     /// Open. `mode` is wire-optional as before (older senders).
+    /// `inner` is the CONTAINER-VIEW path (issue #47): the
+    /// anonymized form of `name`, same component structure, each
+    /// component `anonymize`d under the install salt. The mount tree
+    /// is keyed by `name` (the policy/display language stays clear);
+    /// lookup and readdir inside the container speak `inner` only.
     Serve {
         name: String,
+        inner: String,
         #[serde(default = "crate::protocol::default_secret_mode")]
         mode: u32,
     },
@@ -143,9 +149,16 @@ mod tests {
         // Serve announces a NAME for the tree; identity crosses the
         // wire only where it has a job (StatOk down, Open up). The
         // shape is name (+ optional mode) — nothing else.
-        let line = r#"{"type":"serve","name":"g/one.json","mode":384}"#;
+        let line = r#"{"type":"serve","name":"g/one.json","inner":"a1/f2","mode":384}"#;
         let cmd: OracleCommand = serde_json::from_str(line).expect("serve parses");
-        assert_eq!(cmd, OracleCommand::Serve { name: "g/one.json".into(), mode: 0o600 });
+        assert_eq!(
+            cmd,
+            OracleCommand::Serve {
+                name: "g/one.json".into(),
+                inner: "a1/f2".into(),
+                mode: 0o600,
+            }
+        );
     }
 
 
@@ -153,13 +166,15 @@ mod tests {
     fn serve_without_mode_parses_with_conservative_default() {
         // Wire-optional mode (older senders keep working; the
         // conservative 0o400 default matches the client contract).
-        let back: OracleCommand = serde_json::from_str(
-            r#"{"type":"serve","name":"s.yaml","identity":{"kdev":52,"kino":9}}"#,
-        )
-        .unwrap();
+        let back: OracleCommand =
+            serde_json::from_str(r#"{"type":"serve","name":"s.yaml","inner":"x9"}"#).unwrap();
         assert_eq!(
             back,
-            OracleCommand::Serve { name: "s.yaml".into(), mode: 0o400 }
+            OracleCommand::Serve {
+                name: "s.yaml".into(),
+                inner: "x9".into(),
+                mode: 0o400,
+            }
         );
     }
 
@@ -175,6 +190,7 @@ mod tests {
             .unwrap(),
             serde_json::to_string(&OracleCommand::Serve {
                 name: "s.yaml".into(),
+                inner: "a9".into(),
                 mode: 0o400,
             })
             .unwrap(),
@@ -198,7 +214,11 @@ mod tests {
         let back: OracleCommand = serde_json::from_str(&msgs[1]).unwrap();
         assert_eq!(
             back,
-            OracleCommand::Serve { name: "s.yaml".into(), mode: 0o400 }
+            OracleCommand::Serve {
+                name: "s.yaml".into(),
+                inner: "a9".into(),
+                mode: 0o400,
+            }
         );
         let back: OracleCommand = serde_json::from_str(&msgs[2]).unwrap();
         assert_eq!(back, OracleCommand::Remove { name: "s.yaml".into() });
