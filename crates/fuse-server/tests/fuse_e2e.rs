@@ -447,14 +447,21 @@ fn e2e_grants_survive_a_policy_daemon_kill() {
     let mut cmd = std::process::Command::new(bin("fuse-server"));
     cmd.arg("--socket").arg(&split.socket)
         .arg("--oracle-socket").arg(&split.oracle)
+        .arg("--pending-timeout").arg("5")
         .arg("--secret").arg(format!("s:{}", split.source_path("s").display()))
         .arg("*")
         .env("FUSE_GATEKEEPER_POLICY", split._dirs[1].path().join("policy.json"))
         .stdout(std::process::Stdio::from(server_log2.try_clone().unwrap()))
         .stderr(server_log2);
     let mut child = cmd.spawn().expect("respawn fuse-server");
-    for _ in 0..200 {
-        if split.socket.exists() { break; }
+    // `exists()` is satisfied by the STALE socket file of the killed
+    // server — wait for a live accept instead (the harness's
+    // wait_connect semantics).
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        if std::os::unix::net::UnixStream::connect(&split.socket).is_ok() {
+            break;
+        }
         std::thread::sleep(Duration::from_millis(50));
     }
 
