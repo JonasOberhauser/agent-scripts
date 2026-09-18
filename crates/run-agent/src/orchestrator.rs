@@ -374,6 +374,14 @@ where
                 "--mount-point", mount,
                 "--socket", sock,
             ];
+            let oracle_arg: Option<String> = config
+                .oracle_socket
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned());
+            if let Some(oracle) = oracle_arg.as_deref() {
+                fuse_args.push("--oracle-socket");
+                fuse_args.push(oracle);
+            }
             fuse_args.push("--log-level");
             let log_level_str = config.log_level.clone();
             fuse_args.push(&log_level_str);
@@ -1147,6 +1155,7 @@ mod tests {
 
     fn test_config() -> AgentConfig {
         AgentConfig {
+            oracle_socket: None,
             binary_hash: "abc123".into(),
             secrets: vec![SecretMapping {
                 host: PathBuf::from("/home/user/secrets.yaml"),
@@ -1913,6 +1922,39 @@ mod tests {
     }
 
     // ── spawn argv validation ────────────────────────────────────
+
+    #[test]
+    fn oracle_socket_passthrough_isolates_the_stack() {
+        // The oracle rendezvous must be passable per stack: harnesses
+        // and second projects point it at their own tempdir so a live
+        // gatekeeper can never collide with a spawned test server
+        // (field report: exactly that collision killed every spawn).
+        let mut mock = base_mock().with_file("/home/user/secrets.yaml", b"DATA");
+        let mut cfg = test_config();
+        cfg.oracle_socket = Some(std::path::PathBuf::from("/tmp/.tmpXYZ/oracle.sock"));
+        let _ = run_agent(&mut mock, &cfg, &|_, _| Ok(String::new()), false);
+        let args: Vec<String> = mock
+            .spawned
+            .iter()
+            .flat_map(|(_, a)| a.iter().map(|s| s.to_string()))
+            .collect();
+        let i = args.iter().position(|a| a == "--oracle-socket");
+        assert!(i.is_some(), "spawn passes --oracle-socket when set: {args:?}");
+        assert_eq!(args[i.unwrap() + 1], "/tmp/.tmpXYZ/oracle.sock");
+        // and absent when unset
+        let mut mock2 = base_mock().with_file("/home/user/secrets.yaml", b"DATA");
+        let _ = run_agent(&mut mock2, &test_config(), &|_, _| Ok(String::new()), false);
+        let args2: Vec<String> = mock2
+            .spawned
+            .iter()
+            .flat_map(|(_, a)| a.iter().map(|s| s.to_string()))
+            .collect();
+        assert!(
+            !args2.iter().any(|a| a == "--oracle-socket"),
+            "unset keeps the server default (production single-stack): {args2:?}"
+        );
+    }
+
 
                 
     #[test]

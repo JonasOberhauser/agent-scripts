@@ -133,6 +133,8 @@ struct Seam {
     ws: PathBuf,
     fuse_server: PathBuf,
     socket: PathBuf,
+    oracle_socket: PathBuf,
+    policy_store: PathBuf,
     mount_point: PathBuf,
     state: PathBuf,
     home: PathBuf,
@@ -172,12 +174,17 @@ impl Seam {
             ),
         )
         .expect("write storage.conf");
+        let root2 = dir.path().join(tag);
+        let oracle_socket = root2.join("oracle.sock");
+        let policy_store = root2.join("policy.json");
         Seam {
             fuse_server: compile_stub_fuse_server(dir.path()),
             ws,
             socket: root.join("socket"),
             mount_point,
             state: root.join("state.json"),
+            oracle_socket,
+            policy_store,
             home,
             xdg_runtime,
             storage_conf,
@@ -228,6 +235,8 @@ impl Seam {
         .arg(&self.fuse_server)
         .arg("--socket")
         .arg(&self.socket)
+        .arg("--oracle-socket")
+        .arg(&self.oracle_socket)
         .arg("--mount-point")
         .arg(&self.mount_point)
         .env("HOME", &self.home)
@@ -237,6 +246,7 @@ impl Seam {
         .env("XDG_RUNTIME_DIR", &self.xdg_runtime)
         .env("CONTAINERS_STORAGE_CONF", &self.storage_conf)
         .env("FUSE_GATEKEEPER_STATE", &self.state)
+        .env("FUSE_GATEKEEPER_POLICY", &self.policy_store)
         .env("RUST_LOG", "error")
         .current_dir(&self.ws)
         .stdin(Stdio::null())
