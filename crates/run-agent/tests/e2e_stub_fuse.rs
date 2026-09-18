@@ -39,74 +39,23 @@ use std::time::{Duration, Instant};
 
 // ── stub fuse-server (compiled at test time) ────────────────────
 
-// The stub is RUST, compiled by the toolchain the suite already
-// requires (rustc): the host intentionally has no C compiler
-// (Silverblue-style minimalism), and demanding one for a test double
-// kept this tier from ever running on the host — toolbox-only.
-// A single-file, zero-dependency binary builds in about a second.
-const STUB_RUST: &str = r#"
-use std::io::{Read, Write};
-use std::os::unix::net::UnixListener;
-use std::path::PathBuf;
 
-fn main() {
-    let mut path: Option<PathBuf> = None;
-    let mut args = std::env::args().skip(1);
-    while let Some(a) = args.next() {
-        if a == "--socket" {
-            path = args.next().map(PathBuf::from);
-        }
-    }
-    let path = match path {
-        Some(p) => p,
-        None => { eprintln!("stub: --socket required"); std::process::exit(2); }
-    };
-    let _ = std::fs::remove_file(&path);
-    let listener = match UnixListener::bind(&path) {
-        Ok(l) => l,
-        Err(e) => { eprintln!("stub: bind {}: {e}", path.display()); std::process::exit(3); }
-    };
-    // Accept and hold the socket for up to 60s so no detached stub
-    // outlives the test session.
-    for _ in 0..600 {
-        if let Ok((mut conn, _)) = listener.accept() {
-            let mut buf = [0u8; 4096];
-            if let Ok(n) = conn.read(&mut buf) {
-                let line = String::from_utf8_lossy(&buf[..n]).into_owned();
-                if line.starts_with("add ") {
-                    let name = line.split_whitespace().nth(1).unwrap_or_default().to_string();
-                    let _ = writeln!(conn, "{{\"type\":\"added\",\"inner\":\"stub-{name}\"}}");
-                } else {
-                    let _ = writeln!(conn, "{{\"type\":\"ok\"}}");
-                }
-            }
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-}
-"#;
 
-fn compile_stub_fuse_server(dir: &Path) -> PathBuf {
-    let src = dir.join("stub-fuse-server.rs");
-    std::fs::write(&src, STUB_RUST).expect("write stub source");
-    let bin = dir.join("stub-fuse-server");
-    // rustc, not cc: the suite already requires the Rust toolchain,
-    // and minimal hosts intentionally ship no C compiler.
-    let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into());
-    let out = Command::new(&rustc)
-        .arg("-O")
-        .arg("-o")
-        .arg(&bin)
-        .arg(&src)
-        .output()
-        .unwrap_or_else(|e| panic!("refusing to skip: rustc not runnable for the fuse stub: {e}"));
+fn compile_stub_fuse_server(_dir: &Path) -> PathBuf {
+    // The stub is a cargo EXAMPLE (crates/run-agent/examples/): cargo
+    // builds it under plain `cargo test` with the workspace's own
+    // linker configuration — a bare `rustc` invocation fails on hosts
+    // whose linker setup differs from cargo's (gcc-less minimal
+    // hosts: "linker `cc` not found").
+    let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/debug/examples/stub-fuse-server");
     assert!(
-        out.status.success(),
-        "stub compilation failed:\n{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr),
+        p.exists(),
+        "cargo-built stub example missing at {} — `cargo test` builds examples; \
+         `cargo build --examples` if it was cleaned",
+        p.display()
     );
-    bin
+    p
 }
 
 // ── shared runner ───────────────────────────────────────────────
