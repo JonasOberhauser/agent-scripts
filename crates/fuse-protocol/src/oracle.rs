@@ -21,6 +21,25 @@ pub struct KDev(pub u64);
 #[serde(transparent)]
 pub struct Kino(pub u64);
 
+/// A host file's identity: (device, inode) of one live incarnation.
+/// Absence is expressed with `Option` — never with an in-band
+/// sentinel like (0, 0): a ghost (policy loaded, host file missing)
+/// simply has NO identity until the first stat-on-lookup discovers
+/// one (review: C idioms don't belong in this codebase).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostIdentity {
+    pub kdev: KDev,
+    pub kino: Kino,
+}
+
+/// Identity crosses this wire exactly where it has a job: DOWN in
+/// `StatOk` (the fresh observation — fused's only source of a current
+/// identity) and UP in `Open` (the fino's recorded identity, verified
+/// against the descriptor the server actually opens). `Serve` carries
+/// STRUCTURE only: a name entering the tree; readdir needs an ino
+/// NUMBER, not an identity, and the first lookup's Stat supplies one
+/// regardless.
+///
 /// fused → policy daemon.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -78,8 +97,6 @@ pub enum OracleCommand {
     /// Open. `mode` is wire-optional as before (older senders).
     Serve {
         name: String,
-        kdev: KDev,
-        kino: Kino,
         #[serde(default = "crate::protocol::default_secret_mode")]
         mode: u32,
     },
@@ -119,20 +136,32 @@ pub enum OracleReply {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn serve_carries_structure_only() {
+        // Serve announces a NAME for the tree; identity crosses the
+        // wire only where it has a job (StatOk down, Open up). The
+        // shape is name (+ optional mode) — nothing else.
+        let line = r#"{"type":"serve","name":"g/one.json","mode":384}"#;
+        let cmd: OracleCommand = serde_json::from_str(line).expect("serve parses");
+        assert_eq!(cmd, OracleCommand::Serve { name: "g/one.json".into(), mode: 0o600 });
+    }
+
+
     #[test]
     fn serve_without_mode_parses_with_conservative_default() {
         // Wire-optional mode (older senders keep working; the
         // conservative 0o400 default matches the client contract).
-        let back: OracleCommand =
-            serde_json::from_str(r#"{"type":"serve","name":"s.yaml","kdev":52,"kino":9}"#).unwrap();
+        let back: OracleCommand = serde_json::from_str(
+            r#"{"type":"serve","name":"s.yaml","identity":{"kdev":52,"kino":9}}"#,
+        )
+        .unwrap();
         assert_eq!(
             back,
-            OracleCommand::Serve { name: "s.yaml".into(), kdev: KDev(52), kino: Kino(9), mode: 0o400 }
+            OracleCommand::Serve { name: "s.yaml".into(), mode: 0o400 }
         );
     }
-
-
-    use super::*;
 
     #[test]
     fn round_trips_every_message() {
@@ -146,8 +175,6 @@ mod tests {
             .unwrap(),
             serde_json::to_string(&OracleCommand::Serve {
                 name: "s.yaml".into(),
-                kdev: KDev(52),
-                kino: Kino(9),
                 mode: 0o400,
             })
             .unwrap(),
@@ -171,7 +198,7 @@ mod tests {
         let back: OracleCommand = serde_json::from_str(&msgs[1]).unwrap();
         assert_eq!(
             back,
-            OracleCommand::Serve { name: "s.yaml".into(), kdev: KDev(52), kino: Kino(9), mode: 0o400 }
+            OracleCommand::Serve { name: "s.yaml".into(), mode: 0o400 }
         );
         let back: OracleCommand = serde_json::from_str(&msgs[2]).unwrap();
         assert_eq!(back, OracleCommand::Remove { name: "s.yaml".into() });

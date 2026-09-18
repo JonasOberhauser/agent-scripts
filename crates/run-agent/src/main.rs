@@ -39,7 +39,7 @@ struct Cli {
     fuse_server: PathBuf,
 
     /// Unix socket path for the shared fuse-server.
-    #[arg(long, default_value = DEFAULT_SOCKET, env = "FUSE_GATEKEEPER_SOCKET")]
+    #[arg(long, default_value = DEFAULT_SOCKET, env = fuse_protocol::ENV_CMD_SOCKET)]
     socket: PathBuf,
 
     /// FUSE mount point (shared across projects).

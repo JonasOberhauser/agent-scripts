@@ -22,7 +22,7 @@ struct Cli {
     /// mounting is the data daemon's job now.
     #[arg(short, long)]
     mount_point: Option<PathBuf>,
-    #[arg(short, long, default_value = "/tmp/fuse-gatekeeper.sock")]
+    #[arg(short, long, default_value = fuse_protocol::DEFAULT_CMD_SOCKET)]
     socket: PathBuf,
     #[arg(long, value_name = "NAME:FILE:HASH")]
     secret: Vec<String>,
@@ -32,7 +32,7 @@ struct Cli {
     log_level: String,
     #[arg(long, default_value_t = 300)]
     pending_timeout: u64,
-    #[arg(long, default_value = "/tmp/fuse-gatekeeper.log")]
+    #[arg(long, default_value = fuse_protocol::DEFAULT_LOG_PATH)]
     log_path: PathBuf,
     /// Socket where the data daemon (fused) connects for adjudication
     /// and content updates.
@@ -147,6 +147,25 @@ fn main() {
     let mut state = ServerState::new();
     state.pending_timeout = std::sync::Mutex::new(Duration::from_secs(cli.pending_timeout));
     state.log_path = cli.log_path.to_string_lossy().to_string();
+    // MR5: arm persistence and LOAD BEFORE ANY SOCKET ACCEPTS — a
+    // grant decided against unloaded state is the bug class this
+    // exists to kill. (CLI secrets load after; adds JOIN their hash
+    // sets per the overwrite semantics, so nothing loaded is lost.)
+    state.policy_path = Some(fuse_server::policy_store::policy_path());
+    {
+        use fuse_server::policy_store;
+        let hub = OracleHub::clone(&fuse_server::ORACLE_HUB);
+        let report = policy_store::load(&mut state, &hub);
+        info!(
+            "  policy store:    {} restored, {} ghosts{}",
+            report.restored,
+            report.ghosts,
+            if report.corrupted { " — CORRUPT FILE RENAMED ASIDE, STARTED FRESH" }
+            else if report.unreadable { " — UNREADABLE, PERSISTENCE DISARMED (nothing will overwrite it)" }
+            else { "" }
+        );
+    }
+
     let hub = OracleHub::clone(&fuse_server::ORACLE_HUB);
     for spec in &cli.secret {
         match parse_secret(spec) {
@@ -166,7 +185,7 @@ fn main() {
                     md.ino()
                 );
                 state.add_with_mode(&name, host.clone(), md.len() as usize, &hash, 0o400);
-                hub.serve(&name, fuse_protocol::KDev(md.dev()), fuse_protocol::Kino(md.ino()), 0o400);
+                hub.serve(&name, 0o400);
             }
             Err(e) => {
                 error!("Bad --secret '{spec}': {e}");
