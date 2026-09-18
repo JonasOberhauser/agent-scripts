@@ -332,6 +332,54 @@ fn fully_qualified_missing_image_handled_diagnosably() {
 // ("Failed to create container"), on capable ones the container exists.
 
 #[test]
+#[ignore = "needs real podman; run with --ignored on a capable host"]
+fn secret_wiring_follows_the_server_reported_inner_name() {
+    // The gap that let #47 ship half-wired: every tier tested one
+    // half against a double for the other. This one closes the loop
+    // at the seam level — the stub now ANSWERS Added{inner} (a
+    // contract double, not a connection-closing void), the harness
+    // pre-creates the INNER name in the fake mount, and the run must
+    // succeed: preflight stats the server-reported path, not the
+    // outer form (which does not exist in the mount dir).
+    assert!(
+        Command::new("podman")
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false),
+        "refusing to skip: this test needs a real podman on PATH"
+    );
+    let dir = tempfile::tempdir().expect("tempdir");
+    let seam = Seam::new(&dir, "inner");
+
+    let host_secret = seam.ws.join("secrets.yaml");
+    std::fs::write(&host_secret, b"DATA").expect("write host secret");
+    // ONLY the inner form exists in the mount — the outer name is
+    // absent on purpose: preflight stat'ing it would fail the run.
+    std::fs::write(seam.mount_point.join("stub-secrets.yaml"), b"DATA")
+        .expect("pre-create the INNER mount entry");
+
+    let out = seam.run_with(
+        Some("agentbox"),
+        60,
+        &[
+            "--secret",
+            &format!("{}:/root/secrets.yaml", host_secret.display()),
+        ],
+        None,
+    );
+    let _ = std::io::stderr().write_all(out.combined.as_bytes());
+    assert!(
+        !out.combined.contains("never visible in the FUSE mount"),
+        "preflight stat'ed the OUTER form — the #47 half-wiring is back:\n{}",
+        out.combined
+    );
+}
+
+#[test]
 #[ignore = "needs real podman with registry egress; run with --ignored on a capable host"]
 fn auto_yes_builds_trivial_image_and_reaches_creation() {
     assert!(
