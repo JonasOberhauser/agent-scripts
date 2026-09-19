@@ -9,6 +9,16 @@ use std::sync::Arc;
 use fuse_protocol::VERSION;
 use fuse_server::{run_socket_server, ServerState};
 
+/// Test files belong under cargo's per-target scratch dir
+/// (CARGO_TARGET_TMPDIR), not shared /tmp — no collisions with other
+/// worktrees/checkouts, and shorter socket paths for sun_path.
+fn test_tempdir() -> tempfile::TempDir {
+    match std::env::var_os("CARGO_TARGET_TMPDIR") {
+        Some(base) => tempfile::tempdir_in(base).expect("tempdir under CARGO_TARGET_TMPDIR"),
+        None => tempfile::tempdir().expect("tempdir"),
+    }
+}
+
 fn client_binary() -> PathBuf {
     let manifest = env!("CARGO_MANIFEST_DIR");
     Path::new(manifest).join("../../target/debug/fuse-client")
@@ -99,7 +109,7 @@ fn wait_for_server(socket: &Path) {
 
 #[test]
 fn e2e_client_binary_against_server() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = test_tempdir();
     let socket = dir.path().join("e2e.sock");
 
     // Start socket server with one pre-loaded secret
@@ -218,7 +228,7 @@ fn e2e_client_binary_against_server() {
 /// LIVE and succeed on the very same pending.
 #[test]
 fn grant_forever_retries_hashd_after_remediation() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = test_tempdir();
     let socket = dir.path().join("remediation.sock");
     let hashd_sock = dir.path().join("hashd.sock");
 
@@ -297,7 +307,7 @@ fn restart_spares_processes_that_mention_fuse_server() {
     // blast radius contained: state file in a tempdir (ENV override),
     // server_binary /bin/true, mount and socket in the tempdir. With
     // the substring kill, the marked sleep dies and this fails.
-    let dir = tempfile::tempdir().unwrap();
+    let dir = test_tempdir();
     let dead_socket = dir.path().join("dead.sock");
 
     // $0 carries the marker: the argv mentions "fuse-server" while the
@@ -334,7 +344,7 @@ fn restart_respawns_on_the_state_files_oracle_rendezvous() {
     // no mount is needed), rendezvous asserted by CONNECTING to it.
     // With the rendezvous dropped from the respawn argv, the oracle
     // socket never listens and this fails.
-    let dir = tempfile::tempdir().unwrap();
+    let dir = test_tempdir();
     let cmd_sock = dir.path().join("cmd.sock");
     let oracle_sock = dir.path().join("oracle.sock");
 
