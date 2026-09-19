@@ -435,15 +435,27 @@ fn rootless_userns_cannot_follow_map_files() {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
+    // The inner run must fail FOR THE RIGHT REASON — the map_files
+    // capability gate — not merely fail. A bare !success would pass
+    // on any environmental inner failure (agent spawn under fork
+    // pressure, unshare quirks), which is how this test once showed
+    // up as an undiagnosable bare FAILED under a loaded harness run.
     assert!(
-        !out.status.success(),
-        "hashing inside a rootless userns must fail closed — \
-         the kernel demands init-ns CAP_SYS_ADMIN/CAP_CHECKPOINT_RESTORE"
+        names_the_map_files_gate(&text),
+        "hashing inside a rootless userns must fail closed at the \
+         map_files gate (init-ns CAP_SYS_ADMIN/CAP_CHECKPOINT_RESTORE). \
+         Inner status: {:?}\nInner output:\n{text}",
+        out.status.code()
     );
-    assert!(
-        text.contains("map_files"),
-        "the fail-closed error must name the blocked source:\n{text}"
-    );
+}
+
+/// Whether a fail-closed inner report names the ACTUAL blocked source
+/// (map_files and the capability requirement) — the right reason —
+/// as opposed to an unrelated environmental failure.
+fn names_the_map_files_gate(report: &str) -> bool {
+    report.contains("map_files")
+        && (report.contains("CAP_SYS_ADMIN") || report.contains("CAP_CHECKPOINT_RESTORE"))
+        && !report.contains("spawn ssh-agent")
 }
 
 // ── failure modes ─────────────────────────────────────────────────
@@ -459,4 +471,30 @@ fn dead_pid_fails_closed() {
         io.sha256_process_package(pid).is_err(),
         "a reaped pid must fail closed"
     );
+}
+
+// ── rootless-userns classification ───────────────────────────────
+
+#[test]
+fn gate_classifier_accepts_the_real_fail_closed_report() {
+    // The exact shape RealSystemIo produces when the kernel blocks the
+    // follow (observed live on kernel 6.19): names map_files AND the
+    // capability requirement.
+    let real = r#"IoError("read mapped /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 via /proc/153702/map_files/7fbc0f748000-7fbc0f749000: Operation not permitted (os error 1) — refusing to hash a package with unreadable mappings. Following /proc/<pid>/map_files requires CAP_SYS_ADMIN or CAP_CHECKPOINT_RESTORE in the INITIAL user namespace")"#;
+    assert!(names_the_map_files_gate(real));
+}
+
+#[test]
+fn gate_classifier_rejects_environmental_failures() {
+    // An inner that fails for the WRONG reason (agent could not be
+    // spawned — fork pressure under a loaded harness run) must NOT
+    // satisfy the security assertion: "failed" is not "failed for the
+    // right reason".
+    assert!(
+        !names_the_map_files_gate("inner: spawn ssh-agent: No such file or directory (os error 2)")
+    );
+    // ...nor an empty report, nor one naming the gate without the
+    // capability context.
+    assert!(!names_the_map_files_gate(""));
+    assert!(!names_the_map_files_gate("something about map_files only"));
 }
