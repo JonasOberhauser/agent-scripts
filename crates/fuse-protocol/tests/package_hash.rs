@@ -76,6 +76,15 @@ fn missing(bin: &str) -> bool {
 }
 
 /// `ssh-agent -D`: a foreground daemon — stays loaded until killed.
+///
+/// The fixture waits for the package to be FULLY LOADED before it is
+/// usable: hashing races the dynamic loader otherwise — a process
+/// caught in early startup (state D, ~5 mappings, no libraries yet)
+/// needs ZERO map_files follows (the exe is read via /proc/pid/exe,
+/// gated by ptrace only), so the package hash silently degenerates to
+/// an exe-only hash that SUCCEEDS where the capability gate should
+/// deny. Observed intermittently in the field (deterministic exe-only
+/// hash value); the barrier removes the window structurally.
 fn ssh_agent() -> Option<Fixture> {
     if missing("ssh-agent") {
         eprintln!("skip: ssh-agent not on PATH");
@@ -88,6 +97,21 @@ fn ssh_agent() -> Option<Fixture> {
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn ssh-agent");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let maps = std::fs::read_to_string(format!("/proc/{}/maps", child.id()))
+            .expect("read agent maps while waiting for the loader");
+        // A fully-loaded package maps its libraries (ld.so, libc, ...).
+        if maps.lines().any(|l| l.contains(".so")) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "ssh-agent never finished loading (no mapped libraries after 10s) — \
+             cannot hash a half-loaded package"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
     let exe = exe_path("ssh-agent", child.id());
     let _stdin = child.stdin.take();
     Some(Fixture { child, _stdin, exe })
