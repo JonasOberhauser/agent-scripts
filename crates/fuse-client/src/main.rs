@@ -421,16 +421,22 @@ fn restart_server(app: &App, log_path: Option<&str>) {
         unsafe {
             libc::kill(pid, libc::SIGTERM);
         }
-    }
-    // Orphan fallback: exact process-NAME match only.
-    if let Some(w) = &state.runtime_wrapper {
-        let wparts: Vec<&str> = w.split_whitespace().collect();
-        let mut kill_args: Vec<&str> = wparts[1..].to_vec();
-        kill_args.extend(kill.pkill_argv.iter().copied());
-        let _ = std::process::Command::new(wparts[0]).args(&kill_args).output();
     } else {
-        let (prog, args) = kill.pkill_argv.split_first().expect("non-empty argv");
-        let _ = std::process::Command::new(prog).args(args).output();
+        // No recorded pid (pre-#59 state file): fall back to an exact
+        // process-NAME match — and ONLY then. The by-name sweep must
+        // not run when the pid is known: it kills EVERY fuse-server on
+        // the machine (observed live: a restart under `cargo test`
+        // took down the developer's production gate stack, and its
+        // fused with it). Full precise targeting is #62.
+        if let Some(w) = &state.runtime_wrapper {
+            let wparts: Vec<&str> = w.split_whitespace().collect();
+            let mut kill_args: Vec<&str> = wparts[1..].to_vec();
+            kill_args.extend(kill.pkill_argv.iter().copied());
+            let _ = std::process::Command::new(wparts[0]).args(&kill_args).output();
+        } else {
+            let (prog, args) = kill.pkill_argv.split_first().expect("non-empty argv");
+            let _ = std::process::Command::new(prog).args(args).output();
+        }
     }
     std::thread::sleep(std::time::Duration::from_secs(2));
 
