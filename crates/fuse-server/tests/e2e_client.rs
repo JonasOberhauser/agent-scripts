@@ -99,10 +99,22 @@ fn sacrificial_server_pid() -> std::process::Child {
 fn fuse_server_named_bystander(dir: &Path) -> std::process::Child {
     let faux = dir.join("fuse-server");
     std::fs::copy("/usr/bin/sleep", &faux).expect("copy sleep as fuse-server");
-    Command::new(&faux)
-        .arg("120")
-        .spawn()
-        .expect("spawn bystander named fuse-server")
+    // ETXTBSY: exec of a file the filesystem still holds from the copy
+    // just before — a classic just-written-then-exec'd transient on
+    // shared-runner storage. Bounded retry rather than a race.
+    for attempt in 0..20 {
+        match Command::new(&faux).arg("120").spawn() {
+            Ok(child) => return child,
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(e) => panic!("spawn bystander named fuse-server (attempt {attempt}): {e}"),
+        }
+    }
+    panic!(
+        "spawn bystander named fuse-server: still Text file busy after 20 attempts — \
+         the copy is being held open by something else"
+    )
 }
 
 fn write_state_with_pid(dir: &Path, socket: &Path, oracle: Option<&str>, server_pid: u32) {
