@@ -116,9 +116,14 @@ fn failed_fd_pass_does_not_wedge_the_oracle() {
     // follow-up, as an operator would.
     state.reset(Some("s"));
 
-    // The oracle still serves a fresh open: Allow + fd.
+    // The oracle still serves a fresh open: Allow + fd. The wait is
+    // BOUNDED: if the reply never comes, fail with context instead of
+    // hanging past the harness's 60s notice (the same discipline as
+    // fused's OPEN_REPLY_TIMEOUT — an unbounded recv here once turned
+    // a lost reply into an undiagnosable hang).
     use std::os::unix::io::{AsRawFd, FromRawFd};
     let mut c = std::os::unix::net::UnixStream::connect(&oracle).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
     writeln!(
         c,
         "{}",
