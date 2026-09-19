@@ -9,6 +9,16 @@ use std::sync::Arc;
 use fuse_protocol::VERSION;
 use fuse_server::{run_socket_server, ServerState};
 
+/// Test files belong under cargo's per-target scratch dir
+/// (CARGO_TARGET_TMPDIR), not shared /tmp — no collisions with other
+/// worktrees/checkouts, and shorter socket paths for sun_path.
+fn test_tempdir() -> tempfile::TempDir {
+    match std::env::var_os("CARGO_TARGET_TMPDIR") {
+        Some(base) => tempfile::tempdir_in(base).expect("tempdir under CARGO_TARGET_TMPDIR"),
+        None => tempfile::tempdir().expect("tempdir"),
+    }
+}
+
 fn client_binary() -> PathBuf {
     let manifest = env!("CARGO_MANIFEST_DIR");
     Path::new(manifest).join("../../target/debug/fuse-client")
@@ -29,6 +39,64 @@ fn run_client(socket: &Path, args: &[&str]) -> (String, String, i32) {
     )
 }
 
+/// Serializes tests that touch process-global env (ENV_STATE_FILE):
+/// cargo runs tests in one binary in parallel, and set_var is global.
+static STATE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Run `f` with the state file redirected into `dir` — the blast
+/// radius of a real `fuse-client restart` (pkill, socket/mount
+/// cleanup, respawn) never touches the machine's global paths.
+fn with_state_file_in<T>(dir: &Path, f: impl FnOnce() -> T) -> T {
+    // Poison-tolerant: a panic in one test must not break the other's
+    // locking, and the env MUST be restored even on panic.
+    let _guard = STATE_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    struct Restore(Option<std::ffi::OsString>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(p) => std::env::set_var(fuse_protocol::ENV_STATE_FILE, p),
+                None => std::env::remove_var(fuse_protocol::ENV_STATE_FILE),
+            }
+        }
+    }
+    let _restore = Restore(std::env::var_os(fuse_protocol::ENV_STATE_FILE));
+    std::env::set_var(
+        fuse_protocol::ENV_STATE_FILE,
+        dir.join("state.json").to_string_lossy().into_owned(),
+    );
+    f()
+}
+
+fn write_state(dir: &Path, socket: &Path, oracle: Option<&str>) {
+    let state = serde_json::json!({
+        "version": VERSION,
+        "server_pid": 0,
+        "server_binary": "/bin/true",
+        "mount_point": dir.join("mnt").to_string_lossy(),
+        "socket": socket.to_string_lossy(),
+        "log_level": "info",
+        "pending_timeout": 300,
+        "runtime_wrapper": null,
+        "oracle_socket": oracle,
+        "secrets": [],
+    });
+    std::fs::create_dir_all(dir.join("mnt")).unwrap();
+    std::fs::write(dir.join("state.json"), state.to_string()).unwrap();
+}
+
+fn wait_for_socket(path: &Path, what: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if std::os::unix::net::UnixStream::connect(path).is_ok() {
+            return;
+        }
+        if std::time::Instant::now() > deadline {
+            panic!("{what} never came up at {}", path.display());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
 fn wait_for_server(socket: &Path) {
     for _ in 0..200 {
         if socket.exists() && std::os::unix::net::UnixStream::connect(socket).is_ok() {
@@ -41,7 +109,7 @@ fn wait_for_server(socket: &Path) {
 
 #[test]
 fn e2e_client_binary_against_server() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = test_tempdir();
     let socket = dir.path().join("e2e.sock");
 
     // Start socket server with one pre-loaded secret
@@ -160,7 +228,7 @@ fn e2e_client_binary_against_server() {
 /// LIVE and succeed on the very same pending.
 #[test]
 fn grant_forever_retries_hashd_after_remediation() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = test_tempdir();
     let socket = dir.path().join("remediation.sock");
     let hashd_sock = dir.path().join("hashd.sock");
 
@@ -226,4 +294,88 @@ fn grant_forever_retries_hashd_after_remediation() {
 
     let _ = stub;
     std::env::remove_var("FUSE_HASHD_SOCK");
+}
+
+#[test]
+fn restart_spares_processes_that_mention_fuse_server() {
+    // BEHAVIOR: an innocent process whose command line merely mentions
+    // "fuse-server" survives a real `fuse-client restart`. This is the
+    // observed-live bug — `pkill -f fuse-server` matched any argv
+    // containing the string, and a restart running under
+    // `cargo test -p fuse-server` killed its own test runner —
+    // reproduced here with a marked sleep and the REAL client binary,
+    // blast radius contained: state file in a tempdir (ENV override),
+    // server_binary /bin/true, mount and socket in the tempdir. With
+    // the substring kill, the marked sleep dies and this fails.
+    let dir = test_tempdir();
+    let dead_socket = dir.path().join("dead.sock");
+
+    // $0 carries the marker: the argv mentions "fuse-server" while the
+    // process itself is an innocent sleep.
+    let mut innocent = Command::new("sh")
+        .arg("-c")
+        .arg("sleep 60")
+        .arg("fuse-server-in-argv-only")
+        .spawn()
+        .expect("spawn innocent");
+
+    with_state_file_in(dir.path(), || {
+        write_state(dir.path(), &dead_socket, None);
+        // Bounded by the client's own 10s server wait (/bin/true).
+        let _ = run_client(&dead_socket, &["restart"]);
+    });
+
+    let alive = innocent.try_wait().map(|w| w.is_none()).unwrap_or(false);
+    let _ = innocent.kill();
+    let _ = innocent.wait();
+    assert!(
+        alive,
+        "an innocent process whose argv merely mentions fuse-server was killed by restart"
+    );
+}
+
+#[test]
+fn restart_respawns_on_the_state_files_oracle_rendezvous() {
+    // BEHAVIOR: a stack recorded with an oracle override comes back on
+    // THAT rendezvous — the surviving data daemon retries its socket
+    // forever, so a respawn on the global default leaves an alive
+    // mount that never syncs again (#59 review finding). Real client,
+    // real fuse-server (policy-only: no --mount-point, so no fused and
+    // no mount is needed), rendezvous asserted by CONNECTING to it.
+    // With the rendezvous dropped from the respawn argv, the oracle
+    // socket never listens and this fails.
+    let dir = test_tempdir();
+    let cmd_sock = dir.path().join("cmd.sock");
+    let oracle_sock = dir.path().join("oracle.sock");
+
+    // The state file must name the REAL server for this one.
+    let state = serde_json::json!({
+        "version": VERSION,
+        "server_pid": 0,
+        "server_binary": env!("CARGO_BIN_EXE_fuse-server"),
+        "mount_point": dir.path().join("mnt").to_string_lossy(),
+        "socket": cmd_sock.to_string_lossy(),
+        "log_level": "info",
+        "pending_timeout": 300,
+        "runtime_wrapper": null,
+        "oracle_socket": oracle_sock.to_string_lossy(),
+        "secrets": [],
+    });
+    std::fs::create_dir_all(dir.path().join("mnt")).unwrap();
+    std::fs::write(dir.path().join("state.json"), state.to_string()).unwrap();
+
+    with_state_file_in(dir.path(), || {
+        let (stdout, stderr, code) = run_client(&cmd_sock, &["restart"]);
+        assert_eq!(
+            code, 0,
+            "restart failed: {stderr}\n{stdout}\n(state: {})",
+            std::fs::read_to_string(dir.path().join("state.json")).unwrap_or_default()
+        );
+        // The whole assertion: the respawned server answers on the
+        // CUSTOM oracle rendezvous — where the surviving fused connects.
+        wait_for_socket(&oracle_sock, "the respawned policy daemon");
+    });
+
+    // Take the respawned stack down (its cmd socket names it).
+    let _ = Command::new("pkill").arg("-x").arg("fuse-server").output();
 }

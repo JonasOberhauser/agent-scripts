@@ -68,6 +68,13 @@ pub struct ServerStateFile {
     pub log_level: String,
     pub pending_timeout: u64,
     pub runtime_wrapper: Option<String>,
+    /// The policy daemon's oracle rendezvous when the stack runs with
+    /// an override (test isolation, #59): the restart path must
+    /// respawn the server on the SAME rendezvous or the surviving
+    /// data daemon never reconnects. `None` (and pre-field state
+    /// files) means the server's global default.
+    #[serde(default)]
+    pub oracle_socket: Option<String>,
     pub secrets: Vec<StateSecretEntry>,
 }
 

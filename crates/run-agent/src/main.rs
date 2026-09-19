@@ -41,6 +41,13 @@ struct Cli {
     /// Unix socket path for the shared fuse-server.
     #[arg(long, default_value = DEFAULT_SOCKET, env = fuse_protocol::ENV_CMD_SOCKET)]
     socket: PathBuf,
+    /// The policy daemon's oracle rendezvous (where `fused` connects).
+    /// Unset keeps the server's default — production is single-stack.
+    /// Test harnesses set it per-tempdir so a live gatekeeper and a
+    /// test stack can never collide (field report: they did, and every
+    /// spawned server died as "Another server is running").
+    #[arg(long)]
+    oracle_socket: Option<std::path::PathBuf>,
 
     /// FUSE mount point (shared across projects).
     #[arg(long, default_value = DEFAULT_MOUNT_POINT)]
@@ -131,6 +138,7 @@ fn main() -> ExitCode {
     }
     config.fuse_server_path = resolve_fuse_server(&cli.fuse_server);
     config.socket_path = cli.socket;
+    config.oracle_socket = cli.oracle_socket;
     config.mount_point = cli.mount_point;
     config.pidns_host = cli.pidns_host;
     config.runtime = cli.runtime;
