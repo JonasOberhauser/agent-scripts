@@ -109,11 +109,29 @@ fn failed_fd_pass_does_not_wedge_the_oracle() {
         c.flush().unwrap();
         drop(c);
     }
-    // Let the server thread hit the dead peer.
-    std::thread::sleep(Duration::from_millis(300));
-    // The vanishing reader's open was ADJUDICATED (and consumed the
-    // one-read cycle) before its fd pass failed — re-arm for the
-    // follow-up, as an operator would.
+    // Wait for the vanishing open to be ADJUDICATED — observed by its
+    // EFFECT on the record (access_count == 1), never by sleeping for
+    // a fixed interval: a sleep assumes the server thread's scheduling
+    // and raced exactly that way in the field (the follow-up open hit
+    // "exceeded access limit", pended, and expired after a hang).
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let served = state
+            .status()
+            .into_iter()
+            .find(|s| s.name == "s")
+            .expect("secret registered");
+        if served.access_count >= 1 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the vanishing reader's open was never adjudicated — \
+             the oracle stopped serving?"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // Re-arm the one-read cycle for the follow-up, as an operator would.
     state.reset(Some("s"));
 
     // The oracle still serves a fresh open: Allow + fd. The wait is
