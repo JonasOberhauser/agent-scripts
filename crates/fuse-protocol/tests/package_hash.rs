@@ -438,7 +438,9 @@ fn rootless_userns_cannot_follow_map_files() {
     assert!(
         !out.status.success(),
         "hashing inside a rootless userns must fail closed — \
-         the kernel demands init-ns CAP_SYS_ADMIN/CAP_CHECKPOINT_RESTORE"
+         the kernel demands init-ns CAP_SYS_ADMIN/CAP_CHECKPOINT_RESTORE.\n\
+         Inner status: {:?}\nInner output:\n{text}",
+        out.status.code()
     );
     assert!(
         text.contains("map_files"),
