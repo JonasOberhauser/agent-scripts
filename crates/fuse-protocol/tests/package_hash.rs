@@ -399,7 +399,35 @@ fn inner_ssh_agent_package_hash() {
     if std::env::var(INNER_MARKER_ENV).as_deref() != Ok("1") {
         return;
     }
+    // Self-describing context for the INTERMITTENT success seen in the
+    // field: if the hashing ever succeeds where the kernel gate should
+    // deny, these lines show whether the process really ran with
+    // child-userns credentials when it did.
+    println!(
+        "INNER_CTX uid={} uid_map={:?} CapEff={:?} self_ns={:?} pid1_ns={:?}",
+        std::os::unix::fs::MetadataExt::uid(&std::fs::metadata("/proc/self").unwrap()),
+        std::fs::read_to_string("/proc/self/uid_map").ok(),
+        std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|s| s.lines().find(|l| l.starts_with("CapEff:")).map(|l| l.trim().to_string())),
+        std::fs::read_link("/proc/self/ns/user").ok(),
+        std::fs::read_link("/proc/1/ns/user").ok(),
+    );
     let agent = ssh_agent().expect("inner: spawn ssh-agent");
+    // Success-path forensics: the intermittent field success must be
+    // attributable — WHO was hashed, was the agent alive, what maps did
+    // it have, and was map_files listable?
+    let maps = std::fs::read_to_string(format!("/proc/{}/maps", agent.pid())).ok();
+    println!(
+        "INNER_AGENT pid={} exe={:?} state={:?} maps_lines={} map_files_listable={}",
+        agent.pid(),
+        std::fs::read_link(format!("/proc/{}/exe", agent.pid())).ok(),
+        std::fs::read_to_string(format!("/proc/{}/status", agent.pid()))
+            .ok()
+            .and_then(|s| s.lines().find(|l| l.starts_with("State:")).map(|l| l.trim().to_string())),
+        maps.as_deref().map(str::lines).map(Iterator::count).unwrap_or(usize::MAX),
+        std::fs::read_dir(format!("/proc/{}/map_files", agent.pid())).is_ok(),
+    );
     let io = RealSystemIo::new();
     let hash = io
         .sha256_process_package(agent.pid())
