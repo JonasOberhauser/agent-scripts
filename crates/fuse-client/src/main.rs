@@ -243,20 +243,60 @@ fn check_version_or_restart(app: &App) {
     restart_server(app, Some(&log_path));
 }
 
+/// How the restart stops the old server, as DATA: the pid the state
+/// file names, and the orphan-fallback pkill invocation. Extracted so
+/// the decision is testable without executing any kill — a test that
+/// really pkills would nuke every other stack on the machine,
+/// including other tests' (observed live: a substring `-f` match
+/// killed the `cargo test` runner itself).
+struct ServerKillSpec {
+    pid: Option<i32>,
+    pkill_argv: [&'static str; 3],
+}
+
+fn server_kill_spec(state: &ServerStateFile) -> ServerKillSpec {
+    ServerKillSpec {
+        pid: (state.server_pid != 0).then_some(state.server_pid as i32),
+        // `-x`: exact process-NAME match. NEVER `-f fuse-server` —
+        // substring matching kills any command line that merely
+        // mentions the string (`cargo test -p fuse-server`, an
+        // editor, a grep).
+        pkill_argv: ["pkill", "-x", "fuse-server"],
+    }
+}
+
+/// The argv the restart respawns the server with, as DATA: extracting
+/// it makes the state-file -> argv mapping testable without spawning
+/// anything or touching the fixed state-file path.
+fn respawn_argv(state: &ServerStateFile) -> Vec<String> {
+    let mut argv = vec![
+        "--mount-point".to_string(),
+        state.mount_point.clone(),
+        "--socket".to_string(),
+        state.socket.clone(),
+    ];
+    if let Some(oracle) = &state.oracle_socket {
+        // The surviving data daemon retries THIS rendezvous; respawning
+        // on the global default would orphan it (an alive mount that
+        // never syncs again).
+        argv.push("--oracle-socket".to_string());
+        argv.push(oracle.clone());
+    }
+    argv.push("--log-level".to_string());
+    argv.push(state.log_level.clone());
+    argv.push("--pending-timeout".to_string());
+    argv.push(state.pending_timeout.to_string());
+    argv
+}
+
+
 fn read_state_file() -> Option<ServerStateFile> {
-    let data = std::fs::read("/tmp/fuse-gatekeeper-state.json").ok()?;
+    let data = std::fs::read(fuse_protocol::state_file()).ok()?;
     serde_json::from_slice(&data).ok()
 }
 
 fn start_server_from_state(app: &App, state: &ServerStateFile, log_path: Option<&str>) {
-    let mut cmd_args: Vec<String> = vec![
-        "--mount-point".into(), state.mount_point.clone(),
-        "--socket".into(), state.socket.clone(),
-    ];
-    cmd_args.push("--log-level".into());
-    cmd_args.push(state.log_level.clone());
-    cmd_args.push("--pending-timeout".into());
-    cmd_args.push(state.pending_timeout.to_string());
+    let mut cmd_args = respawn_argv(state);
     if let Some(lp) = log_path {
         cmd_args.push("--log-path".into());
         cmd_args.push(lp.into());
@@ -373,13 +413,30 @@ fn restart_server(app: &App, log_path: Option<&str>) {
     eprintln!("Current server state: {status_info}");
 
     eprintln!("Stopping old server...");
-    if let Some(w) = &state.runtime_wrapper {
-        let wparts: Vec<&str> = w.split_whitespace().collect();
-        let mut kill_args: Vec<&str> = wparts[1..].to_vec();
-        kill_args.extend(&["pkill", "-f", "fuse-server"]);
-        let _ = std::process::Command::new(wparts[0]).args(&kill_args).output();
+    let kill = server_kill_spec(&state);
+    if let Some(pid) = kill.pid {
+        // The state file NAMES the server: kill exactly that process.
+        // SAFETY: a plain signal to one recorded pid; no process-group
+        // or pattern semantics involved.
+        unsafe {
+            libc::kill(pid, libc::SIGTERM);
+        }
     } else {
-        let _ = std::process::Command::new("pkill").arg("-f").arg("fuse-server").output();
+        // No recorded pid (pre-#59 state file): fall back to an exact
+        // process-NAME match — and ONLY then. The by-name sweep must
+        // not run when the pid is known: it kills EVERY fuse-server on
+        // the machine (observed live: a restart under `cargo test`
+        // took down the developer's production gate stack, and its
+        // fused with it). Full precise targeting is #62.
+        if let Some(w) = &state.runtime_wrapper {
+            let wparts: Vec<&str> = w.split_whitespace().collect();
+            let mut kill_args: Vec<&str> = wparts[1..].to_vec();
+            kill_args.extend(kill.pkill_argv.iter().copied());
+            let _ = std::process::Command::new(wparts[0]).args(&kill_args).output();
+        } else {
+            let (prog, args) = kill.pkill_argv.split_first().expect("non-empty argv");
+            let _ = std::process::Command::new(prog).args(args).output();
+        }
     }
     std::thread::sleep(std::time::Duration::from_secs(2));
 
@@ -434,5 +491,70 @@ fn ask_reset_anyway() {
     } else {
         eprintln!("Exiting without restarting.");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kill_spec_names_targets_exactly_never_by_substring() {
+        // The observed-live bug: `pkill -f fuse-server` matched any
+        // command line MENTIONING the string — under `cargo test -p
+        // fuse-server` a restart killed its own test runner. The spec
+        // must name the recorded pid and match orphan names EXACTLY.
+        let mut st = ServerStateFile {
+            version: "0.30.0".into(),
+            server_pid: 4242,
+            server_binary: "/x/fuse-server".into(),
+            mount_point: "/m".into(),
+            socket: "/s".into(),
+            log_level: "info".into(),
+            pending_timeout: 300,
+            runtime_wrapper: None,
+            oracle_socket: None,
+            secrets: vec![],
+        };
+        let kill = server_kill_spec(&st);
+        assert_eq!(kill.pid, Some(4242), "the recorded pid is the target");
+        assert_eq!(kill.pkill_argv, ["pkill", "-x", "fuse-server"]);
+        assert!(
+            !kill.pkill_argv.contains(&"-f"),
+            "never a substring match: {:?}",
+            kill.pkill_argv
+        );
+        st.server_pid = 0;
+        assert_eq!(server_kill_spec(&st).pid, None, "pid 0 = unnamed");
+    }
+
+    #[test]
+    fn respawn_argv_carries_the_oracle_rendezvous() {
+        // The #59 review finding: a stack running with --oracle-socket
+        // must come back on the SAME rendezvous — the surviving data
+        // daemon retries that socket forever, and a respawn on the
+        // global default leaves an alive mount that never syncs again.
+        let base = ServerStateFile {
+            version: "0.30.0".into(),
+            server_pid: 7,
+            server_binary: "/x/fuse-server".into(),
+            mount_point: "/m".into(),
+            socket: "/s".into(),
+            log_level: "info".into(),
+            pending_timeout: 300,
+            runtime_wrapper: None,
+            oracle_socket: Some("/tmp/.tmpABC/oracle.sock".into()),
+            secrets: vec![],
+        };
+        let argv = respawn_argv(&base);
+        let i = argv
+            .iter()
+            .position(|a| a == "--oracle-socket")
+            .expect("the rendezvous flag is present");
+        assert_eq!(argv[i + 1], "/tmp/.tmpABC/oracle.sock");
+        // and the global default stays implicit when unset
+        let mut plain = base.clone();
+        plain.oracle_socket = None;
+        assert!(!respawn_argv(&plain).contains(&"--oracle-socket".to_string()));
     }
 }

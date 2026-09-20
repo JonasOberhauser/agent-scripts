@@ -106,6 +106,8 @@ struct EmptyOs {
     home: PathBuf,
     xdg_runtime: PathBuf,
     socket: PathBuf,
+    oracle_socket: PathBuf,
+    policy_store: PathBuf,
     mount_point: PathBuf,
 }
 
@@ -151,12 +153,21 @@ impl EmptyOs {
         std::fs::create_dir_all(&mount_point).expect("create mount point");
 
         let socket = root.join("gatekeeper.sock");
+        // Full per-test isolation (the field-reported collision: a
+        // global default oracle rendezvous meant every spawned server
+        // died as "Another server is running" whenever a live
+        // gatekeeper held the default path). Oracle socket, MR5 grant
+        // store, state file, sockets, mount: all inside the tempdir.
+        let oracle_socket = root.join("oracle.sock");
+        let policy_store = root.join("policy.json");
         EmptyOs {
             _dir: dir,
             root,
             home,
             xdg_runtime,
             socket,
+            oracle_socket,
+            policy_store,
             mount_point,
         }
     }
@@ -170,6 +181,7 @@ impl EmptyOs {
             .env("XDG_RUNTIME_DIR", &self.xdg_runtime)
             .env("CONTAINERS_STORAGE_CONF", self.root.join("storage.conf"))
             .env("FUSE_GATEKEEPER_STATE", self.root.join("state.json"))
+            .env("FUSE_GATEKEEPER_POLICY", &self.policy_store)
             .env("RUST_LOG", "error")
     }
 
@@ -197,6 +209,8 @@ impl EmptyOs {
             .arg(&fuse_server)
             .arg("--socket")
             .arg(&self.socket)
+            .arg("--oracle-socket")
+            .arg(&self.oracle_socket)
             .arg("--mount-point")
             .arg(&self.mount_point);
         if let Some(img) = image {

@@ -39,64 +39,23 @@ use std::time::{Duration, Instant};
 
 // ── stub fuse-server (compiled at test time) ────────────────────
 
-const STUB_C: &str = r#"
-#include <sys/socket.h>
-#include <sys/un.h>
-#include <fcntl.h>
-#include <string.h>
-#include <unistd.h>
-#include <stdio.h>
 
-int main(int argc, char **argv) {
-    const char *path = NULL;
-    for (int i = 1; i < argc; i++)
-        if (!strcmp(argv[i], "--socket") && i + 1 < argc)
-            path = argv[i + 1];
-    if (!path) { fprintf(stderr, "stub: --socket required\n"); return 2; }
 
-    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    struct sockaddr_un addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sun_family = AF_UNIX;
-    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", path);
-    unlink(path);
-    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) return 3;
-    if (listen(fd, 16) < 0) return 4;
-    fcntl(fd, F_SETFL, O_NONBLOCK);
-
-    /* Accept and hold the socket for up to 60s so no detached stub
-     * outlives the test session. */
-    for (int t = 0; t < 600; t++) {
-        int c = accept(fd, NULL, NULL);
-        if (c >= 0) close(c);
-        usleep(100000);
-    }
-    return 0;
-}
-"#;
-
-fn compile_stub_fuse_server(dir: &Path) -> PathBuf {
-    let src = dir.join("stub-fuse-server.c");
-    std::fs::write(&src, STUB_C).expect("write stub source");
-    let bin = dir.join("stub-fuse-server");
-    let cc = ["cc", "gcc"]
-        .into_iter()
-        .find(|c| Command::new(c).arg("--version").output().is_ok())
-        .unwrap_or_else(|| panic!("refusing to skip: no C compiler found for the fuse stub"));
-    let out = Command::new(cc)
-        .arg("-O2")
-        .arg("-o")
-        .arg(&bin)
-        .arg(&src)
-        .output()
-        .expect("compile stub fuse-server");
+fn compile_stub_fuse_server(_dir: &Path) -> PathBuf {
+    // The stub is a cargo EXAMPLE (crates/run-agent/examples/): cargo
+    // builds it under plain `cargo test` with the workspace's own
+    // linker configuration — a bare `rustc` invocation fails on hosts
+    // whose linker setup differs from cargo's (gcc-less minimal
+    // hosts: "linker `cc` not found").
+    let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/debug/examples/stub-fuse-server");
     assert!(
-        out.status.success(),
-        "stub compilation failed:\n{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr),
+        p.exists(),
+        "cargo-built stub example missing at {} — `cargo test` builds examples; \
+         `cargo build --examples` if it was cleaned",
+        p.display()
     );
-    bin
+    p
 }
 
 // ── shared runner ───────────────────────────────────────────────
@@ -133,6 +92,8 @@ struct Seam {
     ws: PathBuf,
     fuse_server: PathBuf,
     socket: PathBuf,
+    oracle_socket: PathBuf,
+    policy_store: PathBuf,
     mount_point: PathBuf,
     state: PathBuf,
     home: PathBuf,
@@ -172,12 +133,17 @@ impl Seam {
             ),
         )
         .expect("write storage.conf");
+        let root2 = dir.path().join(tag);
+        let oracle_socket = root2.join("oracle.sock");
+        let policy_store = root2.join("policy.json");
         Seam {
             fuse_server: compile_stub_fuse_server(dir.path()),
             ws,
             socket: root.join("socket"),
             mount_point,
             state: root.join("state.json"),
+            oracle_socket,
+            policy_store,
             home,
             xdg_runtime,
             storage_conf,
@@ -228,6 +194,8 @@ impl Seam {
         .arg(&self.fuse_server)
         .arg("--socket")
         .arg(&self.socket)
+        .arg("--oracle-socket")
+        .arg(&self.oracle_socket)
         .arg("--mount-point")
         .arg(&self.mount_point)
         .env("HOME", &self.home)
@@ -237,6 +205,7 @@ impl Seam {
         .env("XDG_RUNTIME_DIR", &self.xdg_runtime)
         .env("CONTAINERS_STORAGE_CONF", &self.storage_conf)
         .env("FUSE_GATEKEEPER_STATE", &self.state)
+        .env("FUSE_GATEKEEPER_POLICY", &self.policy_store)
         .env("RUST_LOG", "error")
         .current_dir(&self.ws)
         .stdin(Stdio::null())

@@ -374,6 +374,14 @@ where
                 "--mount-point", mount,
                 "--socket", sock,
             ];
+            let oracle_arg: Option<String> = config
+                .oracle_socket
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned());
+            if let Some(oracle) = oracle_arg.as_deref() {
+                fuse_args.push("--oracle-socket");
+                fuse_args.push(oracle);
+            }
             fuse_args.push("--log-level");
             let log_level_str = config.log_level.clone();
             fuse_args.push(&log_level_str);
@@ -1112,6 +1120,10 @@ fn write_state_file<S: SystemIo>(
         log_level: config.log_level.clone(),
         pending_timeout: 300,
         runtime_wrapper: config.runtime_wrapper.clone(),
+        oracle_socket: config
+            .oracle_socket
+            .as_deref()
+            .map(|p| p.to_string_lossy().into_owned()),
         secrets: loaded
             .iter()
             .map(|s| fuse_protocol::StateSecretEntry {
@@ -1147,6 +1159,7 @@ mod tests {
 
     fn test_config() -> AgentConfig {
         AgentConfig {
+            oracle_socket: None,
             binary_hash: "abc123".into(),
             secrets: vec![SecretMapping {
                 host: PathBuf::from("/home/user/secrets.yaml"),
@@ -1699,6 +1712,39 @@ mod tests {
         );
     }
 
+    #[test]
+    fn state_file_carries_the_oracle_rendezvous() {
+        // The restart chain's only channel for the override: a stack
+        // spawned with --oracle-socket must record it, or fuse-client
+        // restart respawns on the global default and the surviving
+        // data daemon never reconnects (#59 review).
+        let mut mock = base_mock().with_file("/home/user/secrets.yaml", b"DATA");
+        let mut cfg = test_config();
+        cfg.oracle_socket = Some(std::path::PathBuf::from("/tmp/.tmpT/oracle.sock"));
+        let loaded = vec![LoadedSecret {
+            fuse_name: "i-form".into(),
+            container: PathBuf::from("/root/.config/app/auth.json"),
+            host_path: PathBuf::from("/home/user/secrets.yaml"),
+        }];
+        write_state_file(&cfg, &loaded, &mut mock, 4242);
+        let written = mock
+            .files
+            .get(fuse_protocol::state_file().to_str().unwrap())
+            .expect("state file written");
+        let text = String::from_utf8(written.clone()).unwrap();
+        let f: fuse_protocol::ServerStateFile = serde_json::from_str(&text).unwrap();
+        assert_eq!(f.oracle_socket.as_deref(), Some("/tmp/.tmpT/oracle.sock"));
+        // and unset means the global default, not a wrong path
+        cfg.oracle_socket = None;
+        write_state_file(&cfg, &loaded, &mut mock, 4242);
+        let text = String::from_utf8(
+            mock.files.get(fuse_protocol::state_file().to_str().unwrap()).unwrap().clone(),
+        )
+        .unwrap();
+        let f: fuse_protocol::ServerStateFile = serde_json::from_str(&text).unwrap();
+        assert_eq!(f.oracle_socket, None);
+    }
+
     // ── out-of-sync stack: automatic rebuild (PR #37 review) ──────
 
     #[test]
@@ -1913,6 +1959,39 @@ mod tests {
     }
 
     // ── spawn argv validation ────────────────────────────────────
+
+    #[test]
+    fn oracle_socket_passthrough_isolates_the_stack() {
+        // The oracle rendezvous must be passable per stack: harnesses
+        // and second projects point it at their own tempdir so a live
+        // gatekeeper can never collide with a spawned test server
+        // (field report: exactly that collision killed every spawn).
+        let mut mock = base_mock().with_file("/home/user/secrets.yaml", b"DATA");
+        let mut cfg = test_config();
+        cfg.oracle_socket = Some(std::path::PathBuf::from("/tmp/.tmpXYZ/oracle.sock"));
+        let _ = run_agent(&mut mock, &cfg, &|_, _| Ok(String::new()), false);
+        let args: Vec<String> = mock
+            .spawned
+            .iter()
+            .flat_map(|(_, a)| a.iter().map(|s| s.to_string()))
+            .collect();
+        let i = args.iter().position(|a| a == "--oracle-socket");
+        assert!(i.is_some(), "spawn passes --oracle-socket when set: {args:?}");
+        assert_eq!(args[i.unwrap() + 1], "/tmp/.tmpXYZ/oracle.sock");
+        // and absent when unset
+        let mut mock2 = base_mock().with_file("/home/user/secrets.yaml", b"DATA");
+        let _ = run_agent(&mut mock2, &test_config(), &|_, _| Ok(String::new()), false);
+        let args2: Vec<String> = mock2
+            .spawned
+            .iter()
+            .flat_map(|(_, a)| a.iter().map(|s| s.to_string()))
+            .collect();
+        assert!(
+            !args2.iter().any(|a| a == "--oracle-socket"),
+            "unset keeps the server default (production single-stack): {args2:?}"
+        );
+    }
+
 
                 
     #[test]

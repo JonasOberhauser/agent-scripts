@@ -191,6 +191,10 @@ pub struct AgentConfig {
     pub auto_confirm: bool,
     /// Unix socket path for the shared fuse-server.
     pub socket_path: PathBuf,
+    /// Oracle rendezvous override for the spawned policy daemon;
+    /// `None` = the server's global default (single-stack
+    /// production). Harnesses isolate per tempdir.
+    pub oracle_socket: Option<std::path::PathBuf>,
     /// FUSE mount point (shared across projects).
     pub mount_point: PathBuf,
     /// Pass `--pidns=host` to the container so its processes share the
@@ -225,6 +229,7 @@ impl AgentConfig {
             container_args: container_args.to_vec(),
             agent_path: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             fuse_server_path: PathBuf::from("fuse-server"),
+            oracle_socket: None,
             image_name: "agentbox".to_string(),
             seccomp_profile: seccomp_profile_path(),
             memory: "224G".to_string(),
@@ -424,6 +429,7 @@ mod tests {
             container_args: vec![],
             agent_path: PathBuf::from("/work/myagent"),
             fuse_server_path: "fuse-server".into(),
+            oracle_socket: None,
             image_name: "myimg".into(),
             seccomp_profile: PathBuf::from("/tmp/agentbox-seccomp.json"),
             memory: "16G".into(),
@@ -476,6 +482,7 @@ mod tests {
             container_args: vec![],
             agent_path: PathBuf::from("/work/myagent"),
             fuse_server_path: "fuse-server".into(),
+            oracle_socket: None,
             image_name: "myimg".into(),
             seccomp_profile: PathBuf::from("/tmp/agentbox-seccomp.json"),
             memory: "16G".into(),
@@ -509,6 +516,7 @@ mod tests {
             container_args: vec!["--flag".into()],
             agent_path: PathBuf::from("/work/myagent"),
             fuse_server_path: "fuse-server".into(),
+            oracle_socket: None,
             image_name: "myimg".into(),
             seccomp_profile: PathBuf::from("/tmp/agentbox-seccomp.json"),
             memory: "16G".into(),

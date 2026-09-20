@@ -76,6 +76,15 @@ fn missing(bin: &str) -> bool {
 }
 
 /// `ssh-agent -D`: a foreground daemon — stays loaded until killed.
+///
+/// The fixture waits for the package to be FULLY LOADED before it is
+/// usable: hashing races the dynamic loader otherwise — a process
+/// caught in early startup (state D, ~5 mappings, no libraries yet)
+/// needs ZERO map_files follows (the exe is read via /proc/pid/exe,
+/// gated by ptrace only), so the package hash silently degenerates to
+/// an exe-only hash that SUCCEEDS where the capability gate should
+/// deny. Observed intermittently in the field (deterministic exe-only
+/// hash value); the barrier removes the window structurally.
 fn ssh_agent() -> Option<Fixture> {
     if missing("ssh-agent") {
         eprintln!("skip: ssh-agent not on PATH");
@@ -88,6 +97,21 @@ fn ssh_agent() -> Option<Fixture> {
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn ssh-agent");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let maps = std::fs::read_to_string(format!("/proc/{}/maps", child.id()))
+            .expect("read agent maps while waiting for the loader");
+        // A fully-loaded package maps its libraries (ld.so, libc, ...).
+        if maps.lines().any(|l| l.contains(".so")) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "ssh-agent never finished loading (no mapped libraries after 10s) — \
+             cannot hash a half-loaded package"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
     let exe = exe_path("ssh-agent", child.id());
     let _stdin = child.stdin.take();
     Some(Fixture { child, _stdin, exe })
@@ -399,7 +423,35 @@ fn inner_ssh_agent_package_hash() {
     if std::env::var(INNER_MARKER_ENV).as_deref() != Ok("1") {
         return;
     }
+    // Self-describing context for the INTERMITTENT success seen in the
+    // field: if the hashing ever succeeds where the kernel gate should
+    // deny, these lines show whether the process really ran with
+    // child-userns credentials when it did.
+    println!(
+        "INNER_CTX uid={} uid_map={:?} CapEff={:?} self_ns={:?} pid1_ns={:?}",
+        std::os::unix::fs::MetadataExt::uid(&std::fs::metadata("/proc/self").unwrap()),
+        std::fs::read_to_string("/proc/self/uid_map").ok(),
+        std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|s| s.lines().find(|l| l.starts_with("CapEff:")).map(|l| l.trim().to_string())),
+        std::fs::read_link("/proc/self/ns/user").ok(),
+        std::fs::read_link("/proc/1/ns/user").ok(),
+    );
     let agent = ssh_agent().expect("inner: spawn ssh-agent");
+    // Success-path forensics: the intermittent field success must be
+    // attributable — WHO was hashed, was the agent alive, what maps did
+    // it have, and was map_files listable?
+    let maps = std::fs::read_to_string(format!("/proc/{}/maps", agent.pid())).ok();
+    println!(
+        "INNER_AGENT pid={} exe={:?} state={:?} maps_lines={} map_files_listable={}",
+        agent.pid(),
+        std::fs::read_link(format!("/proc/{}/exe", agent.pid())).ok(),
+        std::fs::read_to_string(format!("/proc/{}/status", agent.pid()))
+            .ok()
+            .and_then(|s| s.lines().find(|l| l.starts_with("State:")).map(|l| l.trim().to_string())),
+        maps.as_deref().map(str::lines).map(Iterator::count).unwrap_or(usize::MAX),
+        std::fs::read_dir(format!("/proc/{}/map_files", agent.pid())).is_ok(),
+    );
     let io = RealSystemIo::new();
     let hash = io
         .sha256_process_package(agent.pid())
@@ -438,7 +490,9 @@ fn rootless_userns_cannot_follow_map_files() {
     assert!(
         !out.status.success(),
         "hashing inside a rootless userns must fail closed — \
-         the kernel demands init-ns CAP_SYS_ADMIN/CAP_CHECKPOINT_RESTORE"
+         the kernel demands init-ns CAP_SYS_ADMIN/CAP_CHECKPOINT_RESTORE.\n\
+         Inner status: {:?}\nInner output:\n{text}",
+        out.status.code()
     );
     assert!(
         text.contains("map_files"),
