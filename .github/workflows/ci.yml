@@ -44,3 +44,11 @@ jobs:
           cargo test -p fuse-server --test protocol_contract
           cargo test -p fuse-server --test e2e_client
           cargo test -p fuse-server --test fuse_e2e -- --include-ignored
+      - name: Integration tests (run-agent e2e tier)
+        # The orchestrator e2e suites (real rootless podman, per-test
+        # tempdir stacks since #59) were previously NEVER run in CI —
+        # 14 tests existing on paper only. Runners have podman and
+        # registry egress; the suites isolate their own storage/state.
+        timeout-minutes: 25
+        run: |
+          cargo test -p run-agent --test e2e_stub_fuse --test e2e_empty_os -- --include-ignored

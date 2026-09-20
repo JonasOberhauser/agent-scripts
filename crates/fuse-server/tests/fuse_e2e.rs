@@ -561,6 +561,41 @@ fn e2e_ghost_opens_to_enoent() {
 }
 
 #[test]
+fn e2e_ghost_heals_when_the_host_file_returns() {
+    // MR4/MR5's documented promise: a ghost (host file missing) opens
+    // ENOENT "until the file returns" — and when it RETURNS, the next
+    // open heals: fresh identity observed via the stat path, live
+    // bytes served, and the read cycle state intact (the ghost period
+    // consumed nothing). The re-add half of the promise is covered by
+    // the policy re-add tests; this is the file-returns half.
+    if !fuse_available() { return; }
+    let _g = serial();
+    let split = Split::new("heal", &[("s", b"V1", "*")]);
+    assert_eq!(split.read("s").unwrap(), b"V1");
+    // Ghost it: source gone, cycle reset, open -> ENOENT.
+    std::fs::remove_file(split.source_path("s")).unwrap();
+    assert!(split.client(&["reset", "--name", "s"]).status.success());
+    let err = split.read("s").unwrap_err();
+    assert_eq!(err.raw_os_error(), Some(libc::ENOENT), "ghost: {err}");
+    // The file returns (a NEW incarnation, as any real restore would):
+    // the mount must heal on the next open — fresh bytes, no pend, no
+    // error — without a re-add or a daemon restart.
+    std::fs::write(split.source_path("s"), b"V2-RETURNED").unwrap();
+    assert_eq!(
+        split.read("s").unwrap(),
+        b"V2-RETURNED",
+        "the ghost heals when the host file returns"
+    );
+    // And the cycle behaves like one consumed read (V2's), not more:
+    let out = split.client(&["status"]);
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        !text.contains("pending"),
+        "healing must not leave a stuck pending: {text}"
+    );
+}
+
+#[test]
 fn e2e_atomic_replace_serves_fresh_bytes_and_a_new_inode() {
     // The standard safe-write flow (temp + rename-over) lands a NEW
     // incarnation at the same path: the mount must serve the new
