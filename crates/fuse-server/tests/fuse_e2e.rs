@@ -284,15 +284,29 @@ fn wait_mount(mount: &Path, dirs: &[tempfile::TempDir]) {
         }
         std::thread::sleep(Duration::from_millis(50));
     }
+    let fused_log = log_tail(dirs.get(2).map(|d| d.path().join("fused.log")).as_deref());
+    // The cross-crate stale-binary trap, named: cargo test -p fuse-server
+    // does NOT rebuild fuse-mount's fused binary — the harness runs
+    // whatever artifact sits in target/debug. A loader error in
+    // fused.log means that artifact was built against a different
+    // libfuse than the host provides (observed live, twice: a binary
+    // demanding libfuse3.so.4/.so.3 while the system ships another
+    // soname — "it used to work" was a fresher artifact).
+    let loader_hint = if fused_log.contains("error while loading shared libraries") {
+        "\nHINT: fused.log shows a shared-library loader error — the          target/debug/fused artifact is STALE (cargo test does not rebuild \
+         other crates' binaries). Run `cargo build -p fuse-mount` and re-run."
+    } else {
+        ""
+    };
     panic!(
         "FUSE mount never came up at {} — /dev/fuse present: {}, fusermount3: {}\
-         \n--- env ---\n{}--- server.log ---\n{}--- fused.log ---\n{}",
+         \n--- env ---\n{}--- server.log ---\n{}--- fused.log ---\n{}{loader_hint}",
         mount.display(),
         Path::new("/dev/fuse").exists(),
         fusermount3_state(),
         probe_env(),
         log_tail(dirs.get(1).map(|d| d.path().join("server.log")).as_deref()),
-        log_tail(dirs.get(2).map(|d| d.path().join("fused.log")).as_deref()),
+        fused_log,
     );
 }
 
