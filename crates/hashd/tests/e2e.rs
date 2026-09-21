@@ -11,6 +11,8 @@
 //! fuse-server got EACCES. It needs root to drop privileges, so it is
 //! #[ignore]-gated like the other environment-dependent suites.
 
+#![cfg_attr(test, allow(clippy::unwrap_used))]
+
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::os::unix::net::UnixStream;
 use std::process::{Child, Command, Stdio};

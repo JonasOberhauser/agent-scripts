@@ -44,8 +44,10 @@ impl OracleHub {
     }
 
     fn broadcast(&self, cmd: &OracleCommand) {
-        self.snapshot.lock().unwrap().push(cmd.clone());
-        let mut controls = self.controls.lock().unwrap();
+        self.snapshot.lock()
+            .expect("oracle hub lock: never held across a panic — poisoning means a server bug").push(cmd.clone());
+        let mut controls = self.controls.lock()
+            .expect("oracle hub lock: never held across a panic — poisoning means a server bug");
         controls.retain(|stream| {
             let mut w = stream;
             match serde_json::to_string(cmd) {
@@ -181,7 +183,8 @@ fn open_secret(
     use std::os::unix::io::AsRawFd;
 
     let reply_line = |r: &OracleReply| -> String {
-        serde_json::to_string(r).unwrap()
+        serde_json::to_string(r)
+            .expect("serializing oracle reply: internal enum, infallible")
     };
 
     let Some(host) = state.host_path(name) else {
@@ -262,7 +265,10 @@ fn adjudicate(state: &ServerState, name: &str, pid: u32, offset: usize, size: us
                 .attempt_read(name, pid, None, offset, size)
                 .denial_reason()
                 .unwrap_or_else(|| "access denied".into());
-            let timeout = *state.pending_timeout.lock().unwrap();
+            let timeout = *state
+            .pending_timeout
+            .lock()
+            .expect("pending-timeout lock: never held across a panic");
             if timeout.is_zero() {
                 return OracleReply::Deny { errno: libc::EACCES, reason };
             }
@@ -341,13 +347,17 @@ fn handle_conn(state: &Arc<ServerState>, hub: &OracleHub, conn: UnixStream) {
             }
             _ => {}
         }
-        let _ = writeln!(stream, "{}", serde_json::to_string(&OracleReply::Ok).unwrap());
+        let _ = writeln!(stream, "{}", serde_json::to_string(&OracleReply::Ok)
+                .expect("serializing Ok ack: internal enum, infallible"));
         // Replay the content snapshot: late joiners get every secret.
-        for cmd in hub.snapshot.lock().unwrap().iter() {
-            let _ = writeln!(stream, "{}", serde_json::to_string(cmd).unwrap());
+        for cmd in hub.snapshot.lock()
+            .expect("oracle hub lock: never held across a panic — poisoning means a server bug").iter() {
+            let _ = writeln!(stream, "{}", serde_json::to_string(cmd)
+                .expect("serializing replayed command: internal enum, infallible"));
         }
         let _ = stream.flush();
-        hub.controls.lock().unwrap().push(stream);
+        hub.controls.lock()
+            .expect("oracle hub lock: never held across a panic — poisoning means a server bug").push(stream);
         return;
     }
     // Otherwise: one or more requests on this connection.
@@ -356,12 +366,14 @@ fn handle_conn(state: &Arc<ServerState>, hub: &OracleHub, conn: UnixStream) {
         match serde_json::from_str::<OracleRequest>(line.trim()) {
             Ok(OracleRequest::Ask { name, pid, offset, size }) => {
                 let reply = adjudicate(state, &name, pid, offset as usize, size as usize);
-                let _ = writeln!(stream, "{}", serde_json::to_string(&reply).unwrap());
+                let _ = writeln!(stream, "{}", serde_json::to_string(&reply)
+                .expect("serializing reply line: internal enum, infallible"));
                 let _ = stream.flush();
             }
             Ok(OracleRequest::Stat { name }) => {
                 let reply = stat_secret(state, &name);
-                let _ = writeln!(stream, "{}", serde_json::to_string(&reply).unwrap());
+                let _ = writeln!(stream, "{}", serde_json::to_string(&reply)
+                .expect("serializing reply line: internal enum, infallible"));
                 let _ = stream.flush();
             }
             Ok(OracleRequest::Open { name, pid, kdev, kino }) => {
@@ -371,7 +383,8 @@ fn handle_conn(state: &Arc<ServerState>, hub: &OracleHub, conn: UnixStream) {
                 let _ = writeln!(
                     stream,
                     "{}",
-                    serde_json::to_string(&OracleReply::Error { message: "malformed request".into() }).unwrap()
+                    serde_json::to_string(&OracleReply::Error { message: "malformed request".into() })
+                        .expect("serializing Error reply: internal enum, infallible")
                 );
                 return;
             }

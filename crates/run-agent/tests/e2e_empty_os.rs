@@ -36,6 +36,8 @@
 //! podman run --device /dev/fuse --cap-add SYS_ADMIN ...
 //! ```
 
+#![cfg_attr(test, allow(clippy::unwrap_used))]
+
 use std::io::Write as _;
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};

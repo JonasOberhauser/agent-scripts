@@ -212,7 +212,9 @@ impl ServerState {
         // the snapshot must follow the mutation in program order, and
         // concurrent write_atomic calls must never interleave
         // (review blocker on #57).
-        let _pl = self.persist_lock.lock().unwrap();
+        let _pl = self.persist_lock
+                .lock()
+                .expect("persist lock: mutations never panic while holding it");
         if let Some(existing) = self.secrets.get(&name) {
             let mut rec = lock_secret(existing.value(), &name);
             // MR2: the incoming hash JOINS the permitted set — a second
@@ -250,7 +252,9 @@ impl ServerState {
     }
 
     pub fn remove(&self, name: &str) -> bool {
-        let _pl = self.persist_lock.lock().unwrap();
+        let _pl = self.persist_lock
+                .lock()
+                .expect("persist lock: mutations never panic while holding it");
         let existed = self.secrets.remove(name).is_some();
         if existed {
             crate::policy_store::persist_locked(self);
@@ -281,7 +285,9 @@ impl ServerState {
             let end = offset.saturating_add(size).min(rec.size);
             rec.read_progress = rec.read_progress.max(end);
             drop(rec);
-            let _pl = self.persist_lock.lock().unwrap();
+            let _pl = self.persist_lock
+                .lock()
+                .expect("persist lock: mutations never panic while holding it");
             crate::policy_store::persist_locked(self);
             return ReadOutcome::Granted;
         }
@@ -304,7 +310,9 @@ impl ServerState {
             let end = offset.saturating_add(size).min(rec.size);
             rec.read_progress = end;
             drop(rec);
-            let _pl = self.persist_lock.lock().unwrap();
+            let _pl = self.persist_lock
+                .lock()
+                .expect("persist lock: mutations never panic while holding it");
             crate::policy_store::persist_locked(self);
             ReadOutcome::Granted
         } else {
@@ -321,7 +329,9 @@ impl ServerState {
     }
 
     pub fn reset(&self, name: Option<&str>) -> usize {
-        let _pl = self.persist_lock.lock().unwrap();
+        let _pl = self.persist_lock
+                .lock()
+                .expect("persist lock: mutations never panic while holding it");
         let count = match name {
             Some(n) => {
                 if let Some(entry) = self.secrets.get(n) {
@@ -360,7 +370,9 @@ impl ServerState {
     /// Replace the permitted-hash set with a single hash — the
     /// explicit policy path (`rotate`); re-adds APPEND instead.
     pub fn rotate_hash(&self, name: &str, new_hash: &str) -> bool {
-        let _pl = self.persist_lock.lock().unwrap();
+        let _pl = self.persist_lock
+                .lock()
+                .expect("persist lock: mutations never panic while holding it");
         let rotated = if let Some(entry) = self.secrets.get(name) {
             let rec_arc = Arc::clone(entry.value());
             drop(entry);
@@ -415,7 +427,11 @@ impl ServerState {
             pid_hash: pid_hash.map(|s| s.to_string()),
             hash_error: hash_error.map(|s| s.to_string()),
             reason: reason.to_string(),
-            expires_at: Instant::now() + *self.pending_timeout.lock().unwrap(),
+            expires_at: Instant::now()
+                + *self
+                    .pending_timeout
+                    .lock()
+                    .expect("pending-timeout lock: never held across a panic"),
             granted: false,
         });
         id
@@ -465,7 +481,9 @@ impl ServerState {
     /// becomes the secret's allowed hash and the read limit is lifted.
     /// The waiting reader is served like a normal grant.
     pub fn grant_pending_forever(&self, id: u64) -> Result<(), String> {
-        let _pl = self.persist_lock.lock().unwrap();
+        let _pl = self.persist_lock
+                .lock()
+                .expect("persist lock: mutations never panic while holding it");
         let (secret_name, package_hash, process_name) = {
             let entry = self
                 .pending
@@ -572,7 +590,9 @@ impl ServerState {
     /// served regardless of hash — record the access (forward-only
     /// progress by offset/size) and confirm the secret still exists.
     pub fn granted_read(&self, name: &str, pid: u32, offset: usize, size: usize) -> bool {
-        let _pl = self.persist_lock.lock().unwrap();
+        let _pl = self.persist_lock
+                .lock()
+                .expect("persist lock: mutations never panic while holding it");
         let Some(entry) = self.secrets.get(name) else { return false; };
         let rec_arc = Arc::clone(entry.value());
         drop(entry);

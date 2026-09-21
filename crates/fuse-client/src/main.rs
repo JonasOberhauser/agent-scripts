@@ -1,3 +1,4 @@
+#![cfg_attr(test, allow(clippy::unwrap_used))]
 use std::path::PathBuf;
 
 use clap::Parser;
@@ -147,7 +148,10 @@ fn main() {
             )
             .with_collapsed_names(collapsed_names.clone())
             .with_log_window(Box::new(move |line: &str| {
-                panel_sink.lock().unwrap().push(line.to_string());
+                panel_sink
+                    .lock()
+                    .expect("panel log sink lock: TUI callback, single consumer")
+                    .push(line.to_string());
             }));
             display.add_layer(Box::new(panel));
             display.set_log_sink(log_sink);

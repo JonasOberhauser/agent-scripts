@@ -1,3 +1,4 @@
+#![cfg_attr(test, allow(clippy::unwrap_used))]
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 

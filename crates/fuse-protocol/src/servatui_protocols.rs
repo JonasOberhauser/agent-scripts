@@ -350,7 +350,13 @@ fn name_completer(
     complete_after_space: bool,
 ) -> impl Fn(&str) -> Vec<String> + Send + Sync + 'static {
     move |s| {
-        let names = secrets.lock().unwrap().clone();
+        // #64: the snapshot Mutex is only ever locked here and by the
+        // poller's assignment — no panic path exists between them, so
+        // poisoning is impossible by construction.
+        let names = secrets
+            .lock()
+            .expect("secret-name snapshot lock: never held across a panic")
+            .clone();
         complete_first_secret(&names, s, complete_after_space)
     }
 }
@@ -362,7 +368,14 @@ fn pending_completer(
     pending: PendingIds,
 ) -> impl Fn(&str) -> Vec<String> + Send + Sync + 'static {
     move |s| {
-        let ids: Vec<u64> = pending.lock().unwrap().iter().map(|p| p.id).collect();
+        // #64: same snapshot discipline as the name completer — locked
+        // briefly by the poller and here, never across a panic.
+        let ids: Vec<u64> = pending
+            .lock()
+            .expect("pending-id snapshot lock: never held across a panic")
+            .iter()
+            .map(|p| p.id)
+            .collect();
         pending_completions(&ids, s)
     }
 }

@@ -5,6 +5,7 @@
 //! fuse-client, and the oracle endpoint the data daemon (`fused`)
 //! connects to. It holds NO secret bytes in split mode: content goes to
 //! the data daemon through the oracle hub, metadata stays here.
+#![cfg_attr(test, allow(clippy::unwrap_used))]
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
@@ -105,7 +106,10 @@ fn main() {
                     .spawn();
                 match child {
                     Ok(c) => {
-                        SUPERVISED_FUSED.lock().unwrap().replace(c);
+                        SUPERVISED_FUSED
+                            .lock()
+                            .expect("supervised-fused lock: set once at spawn")
+                            .replace(c);
                     }
                     Err(e) => error!("cannot spawn data daemon {}: {e}", fused.display()),
                 }

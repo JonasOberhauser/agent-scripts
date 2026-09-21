@@ -1,3 +1,4 @@
+#![cfg_attr(test, allow(clippy::unwrap_used))]
 pub mod config;
 pub mod orchestrator;
 pub(crate) mod preflight;

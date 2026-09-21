@@ -224,7 +224,10 @@ pub struct LoadReport {
 /// operation would turn a full disk into "you may not approve
 /// anything".
 pub fn persist(state: &ServerState) {
-    let _pl = state.persist_lock.lock().unwrap();
+    let _pl = state
+        .persist_lock
+        .lock()
+        .expect("persist lock: mutations never panic while holding it");
     persist_locked(state);
 }
 
