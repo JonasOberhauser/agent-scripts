@@ -15,6 +15,11 @@ edition = "2021"
 license = "MIT"
 
 [workspace.lints.clippy]
+# #64: no bare unwraps in production code. Use
+# .expect("why this must succeed / who owns the invariant") — the
+# message is the reviewer's evidence. Tests are exempt (a panicking
+# test is the desired failure mode) via the cfg(test) allowance below.
+unwrap_used = "deny"
 # Every unsafe block must carry a // SAFETY: justification (review
 # directive, PR #41): restriction-group lint, denied workspace-wide so
 # the plain `cargo clippy -- -D warnings` step in CI enforces it with

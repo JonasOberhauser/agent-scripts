@@ -13,6 +13,8 @@
 //! a message (unlike the podman suites, where skipping would hide
 //! regressions of the system under test itself).
 
+#![cfg_attr(test, allow(clippy::unwrap_used))]
+
 use std::io::Write;
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;

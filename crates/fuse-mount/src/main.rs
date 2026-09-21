@@ -5,6 +5,7 @@
 //! content updates arrive on the same socket's control channel. Either
 //! half alone is useless — compromise of fused yields no authorization,
 //! compromise of the policy daemon yields no bytes.
+#![cfg_attr(test, allow(clippy::unwrap_used))]
 
 use std::path::PathBuf;
 

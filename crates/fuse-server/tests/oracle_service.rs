@@ -3,6 +3,8 @@
 //! content forwarding to (fake) data daemons, and snapshot replay for
 //! late joiners.
 
+#![cfg_attr(test, allow(clippy::unwrap_used))]
+
 use std::io::{BufRead, BufReader, Read as _, Write};
 use std::sync::Arc;
 use std::time::Duration;

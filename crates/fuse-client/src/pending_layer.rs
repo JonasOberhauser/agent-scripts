@@ -268,7 +268,12 @@ pub(crate) fn cursor_up(slots: &Slots, cur: Cursor, disabled: &std::collections:
             }
         }
         Cursor::All { grant } => Cursor::Request {
-            slot: *occ.last().unwrap(),
+            // #64: the all-row only exists while >=1 request is
+            // occupied (it un-occupies itself otherwise), so `last()`
+            // is Some by the caller's own invariant.
+            slot: *occ
+                .last()
+                .expect("all-row implies >=1 occupied request slot"),
             sel: if grant { Sel::Grant } else { Sel::Deny },
         },
     }
@@ -645,7 +650,7 @@ fn service(
     match req {
         PanelRequest::Poll => {
             match poll_pending_info(socket) {
-                Ok(list) => *pending.lock().unwrap() = list,
+                Ok(list) => *pending.lock().expect("pending snapshot lock: poller discipline") = list,
                 Err(e) => tracing::warn!("pending poll failed: {e}"),
             }
             // The same tick refreshes the secret-name snapshot that
@@ -654,9 +659,9 @@ fn service(
             // difference (issue #34).
             match poll_secret_names(socket) {
                 Ok(names) => {
-                    *secrets.lock().unwrap() = names.clone();
+                    *secrets.lock().expect("names snapshot lock: poller discipline") = names.clone();
                     let rendered = fuse_protocol::collapse_paths(&names);
-                    let mut c = collapsed.lock().unwrap();
+                    let mut c = collapsed.lock().expect("collapsed-map lock: poller discipline");
                     c.clear();
                     c.extend(names.into_iter().zip(rendered));
                 }
@@ -679,16 +684,16 @@ fn service(
                     // human actually sees (stderr is hidden behind the
                     // alternate screen): push every line, including any
                     // remediation commands embedded by the server.
-                    log.lock().unwrap().extend(
+                    log.lock().expect("log-window lock: action-path discipline").extend(
                         format!("pending action '{name}' failed: {e}")
                             .lines()
                             .map(str::to_string),
                     );
-                    *error.lock().unwrap() = Some(format!("{name}: {e}"));
+                    *error.lock().expect("last-error lock: action-path discipline") = Some(format!("{name}: {e}"));
                 }
                 None => {
                     tracing::info!("pending action '{name}' ok");
-                    *error.lock().unwrap() = None;
+                    *error.lock().expect("last-error lock: action-path discipline") = None;
                 }
             }
         }
@@ -916,7 +921,11 @@ impl PendingPanelLayer {
             _ => false,
         };
 
-        let snapshot = self.pending.lock().unwrap().clone();
+        let snapshot = self
+            .pending
+            .lock()
+            .expect("pending snapshot lock: press-path discipline")
+            .clone();
         let dispatch: Vec<(String, Command)> = button
             .commands(&snapshot)
             .into_iter()
@@ -951,7 +960,11 @@ impl DisplayLayer for PendingPanelLayer {
 
         // One lock scope drives the whole frame: slot sync, cursor
         // reconcile, new-request detection and the title count.
-        let snapshot = self.pending.lock().unwrap().clone();
+        let snapshot = self
+            .pending
+            .lock()
+            .expect("pending snapshot lock: press-path discipline")
+            .clone();
         sync_slots(&mut self.slots, &snapshot);
         // Confirm in-flight decisions: once the server consumed a
         // decision the request leaves the snapshot.  A timeout guards
@@ -1021,7 +1034,11 @@ impl DisplayLayer for PendingPanelLayer {
             widget: Box::new(Paragraph::new(title_line(
                 occupied(&self.slots).len(),
                 snapshot.len(),
-                self.error.lock().unwrap().as_deref(),
+                self
+                .error
+                .lock()
+                .expect("last-error lock: render-path discipline")
+                .as_deref(),
                 panel.width,
             ))),
             area: panel,
@@ -1069,7 +1086,12 @@ impl DisplayLayer for PendingPanelLayer {
                             row.width,
                             None,
                             true,
-                            self.collapsed.lock().unwrap().get(&req.secret_name).map(String::as_str),
+                            self
+                            .collapsed
+                            .lock()
+                            .expect("collapsed-map lock: render-path discipline")
+                            .get(&req.secret_name)
+                            .map(String::as_str),
                         )
                     } else {
                         grid_row_line_hover(
@@ -1077,7 +1099,12 @@ impl DisplayLayer for PendingPanelLayer {
                             row.width,
                             sel_here,
                             hovered.as_ref(),
-                            self.collapsed.lock().unwrap().get(&req.secret_name).map(String::as_str),
+                            self
+                            .collapsed
+                            .lock()
+                            .expect("collapsed-map lock: render-path discipline")
+                            .get(&req.secret_name)
+                            .map(String::as_str),
                         )
                     }
                 }

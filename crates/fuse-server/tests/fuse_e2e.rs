@@ -10,6 +10,8 @@
 //!
 //! Run under a mount-capable context (e.g. the userns wrapper).
 
+#![cfg_attr(test, allow(clippy::unwrap_used))]
+
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};

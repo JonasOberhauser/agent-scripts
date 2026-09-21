@@ -41,6 +41,7 @@
 //! ```sh
 //! sudo systemd-run --unit=fuse-hashd <path-to-this-binary> --socket <sock>
 //! ```
+#![cfg_attr(test, allow(clippy::unwrap_used))]
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;

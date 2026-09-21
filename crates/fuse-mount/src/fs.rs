@@ -142,7 +142,8 @@ impl Store {
     /// current fino follows the host identity, allocating a fresh one
     /// when the incarnation changed since last Serve/stat.
     pub fn serve(&self, name: &str, inner: &str, mode: u32) {
-        let mut s = self.0.lock().unwrap();
+        let mut s = self.0.lock()
+            .expect("store lock: never held across a panic — poisoning means a data-daemon bug");
         let path = PathBuf::from(name);
         let comps: Vec<String> = path
             .components()
@@ -193,7 +194,11 @@ impl Store {
             // stat (lookup is authoritative; open verifies against the
             // recorded identity regardless).
             Some(Node::File { .. }) => {
-                let Node::File { mode: m, .. } = s.tree.get_mut(&path).unwrap() else {
+                let Node::File { mode: m, .. } = s
+                    .tree
+                    .get_mut(&path)
+                    .expect("checked File in the match arm directly above")
+                else {
                     unreachable!("checked File above");
                 };
                 *m = mode;
@@ -240,7 +245,8 @@ impl Store {
     /// Remove a secret: prune the tree node and its fino entry, then
     /// childless structural ancestors vanish with it.
     pub fn remove(&self, name: &str) {
-        let mut s = self.0.lock().unwrap();
+        let mut s = self.0.lock()
+            .expect("store lock: never held across a panic — poisoning means a data-daemon bug");
         let mut path = PathBuf::from(name);
         if !matches!(s.tree.get(&path), Some(Node::File { .. })) {
             return;
@@ -278,7 +284,8 @@ impl Store {
             return None;
         }
         let label = label.to_string_lossy().into_owned();
-        let s = self.0.lock().unwrap();
+        let s = self.0.lock()
+            .expect("store lock: never held across a panic — poisoning means a data-daemon bug");
         let Node::Dir { labels, .. } = s.tree.get(Path::new(""))? else {
             return None;
         };
@@ -292,7 +299,8 @@ impl Store {
 
     /// The fino table entry (identity + address) for by-ino requests.
     fn fino_record(&self, ino: FuseIno) -> Option<FinoRecord> {
-        self.0.lock().unwrap().identities.get(&ino).cloned()
+        self.0.lock()
+            .expect("store lock: never held across a panic — poisoning means a data-daemon bug").identities.get(&ino).cloned()
     }
 
     /// Observe a fresh host identity for a path (from Stat at
@@ -304,7 +312,8 @@ impl Store {
         path: &Path,
         identity: fuse_protocol::oracle::HostIdentity,
     ) -> Option<FuseIno> {
-        let mut s = self.0.lock().unwrap();
+        let mut s = self.0.lock()
+            .expect("store lock: never held across a panic — poisoning means a data-daemon bug");
         let current = match s.tree.get(path)? {
             Node::File { fino, .. } => *fino,
             _ => return None,
@@ -322,7 +331,8 @@ impl Store {
 
     /// The Serve-time mode fallback for a file path.
     fn mode_of(&self, path: &Path) -> Option<u32> {
-        match self.0.lock().unwrap().tree.get(path)? {
+        match self.0.lock()
+            .expect("store lock: never held across a panic — poisoning means a data-daemon bug").tree.get(path)? {
             Node::File { mode, .. } => Some(*mode),
             _ => None,
         }
@@ -332,7 +342,8 @@ impl Store {
     /// Dir children get their fino minted on demand — a freshly
     /// served tree must list completely without prior lookups.
     fn dir_children(&self, _dir: FuseIno) -> Option<Vec<(FuseIno, bool, String)>> {
-        let s = self.0.lock().unwrap();
+        let s = self.0.lock()
+            .expect("store lock: never held across a panic — poisoning means a data-daemon bug");
         let Node::Dir { labels, .. } = s.tree.get(Path::new(""))? else {
             return None;
         };
@@ -352,7 +363,8 @@ impl Store {
         if ino == FuseIno::ROOT {
             return Some(FuseIno::ROOT);
         }
-        let s = self.0.lock().unwrap();
+        let s = self.0.lock()
+            .expect("store lock: never held across a panic — poisoning means a data-daemon bug");
         let path = &s.identities.get(&ino)?.path;
         let mut parent = path.clone();
         parent.pop();
@@ -374,7 +386,7 @@ impl Store {
     fn file_count(&self) -> usize {
         self.0
             .lock()
-            .unwrap()
+            .expect("store lock: never held across a panic — poisoning means a data-daemon bug")
             .tree
             .values()
             .filter(|n| matches!(n, Node::File { .. }))
@@ -395,7 +407,8 @@ fn send_line(sock: &str, line: &str) -> Result<UnixStream, String> {
 pub fn stat_secret(socket: &str, name: &str) -> Result<OracleReply, String> {
     let s = send_line(
         socket,
-        &serde_json::to_string(&OracleRequest::Stat { name: name.into() }).unwrap(),
+        &serde_json::to_string(&OracleRequest::Stat { name: name.into() })
+            .expect("serializing Stat: internal enum, infallible"),
     )?;
     // Metadata has no pending machinery to wait out — bound it tight.
     s.set_read_timeout(Some(std::time::Duration::from_secs(10)))
@@ -441,7 +454,8 @@ fn open_secret_timeout(
 
     let s = send_line(
         socket,
-        &serde_json::to_string(&OracleRequest::Open { name: name.into(), pid, kdev, kino }).unwrap(),
+        &serde_json::to_string(&OracleRequest::Open { name: name.into(), pid, kdev, kino })
+            .expect("serializing Open: internal enum, infallible"),
     )?;
     s.set_read_timeout(Some(timeout)).map_err(|e| e.to_string())?;
 
@@ -856,7 +870,7 @@ pub fn run_control_loop(store: Store, oracle_socket: String) {
                 serde_json::to_string(&OracleRequest::Hello {
                     version: Some(fuse_protocol::VERSION.to_string()),
                 })
-                .unwrap()
+                .expect("serializing Hello: internal enum, infallible")
             )
             .is_err()
             {
