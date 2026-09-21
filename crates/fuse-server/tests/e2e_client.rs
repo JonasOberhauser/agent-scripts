@@ -3,6 +3,7 @@
 //! No /dev/fuse needed — the socket server runs independently from the FUSE mount.
 
 use std::path::{Path, PathBuf};
+use std::os::unix::net::UnixStream;
 use std::process::Command;
 use std::sync::Arc;
 
@@ -84,12 +85,24 @@ fn wait_for_socket(path: &Path, what: &str) {
 /// A sacrificial process recorded as the state file's server_pid: the
 /// restart kills EXACTLY this (never a by-name sweep — that once took
 /// down a developer's live gate stack). We own it, we reap it.
-fn sacrificial_server_pid() -> std::process::Child {
-    Command::new("sh")
-        .arg("-c")
-        .arg("sleep 120")
-        .spawn()
-        .expect("spawn sacrificial server-pid stand-in")
+///
+/// The stand-in is a copy of `sleep` at `dir/<name>` and the state
+/// file records THAT path as server_binary — so the pid-reuse guard
+/// (cmdline argv[0] must name the recorded binary) verifies and the
+/// NamedPid branch fires, exactly as with a real recorded server.
+fn sacrificial_server_pid_as(dir: &Path, name: &str) -> (std::process::Child, String) {
+    let bin = dir.join(name);
+    std::fs::copy("/usr/bin/sleep", &bin).expect("copy sleep as sacrificial server");
+    for attempt in 0..20 {
+        match Command::new(&bin).arg("120").spawn() {
+            Ok(child) => return (child, bin.to_string_lossy().into_owned()),
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(e) => panic!("spawn sacrificial {name} (attempt {attempt}): {e}"),
+        }
+    }
+    panic!("sacrificial {name}: still Text file busy after 20 attempts");
 }
 
 /// A bystander process NAMED fuse-server (comm matches) that is NOT
@@ -117,11 +130,17 @@ fn fuse_server_named_bystander(dir: &Path) -> std::process::Child {
     )
 }
 
-fn write_state_with_pid(dir: &Path, socket: &Path, oracle: Option<&str>, server_pid: u32) {
+fn write_state_with_pid(
+    dir: &Path,
+    socket: &Path,
+    oracle: Option<&str>,
+    server_pid: u32,
+    server_binary: &str,
+) {
     let state = serde_json::json!({
         "version": VERSION,
         "server_pid": server_pid,
-        "server_binary": "/bin/true",
+        "server_binary": server_binary,
         "mount_point": dir.join("mnt").to_string_lossy(),
         "socket": socket.to_string_lossy(),
         "log_level": "info",
@@ -360,13 +379,20 @@ fn restart_spares_processes_that_mention_fuse_server() {
         .expect("spawn innocent");
 
     let mut bystander = fuse_server_named_bystander(dir.path());
-    let mut sacrificial = sacrificial_server_pid();
+    let (mut sacrificial, sacrificial_bin) = sacrificial_server_pid_as(dir.path(), "sacrificial-server");
     with_state_file_in(dir.path(), || {
-        write_state_with_pid(dir.path(), &dead_socket, None, sacrificial.id());
-        // Bounded by the client's own 10s server wait (/bin/true).
+        write_state_with_pid(dir.path(), &dead_socket, None, sacrificial.id(), &sacrificial_bin);
+        // Bounded by the client's own 10s server wait.
         let _ = run_client(&dead_socket, &["restart"]);
     });
+    let sacrificial_gone = sacrificial.try_wait().map(|w| w.is_some()).unwrap_or(false);
+    let _ = sacrificial.kill();
     let _ = sacrificial.wait();
+    assert!(
+        sacrificial_gone,
+        "the VERIFIED recorded pid was not stopped — the restart must still \
+         kill exactly the server the state file names"
+    );
 
     let alive = innocent.try_wait().map(|w| w.is_none()).unwrap_or(false);
     let _ = innocent.kill();
@@ -386,6 +412,73 @@ fn restart_spares_processes_that_mention_fuse_server() {
 }
 
 #[test]
+fn restart_of_one_stack_spares_the_other_live_stack() {
+    // #62's named behavioral test: two REAL policy stacks with
+    // distinct cmd+oracle sockets; `fuse-client restart` against
+    // stack A's state file; stack B must keep answering its cmd
+    // socket throughout. A by-name sweep (the pre-#62 fallback)
+    // kills B's server and B goes silent — this fails.
+    let dir = test_tempdir();
+    let a_cmd = dir.path().join("a-cmd.sock");
+    let a_oracle = dir.path().join("a-oracle.sock");
+    let b_cmd = dir.path().join("b-cmd.sock");
+    let b_oracle = dir.path().join("b-oracle.sock");
+
+    // Stack B: a real policy server we prove stays alive.
+    let mut b_server = Command::new(env!("CARGO_BIN_EXE_fuse-server"))
+        .arg("--socket").arg(&b_cmd)
+        .arg("--oracle-socket").arg(&b_oracle)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn stack B");
+    wait_for_server(&b_cmd);
+
+    // Stack A's state file names a verifiable sacrificial "server".
+    let (mut sacrificial, sacrificial_bin) =
+        sacrificial_server_pid_as(dir.path(), "sacrificial-two-stack");
+    let state = serde_json::json!({
+        "version": VERSION,
+        "server_pid": sacrificial.id(),
+        "server_binary": sacrificial_bin,
+        "mount_point": dir.path().join("a-mnt").to_string_lossy(),
+        "socket": a_cmd.to_string_lossy(),
+        "log_level": "info",
+        "pending_timeout": 300,
+        "runtime_wrapper": null,
+        "oracle_socket": a_oracle.to_string_lossy(),
+        "secrets": [],
+    });
+    std::fs::create_dir_all(dir.path().join("a-mnt")).unwrap();
+    std::fs::write(dir.path().join("state.json"), state.to_string()).unwrap();
+
+    let spawned_pid = with_state_file_in(dir.path(), || {
+        let (stdout, _stderr, _code) = run_client(&a_cmd, &["restart"]);
+        stdout
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("Spawned pid ").and_then(|p| p.parse::<i32>().ok()))
+    });
+
+    // THE assertion: stack B still answers — its server was never touched.
+    assert!(
+        UnixStream::connect(&b_cmd).is_ok(),
+        "stack B's server was killed by a restart of stack A — the kill is not stack-scoped"
+    );
+    assert!(
+        b_server.try_wait().map(|w| w.is_none()).unwrap_or(false),
+        "stack B's server process died"
+    );
+
+    if let Some(pid) = spawned_pid {
+        let _ = Command::new("kill").arg(pid.to_string()).output();
+    }
+    let _ = b_server.kill();
+    let _ = b_server.wait();
+    let _ = sacrificial.kill();
+    let _ = sacrificial.wait();
+}
+
+#[test]
 fn restart_respawns_on_the_state_files_oracle_rendezvous() {
     // BEHAVIOR: a stack recorded with an oracle override comes back on
     // THAT rendezvous — the surviving data daemon retries its socket
@@ -399,8 +492,12 @@ fn restart_respawns_on_the_state_files_oracle_rendezvous() {
     let cmd_sock = dir.path().join("cmd.sock");
     let oracle_sock = dir.path().join("oracle.sock");
 
-    // The state file must name the REAL server for this one.
-    let mut sacrificial = sacrificial_server_pid();
+    // The recorded pid is a sacrificial sleep (its cmdline will NOT
+    // match the recorded binary, so the guard routes to the harmless
+    // socket-scoped branch); the RESPAWN target is the real server,
+    // which must come back on the custom oracle rendezvous.
+    let (mut sacrificial, _sacrificial_bin) =
+        sacrificial_server_pid_as(dir.path(), "sacrificial-oracle");
     let state = serde_json::json!({
         "version": VERSION,
         "server_pid": sacrificial.id(),

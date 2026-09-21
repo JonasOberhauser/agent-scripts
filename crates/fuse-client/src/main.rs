@@ -244,25 +244,47 @@ fn check_version_or_restart(app: &App) {
 }
 
 /// How the restart stops the old server, as DATA: the pid the state
-/// file names, and the orphan-fallback pkill invocation. Extracted so
-/// the decision is testable without executing any kill — a test that
-/// really pkills would nuke every other stack on the machine,
-/// including other tests' (observed live: a substring `-f` match
-/// killed the `cargo test` runner itself).
-struct ServerKillSpec {
-    pid: Option<i32>,
-    pkill_argv: [&'static str; 3],
+/// file names (after a pid-reuse guard), or — when the state file
+/// names no pid — a socket-scoped orphan match. Extracted so the
+/// decision is testable without executing any kill (#62).
+enum ServerKillSpec {
+    /// The state file names the pid AND /proc/<pid>/cmdline still
+    /// names the fuse-server binary: signal exactly this process.
+    NamedPid { pid: i32 },
+    /// No recorded pid, or the pid now belongs to something else
+    /// (reused): match orphans PRECISELY by the stack's own socket
+    /// path — a command line carrying `--socket <state.socket>`. A
+    /// bare-name sweep (`pkill -x fuse-server`) is NEVER produced:
+    /// on a multi-stack machine it kills every policy daemon, and
+    /// the observed-live incident did exactly that.
+    OrphanBySocket { socket: String },
+}
+
+/// Pid-reuse guard: the state file's pid only counts when the
+/// process behind it still looks like OUR server. Pure over its
+/// inputs (the cmdline bytes) so it stays testable.
+fn pid_cmdline_names_server(cmdline: &[u8], server_binary: &str) -> bool {
+    // cmdline args are NUL-separated; the executable is argv[0].
+    let argv0 = cmdline.split(|&b| b == 0).next().unwrap_or(&[]);
+    let argv0 = String::from_utf8_lossy(argv0);
+    argv0 == server_binary
+        || argv0.ends_with(&format!("/{server_binary}"))
+        || server_binary.ends_with(&format!("/{argv0}"))
 }
 
 fn server_kill_spec(state: &ServerStateFile) -> ServerKillSpec {
-    ServerKillSpec {
-        pid: (state.server_pid != 0).then_some(state.server_pid as i32),
-        // `-x`: exact process-NAME match. NEVER `-f fuse-server` —
-        // substring matching kills any command line that merely
-        // mentions the string (`cargo test -p fuse-server`, an
-        // editor, a grep).
-        pkill_argv: ["pkill", "-x", "fuse-server"],
+    if state.server_pid != 0 {
+        let cmdline = std::fs::read(format!("/proc/{}/cmdline", state.server_pid));
+        let verified = cmdline
+            .map(|c| pid_cmdline_names_server(&c, &state.server_binary))
+            .unwrap_or(false);
+        if verified {
+            return ServerKillSpec::NamedPid { pid: state.server_pid as i32 };
+        }
+        // pid gone or reused: fall through to the socket-scoped match,
+        // never a name sweep.
     }
+    ServerKillSpec::OrphanBySocket { socket: state.socket.clone() }
 }
 
 /// The argv the restart respawns the server with, as DATA: extracting
@@ -413,29 +435,34 @@ fn restart_server(app: &App, log_path: Option<&str>) {
     eprintln!("Current server state: {status_info}");
 
     eprintln!("Stopping old server...");
-    let kill = server_kill_spec(&state);
-    if let Some(pid) = kill.pid {
-        // The state file NAMES the server: kill exactly that process.
-        // SAFETY: a plain signal to one recorded pid; no process-group
-        // or pattern semantics involved.
-        unsafe {
-            libc::kill(pid, libc::SIGTERM);
+    match server_kill_spec(&state) {
+        ServerKillSpec::NamedPid { pid, .. } => {
+            // The state file NAMES the server and the pid-reuse guard
+            // passed: signal exactly this process.
+            // SAFETY: a plain signal to one verified pid; no
+            // process-group or pattern semantics involved.
+            unsafe {
+                libc::kill(pid, libc::SIGTERM);
+            }
         }
-    } else {
-        // No recorded pid (pre-#59 state file): fall back to an exact
-        // process-NAME match — and ONLY then. The by-name sweep must
-        // not run when the pid is known: it kills EVERY fuse-server on
-        // the machine (observed live: a restart under `cargo test`
-        // took down the developer's production gate stack, and its
-        // fused with it). Full precise targeting is #62.
-        if let Some(w) = &state.runtime_wrapper {
-            let wparts: Vec<&str> = w.split_whitespace().collect();
-            let mut kill_args: Vec<&str> = wparts[1..].to_vec();
-            kill_args.extend(kill.pkill_argv.iter().copied());
-            let _ = std::process::Command::new(wparts[0]).args(&kill_args).output();
-        } else {
-            let (prog, args) = kill.pkill_argv.split_first().expect("non-empty argv");
-            let _ = std::process::Command::new(prog).args(args).output();
+        ServerKillSpec::OrphanBySocket { socket } => {
+            // Unnamed or pid-reused: match orphans by the stack's OWN
+            // socket path — `--socket <path>` in the command line.
+            // Precise on multi-stack machines; a bare-name sweep
+            // here took down the developer's production gate stack
+            // (observed live).
+            let pat = format!("--socket {socket}");
+            if let Some(w) = &state.runtime_wrapper {
+                let wparts: Vec<&str> = w.split_whitespace().collect();
+                let mut kill_args: Vec<&str> = wparts[1..].to_vec();
+                kill_args.extend(&["pkill", "-f", &pat]);
+                let _ = std::process::Command::new(wparts[0]).args(&kill_args).output();
+            } else {
+                let _ = std::process::Command::new("pkill")
+                    .arg("-f")
+                    .arg(&pat)
+                    .output();
+            }
         }
     }
     std::thread::sleep(std::time::Duration::from_secs(2));
@@ -498,35 +525,6 @@ fn ask_reset_anyway() {
 mod tests {
     use super::*;
 
-    #[test]
-    fn kill_spec_names_targets_exactly_never_by_substring() {
-        // The observed-live bug: `pkill -f fuse-server` matched any
-        // command line MENTIONING the string — under `cargo test -p
-        // fuse-server` a restart killed its own test runner. The spec
-        // must name the recorded pid and match orphan names EXACTLY.
-        let mut st = ServerStateFile {
-            version: "0.30.0".into(),
-            server_pid: 4242,
-            server_binary: "/x/fuse-server".into(),
-            mount_point: "/m".into(),
-            socket: "/s".into(),
-            log_level: "info".into(),
-            pending_timeout: 300,
-            runtime_wrapper: None,
-            oracle_socket: None,
-            secrets: vec![],
-        };
-        let kill = server_kill_spec(&st);
-        assert_eq!(kill.pid, Some(4242), "the recorded pid is the target");
-        assert_eq!(kill.pkill_argv, ["pkill", "-x", "fuse-server"]);
-        assert!(
-            !kill.pkill_argv.contains(&"-f"),
-            "never a substring match: {:?}",
-            kill.pkill_argv
-        );
-        st.server_pid = 0;
-        assert_eq!(server_kill_spec(&st).pid, None, "pid 0 = unnamed");
-    }
 
     #[test]
     fn respawn_argv_carries_the_oracle_rendezvous() {
