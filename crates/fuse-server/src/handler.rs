@@ -17,6 +17,17 @@ pub fn handle_command(cmd: Command, state: &ServerState, hub: &crate::oracle_ser
             Response::Status { secrets: state.status() }
         }
 
+        Command::ShowMap => Response::Map {
+            entries: state
+                .secrets
+                .iter()
+                .map(|e| fuse_protocol::MapEntry {
+                    outer: e.key().clone(),
+                    inner: fuse_protocol::anonymize_path(&state.anon_salt, e.key()),
+                })
+                .collect(),
+        },
+
         Command::AddSecret { name, path, hash, mode } => {
             // MR4: register by stat — the policy daemon holds the host
             // PATH and identity, never bytes (see register_secret).

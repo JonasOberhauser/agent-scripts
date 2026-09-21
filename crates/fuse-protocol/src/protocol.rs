@@ -206,11 +206,13 @@ pub fn new_salt() -> Vec<u8> {
 
 /// The container-view form of a full path: same components, each
 /// anonymized under the salt.
+/// The container-view name of a full path: ONE hash of the whole
+/// path (review on #58), not per-component — short names, a flat
+/// mount, and no depth/fan-out structure leaking into the
+/// container. The hash input is the full path with separators, so
+/// distinct paths are unambiguous.
 pub fn anonymize_path(salt: &[u8], name: &str) -> String {
-    name.split('/')
-        .map(|c| anonymize(salt, c))
-        .collect::<Vec<_>>()
-        .join("/")
+    anonymize(salt, name)
 }
 
 /// Whether a server version and a client version speak the same
@@ -272,6 +274,10 @@ pub enum Command {
     },
     /// Remove a secret from the mount.
     RemoveSecret { name: String },
+    /// The outer->inner (container-view) name map, on demand —
+    /// status keeps its compact shape (review on #58: the inline
+    /// anonymized-path column was far too long).
+    ShowMap,
     /// Replace the allowed binary hash for a secret.
     RotateHash { name: String, new_hash: String },
     /// List all currently served secret filenames.
@@ -312,6 +318,17 @@ pub enum Response {
     Version { version: String },
     /// Server's log file path.
     LogPath { path: String },
+    /// The outer->inner name map (issue #47), on demand.
+    Map { entries: Vec<MapEntry> },
+}
+
+/// One row of the outer->inner name map.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MapEntry {
+    /// Clear host-side name (the policy/display language).
+    pub outer: String,
+    /// Anonymized container-view path the mount serves it under.
+    pub inner: String,
 }
 
 #[cfg(test)]
@@ -326,7 +343,7 @@ fn anonymize_is_deterministic_salt_sensitive_and_shaped() {
     assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
     assert_ne!(a, anonymize(b"other", "git.netrc"), "salt changes the name");
     assert_ne!(anonymize(b"salt", "a"), anonymize(b"salt", "b"));
-    assert_eq!(anonymize_path(b"s", "x/y/z.txt").split('/').count(), 3, "structure preserved");
+    assert!(!anonymize_path(b"s", "x/y/z.txt").contains('/'), "flat whole-path hash");
 }
 
 

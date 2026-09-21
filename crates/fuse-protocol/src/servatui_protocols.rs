@@ -22,18 +22,15 @@ pub fn print_response(resp: &Response, out: &mut dyn Console) {
                 let collapsed = crate::protocol::collapse_paths(
                     &secrets.iter().map(|s| s.name.clone()).collect::<Vec<_>>(),
                 );
-                out.print_line(&format!(
-                    "{:<24} {:<18} {:>8} {:>8}  HASH",
-                    "NAME", "AS /fuse/…", "READS", "SIZE"
-                ));
+                out.print_line(&format!("{:<24} {:>8} {:>8}  HASH", "NAME", "READS", "SIZE"));
                 // One row per permitted hash (review on #45): the
                 // first shares the secret's row, the rest continue
                 // aligned under the HASH column as `by -- hash`.
-                const HASH_COL: usize = 62;
+                const HASH_COL: usize = 44;
                 for (s, name) in secrets.iter().zip(&collapsed) {
                     let lead = format!(
-                        "{:<24} {:<18} {:>8} {:>8}  ",
-                        name, s.inner, s.access_count, s.size
+                        "{:<24} {:>8} {:>8}  ",
+                        name, s.access_count, s.size
                     );
                     if s.allowed_hashes.is_empty() {
                         out.print_line(&format!("{lead}-"));
@@ -78,6 +75,16 @@ pub fn print_response(resp: &Response, out: &mut dyn Console) {
                         p.pid_hash.as_deref().unwrap_or("<unknown>"),
                         p.reason, p.expires_at
                     ));
+                }
+            }
+        }
+        Response::Map { entries } => {
+            if entries.is_empty() {
+                out.print_line("No secrets served.");
+            } else {
+                out.print_line("OUTER -> AS /fuse/…");
+                for e in entries {
+                    out.print_line(&format!("  {} -> {}", e.outer, e.inner));
                 }
             }
         }
@@ -244,6 +251,7 @@ fn parse_deny(args: &str) -> Result<Command, String> {
         .map_err(|_| "Usage: deny ID (ID must be a number)".into())
 }
 fn parse_version(_: &str) -> Result<Command, String> { Ok(Command::GetVersion) }
+fn parse_show_map(_: &str) -> Result<Command, String> { Ok(Command::ShowMap) }
 fn parse_logpath(_: &str) -> Result<Command, String> { Ok(Command::GetLogPath) }
 
 fn offline_version(_args: &str, out: &mut dyn Console) -> Result<(), String> {
@@ -264,6 +272,7 @@ pub const COMMAND_TABLE: &[CommandSpec] = &[
     CommandSpec { name: "grant", help: "Grant a pending access request", parse: parse_grant, complete: Completer::PendingIds, offline: None },
     CommandSpec { name: "grant-forever", help: "Grant a pending access permanently (whitelists the observed package hash)", parse: parse_grant_forever, complete: Completer::PendingIds, offline: None },
     CommandSpec { name: "deny", help: "Deny a pending access request", parse: parse_deny, complete: Completer::PendingIds, offline: None },
+    CommandSpec { name: "show-map", help: "Show the outer -> anonymized container-view name map", parse: parse_show_map, complete: NO_COMPLETE, offline: None },
     CommandSpec { name: "version", help: "Show server version", parse: parse_version, complete: NO_COMPLETE, offline: Some(offline_version) },
     CommandSpec { name: "logpath", help: "Show server log file path", parse: parse_logpath, complete: NO_COMPLETE, offline: None },
 ];
@@ -454,6 +463,41 @@ mod tests {
     }
 
     #[test]
+    fn show_map_renders_the_pairs_and_status_stays_compact() {
+        // Review on #58: the inline anonymized-path column made status
+        // far too long. The map moved to its own command; status is
+        // back to the compact shape and must NOT render inner names.
+        let resp = Response::Status {
+            secrets: vec![crate::protocol::SecretStatus {
+                inner: "ab12/cd34/ef56/789a".into(),
+                name: "var/home/jonas/secrets/zai.key".into(),
+                access_count: 0,
+                allowed_hashes: vec![crate::protocol::HashEntryStatus {
+                    hash: crate::PENDING_ONLY_HASH.into(),
+                    by: None,
+                }],
+                size: 9,
+                unlimited: false,
+            }],
+        };
+        let mut cap = Cap(Vec::new());
+        print_response(&resp, &mut cap);
+        let status_out = cap.0.join("\n");
+        assert!(!status_out.contains("ab12"), "no inner in status: {status_out:?}");
+
+        let map = Response::Map {
+            entries: vec![crate::protocol::MapEntry {
+                outer: "var/home/jonas/secrets/zai.key".into(),
+                inner: "ab12/cd34/ef56/789a".into(),
+            }],
+        };
+        let mut cap = Cap(Vec::new());
+        print_response(&map, &mut cap);
+        let out = cap.0.join("\n");
+        assert!(out.contains("var/home/jonas/secrets/zai.key -> ab12/cd34/ef56/789a"), "{out:?}");
+    }
+
+    #[test]
     fn status_renders_one_row_per_hash() {
         // Review mockup on #45:
         //   bar/secret.txt     6    167    blah -- hash1
@@ -499,7 +543,7 @@ mod tests {
         let cont = &rows[2];
         assert!(cont.trim() == "bloo -- hash2", "continuation carries only the hash row: {cont:?}");
         assert!(cont.starts_with(" "), "aligned under the HASH column");
-        assert_eq!(cont.find("bloo"), Some(62), "HASH column start: {cont:?}");
+        assert_eq!(cont.find("bloo"), Some(44), "HASH column start: {cont:?}");
         assert!(rows[3].contains(".../foo/secret2.txt") && rows[3].contains("(manual approval only)"),
             "single-entry secret stays on one row: {:?}", rows[3]);
     }
