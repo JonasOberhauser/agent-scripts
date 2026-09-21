@@ -512,7 +512,38 @@ fn ask_reset_anyway() {
     let mut input = String::new();
     let _ = std::io::stdin().read_line(&mut input);
     if input.trim().to_lowercase() == "y" {
-        let _ = std::process::Command::new("pkill").arg("-f").arg("fuse-server").output();
+        // #62 discipline here too: the reset kills through the same
+        // precise spec as restart — a raw `pkill -f fuse-server` here
+        // was the last bare sweep in the client, with the same blast
+        // radius as the original incident (anything mentioning the
+        // string, every stack on the machine).
+        let state = read_state_file();
+        let st = ServerStateFile {
+            version: String::new(),
+            server_pid: 0,
+            server_binary: String::new(),
+            mount_point: String::new(),
+            socket: "/tmp/fuse-gatekeeper.sock".into(),
+            log_level: "info".into(),
+            pending_timeout: 300,
+            runtime_wrapper: None,
+            oracle_socket: None,
+            secrets: vec![],
+        };
+        let st = state.as_ref().unwrap_or(&st);
+        match server_kill_spec(st) {
+            ServerKillSpec::NamedPid { pid, .. } => {
+                // SAFETY: one verified pid, plain SIGTERM.
+                unsafe { libc::kill(pid, libc::SIGTERM) };
+            }
+            ServerKillSpec::OrphanBySocket { socket } => {
+                let pat = format!("--socket {socket}");
+                let _ = std::process::Command::new("pkill")
+                    .arg("-f")
+                    .arg(&pat)
+                    .output();
+            }
+        }
         eprintln!("Server killed. Re-run run-agent to start a fresh server.");
         std::process::exit(0);
     } else {
