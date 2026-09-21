@@ -425,16 +425,24 @@ fn e2e_nonexistent_file_enoent() {
 }
 
 #[test]
-fn e2e_path_shaped_names_serve_a_directory_tree() {
-    // Issue #34: names are normalized host paths; the mount must show
-    // the intermediate directories and serve the file at the nested
-    // path — full stack: add -> oracle -> fused tree -> read.
+fn e2e_path_shaped_names_serve_flat() {
+    // Issue #34 + review on #58: names are normalized host paths
+    // HOST-side (policy/display), but the CONTAINER view is FLAT —
+    // one directory of whole-path hashes. Nested outer paths serve
+    // as single flat entries; the mount root is a directory and
+    // nothing else is.
     if !fuse_available() { return; }
     let _g = serial();
     let split = Split::new("paths", &[("a/b/c.txt", b"NESTED", "*")]);
-    assert!(split.path("a").is_dir(), "implicit directory materializes");
-    assert!(split.path("a/b").is_dir());
-    assert_eq!(std::fs::read(split.path("a/b/c.txt")).unwrap(), b"NESTED");
+    assert!(split.mount.is_dir(), "the mount root is a directory");
+    let labels: Vec<std::ffi::OsString> = std::fs::read_dir(&split.mount)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(labels.len(), 1, "one flat entry, not a tree: {labels:?}");
+    let entry = split.mount.join(&labels[0]);
+    assert!(entry.is_file(), "the flat entry is the secret file");
+    assert_eq!(std::fs::read(&entry).unwrap(), b"NESTED");
 }
 
 #[test]
