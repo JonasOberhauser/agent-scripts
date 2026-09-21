@@ -360,6 +360,68 @@ fn inner_name_of(store: &Path, name: &str) -> String {
     fuse_protocol::anonymize_path(&salt, name)
 }
 
+/// SIGKILL a daemon child and reap it. The kill points exercised by
+/// the split-invariant tests (#50): kill -9 leaves no cleanup hooks —
+/// stale sockets and dead mounts are exactly what the survivors see.
+fn kill9(c: &mut Child) {
+    // SAFETY: a plain signal to one child pid we own.
+    unsafe { libc::kill(c.id() as i32, libc::SIGKILL); }
+    let _ = c.wait();
+}
+
+impl Split {
+    /// Respawn the POLICY daemon on the same sockets and policy store,
+    /// WITHOUT --secret: the pure MR5 load path must re-register every
+    /// secret from the store (this is what distinguishes it from the
+    /// grants-survive test, which re-passes --secret).
+    fn respawn_policy(&mut self, tag: &str) {
+        let log = std::fs::OpenOptions::new()
+            .create(true).append(true)
+            .open(self._dirs[1].path().join(format!("server-respawn-{tag}.log")))
+            .unwrap();
+        let mut cmd = std::process::Command::new(bin("fuse-server"));
+        cmd.arg("--socket").arg(&self.socket)
+            .arg("--oracle-socket").arg(&self.oracle)
+            .arg("--pending-timeout").arg("5")
+            .env("FUSE_GATEKEEPER_POLICY", self._dirs[1].path().join("policy.json"))
+            .env("RUST_LOG", "fuse_mount=info,fuse_server=info")
+            .stdout(std::process::Stdio::from(log.try_clone().unwrap()))
+            .stderr(log);
+        self.procs[0] = cmd.spawn().expect("respawn fuse-server");
+        // The stale socket file still exists — wait for a LIVE accept.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if std::os::unix::net::UnixStream::connect(&self.socket).is_ok() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!("respawned policy daemon never accepted: {}", self.dump_logs(tag));
+    }
+
+    /// Spawn a FRESH data daemon on the same mountpoint + oracle —
+    /// the recovery for a killed fused. Clears the dead mount first
+    /// (lazy unmount), exactly as the orchestrator's teardown does.
+    fn respawn_data(&mut self, tag: &str) {
+        for b in ["fusermount3", "fusermount"] {
+            let _ = Command::new(b).arg("-uz").arg(&self.mount).status();
+        }
+        let log = std::fs::OpenOptions::new()
+            .create(true).append(true)
+            .open(self._dirs[2].path().join(format!("fused-respawn-{tag}.log")))
+            .unwrap();
+        let mut cmd = Command::new(bin("fused"));
+        cmd.arg("--mount-point").arg(&self.mount)
+            .arg("--oracle-socket").arg(&self.oracle)
+            .env("RUST_LOG", "info")
+            .stdout(std::process::Stdio::from(log.try_clone().unwrap()))
+            .stderr(log);
+        self.procs[1] = cmd.spawn().expect("respawn fused");
+        wait_mount(&self.mount, &self._dirs);
+    }
+}
+
+
 /// Whether the kernel has a FUSE mount ON this exact path: statfs(2)
 /// reports FUSE_SUPER_MAGIC for the filesystem covering the path — a
 /// kernel-standardized ABI answer with no mounts-table format to
@@ -536,6 +598,79 @@ fn e2e_grants_survive_a_policy_daemon_kill() {
     }
     child.kill().unwrap();
     let _ = child.wait();
+}
+
+#[test]
+fn e2e_fused_kill9_policy_untouched_a_fresh_data_daemon_remounts() {
+    // The other half's kill point (#50): kill -9 the DATA daemon —
+    // the mount dies with it (fused owns it) — while the policy
+    // daemon must be untouched and fully serving (cmd socket answers,
+    // state intact). A fresh fused on the same mountpoint + oracle
+    // remounts, the control-channel snapshot replays, and reads work
+    // under the SAME one-read budget (spent stays spent — the budget
+    // lives in the policy daemon, which never died).
+    if !fuse_available() { return; }
+    let _g = serial();
+    let mut split = Split::new("datakill", &[("s", b"DK", "*")]);
+    assert_eq!(split.read("s").unwrap(), b"DK");
+    // Budget now spent — and must REMAIN spent across the data
+    // daemon's death+remount (policy never died).
+
+    kill9(&mut split.procs[1]);
+
+    // Policy untouched: the cmd socket answers status immediately.
+    let out = split.client(&["status"]);
+    assert!(out.status.success(), "policy must not notice fused's death: {}", write_out(&out));
+
+    // Fresh data daemon on the same rendezvous; the snapshot replays.
+    split.respawn_data("datakill");
+    let mut listed = false;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if let Ok(rd) = std::fs::read_dir(&split.mount) {
+            if rd.filter_map(|e| e.ok())
+                .any(|e| e.file_name().to_string_lossy() == split.inner("s"))
+            {
+                listed = true;
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(listed, "remounted data daemon never re-listed the secret: {}", split.dump_logs("datakill"));
+
+    // The budget survived (policy-side state): the next open pends
+    // out the 5s timeout and denies, not grants.
+    let err = split.read("s").unwrap_err();
+    assert_eq!(err.raw_os_error(), Some(libc::EACCES), "budget must survive the data daemon's death: {err}");
+
+    // And the explicit reset restores reads through the new mount.
+    let out = split.client(&["reset", "--name", "s"]);
+    assert!(out.status.success(), "reset after remount: {}", write_out(&out));
+    assert_eq!(split.read("s").unwrap(), b"DK");
+}
+
+#[test]
+fn e2e_policy_kill9_before_any_read_a_store_only_respawn_serves() {
+    // Kill point corner (#50): the policy daemon dies BEFORE the
+    // first read — no budget consumed, no pinned fds. The pure-load
+    // respawn must serve reads on the first attempt.
+    if !fuse_available() { return; }
+    let _g = serial();
+    let mut split = Split::new("earlykill", &[("s", b"EARLY", "*")]);
+    kill9(&mut split.procs[0]);
+    split.respawn_policy("earlykill");
+    let mut ok = false;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if let Ok(b) = split.read("s") {
+            assert_eq!(b, b"EARLY");
+            ok = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(ok, "first read after an early kill + store-only respawn failed: {}", split.dump_logs("earlykill"));
 }
 
 #[test]
@@ -998,19 +1133,91 @@ fn e2e_package_hash_works_with_deleted_mapped_library() {
     }
 
 #[test]
-fn e2e_data_daemon_survives_policy_restart() {
+fn e2e_policy_kill9_the_mount_survives_and_a_store_only_respawn_resyncs() {
+    // THE split's headline invariant (#50), as behavior at three
+    // phases around a kill -9 of the POLICY daemon:
+    //   before: a pinned fd is taken (MR4 open-time adjudication);
+    //   during: the mount itself survives — the frozen tree still
+    //           lists the secret (readdir needs no policy), the
+    //           pinned fd still reads (preads of the host fd), and a
+    //           FRESH open fails fast instead of hanging;
+    //   after:  a respawn with NO --secret (the pure MR5 load path)
+    //           re-registers from the store, fused's control loop
+    //           reconnects, reads work again, and a NEW add served by
+    //           the respawned policy becomes visible through the
+    //           mount — re-sync, not just survival.
     if !fuse_available() { return; }
     let _g = serial();
-    // THE split's headline property: the mount survives a policy daemon
-    // restart (no agent-box re-open). Policy state is lost on restart —
-    // documented — so re-register via the socket and read again.
-    let split = Split::new("restart", &[("s", b"R1", "*")]);
-    assert_eq!(std::fs::read(split.path("s")).unwrap(), b"R1");
-    // Kill and restart the policy daemon on the same sockets.
-    // (Split owns the children; we poke at them through proc.)
-    let _ = split; // teardown order is exercised implicitly by the suite;
-    // a full restart dance needs the orchestrator harness — tracked as
-    // follow-up once run-agent drives the split stack.
+    let mut split = Split::new("restart", &[("s", b"R1", "*")]);
+
+    // Pinned fd: open BEFORE the kill (consumes this cycle's read).
+    let mut pinned = std::fs::File::open(split.path("s"))
+        .expect("open before the kill");
+    let mut buf = [0u8; 2];
+    std::io::Read::read_exact(&mut pinned, &mut buf).unwrap();
+    assert_eq!(&buf, b"R1");
+
+    kill9(&mut split.procs[0]);
+
+    // Dead window: the mount survives...
+    let names = std::fs::read_dir(&split.mount).unwrap()
+        .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+        .collect::<Vec<_>>();
+    assert!(
+        names.iter().any(|n| *n == split.inner("s")),
+        "the frozen tree outlives the policy daemon (readdir needs no policy): {names:?}"
+    );
+    // ...the pinned fd still reads (pread of the host fd, no oracle)...
+    use std::io::Seek;
+    pinned.seek(std::io::SeekFrom::Start(0)).unwrap();
+    let mut again = Vec::new();
+    std::io::Read::read_to_end(&mut pinned, &mut again).unwrap();
+    assert_eq!(again, b"R1", "an fd pinned before the kill keeps serving");
+    // ...and a fresh open fails FAST (dead oracle socket refuses
+    // connections — the bounded-open discipline), never hangs.
+    let t0 = Instant::now();
+    let err = split.read("s").unwrap_err();
+    assert!(t0.elapsed() < Duration::from_secs(5), "fresh open under a dead policy must fail fast, hung {t0:?}");
+    assert_eq!(err.raw_os_error(), Some(libc::EIO), "fresh open under a dead policy: {err}");
+
+    // Respawn with NO --secret: the store alone must re-register.
+    split.respawn_policy("restart");
+
+    // fused's control loop reconnects (~1s poll) and the snapshot
+    // replay re-serves; budget was spent pre-kill (MR5 persistence),
+    // so reset — the explicit policy path — then read.
+    let out = split.client(&["reset", "--name", "s"]);
+    assert!(out.status.success(), "reset after respawn: {}", write_out(&out));
+    let mut ok = false;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if let Ok(b) = split.read("s") {
+            assert_eq!(b, b"R1");
+            ok = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(ok, "read after store-only respawn never recovered: {}", split.dump_logs("restart"));
+
+    // Re-sync proof: a NEW secret served by the respawned policy
+    // becomes visible through the reconnected mount.
+    let src = tempfile::tempdir().unwrap();
+    let f = src.path().join("post-restart.secret");
+    std::fs::write(&f, b"AFTER").unwrap();
+    let out = split.client(&["add-secret", "late", "--file", &f.display().to_string(), "--hash", "*"]);
+    assert!(out.status.success(), "post-respawn add failed: {}", write_out(&out));
+    let mut seen = false;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if let Ok(b) = split.read("late") {
+            assert_eq!(b, b"AFTER");
+            seen = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(seen, "post-respawn add never became visible (no re-sync): {}", split.dump_logs("restart"));
 }
 
 /// Keep the writer import used (build hygiene for helper fns above).
