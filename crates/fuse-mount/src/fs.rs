@@ -54,12 +54,11 @@ enum Node {
     Dir {
         /// Child labels keyed by the OUTER (host) name.
         children: BTreeMap<String, ()>,
-        /// Issue #47: per-directory label bijection. The CONTAINER
-        /// speaks only `inner` labels (anonymized, stable); policy
-        /// and display speak outer. outer→inner renders readdir;
-        /// inner→outer resolves lookup.
-        inner_by_outer: BTreeMap<String, String>,
-        outer_by_inner: BTreeMap<String, String>,
+        /// Issue #47: the outer<->inner label bijection (review on
+        /// #58: an off-the-shelf bimap, not two hand-rolled maps).
+        /// Only the ROOT's map is consulted — the container view is
+        /// flat.
+        labels: bimap::BiBTreeMap<String, String>,
     },
 }
 
@@ -104,8 +103,7 @@ impl StoreInner {
                 PathBuf::new(),
                 Node::Dir {
                     children: BTreeMap::new(),
-                    inner_by_outer: BTreeMap::new(),
-                    outer_by_inner: BTreeMap::new(),
+                    labels: bimap::BiBTreeMap::new(),
                 },
             )]),
             identities: HashMap::new(),
@@ -183,8 +181,7 @@ impl Store {
                         prefix.clone(),
                         Node::Dir {
                             children: BTreeMap::new(),
-                            inner_by_outer: BTreeMap::new(),
-                            outer_by_inner: BTreeMap::new(),
+                            labels: bimap::BiBTreeMap::new(),
                         },
                     );
                 }
@@ -217,40 +214,26 @@ impl Store {
         // Flat container label: link the whole-path hash into the
         // ROOT's bijection — the only place inner names resolve.
         let last = &comps[comps.len() - 1];
-        if let Some(Node::Dir { children, inner_by_outer, outer_by_inner }) =
-            s.tree.get_mut(&prefix)
-        {
+        if let Some(Node::Dir { children, .. }) = s.tree.get_mut(&prefix) {
             children.insert(last.clone(), ());
-            // keep the outer tree coherent for policy paths
-            let _ = inner_by_outer;
-            let _ = outer_by_inner;
         }
-        if let Some(Node::Dir { children, inner_by_outer, outer_by_inner }) =
-            s.tree.get_mut(Path::new(""))
-        {
+        if let Some(Node::Dir { labels, .. }) = s.tree.get_mut(Path::new("")) {
             let outer_full = comps.join("/");
-            let _ = children;
-            // Re-serve replaces the label: drop any previous inner
-            // binding for this outer so the old label stops
-            // resolving (relabel is a rename, not an alias).
-            if let Some(prev) = inner_by_outer.get(&outer_full) {
-                let prev = prev.clone();
-                if prev != inner {
-                    outer_by_inner.remove(&prev);
-                }
-            }
-            inner_by_outer.insert(outer_full.clone(), inner.to_string());
-            if let Some(old) = outer_by_inner.insert(inner.to_string(), outer_full.clone()) {
-                if old != outer_full {
+            // A bimap is bijective by construction: insert removes the
+            // previous pairing on BOTH sides (relabel is a rename),
+            // and a conflicting inner label would evict the old
+            // outer's binding — so check the collision FIRST, refuse.
+            if let Some(existing_outer) = labels.get_by_right(inner) {
+                if existing_outer != &outer_full {
                     warn!(
-                        "anonymized label \"{inner}\" collides between \"{old}\" and \
+                        "anonymized label \"{inner}\" collides between \"{existing_outer}\" and \
                          \"{outer_full}\" — refusing the second name (never alias two secrets)"
                     );
-                    // undo the partial insert so nothing half-serves
-                    inner_by_outer.remove(&outer_full);
-                    outer_by_inner.insert(inner.to_string(), old);
+                    return;
                 }
             }
+            labels.remove_by_left(&outer_full);
+            labels.insert(outer_full, inner.to_string());
         }
     }
 
@@ -270,14 +253,10 @@ impl Store {
                 break;
             }
             let now_empty = {
-                let Some(Node::Dir { children, inner_by_outer, outer_by_inner }) =
-                    s.tree.get_mut(&path)
-                else {
+                let Some(Node::Dir { children, labels }) = s.tree.get_mut(&path) else {
                     break;
                 };
-                if let Some(inner) = inner_by_outer.remove(&label) {
-                    outer_by_inner.remove(&inner);
-                }
+                labels.remove_by_left(&label);
                 children.remove(&label);
                 children.is_empty() && !path.as_os_str().is_empty()
             };
@@ -300,12 +279,10 @@ impl Store {
         }
         let label = label.to_string_lossy().into_owned();
         let s = self.0.lock().unwrap();
-        let Node::Dir { outer_by_inner, .. } = s.tree.get(Path::new(""))? else {
+        let Node::Dir { labels, .. } = s.tree.get(Path::new(""))? else {
             return None;
         };
-        let outer_full = outer_by_inner.get(&label)?;
-        let is_dir = false; // flat: every inner label names a FILE
-        let _ = is_dir;
+        let outer_full = labels.get_by_right(&label)?;
         let ino = match s.tree.get(Path::new(outer_full.as_str()))? {
             Node::File { fino, .. } => *fino,
             _ => return None,
@@ -356,11 +333,11 @@ impl Store {
     /// served tree must list completely without prior lookups.
     fn dir_children(&self, _dir: FuseIno) -> Option<Vec<(FuseIno, bool, String)>> {
         let s = self.0.lock().unwrap();
-        let Node::Dir { outer_by_inner, .. } = s.tree.get(Path::new(""))? else {
+        let Node::Dir { labels, .. } = s.tree.get(Path::new(""))? else {
             return None;
         };
         let mut out = Vec::new();
-        for (inner, outer_full) in outer_by_inner.iter() {
+        for (outer_full, inner) in labels.iter() {
             if let Some(Node::File { fino, .. }) = s.tree.get(Path::new(outer_full.as_str())) {
                 out.push((*fino, false, inner.clone()));
             }

@@ -22,6 +22,7 @@ license = "MIT"
 undocumented_unsafe_blocks = "deny"
 
 [workspace.dependencies]
+bimap = "0.6"
 fuse-protocol = { path = "crates/fuse-protocol" }
 fuse-server = { path = "crates/fuse-server" }
 fuse-client = { path = "crates/fuse-client" }
