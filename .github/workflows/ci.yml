@@ -54,5 +54,13 @@ jobs:
           # Rootless podman needs subid ranges; runner images do not
           # configure them for the runner user by default.
           sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 "$USER"
+          # The runner has no user systemd session: crun's sd-bus
+          # scope creation fails with "Interactive authentication
+          # required" inside build RUN steps. Force the cgroupfs
+          # manager (podman then passes --systemd-cgroup=false) and
+          # runc (no sd-bus at all) for the whole tier.
+          mkdir -p ~/.config/containers
+          printf '[engine]\ncgroup_manager = "cgroupfs"\nruntime = "runc"\n' \
+            > ~/.config/containers/containers.conf
           podman system migrate || true
           cargo test -p run-agent --test e2e_stub_fuse --test e2e_empty_os -- --include-ignored
