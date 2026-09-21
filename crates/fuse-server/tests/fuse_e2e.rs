@@ -350,10 +350,11 @@ fn inner_name_of(store: &Path, name: &str) -> String {
         .expect("policy store written at first registration");
     let v: serde_json::Value = serde_json::from_str(&txt).unwrap();
     let hex = v["salt"].as_str().unwrap_or_default();
-    let salt: Vec<u8> = (0..hex.len() / 2)
+    let bytes: Vec<u8> = (0..hex.len() / 2)
         .filter_map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok())
         .collect();
-    assert!(!salt.is_empty(), "salt persisted before the mount serves");
+    let salt = fuse_protocol::Salt::from_bytes(bytes)
+        .expect("salt persisted before the mount serves");
     fuse_protocol::anonymize_path(&salt, name)
 }
 

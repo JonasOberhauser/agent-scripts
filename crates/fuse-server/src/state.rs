@@ -134,7 +134,7 @@ pub struct ServerState {
     /// Per-install anonymization salt (issue #47): loaded from (or
     /// minted into) the policy store; stable across restarts, so the
     /// container-view names derived from it are stable too.
-    pub anon_salt: Vec<u8>,
+    pub anon_salt: fuse_protocol::Salt,
 }
 
 impl Default for ServerState {
@@ -147,7 +147,7 @@ impl Default for ServerState {
             log_path: String::new(),
             policy_path: None,
             persist_lock: Mutex::new(()),
-            anon_salt: Vec::new(),
+            anon_salt: fuse_protocol::Salt::generate(),
         }
     }
 }

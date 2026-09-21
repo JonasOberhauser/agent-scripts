@@ -179,30 +179,52 @@ pub fn collapse_paths(paths: &[String]) -> Vec<String> {
 /// collision probability is negligible (and detectable at serve
 /// time — the server refuses a colliding anonymized name rather than
 /// alias two secrets).
-pub fn anonymize(salt: &[u8], component: &str) -> String {
+/// The per-install anonymization salt: NON-EMPTY by construction.
+/// The only constructors are [`Salt::from_bytes`] (rejects empty) and
+/// [`Salt::generate`] (OS entropy) — an unsalted, dictionary-reversible
+/// anonymization (review on #58: "why do you just allow calling the
+/// anonymize path function with an empty salt?") cannot be expressed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Salt(Vec<u8>);
+
+impl Salt {
+    /// Adopt an existing salt; `None` when the bytes are empty (the
+    /// caller decides what a missing salt means — mint or refuse).
+    pub fn from_bytes(bytes: Vec<u8>) -> Option<Salt> {
+        if bytes.is_empty() {
+            None
+        } else {
+            Some(Salt(bytes))
+        }
+    }
+
+    /// A fresh 32-byte salt from the OS entropy source. A salt must
+    /// come from the OS — hashing time/pid/addresses quietly degrades
+    /// every anonymized name. Refuse rather than degrade.
+    pub fn generate() -> Salt {
+        let mut buf = [0u8; 32];
+        let mut f = std::fs::File::open("/dev/urandom")
+            .expect("/dev/urandom for the anonymization salt");
+        use std::io::Read as _;
+        f.read_exact(&mut buf)
+            .expect("32 bytes from /dev/urandom");
+        Salt(buf.to_vec())
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+pub fn anonymize(salt: &Salt, component: &str) -> String {
     use sha2::{Digest as _, Sha256};
     let mut h = Sha256::new();
-    h.update(salt);
+    h.update(salt.as_bytes());
     h.update(component.as_bytes());
     let d = h.finalize();
     d.iter().take(6).map(|b| format!("{b:02x}")).collect()
 }
 
-/// A fresh per-install salt (32 random bytes, hex) — generated once
-/// when the policy store first persists, then stable for the life of
-/// the store.
-pub fn new_salt() -> Vec<u8> {
-    // A salt must come from the OS entropy source — hashing time/pid/
-    // addresses is NOT enough and quietly degrades every anonymized
-    // name in the mount. Refuse rather than degrade.
-    let mut buf = [0u8; 32];
-    let mut f = std::fs::File::open("/dev/urandom")
-        .expect("/dev/urandom for the anonymization salt");
-    use std::io::Read as _;
-    f.read_exact(&mut buf)
-        .expect("32 bytes from /dev/urandom");
-    buf.to_vec()
-}
 
 /// The container-view form of a full path: same components, each
 /// anonymized under the salt.
@@ -211,7 +233,7 @@ pub fn new_salt() -> Vec<u8> {
 /// mount, and no depth/fan-out structure leaking into the
 /// container. The hash input is the full path with separators, so
 /// distinct paths are unambiguous.
-pub fn anonymize_path(salt: &[u8], name: &str) -> String {
+pub fn anonymize_path(salt: &Salt, name: &str) -> String {
     anonymize(salt, name)
 }
 
@@ -333,17 +355,33 @@ pub struct MapEntry {
 
 #[cfg(test)]
 mod tests {
+    use super::Salt;
+    fn s4lt() -> Salt {
+        Salt::from_bytes(b"salt".to_vec()).unwrap()
+    }
+
 
 #[test]
-fn anonymize_is_deterministic_salt_sensitive_and_shaped() {
-    let a = anonymize(b"salt", "git.netrc");
-    let b = anonymize(b"salt", "git.netrc");
+fn an_empty_salt_is_unrepresentable() {
+        // Review on #58: "why do you just allow calling the anonymize
+        // path function with an empty salt?" — you cannot anymore:
+        // Salt::from_bytes rejects empty, anonymize* only accept &Salt,
+        // and the only other constructor is OS entropy.
+        assert!(Salt::from_bytes(Vec::new()).is_none());
+        assert!(Salt::from_bytes(vec![1]).is_some());
+        assert!(!Salt::generate().as_bytes().is_empty());
+    }
+
+    #[test]
+    fn anonymize_is_deterministic_salt_sensitive_and_shaped() {
+    let a = anonymize(&s4lt(), "git.netrc");
+    let b = anonymize(&s4lt(), "git.netrc");
     assert_eq!(a, b, "same salt + component -> same name (stability)");
     assert_eq!(a.len(), 12, "12 hex chars");
     assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
-    assert_ne!(a, anonymize(b"other", "git.netrc"), "salt changes the name");
-    assert_ne!(anonymize(b"salt", "a"), anonymize(b"salt", "b"));
-    assert!(!anonymize_path(b"s", "x/y/z.txt").contains('/'), "flat whole-path hash");
+    assert_ne!(a, anonymize(&Salt::from_bytes(b"other".to_vec()).unwrap(), "git.netrc"), "salt changes the name");
+    assert_ne!(anonymize(&s4lt(), "a"), anonymize(&s4lt(), "b"));
+    assert!(!anonymize_path(&s4lt(), "x/y/z.txt").contains('/'), "flat whole-path hash");
 }
 
 

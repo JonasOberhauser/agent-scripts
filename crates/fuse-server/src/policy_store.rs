@@ -97,7 +97,7 @@ pub fn load(state: &mut ServerState, hub: &OracleHub) -> LoadReport {
         Ok(d) => d,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             tracing::info!("policy store {}: no file — fresh start", path.display());
-            mint_salt_if_needed(state);
+            persist_locked(state);
             return LoadReport::default();
         }
         Err(e) => {
@@ -120,7 +120,7 @@ pub fn load(state: &mut ServerState, hub: &OracleHub) -> LoadReport {
             data.len(),
             MAX_POLICY_BYTES
         );
-        mint_salt_if_needed(state);
+        persist_locked(state);
         return LoadReport { corrupted: true, ..Default::default() };
     }
     let file: PolicyFile = match serde_json::from_slice(&data) {
@@ -140,7 +140,7 @@ pub fn load(state: &mut ServerState, hub: &OracleHub) -> LoadReport {
                 aside.display()
             );
             let _ = std::fs::rename(&path, &aside);
-            mint_salt_if_needed(state);
+            persist_locked(state);
             return LoadReport { corrupted: true, ..Default::default() };
         }
     };
@@ -155,8 +155,16 @@ pub fn load(state: &mut ServerState, hub: &OracleHub) -> LoadReport {
     // (stable container-view names across restarts); minted on the
     // first #47 boot — pre-#47 stores have no salt, and their inner
     // names did not exist yet, so nothing rotates that mattered.
-    state.anon_salt = hex_to_bytes(&file.salt);
-    mint_salt_if_needed(state);
+    // The salt TYPE is non-empty by construction: a stored salt is
+    // adopted, an absent one keeps the freshly generated salt the
+    // state was born with. mint_salt_if_needed is gone — the type
+    // does the enforcing now (review on #58).
+    if let Some(salt) = fuse_protocol::Salt::from_bytes(hex_to_bytes(&file.salt)) {
+        state.anon_salt = salt;
+    } else {
+        tracing::info!("policy store: no salt stored — keeping the freshly minted one (issue #47)");
+        persist_locked(state);
+    }
     let mut report = LoadReport::default();
     for s in file.secrets {
         // A live host file re-registers with its CURRENT identity
@@ -229,7 +237,7 @@ pub(crate) fn persist_locked(state: &ServerState) {
     };
     let mut file = PolicyFile {
         version: fuse_protocol::VERSION.to_string(),
-        salt: bytes_to_hex(&state.anon_salt),
+        salt: bytes_to_hex(state.anon_salt.as_bytes()),
         secrets: Vec::new(),
     };
     for entry in state.secrets.iter() {
@@ -263,22 +271,6 @@ pub(crate) fn persist_locked(state: &ServerState) {
     }
 }
 
-/// The anonymization salt must NEVER be empty: an empty salt quietly
-/// turns every container-view name into an UNSALTED hash —
-/// dictionary-reversible for common path segments (the exact leak
-/// #47 exists to close). Mint on any path that reaches state without
-/// one (fresh boot, corrupt-aside, store-without-salt).
-fn mint_salt_if_needed(state: &mut ServerState) {
-    if state.anon_salt.is_empty() {
-        let salt = fuse_protocol::new_salt();
-        tracing::info!("policy store: minted a fresh anonymization salt (issue #47)");
-        // Write it NOW: registration derives inner names from it, and
-        // the first registration persist must carry the same salt the
-        // mount is serving under.
-        state.anon_salt = salt;
-        persist(state);
-    }
-}
 
 fn hex_to_bytes(h: &str) -> Vec<u8> {
     (0..h.len() / 2)
@@ -350,8 +342,8 @@ mod policy_tests {
         let hub = crate::oracle_service::OracleHub::new();
         assert!(!p.exists(), "no store yet");
         load(&mut s, &hub);
-        assert!(!s.anon_salt.is_empty(), "salt minted in memory");
-        assert_eq!(persisted_salt(&p), bytes_to_hex(&s.anon_salt),
+        assert!(!s.anon_salt.as_bytes().is_empty(), "salt minted in memory");
+        assert_eq!(persisted_salt(&p), bytes_to_hex(s.anon_salt.as_bytes()),
             "the minted salt is persisted before any registration");
     }
 
@@ -368,7 +360,7 @@ mod policy_tests {
         let hub = crate::oracle_service::OracleHub::new();
         let report = load(&mut s, &hub);
         assert!(report.corrupted, "aside happened");
-        assert_eq!(persisted_salt(&p), bytes_to_hex(&s.anon_salt),
+        assert_eq!(persisted_salt(&p), bytes_to_hex(s.anon_salt.as_bytes()),
             "fresh salt minted and persisted after the aside");
         assert_ne!(persisted_salt(&p), old_salt,
             "the corrupt file's salt is never resurrected");
@@ -399,8 +391,8 @@ mod policy_tests {
         let hub = crate::oracle_service::OracleHub::new();
         let report = load(&mut s, &hub);
         assert_eq!(report.restored, 1, "pre-#47 grants load");
-        assert!(!s.anon_salt.is_empty(), "salt minted for the old store");
-        assert_eq!(persisted_salt(&p), bytes_to_hex(&s.anon_salt));
+        assert!(!s.anon_salt.as_bytes().is_empty(), "salt minted for the old store");
+        assert_eq!(persisted_salt(&p), bytes_to_hex(s.anon_salt.as_bytes()));
     }
 
     #[test]
@@ -448,7 +440,7 @@ mod policy_tests {
                 std::fs::write(&p, "not json").unwrap();
             }
             let _ = load(&mut s, &hub);
-            assert!(!s.anon_salt.is_empty(), "{label}: salt must exist before serving");
+            assert!(!s.anon_salt.as_bytes().is_empty(), "{label}: salt must exist before serving");
         }
     }
 
