@@ -99,7 +99,12 @@ fn lazy_unmount<S: SystemIo>(io: &S, mount_point: &str, wrapper: Option<&str>) -
 /// its reconnecting control loop.
 fn teardown_server<S: SystemIo>(io: &mut S, config: &AgentConfig) {
     let wrapper = config.runtime_wrapper.as_deref();
-    run_wrapped(io, wrapper, "pkill", &["-f", "fuse-server"]);
+    // #62: scope the recycle to THIS stack's socket — a bare
+    // `pkill -f fuse-server` here was the incident class (substring
+    // match killed a `cargo test` runner; a name sweep kills every
+    // policy daemon on a multi-stack machine).
+    let pat = format!("--socket {}", config.socket_path.to_string_lossy());
+    run_wrapped(io, wrapper, "pkill", &["-f", &pat]);
     io.sleep_ms(500);
     if io.file_exists(&config.socket_path) {
         let _ = io.remove_path(&config.socket_path);
@@ -1858,10 +1863,9 @@ mod tests {
         assert_eq!(mock.spawned.len(), 2, "the server must be respawned once");
         let calls = mock.command_calls.borrow();
         assert!(
-            calls
-                .iter()
-                .any(|(p, a)| p == "pkill" && a.contains(&"fuse-server".to_string())),
-            "recycle must kill the old server: {calls:?}"
+            calls.iter().any(|(p, a)| p == "pkill"
+                && a.contains(&"--socket /tmp/fgk.sock".to_string())),
+            "recycle must kill the old server BY ITS SOCKET: {calls:?}"
         );
         assert!(
             !calls.iter().any(|(p, a)| p == "pkill" && a.contains(&"fused".to_string())),
@@ -1965,9 +1969,19 @@ mod tests {
         assert!(result.is_ok(), "got: {:?}", result.err());
         assert_eq!(mock.spawned.len(), 1, "the stale server must be respawned once");
         let calls = mock.command_calls.borrow();
+        // #62: the teardown is socket-scoped, never a name sweep —
+        // assert the precise pattern.
         assert!(
-            calls.iter().any(|(p, a)| p == "pkill" && a.contains(&"fuse-server".to_string())),
-            "the incompatible server must be torn down: {calls:?}"
+            calls
+                .iter()
+                .any(|(p, a)| p == "pkill"
+                    && a.contains(&"-f".to_string())
+                    && a.contains(&"--socket /tmp/fgk.sock".to_string())),
+            "the incompatible server must be torn down BY ITS SOCKET: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|(p, a)| p == "pkill" && a.contains(&"fuse-server".to_string())),
+            "no bare fuse-server sweep may remain: {calls:?}"
         );
     }
 
