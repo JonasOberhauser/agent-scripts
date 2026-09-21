@@ -108,6 +108,7 @@ struct EmptyOs {
     socket: PathBuf,
     oracle_socket: PathBuf,
     policy_store: PathBuf,
+    containers_conf: PathBuf,
     mount_point: PathBuf,
 }
 
@@ -139,6 +140,18 @@ impl EmptyOs {
         // No containers.conf/registries.conf are written: a naive user runs
         // on pure distro defaults, which is exactly what issue #1 depends on.
         let storage_conf = root.join("storage.conf");
+        // Rootless builds on sessionless hosts (CI runners): crun's
+        // sd-bus scope creation fails with "Interactive authentication
+        // required" unless the cgroupfs manager is pinned — and the
+        // harness overrides XDG_CONFIG_HOME, so a runner-global
+        // containers.conf is INVISIBLE to the isolated stack. Pin the
+        // config explicitly via CONTAINERS_CONF.
+        let containers_conf = root.join("containers.conf");
+        std::fs::write(
+            &containers_conf,
+            "[engine]\ncgroup_manager = \"cgroupfs\"\n",
+        )
+        .expect("write containers.conf");
         std::fs::write(
             &storage_conf,
             format!(
@@ -168,6 +181,7 @@ impl EmptyOs {
             socket,
             oracle_socket,
             policy_store,
+            containers_conf,
             mount_point,
         }
     }
@@ -179,6 +193,7 @@ impl EmptyOs {
             .env("XDG_CACHE_HOME", self.home.join(".cache"))
             .env("XDG_DATA_HOME", self.home.join(".local/share"))
             .env("XDG_RUNTIME_DIR", &self.xdg_runtime)
+            .env("CONTAINERS_CONF", &self.containers_conf)
             .env("CONTAINERS_STORAGE_CONF", self.root.join("storage.conf"))
             .env("FUSE_GATEKEEPER_STATE", self.root.join("state.json"))
             .env("FUSE_GATEKEEPER_POLICY", &self.policy_store)
