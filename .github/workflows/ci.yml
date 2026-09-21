@@ -44,3 +44,21 @@ jobs:
           cargo test -p fuse-server --test protocol_contract
           cargo test -p fuse-server --test e2e_client
           cargo test -p fuse-server --test fuse_e2e -- --include-ignored
+      - name: Integration tests (run-agent e2e tier)
+        # The orchestrator e2e suites (real rootless podman, per-test
+        # tempdir stacks since #59) were previously NEVER run in CI —
+        # 14 tests existing on paper only. Runners have podman and
+        # registry egress; the suites isolate their own storage/state.
+        timeout-minutes: 25
+        run: |
+          # Rootless podman needs subid ranges; runner images do not
+          # configure them for the runner user by default.
+          sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 "$USER"
+          # crun's sd-bus fix lives IN the harnesses now: each stack
+          # writes its own containers.conf (cgroupfs manager) and pins
+          # it via CONTAINERS_CONF — the harness overrides
+          # XDG_CONFIG_HOME, so a runner-global config never reached
+          # the isolated stacks (the first CI attempt failed exactly
+          # there).
+          podman system migrate || true
+          cargo test -p run-agent --test e2e_stub_fuse --test e2e_empty_os -- --include-ignored

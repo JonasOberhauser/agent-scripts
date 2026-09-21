@@ -180,9 +180,19 @@ impl Split {
             .expect("spawn fused (data daemon)");
 
         wait_mount(&mount, &dirs);
-        // Wait until the content snapshot has landed in the data daemon.
+        // Wait until the content snapshot has landed in the data
+        // daemon. The container view is anonymized (issue #47): the
+        // salt lands in the policy store at the server's first
+        // registration persist — poll for it, then wait on the INNER
+        // name the mount actually serves.
+        for _ in 0..200 {
+            if dirs[1].path().join("policy.json").exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
         for (name, _, _) in secrets {
-            let target = mount.join(name);
+            let target = mount.join(inner_name_of(dirs[1].path(), name));
             let deadline = Instant::now() + Duration::from_secs(10);
             while Instant::now() < deadline {
                 if target.exists() {
@@ -199,8 +209,15 @@ impl Split {
         Split { mount, socket, oracle, procs: vec![policy, data], _dirs: dirs, _secret_dir: secret_dir }
     }
 
+    /// Resolve a secret's mount path by its OUTER (clear) name: the
+    /// container view serves the anonymized form (issue #47), derived
+    /// from the salt in this split's own policy store.
     fn path(&self, name: &str) -> PathBuf {
-        self.mount.join(name)
+        self.mount.join(self.inner(name))
+    }
+
+    fn inner(&self, name: &str) -> String {
+        inner_name_of(self._dirs[1].path(), name)
     }
 
     /// The host-side source file behind a served name (MR4 tests:
@@ -267,15 +284,29 @@ fn wait_mount(mount: &Path, dirs: &[tempfile::TempDir]) {
         }
         std::thread::sleep(Duration::from_millis(50));
     }
+    let fused_log = log_tail(dirs.get(2).map(|d| d.path().join("fused.log")).as_deref());
+    // The cross-crate stale-binary trap, named: cargo test -p fuse-server
+    // does NOT rebuild fuse-mount's fused binary — the harness runs
+    // whatever artifact sits in target/debug. A loader error in
+    // fused.log means that artifact was built against a different
+    // libfuse than the host provides (observed live, twice: a binary
+    // demanding libfuse3.so.4/.so.3 while the system ships another
+    // soname — "it used to work" was a fresher artifact).
+    let loader_hint = if fused_log.contains("error while loading shared libraries") {
+        "\nHINT: fused.log shows a shared-library loader error — the          target/debug/fused artifact is STALE (cargo test does not rebuild \
+         other crates' binaries). Run `cargo build -p fuse-mount` and re-run."
+    } else {
+        ""
+    };
     panic!(
         "FUSE mount never came up at {} — /dev/fuse present: {}, fusermount3: {}\
-         \n--- env ---\n{}--- server.log ---\n{}--- fused.log ---\n{}",
+         \n--- env ---\n{}--- server.log ---\n{}--- fused.log ---\n{}{loader_hint}",
         mount.display(),
         Path::new("/dev/fuse").exists(),
         fusermount3_state(),
         probe_env(),
         log_tail(dirs.get(1).map(|d| d.path().join("server.log")).as_deref()),
-        log_tail(dirs.get(2).map(|d| d.path().join("fused.log")).as_deref()),
+        fused_log,
     );
 }
 
@@ -308,6 +339,23 @@ fn probe_env() -> String {
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_default();
     format!("{id}\n{caps}\n")
+}
+
+
+// Resolve a secret's container-view (anonymized) name from a split's
+// policy store — the salt lands there at the server's first
+// registration persist.
+fn inner_name_of(store: &Path, name: &str) -> String {
+    let txt = std::fs::read_to_string(store.join("policy.json"))
+        .expect("policy store written at first registration");
+    let v: serde_json::Value = serde_json::from_str(&txt).unwrap();
+    let hex = v["salt"].as_str().unwrap_or_default();
+    let bytes: Vec<u8> = (0..hex.len() / 2)
+        .filter_map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok())
+        .collect();
+    let salt = fuse_protocol::Salt::from_bytes(bytes)
+        .expect("salt persisted before the mount serves");
+    fuse_protocol::anonymize_path(&salt, name)
 }
 
 /// Whether the kernel has a FUSE mount ON this exact path: statfs(2)
@@ -378,16 +426,24 @@ fn e2e_nonexistent_file_enoent() {
 }
 
 #[test]
-fn e2e_path_shaped_names_serve_a_directory_tree() {
-    // Issue #34: names are normalized host paths; the mount must show
-    // the intermediate directories and serve the file at the nested
-    // path — full stack: add -> oracle -> fused tree -> read.
+fn e2e_path_shaped_names_serve_flat() {
+    // Issue #34 + review on #58: names are normalized host paths
+    // HOST-side (policy/display), but the CONTAINER view is FLAT —
+    // one directory of whole-path hashes. Nested outer paths serve
+    // as single flat entries; the mount root is a directory and
+    // nothing else is.
     if !fuse_available() { return; }
     let _g = serial();
     let split = Split::new("paths", &[("a/b/c.txt", b"NESTED", "*")]);
-    assert!(split.path("a").is_dir(), "implicit directory materializes");
-    assert!(split.path("a/b").is_dir());
-    assert_eq!(std::fs::read(split.path("a/b/c.txt")).unwrap(), b"NESTED");
+    assert!(split.mount.is_dir(), "the mount root is a directory");
+    let labels: Vec<std::ffi::OsString> = std::fs::read_dir(&split.mount)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(labels.len(), 1, "one flat entry, not a tree: {labels:?}");
+    let entry = split.mount.join(&labels[0]);
+    assert!(entry.is_file(), "the flat entry is the secret file");
+    assert_eq!(std::fs::read(&entry).unwrap(), b"NESTED");
 }
 
 #[test]
@@ -528,6 +584,41 @@ fn e2e_ghost_opens_to_enoent() {
 }
 
 #[test]
+fn e2e_ghost_heals_when_the_host_file_returns() {
+    // MR4/MR5's documented promise: a ghost (host file missing) opens
+    // ENOENT "until the file returns" — and when it RETURNS, the next
+    // open heals: fresh identity observed via the stat path, live
+    // bytes served, and the read cycle state intact (the ghost period
+    // consumed nothing). The re-add half of the promise is covered by
+    // the policy re-add tests; this is the file-returns half.
+    if !fuse_available() { return; }
+    let _g = serial();
+    let split = Split::new("heal", &[("s", b"V1", "*")]);
+    assert_eq!(split.read("s").unwrap(), b"V1");
+    // Ghost it: source gone, cycle reset, open -> ENOENT.
+    std::fs::remove_file(split.source_path("s")).unwrap();
+    assert!(split.client(&["reset", "--name", "s"]).status.success());
+    let err = split.read("s").unwrap_err();
+    assert_eq!(err.raw_os_error(), Some(libc::ENOENT), "ghost: {err}");
+    // The file returns (a NEW incarnation, as any real restore would):
+    // the mount must heal on the next open — fresh bytes, no pend, no
+    // error — without a re-add or a daemon restart.
+    std::fs::write(split.source_path("s"), b"V2-RETURNED").unwrap();
+    assert_eq!(
+        split.read("s").unwrap(),
+        b"V2-RETURNED",
+        "the ghost heals when the host file returns"
+    );
+    // And the cycle behaves like one consumed read (V2's), not more:
+    let out = split.client(&["status"]);
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        !text.contains("pending"),
+        "healing must not leave a stuck pending: {text}"
+    );
+}
+
+#[test]
 fn e2e_atomic_replace_serves_fresh_bytes_and_a_new_inode() {
     // The standard safe-write flow (temp + rename-over) lands a NEW
     // incarnation at the same path: the mount must serve the new
@@ -625,7 +716,14 @@ fn e2e_readdir_lists_secrets() {
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
-    assert!(names.contains(&"a".to_string()) && names.contains(&"b".to_string()));
+    // Issue #47: the container lists the ANONYMIZED forms; the clear
+    // names must NOT appear (that is the leak being closed).
+    let ia = split.inner("a");
+    let ib = split.inner("b");
+    assert!(names.contains(&ia), "{ia} in {names:?}");
+    assert!(names.contains(&ib), "{ib} in {names:?}");
+    assert!(!names.contains(&"a".to_string()) && !names.contains(&"b".to_string()),
+        "clear host names must never appear inside the container: {names:?}");
 }
 
 #[test]

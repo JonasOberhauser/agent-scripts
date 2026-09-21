@@ -685,6 +685,10 @@ where
 
 /// A secret loaded into the FUSE server, ready to be symlinked.
 pub(crate) struct LoadedSecret {
+    /// The CONTAINER-VIEW name (issue #47: anonymized inside the
+    /// mount). Symlinks, preflight and the container's bind mounts
+    /// all reference this; the outer name remains the policy/display
+    /// language host-side.
     pub(crate) fuse_name: String,
     pub(crate) container: PathBuf,
     pub(crate) host_path: PathBuf,
@@ -788,13 +792,35 @@ where
     let fuse_name = secret_name(&canonical);
 
     let args = format!("{} {} {}", fuse_name, host.display(), config.binary_hash);
-    send("add", &args)
+    let reply = send("add", &args)
         .map_err(|e| format!("failed to add secret {fuse_name}: {e}"))?;
 
-    info!("Secret loaded: {} → /fuse/{fuse_name}", host.display());
+    // The server answers Added { inner } with the anonymized
+    // container-view name (issue #47) — that is what the mount serves
+    // and what everything container-side must reference. A plain Ok
+    // (stub servers in e2e) falls back to the outer name.
+    let inner = match serde_json::from_str::<fuse_protocol::Response>(reply.trim()) {
+        Ok(fuse_protocol::Response::Added { inner }) => inner,
+        Ok(fuse_protocol::Response::Ok) => {
+            warn!(
+                "add replied Ok without the container-view name — using the outer \
+                 form (stub server? a real 0.31 server answers Added)"
+            );
+            fuse_name.clone()
+        }
+        Ok(other) => {
+            return Err(format!("add secret {fuse_name}: unexpected reply {other:?}"));
+        }
+        Err(e) => {
+            warn!("add reply unparsable ({e}) — using the outer form: {reply:?}");
+            fuse_name.clone()
+        }
+    };
+
+    info!("Secret loaded: {} → /fuse/{inner}", host.display());
 
     loaded.push(LoadedSecret {
-        fuse_name,
+        fuse_name: inner,
         container: dest,
         host_path: host.to_path_buf(),
     });
@@ -1332,6 +1358,41 @@ mod tests {
         let n = secret_name(Path::new("/home/u/.ssh/id_ed25519"));
         assert!(n.contains('/'), "nested: {n}");
         assert!(n.ends_with("id_ed25519"));
+    }
+
+    #[test]
+    fn added_inner_name_drives_container_paths() {
+        // Issue #47: the mount serves anonymized names inside the
+        // container — the symlink target, preflight stat and the
+        // loaded record must all reference the INNER form the server
+        // reports, never the outer (which no longer resolves).
+        let mut mock = base_mock().with_file("/home/user/secrets.yaml", b"DATA");
+        let cfg = test_config();
+        let loaded_cell = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = std::sync::Arc::clone(&loaded_cell);
+        let result = run_agent(&mut mock, &cfg, &|name, args| {
+            if name == "add" {
+                let outer = args.split_whitespace().next().unwrap_or_default();
+                let reply = format!(
+                    "{{\"type\":\"added\",\"inner\":\"i-{outer}\"}}"
+                );
+                sink.lock().unwrap().push(reply.clone());
+                return Ok(reply);
+            }
+            Ok(String::new())
+        }, false);
+        assert!(result.is_ok(), "got: {:?}", result.err());
+        let replies = loaded_cell.lock().unwrap();
+        assert!(!replies.is_empty());
+        // the setup script symlinked the INNER form
+        let calls = mock.command_calls.borrow();
+        let setup = calls.iter().find(|(_, a)| a.iter().any(|x| x.starts_with("mkdir -p")));
+        if let Some((_, a)) = setup {
+            assert!(
+                a.iter().any(|x| x.contains("/fuse/i-secrets.yaml")),
+                "symlink target must be the inner name: {a:?}"
+            );
+        }
     }
 
     // ── run_agent integration ────────────────────────────────────

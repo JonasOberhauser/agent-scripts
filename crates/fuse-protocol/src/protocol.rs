@@ -12,6 +12,10 @@ pub struct SecretStatus {
     /// change: minor version bumped, mixed vintages fail the
     /// handshake instead of the parse.
     pub allowed_hashes: Vec<HashEntryStatus>,
+    /// The container-view (anonymized) name for this secret (issue
+    /// #47) — shown beside the clear name so bind-mounts and
+    /// container configs can reference the stable inner form.
+    pub inner: String,
     pub size: usize,
     /// Set by `grant-forever`: the allowed package may read without
     /// per-read approval.
@@ -167,6 +171,72 @@ pub fn collapse_paths(paths: &[String]) -> Vec<String> {
     comps.iter().map(|c| trie.render(c)).collect()
 }
 
+/// Deterministically anonymize one path component (issue #47):
+/// first 12 hex of sha256(salt || component) — unguessable without
+/// the per-install salt, stable across restarts because the salt is
+/// persisted with the grant store. Twelve hex = 48 bits per
+/// component; with the handful of components a real tree holds, the
+/// collision probability is negligible (and detectable at serve
+/// time — the server refuses a colliding anonymized name rather than
+/// alias two secrets).
+/// The per-install anonymization salt: NON-EMPTY by construction.
+/// The only constructors are [`Salt::from_bytes`] (rejects empty) and
+/// [`Salt::generate`] (OS entropy) — an unsalted, dictionary-reversible
+/// anonymization (review on #58: "why do you just allow calling the
+/// anonymize path function with an empty salt?") cannot be expressed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Salt(Vec<u8>);
+
+impl Salt {
+    /// Adopt an existing salt; `None` when the bytes are empty (the
+    /// caller decides what a missing salt means — mint or refuse).
+    pub fn from_bytes(bytes: Vec<u8>) -> Option<Salt> {
+        if bytes.is_empty() {
+            None
+        } else {
+            Some(Salt(bytes))
+        }
+    }
+
+    /// A fresh 32-byte salt from the OS entropy source. A salt must
+    /// come from the OS — hashing time/pid/addresses quietly degrades
+    /// every anonymized name. Refuse rather than degrade.
+    pub fn generate() -> Salt {
+        let mut buf = [0u8; 32];
+        let mut f = std::fs::File::open("/dev/urandom")
+            .expect("/dev/urandom for the anonymization salt");
+        use std::io::Read as _;
+        f.read_exact(&mut buf)
+            .expect("32 bytes from /dev/urandom");
+        Salt(buf.to_vec())
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+pub fn anonymize(salt: &Salt, component: &str) -> String {
+    use sha2::{Digest as _, Sha256};
+    let mut h = Sha256::new();
+    h.update(salt.as_bytes());
+    h.update(component.as_bytes());
+    let d = h.finalize();
+    d.iter().take(6).map(|b| format!("{b:02x}")).collect()
+}
+
+
+/// The container-view form of a full path: same components, each
+/// anonymized under the salt.
+/// The container-view name of a full path: ONE hash of the whole
+/// path (review on #58), not per-component — short names, a flat
+/// mount, and no depth/fan-out structure leaking into the
+/// container. The hash input is the full path with separators, so
+/// distinct paths are unambiguous.
+pub fn anonymize_path(salt: &Salt, name: &str) -> String {
+    anonymize(salt, name)
+}
+
 /// Whether a server version and a client version speak the same
 /// protocol: major and minor must match; the patch component is
 /// ignored by design (AGENTS.md) so patch releases never force a
@@ -226,6 +296,10 @@ pub enum Command {
     },
     /// Remove a secret from the mount.
     RemoveSecret { name: String },
+    /// The outer->inner (container-view) name map, on demand —
+    /// status keeps its compact shape (review on #58: the inline
+    /// anonymized-path column was far too long).
+    ShowMap,
     /// Replace the allowed binary hash for a secret.
     RotateHash { name: String, new_hash: String },
     /// List all currently served secret filenames.
@@ -254,6 +328,9 @@ pub enum Command {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Response {
+    /// AddSecret succeeded; `inner` is the anonymized container-view
+    /// name (issue #47) the mount serves the secret under.
+    Added { inner: String },
     Ok,
     Error { message: String },
     Status { secrets: Vec<SecretStatus> },
@@ -263,10 +340,51 @@ pub enum Response {
     Version { version: String },
     /// Server's log file path.
     LogPath { path: String },
+    /// The outer->inner name map (issue #47), on demand.
+    Map { entries: Vec<MapEntry> },
+}
+
+/// One row of the outer->inner name map.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MapEntry {
+    /// Clear host-side name (the policy/display language).
+    pub outer: String,
+    /// Anonymized container-view path the mount serves it under.
+    pub inner: String,
 }
 
 #[cfg(test)]
 mod tests {
+    use super::Salt;
+    fn s4lt() -> Salt {
+        Salt::from_bytes(b"salt".to_vec()).unwrap()
+    }
+
+
+#[test]
+fn an_empty_salt_is_unrepresentable() {
+        // Review on #58: "why do you just allow calling the anonymize
+        // path function with an empty salt?" — you cannot anymore:
+        // Salt::from_bytes rejects empty, anonymize* only accept &Salt,
+        // and the only other constructor is OS entropy.
+        assert!(Salt::from_bytes(Vec::new()).is_none());
+        assert!(Salt::from_bytes(vec![1]).is_some());
+        assert!(!Salt::generate().as_bytes().is_empty());
+    }
+
+    #[test]
+    fn anonymize_is_deterministic_salt_sensitive_and_shaped() {
+    let a = anonymize(&s4lt(), "git.netrc");
+    let b = anonymize(&s4lt(), "git.netrc");
+    assert_eq!(a, b, "same salt + component -> same name (stability)");
+    assert_eq!(a.len(), 12, "12 hex chars");
+    assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+    assert_ne!(a, anonymize(&Salt::from_bytes(b"other".to_vec()).unwrap(), "git.netrc"), "salt changes the name");
+    assert_ne!(anonymize(&s4lt(), "a"), anonymize(&s4lt(), "b"));
+    assert!(!anonymize_path(&s4lt(), "x/y/z.txt").contains('/'), "flat whole-path hash");
+}
+
+
     #[test]
     fn collapse_to_first_points_of_difference_issue_example_1() {
         let got = collapse_paths(&[

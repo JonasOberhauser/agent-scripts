@@ -80,6 +80,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
+name = "bimap"
+version = "0.6.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "230c5f1ca6a325a32553f8640d31ac9b49f2411e901e427570154868b46da4f7"
+
+[[package]]
 name = "bitflags"
 version = "2.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -357,7 +363,7 @@ checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
 
 [[package]]
 name = "fuse-client"
-version = "0.30.0"
+version = "0.31.0"
 dependencies = [
  "clap",
  "crossterm",
@@ -378,8 +384,9 @@ dependencies = [
 
 [[package]]
 name = "fuse-mount"
-version = "0.30.0"
+version = "0.31.0"
 dependencies = [
+ "bimap",
  "clap",
  "fuse-protocol",
  "fuser",
@@ -393,7 +400,7 @@ dependencies = [
 
 [[package]]
 name = "fuse-protocol"
-version = "0.30.0"
+version = "0.31.0"
 dependencies = [
  "libc",
  "serde",
@@ -405,7 +412,7 @@ dependencies = [
 
 [[package]]
 name = "fuse-server"
-version = "0.30.0"
+version = "0.31.0"
 dependencies = [
  "clap",
  "dashmap",
@@ -477,7 +484,7 @@ dependencies = [
 
 [[package]]
 name = "hashd"
-version = "0.30.0"
+version = "0.31.0"
 dependencies = [
  "fuse-protocol",
  "tempfile",
@@ -808,7 +815,7 @@ checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
 
 [[package]]
 name = "run-agent"
-version = "0.30.0"
+version = "0.31.0"
 dependencies = [
  "clap",
  "fuse-protocol",

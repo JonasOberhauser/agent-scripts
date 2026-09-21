@@ -15,6 +15,7 @@ serde_json = { workspace = true }
 fuser = "0.15"
 libc = "0.2"
 nix = { workspace = true }
+bimap = { workspace = true }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { workspace = true }

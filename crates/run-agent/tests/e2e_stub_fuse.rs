@@ -99,6 +99,7 @@ struct Seam {
     home: PathBuf,
     xdg_runtime: PathBuf,
     storage_conf: PathBuf,
+    containers_conf: PathBuf,
 }
 
 impl Seam {
@@ -124,6 +125,18 @@ impl Seam {
                 .expect("chmod xdg runtime dir");
         }
         let storage_conf = root.join("storage.conf");
+        // Rootless builds on sessionless hosts (CI runners): crun's
+        // sd-bus scope creation fails with "Interactive authentication
+        // required" unless the cgroupfs manager is pinned — and the
+        // harness overrides XDG_CONFIG_HOME, so a runner-global
+        // containers.conf is INVISIBLE to the isolated stack. Pin the
+        // config explicitly via CONTAINERS_CONF.
+        let containers_conf = root.join("containers.conf");
+        std::fs::write(
+            &containers_conf,
+            "[engine]\ncgroup_manager = \"cgroupfs\"\n",
+        )
+        .expect("write containers.conf");
         std::fs::write(
             &storage_conf,
             format!(
@@ -147,6 +160,7 @@ impl Seam {
             home,
             xdg_runtime,
             storage_conf,
+            containers_conf,
         }
     }
 
@@ -157,6 +171,7 @@ impl Seam {
             .env("XDG_CACHE_HOME", self.home.join(".cache"))
             .env("XDG_DATA_HOME", self.home.join(".local/share"))
             .env("XDG_RUNTIME_DIR", &self.xdg_runtime)
+            .env("CONTAINERS_CONF", &self.containers_conf)
             .env("CONTAINERS_STORAGE_CONF", &self.storage_conf)
             .args(args)
             .stdin(Stdio::null())
@@ -330,6 +345,54 @@ fn fully_qualified_missing_image_handled_diagnosably() {
 // container creation) runs for real in seconds.  Creation outcome
 // depends on the machine: on restricted runtimes it fails diagnosably
 // ("Failed to create container"), on capable ones the container exists.
+
+#[test]
+#[ignore = "needs real podman; run with --ignored on a capable host"]
+fn secret_wiring_follows_the_server_reported_inner_name() {
+    // The gap that let #47 ship half-wired: every tier tested one
+    // half against a double for the other. This one closes the loop
+    // at the seam level — the stub now ANSWERS Added{inner} (a
+    // contract double, not a connection-closing void), the harness
+    // pre-creates the INNER name in the fake mount, and the run must
+    // succeed: preflight stats the server-reported path, not the
+    // outer form (which does not exist in the mount dir).
+    assert!(
+        Command::new("podman")
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false),
+        "refusing to skip: this test needs a real podman on PATH"
+    );
+    let dir = tempfile::tempdir().expect("tempdir");
+    let seam = Seam::new(&dir, "inner");
+
+    let host_secret = seam.ws.join("secrets.yaml");
+    std::fs::write(&host_secret, b"DATA").expect("write host secret");
+    // ONLY the inner form exists in the mount — the outer name is
+    // absent on purpose: preflight stat'ing it would fail the run.
+    std::fs::write(seam.mount_point.join("stub-secrets.yaml"), b"DATA")
+        .expect("pre-create the INNER mount entry");
+
+    let out = seam.run_with(
+        Some("agentbox"),
+        60,
+        &[
+            "--secret",
+            &format!("{}:/root/secrets.yaml", host_secret.display()),
+        ],
+        None,
+    );
+    let _ = std::io::stderr().write_all(out.combined.as_bytes());
+    assert!(
+        !out.combined.contains("never visible in the FUSE mount"),
+        "preflight stat'ed the OUTER form — the #47 half-wiring is back:\n{}",
+        out.combined
+    );
+}
 
 #[test]
 #[ignore = "needs real podman with registry egress; run with --ignored on a capable host"]

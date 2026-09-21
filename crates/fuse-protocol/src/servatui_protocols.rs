@@ -9,6 +9,9 @@ use crate::protocol::{Command, PendingAccessInfo, Response};
 pub fn print_response(resp: &Response, out: &mut dyn Console) {
     match resp {
         Response::Ok => out.print_line("OK"),
+        Response::Added { inner } => {
+            out.print_line(&format!("added — container view: /fuse/{inner}"))
+        }
         Response::Error { message } => out.print_error(message),
         Response::Status { secrets } => {
             if secrets.is_empty() {
@@ -72,6 +75,16 @@ pub fn print_response(resp: &Response, out: &mut dyn Console) {
                         p.pid_hash.as_deref().unwrap_or("<unknown>"),
                         p.reason, p.expires_at
                     ));
+                }
+            }
+        }
+        Response::Map { entries } => {
+            if entries.is_empty() {
+                out.print_line("No secrets served.");
+            } else {
+                out.print_line("OUTER -> AS /fuse/…");
+                for e in entries {
+                    out.print_line(&format!("  {} -> {}", e.outer, e.inner));
                 }
             }
         }
@@ -238,6 +251,7 @@ fn parse_deny(args: &str) -> Result<Command, String> {
         .map_err(|_| "Usage: deny ID (ID must be a number)".into())
 }
 fn parse_version(_: &str) -> Result<Command, String> { Ok(Command::GetVersion) }
+fn parse_show_map(_: &str) -> Result<Command, String> { Ok(Command::ShowMap) }
 fn parse_logpath(_: &str) -> Result<Command, String> { Ok(Command::GetLogPath) }
 
 fn offline_version(_args: &str, out: &mut dyn Console) -> Result<(), String> {
@@ -258,6 +272,7 @@ pub const COMMAND_TABLE: &[CommandSpec] = &[
     CommandSpec { name: "grant", help: "Grant a pending access request", parse: parse_grant, complete: Completer::PendingIds, offline: None },
     CommandSpec { name: "grant-forever", help: "Grant a pending access permanently (whitelists the observed package hash)", parse: parse_grant_forever, complete: Completer::PendingIds, offline: None },
     CommandSpec { name: "deny", help: "Deny a pending access request", parse: parse_deny, complete: Completer::PendingIds, offline: None },
+    CommandSpec { name: "show-map", help: "Show the outer -> anonymized container-view name map", parse: parse_show_map, complete: NO_COMPLETE, offline: None },
     CommandSpec { name: "version", help: "Show server version", parse: parse_version, complete: NO_COMPLETE, offline: Some(offline_version) },
     CommandSpec { name: "logpath", help: "Show server log file path", parse: parse_logpath, complete: NO_COMPLETE, offline: None },
 ];
@@ -448,6 +463,41 @@ mod tests {
     }
 
     #[test]
+    fn show_map_renders_the_pairs_and_status_stays_compact() {
+        // Review on #58: the inline anonymized-path column made status
+        // far too long. The map moved to its own command; status is
+        // back to the compact shape and must NOT render inner names.
+        let resp = Response::Status {
+            secrets: vec![crate::protocol::SecretStatus {
+                inner: "ab12/cd34/ef56/789a".into(),
+                name: "var/home/jonas/secrets/zai.key".into(),
+                access_count: 0,
+                allowed_hashes: vec![crate::protocol::HashEntryStatus {
+                    hash: crate::PENDING_ONLY_HASH.into(),
+                    by: None,
+                }],
+                size: 9,
+                unlimited: false,
+            }],
+        };
+        let mut cap = Cap(Vec::new());
+        print_response(&resp, &mut cap);
+        let status_out = cap.0.join("\n");
+        assert!(!status_out.contains("ab12"), "no inner in status: {status_out:?}");
+
+        let map = Response::Map {
+            entries: vec![crate::protocol::MapEntry {
+                outer: "var/home/jonas/secrets/zai.key".into(),
+                inner: "ab12/cd34/ef56/789a".into(),
+            }],
+        };
+        let mut cap = Cap(Vec::new());
+        print_response(&map, &mut cap);
+        let out = cap.0.join("\n");
+        assert!(out.contains("var/home/jonas/secrets/zai.key -> ab12/cd34/ef56/789a"), "{out:?}");
+    }
+
+    #[test]
     fn status_renders_one_row_per_hash() {
         // Review mockup on #45:
         //   bar/secret.txt     6    167    blah -- hash1
@@ -455,6 +505,7 @@ mod tests {
         let resp = Response::Status {
             secrets: vec![
                 crate::protocol::SecretStatus {
+                    inner: "i1/i2/i3/i4".into(),
                     name: "var/home/jonas/bar/secret.txt".into(),
                     access_count: 6,
                     allowed_hashes: vec![
@@ -471,7 +522,8 @@ mod tests {
                     unlimited: false,
                 },
                 crate::protocol::SecretStatus {
-                    name: "var/home/jonas/foo/secret2.txt".into(),
+                    inner: "i0".into(),
+            name: "var/home/jonas/foo/secret2.txt".into(),
                     access_count: 0,
                     allowed_hashes: vec![crate::protocol::HashEntryStatus {
                         hash: crate::PENDING_ONLY_HASH.into(),
@@ -502,7 +554,8 @@ mod tests {
         let resp = Response::Status {
             secrets: vec![
                 SecretStatus {
-                    name: "var/home/jonas/secrets/agent/github.netrc".into(),
+                    inner: "i0".into(),
+            name: "var/home/jonas/secrets/agent/github.netrc".into(),
                     access_count: 0,
                     allowed_hashes: vec![crate::protocol::HashEntryStatus {
                         hash: crate::PENDING_ONLY_HASH.into(),
@@ -512,7 +565,8 @@ mod tests {
                     unlimited: false,
                 },
                 SecretStatus {
-                    name: "var/home/jonas/secrets/zai.key".into(),
+                    inner: "i0".into(),
+            name: "var/home/jonas/secrets/zai.key".into(),
                     access_count: 1,
                     allowed_hashes: vec![crate::protocol::HashEntryStatus {
                         hash: crate::PENDING_ONLY_HASH.into(),
