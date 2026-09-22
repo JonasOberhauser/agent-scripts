@@ -92,18 +92,10 @@ pub(crate) fn compute_pid_hash(
     state: &ServerState,
     pid: u32,
 ) -> (Option<String>, Option<String>) {
-    // Per-state override first (the #59 seam: a host running a live
-    // production hashd must not leak into in-process tests), then the
-    // ambient resolution the deployed daemons use.
-    let socket = state
-        .hashd_sock
-        .lock()
-        .expect("hashd-sock override lock: never held across a panic")
-        .clone()
-        .unwrap_or_else(|| {
-            std::env::var(fuse_protocol::ENV_HASHD_SOCK)
-                .unwrap_or_else(|_| fuse_protocol::hashd::DEFAULT_SOCK.to_string())
-        });
+    // Resolved once at construction (immutable field): production
+    // keeps the ambient env->default resolution; in-process harnesses
+    // pin it pre-share (#69).
+    let socket = state.hashd_sock.clone();
     match fuse_protocol::hashd::ask(&socket, pid) {
         Ok(h) => (Some(h), None),
         Err(hashd_err) => {

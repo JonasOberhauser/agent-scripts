@@ -17,15 +17,24 @@ use fuse_server::{ReadOutcome, ServerState};
 fn oracle_env() -> (std::path::PathBuf, Arc<ServerState>, std::thread::JoinHandle<()>) {
     // keep()d for the test's lifetime (unique per test; tmp litter only)
     let dir = tempfile::tempdir().unwrap().keep();
+    // #59 discipline, applied to the hashd seam (#69): pin it to a
+    // dead per-test path so a hashd running on the HOST (production
+    // /run/fuse-hashd.sock) can neither answer nor error. Tests that
+    // want a hashd bind their own stub and pin its path instead.
+    oracle_env_with_hashd(&dir.join("hashd.dead.sock").display().to_string())
+}
+
+fn oracle_env_with_hashd(
+    hashd_sock: &str,
+) -> (std::path::PathBuf, Arc<ServerState>, std::thread::JoinHandle<()>) {
+    let dir = tempfile::tempdir().unwrap().keep();
     let path = dir.join("oracle.sock");
-    let state = Arc::new(ServerState::new());
+    // Same arming discipline as main()'s policy_path: assign the
+    // immutable socket on the mut local BEFORE the Arc is shared.
+    let mut st = ServerState::new();
+    st.hashd_sock = hashd_sock.to_string();
+    let state = Arc::new(st);
     *state.pending_timeout.lock().unwrap() = Duration::from_secs(2);
-    // #59 discipline, applied to the hashd seam: pin it to a dead
-    // per-test path so a hashd running on the HOST (production
-    // /run/fuse-hashd.sock) can neither answer nor error — the tests
-    // that want a hashd bind their own stub on a pinned path below.
-    *state.hashd_sock.lock().unwrap() =
-        Some(dir.join("hashd.dead.sock").display().to_string());
     let s2 = Arc::clone(&state);
     let hub = OracleHub::new();
     let (moved, wait_path) = (path.clone(), path.clone());
@@ -385,8 +394,6 @@ fn deny_unblocks_the_reader_immediately_with_eperm() {
 /// the synthetic pid).
 #[test]
 fn stub_hashd_answer_carries_the_pid_hash_not_an_error() {
-    let (path, state, _t) = oracle_env();
-    state.add("s", "/tmp/host/s", 1, "some_hash");
     let canned = "a".repeat(64);
     // Bind the stub on a per-test path and pin the state to it.
     let dir = tempfile::tempdir().unwrap().keep();
@@ -408,7 +415,8 @@ fn stub_hashd_answer_carries_the_pid_hash_not_an_error() {
             let _ = conn.flush();
         }
     });
-    *state.hashd_sock.lock().unwrap() = Some(sock.display().to_string());
+    let (path, state, _t) = oracle_env_with_hashd(&sock.display().to_string());
+    state.add("s", "/tmp/host/s", 1, "some_hash");
     // Wait for the stub listener before asking.
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while !sock.exists() {
