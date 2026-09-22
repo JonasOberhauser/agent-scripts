@@ -117,6 +117,15 @@ pub struct ServerState {
     pub pending: DashMap<u64, PendingAccess>,
     pub next_pending_id: AtomicU64,
     pub pending_timeout: Mutex<Duration>,
+    /// Hashd socket this daemon hashes through, resolved ONCE at
+    /// construction (FUSE_HASHD_SOCK env, then /run/fuse-hashd.sock)
+    /// and immutable thereafter: production never re-points it at
+    /// runtime. Harnesses pin it the same way main() arms
+    /// `policy_path` — assigned on the `mut` local BEFORE the Arc is
+    /// shared with the server threads (the #69 seam: in-process tests
+    /// run in parallel threads and must not mutate process-global
+    /// env), so no interior mutability is needed.
+    pub hashd_sock: String,
     pub log_path: String,
     /// MR5 persistence target; `None` disarms write-through entirely
     /// (the default — unit tests and e2e harnesses stay hermetic).
@@ -144,6 +153,8 @@ impl Default for ServerState {
             pending: DashMap::new(),
             next_pending_id: AtomicU64::new(1),
             pending_timeout: Mutex::new(Duration::from_secs(300)),
+            hashd_sock: std::env::var(fuse_protocol::ENV_HASHD_SOCK)
+                .unwrap_or_else(|_| fuse_protocol::hashd::DEFAULT_SOCK.to_string()),
             log_path: String::new(),
             policy_path: None,
             persist_lock: Mutex::new(()),

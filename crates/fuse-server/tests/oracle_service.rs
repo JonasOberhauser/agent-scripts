@@ -17,8 +17,23 @@ use fuse_server::{ReadOutcome, ServerState};
 fn oracle_env() -> (std::path::PathBuf, Arc<ServerState>, std::thread::JoinHandle<()>) {
     // keep()d for the test's lifetime (unique per test; tmp litter only)
     let dir = tempfile::tempdir().unwrap().keep();
+    // #59 discipline, applied to the hashd seam (#69): pin it to a
+    // dead per-test path so a hashd running on the HOST (production
+    // /run/fuse-hashd.sock) can neither answer nor error. Tests that
+    // want a hashd bind their own stub and pin its path instead.
+    oracle_env_with_hashd(&dir.join("hashd.dead.sock").display().to_string())
+}
+
+fn oracle_env_with_hashd(
+    hashd_sock: &str,
+) -> (std::path::PathBuf, Arc<ServerState>, std::thread::JoinHandle<()>) {
+    let dir = tempfile::tempdir().unwrap().keep();
     let path = dir.join("oracle.sock");
-    let state = Arc::new(ServerState::new());
+    // Same arming discipline as main()'s policy_path: assign the
+    // immutable socket on the mut local BEFORE the Arc is shared.
+    let mut st = ServerState::new();
+    st.hashd_sock = hashd_sock.to_string();
+    let state = Arc::new(st);
     *state.pending_timeout.lock().unwrap() = Duration::from_secs(2);
     let s2 = Arc::clone(&state);
     let hub = OracleHub::new();
@@ -368,6 +383,65 @@ fn deny_unblocks_the_reader_immediately_with_eperm() {
         "deny must unblock immediately, waited {:.1}s",
         started.elapsed().as_secs_f32()
     );
+}
+
+/// The OTHER branch of the hashd seam, deterministically: a stub
+/// hashd answers `ok <hash>` on the state's pinned socket, so the
+/// pending must carry the pid hash and NO error — regardless of
+/// whether the machine running the test has a live production hashd
+/// (the leak that made `wrong_hash_pends_and_carries_the_hash_error`
+/// fail on a real host: the production hashd answered with `gone` for
+/// the synthetic pid).
+#[test]
+fn stub_hashd_answer_carries_the_pid_hash_not_an_error() {
+    let canned = "a".repeat(64);
+    // Bind the stub on a per-test path and pin the state to it.
+    let dir = tempfile::tempdir().unwrap().keep();
+    let sock = dir.join("hashd.stub.sock");
+    let stub_sock = sock.clone();
+    let canned2 = canned.clone();
+    std::thread::spawn(move || {
+        let listener = std::os::unix::net::UnixListener::bind(&stub_sock).unwrap();
+        for conn in listener.incoming() {
+            let Ok(mut conn) = conn else { break };
+            use std::io::{BufRead, BufReader, Write};
+            let mut reader = BufReader::new(conn.try_clone().unwrap());
+            let mut line = String::new();
+            if reader.read_line(&mut line).is_err() {
+                break;
+            }
+            // One question, one answer — the hashd wire contract.
+            let _ = writeln!(conn, "ok {canned2}");
+            let _ = conn.flush();
+        }
+    });
+    let (path, state, _t) = oracle_env_with_hashd(&sock.display().to_string());
+    state.add("s", "/tmp/host/s", 1, "some_hash");
+    // Wait for the stub listener before asking.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !sock.exists() {
+        assert!(std::time::Instant::now() < deadline, "stub hashd never bound");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    // The ask presents no hash; adjudication hashes via the seam. The
+    // canned hash is NOT the secret's permitted hash, so it pends —
+    // carrying the observed hash for grant-forever.
+    let p = path.clone();
+    let asker = std::thread::spawn(move || ask(&p, "s", 30, 0, 1));
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let (pid_hash, hash_error) = loop {
+        let Some(entry) = state.pending.iter().next() else {
+            assert!(std::time::Instant::now() < deadline, "pending never appeared");
+            std::thread::sleep(Duration::from_millis(10));
+            continue;
+        };
+        break (entry.pid_hash.clone(), entry.hash_error.clone());
+    };
+    assert_eq!(pid_hash.as_deref(), Some(canned.as_str()),
+        "a hashd that answered must land in the pending");
+    assert!(hash_error.is_none(), "no error expected, got: {hash_error:?}");
+    let _ = asker.join().unwrap();
 }
 
 #[test]
