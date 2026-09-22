@@ -88,9 +88,22 @@ impl OracleHub {
 /// `/proc/<pid>/map_files` itself (that is hashd's one job). Failures
 /// carry the commands that fix them, so a pending shown to a human
 /// says what to run.
-pub(crate) fn compute_pid_hash(pid: u32) -> (Option<String>, Option<String>) {
-    let socket = std::env::var(fuse_protocol::ENV_HASHD_SOCK)
-        .unwrap_or_else(|_| fuse_protocol::hashd::DEFAULT_SOCK.to_string());
+pub(crate) fn compute_pid_hash(
+    state: &ServerState,
+    pid: u32,
+) -> (Option<String>, Option<String>) {
+    // Per-state override first (the #59 seam: a host running a live
+    // production hashd must not leak into in-process tests), then the
+    // ambient resolution the deployed daemons use.
+    let socket = state
+        .hashd_sock
+        .lock()
+        .expect("hashd-sock override lock: never held across a panic")
+        .clone()
+        .unwrap_or_else(|| {
+            std::env::var(fuse_protocol::ENV_HASHD_SOCK)
+                .unwrap_or_else(|_| fuse_protocol::hashd::DEFAULT_SOCK.to_string())
+        });
     match fuse_protocol::hashd::ask(&socket, pid) {
         Ok(h) => (Some(h), None),
         Err(hashd_err) => {
@@ -252,7 +265,7 @@ fn open_secret(
 }
 
 fn adjudicate(state: &ServerState, name: &str, pid: u32, offset: usize, size: usize) -> OracleReply {
-    let (pid_hash, hash_error) = compute_pid_hash(pid);
+    let (pid_hash, hash_error) = compute_pid_hash(state, pid);
     match state.attempt_read(name, pid, pid_hash.as_deref(), offset, size) {
         ReadOutcome::Granted => OracleReply::Allow,
         ReadOutcome::NotFound => OracleReply::Deny {

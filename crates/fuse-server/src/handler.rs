@@ -76,7 +76,7 @@ pub fn handle_command(cmd: Command, state: &ServerState, hub: &crate::oracle_ser
             // started hashd since — retry the lookup live before
             // refusing, so following the printed fix actually works.
             if let Some(pid) = state.pending_pid_needing_hash(id) {
-                let (pid_hash, hash_error) = crate::oracle_service::compute_pid_hash(pid);
+                let (pid_hash, hash_error) = crate::oracle_service::compute_pid_hash(state, pid);
                 state.refresh_pending_hash(id, pid_hash, hash_error);
             }
             match state.grant_pending_forever(id) {
