@@ -25,6 +25,14 @@ pub enum HashdError {
     Other(String),
     /// No hashd listening (or it did not answer in time).
     Unreachable(String),
+    /// hashd IS running but did not serve this ask in time (#38):
+    /// either it accepted the connection but answered nothing while
+    /// busy hashing (our 500ms read timeout surfaces as errno 11 —
+    /// the exact error the operator saw mislabeled "unreachable"),
+    /// or a non-blocking connect met a full accept backlog. Transient
+    /// — a retry shortly will succeed; restarting hashd is the WRONG
+    /// remediation.
+    Busy(String),
 }
 
 impl std::fmt::Display for HashdError {
@@ -34,6 +42,7 @@ impl std::fmt::Display for HashdError {
             HashdError::Gone(why) => write!(f, "hashd: process gone — {why}"),
             HashdError::Other(why) => write!(f, "hashd: {why}"),
             HashdError::Unreachable(why) => write!(f, "hashd unreachable — {why}"),
+            HashdError::Busy(why) => write!(f, "hashd busy — {why}"),
         }
     }
 }
@@ -41,8 +50,7 @@ impl std::fmt::Display for HashdError {
 /// One question, one answer. Short timeout: callers sit on the read
 /// path of a (blocked) secret read and must degrade quickly.
 pub fn ask(socket: &str, pid: u32) -> Result<String, HashdError> {
-    let mut stream = UnixStream::connect(socket)
-        .map_err(|e| HashdError::Unreachable(e.to_string()))?;
+    let mut stream = connect_with_retry(socket)?;
     stream
         .set_read_timeout(Some(Duration::from_millis(500)))
         .map_err(|e| HashdError::Unreachable(e.to_string()))?;
@@ -56,10 +64,46 @@ pub fn ask(socket: &str, pid: u32) -> Result<String, HashdError> {
             .map_err(|e| HashdError::Unreachable(e.to_string()))?,
     );
     let mut line = String::new();
-    reader
-        .read_line(&mut line)
-        .map_err(|e| HashdError::Unreachable(e.to_string()))?;
+    reader.read_line(&mut line).map_err(|e| {
+        // The read timeout (500ms) surfaces as WouldBlock/errno 11:
+        // hashd accepted us but is busy hashing something big and
+        // answered nothing — NOT unreachable (#38).
+        if e.kind() == std::io::ErrorKind::WouldBlock
+            || e.raw_os_error() == Some(libc::EAGAIN)
+        {
+            HashdError::Busy(e.to_string())
+        } else {
+            HashdError::Unreachable(e.to_string())
+        }
+    })?;
     parse_reply(line.trim())
+}
+
+/// connect(2) to a unix stream socket whose accept backlog is full
+/// fails EAGAIN on Linux — the daemon is UP, just not accepting while
+/// it hashes (#38). Retry within a bounded window (concurrent asks
+/// drain as the daemon accepts) before classifying; every other
+/// connect error is genuinely unreachable. Note: only the CONNECT
+/// step may classify EAGAIN this way — on the read path the same
+/// errno comes from our own 500ms timeout and means "no answer".
+fn connect_with_retry(socket: &str) -> Result<UnixStream, HashdError> {
+    let deadline = std::time::Instant::now() + Duration::from_millis(400);
+    loop {
+        match UnixStream::connect(socket) {
+            Ok(s) => return Ok(s),
+            Err(e) => {
+                let busy = e.raw_os_error() == Some(libc::EAGAIN); // EWOULDBLOCK is the same errno
+                if !busy || std::time::Instant::now() >= deadline {
+                    return Err(if busy {
+                        HashdError::Busy(e.to_string())
+                    } else {
+                        HashdError::Unreachable(e.to_string())
+                    });
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        }
+    }
 }
 
 /// Parse one reply line into a result.
@@ -144,6 +188,11 @@ pub fn actionable_error(err: &HashdError, socket: &str, hashd_binary: Option<&st
             }
             text
         }
+        HashdError::Busy(_) => format!(
+            "{err} — hashd is running but busy (its accept backlog filled while it \
+             hashed). A retry in a moment will succeed; restarting hashd is NOT \
+             the fix."
+        ),
         HashdError::Unprivileged(_) => format!(
             "{err}\nReinstall via the socket-activated unit so hashd carries the \
              capability (one-time, root):\n  {}\nOr restart it privileged only \
@@ -197,6 +246,115 @@ mod tests {
             parse_reply("garbage"),
             Err(HashdError::Other(_))
         ));
+    }
+
+    /// Bind a listener with an EXPLICIT tiny backlog and return its
+    /// fd — std's bind() hardcodes 128 and cannot express "#38:
+    /// backlog full". Raw socket(2)/bind(2)/listen(1) on a tempdir
+    /// path we own; wrap with `UnixListener::from_raw_fd` to accept.
+    fn tiny_backlog_listener(path: &std::path::Path) -> std::os::unix::io::RawFd {
+        use std::os::unix::io::RawFd;
+        // SAFETY: plain socket(2)/bind(2)/listen(2) syscalls on a
+        // path we own in a per-test tempdir; a leaked fd in a test
+        // process is reclaimed at exit.
+        unsafe {
+            let fd: RawFd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+            assert!(fd >= 0, "socket(2) failed");
+            let mut addr: libc::sockaddr_un = std::mem::zeroed();
+            addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+            let bytes = path.as_os_str().as_encoded_bytes();
+            assert!(bytes.len() < addr.sun_path.len(), "tempdir path too long");
+            addr.sun_path[..bytes.len()]
+                .copy_from_slice(std::mem::transmute::<&[u8], &[libc::c_char]>(bytes));
+            assert!(
+                libc::bind(
+                    fd,
+                    &addr as *const _ as *const libc::sockaddr,
+                    std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+                ) == 0,
+                "bind(2) failed"
+            );
+            assert!(libc::listen(fd, 1) == 0, "listen(2) failed");
+            fd
+        }
+    }
+
+    #[test]
+    fn unanswered_ask_is_busy_not_unreachable_and_names_no_restart() {
+        // #38, the operator's exact case: hashd accepted the
+        // connection (one holder occupies a queue slot — Linux's
+        // AF_UNIX queue holds backlog+1, so listen(1) still admits
+        // this ask) but answers nothing while busy hashing: the
+        // 500ms read timeout surfaces as errno 11, which used to be
+        // mislabeled "hashd unreachable — (Re)start hashd now". It
+        // must classify as Busy with a retry remediation.
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("busy.sock");
+        let _fd = tiny_backlog_listener(&sock);
+        // Connected, never accepted, never answered — hashd "busy".
+        let _holder = UnixStream::connect(&sock).unwrap();
+        let t0 = std::time::Instant::now();
+        let e = ask(&sock.display().to_string(), 1).unwrap_err();
+        assert!(
+            matches!(e, HashdError::Busy(_)),
+            "an unanswered (busy) ask must classify Busy, got: {e:?}"
+        );
+        assert!(
+            t0.elapsed() < Duration::from_secs(2),
+            "bounded retry window exceeded: {:?}",
+            t0.elapsed()
+        );
+        let text = actionable_error(&e, &sock.display().to_string(), None);
+        assert!(
+            !text.contains("(Re)start"),
+            "busy must not tell the user to restart hashd: {text}"
+        );
+        assert!(text.contains("retry"), "busy must name retry: {text}");
+    }
+
+    #[test]
+    fn busy_backlog_retries_recover_when_a_slot_frees() {
+        // The other half of #38: the EAGAIN is transient. A listener
+        // with backlog 1 that accepts one connection every 30ms must
+        // let concurrent asks through — the bounded retry absorbs the
+        // EAGAINs, so every ask succeeds despite the tiny backlog.
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("slow.sock");
+        let fd = tiny_backlog_listener(&sock);
+        std::thread::spawn(move || {
+            use std::io::{BufRead, BufReader, Write};
+            use std::os::fd::FromRawFd;
+            // SAFETY: the fd was created by tiny_backlog_listener and
+            // is owned exclusively by this thread from here on; std
+            // closes it when the listener drops.
+            let listener =
+                unsafe { std::os::unix::net::UnixListener::from_raw_fd(fd) };
+            let reply = format!("ok {}\n", "a".repeat(64));
+            for conn in listener.incoming().flatten() {
+                let mut conn = conn;
+                let mut line = String::new();
+                let mut reader = BufReader::new(conn.try_clone().unwrap());
+                if reader.read_line(&mut line).is_err() {
+                    break;
+                }
+                let _ = conn.write_all(reply.as_bytes());
+                let _ = conn.flush();
+                std::thread::sleep(Duration::from_millis(30));
+            }
+        });
+        let sock_str = sock.display().to_string();
+        let askers: Vec<_> = (0..3)
+            .map(|_| {
+                let s = sock_str.clone();
+                std::thread::spawn(move || ask(&s, 1))
+            })
+            .collect();
+        for a in askers {
+            assert!(
+                a.join().unwrap().is_ok(),
+                "a transiently-busy backlog must not fail an ask — retry recovers"
+            );
+        }
     }
 
     #[test]

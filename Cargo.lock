@@ -407,6 +407,7 @@ dependencies = [
  "serde_json",
  "servyi-servatui",
  "sha2",
+ "tempfile",
  "thiserror",
 ]
 

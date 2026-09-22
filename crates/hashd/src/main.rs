@@ -190,8 +190,24 @@ fn main() {
         "hashd: listening on {socket} ({})",
         if privileges_ok() { "privileged" } else { "unprivileged" }
     );
+    serve_conns(listener, std::sync::Arc::new(handle));
+}
+
+/// Accept loop: one thread per connection. #38: a single privileged
+/// package hash can take hundreds of milliseconds (a whole process's
+/// mapped files through /proc), and a sequential loop serializes
+/// accepts behind it — the kernel backlog fills and clients'
+/// connect(2) fails EAGAIN, which they used to misread as "hashd
+/// down". Handlers are stateless pure /proc reads, so the threads
+/// share nothing; connections are one question, one answer, and
+/// short-lived.
+fn serve_conns(
+    listener: UnixListener,
+    handler: std::sync::Arc<dyn Fn(std::os::unix::net::UnixStream) + Send + Sync>,
+) {
     for conn in listener.incoming().flatten() {
-        handle(conn);
+        let handler = std::sync::Arc::clone(&handler);
+        std::thread::spawn(move || handler(conn));
     }
 }
 
@@ -213,5 +229,50 @@ mod tests {
     fn privileges_probe_returns_bool() {
         // Any environment: must answer, never panic.
         let _ = privileges_ok();
+    }
+
+    #[test]
+    fn concurrent_asks_do_not_serialize_behind_a_slow_hash() {
+        // #38 behavioral pin: six asks against a handler that takes
+        // 150ms each must all succeed in well under the sequential
+        // floor (6 × 150ms = 900ms) — thread-per-connection keeps
+        // accepting while a hash is in flight, so the backlog never
+        // fills and no client sees EAGAIN-as-unreachable.
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("hashd.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let reply = format!("ok {}\n", "a".repeat(64));
+        // The daemon side: the accept loop owns its own thread,
+        // exactly as in main().
+        std::thread::spawn(move || {
+            serve_conns(
+                listener,
+                std::sync::Arc::new(move |mut conn: std::os::unix::net::UnixStream| {
+                    use std::io::{BufRead, BufReader, Write};
+                    let mut line = String::new();
+                    let mut reader = BufReader::new(conn.try_clone().unwrap());
+                    let _ = reader.read_line(&mut line);
+                    std::thread::sleep(std::time::Duration::from_millis(150));
+                    let _ = conn.write_all(reply.as_bytes());
+                    let _ = conn.flush();
+                }),
+            );
+        });
+        let sock_str = sock.display().to_string();
+        let t0 = std::time::Instant::now();
+        let askers: Vec<_> = (0..6)
+            .map(|_| {
+                let s = sock_str.clone();
+                std::thread::spawn(move || fuse_protocol::hashd::ask(&s, 1))
+            })
+            .collect();
+        for a in askers {
+            assert!(a.join().unwrap().is_ok(), "an ask failed under concurrency");
+        }
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(750),
+            "asks serialized behind the slow hash: {elapsed:?} (sequential floor 900ms)"
+        );
     }
 }
