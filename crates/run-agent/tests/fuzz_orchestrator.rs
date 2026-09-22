@@ -86,9 +86,17 @@ struct FuzzSystemIo {
     files: RefCell<BTreeMap<String, Vec<u8>>>,
     dirs: RefCell<BTreeSet<String>>,
     symlinks: RefCell<BTreeMap<String, String>>,
+    /// Dead-mount world state (a killed data daemon): the kernel still
+    /// holds the name; stat fails, mkdir says EEXIST — the exact model
+    /// MockSystemIo's honesty note describes.
+    stale_mounts: RefCell<BTreeSet<String>>,
     unix_up: Cell<bool>,
     unix_fails: Cell<u32>,
     budget: Cell<usize>,
+    /// Observed at the moment of each fuse-server spawn: was the
+    /// mountpoint already ensured? (End-state checks cannot answer
+    /// ordering questions — dirs grow monotonically.)
+    pub spawned_without_mountpoint: Cell<bool>,
     pub commands: RefCell<Vec<(String, Vec<String>)>>,
     pub spawns: RefCell<Vec<(String, Vec<String>)>>,
     pub interactive: RefCell<Vec<(String, Vec<String>)>>,
@@ -106,18 +114,51 @@ impl FuzzSystemIo {
             files: RefCell::new(files),
             dirs: RefCell::new(BTreeSet::new()),
             symlinks: RefCell::new(BTreeMap::new()),
+            stale_mounts: RefCell::new(BTreeSet::new()),
             unix_up: Cell::new(false),
             unix_fails: Cell::new(0),
             budget: Cell::new(COMMAND_BUDGET),
+            spawned_without_mountpoint: Cell::new(false),
             commands: RefCell::new(Vec::new()),
             spawns: RefCell::new(Vec::new()),
             interactive: RefCell::new(Vec::new()),
         }
     }
 
+    /// Mid-flight world chaos (the gap this closes): a RUNNING daemon
+    /// dies at a random moment — the policy daemon (rendezvous drops,
+    /// state file survives per MR5: our files are never corrupt), the
+    /// data daemon (mount goes dead), or both. Small probabilities:
+    /// deaths must be common enough to hit every phase across 256
+    /// seeds, rare enough that healthy paths dominate.
+    fn inject_daemon_death(&self) {
+        let mut rng = self.rng.borrow_mut();
+        match rng.next() % 1000 {
+            0..=14 => {
+                // policy daemon killed (pkill -9 / OOM / crash)
+                self.unix_up.set(false);
+            }
+            15..=29 => {
+                // data daemon killed: the mount it owned dies with it
+                self.stale_mounts.borrow_mut().insert("/tmp/fgk-mnt".into());
+            }
+            30..=37 => {
+                // both: the full incident from the field reports
+                self.unix_up.set(false);
+                self.stale_mounts.borrow_mut().insert("/tmp/fgk-mnt".into());
+            }
+            _ => {}
+        }
+    }
+
     /// The taxonomy, as one draw: spawn failure, or a status from the
     /// real-world distribution with a plausible stdout/stderr pairing.
     fn draw_command(&self, program: &str) -> Result<CommandOutput, IoError> {
+        {
+            let mut rng = self.rng.borrow_mut();
+            let _ = &mut rng;
+        }
+        self.inject_daemon_death();
         let mut rng = self.rng.borrow_mut();
         if rng.chance(8) {
             // The exec-failure class (command absent, PATH broken).
@@ -166,16 +207,27 @@ impl SystemIo for FuzzSystemIo {
     }
     fn path_state(&self, path: &Path) -> PathState {
         let key = path.to_string_lossy().into_owned();
+        if self.stale_mounts.borrow().contains(&key) {
+            return PathState::Unreachable("Transport endpoint is not connected (os error 107)".into());
+        }
         if self.dirs.borrow().contains(&key) { return PathState::Dir; }
         if self.files.borrow().contains_key(&key) { return PathState::File; }
         PathState::Missing
     }
     fn mkdir(&self, path: &Path) -> Result<(), IoError> {
-        self.dirs.borrow_mut().insert(path.to_string_lossy().into_owned());
+        let key = path.to_string_lossy().into_owned();
+        if self.stale_mounts.borrow().contains(&key) {
+            return Err(IoError("File exists (os error 17)".into()));
+        }
+        self.dirs.borrow_mut().insert(key);
         Ok(())
     }
     fn create_dir_all(&self, path: &Path) -> Result<(), IoError> {
-        self.dirs.borrow_mut().insert(path.to_string_lossy().into_owned());
+        let key = path.to_string_lossy().into_owned();
+        if self.stale_mounts.borrow().contains(&key) {
+            return Err(IoError("File exists (os error 17)".into()));
+        }
+        self.dirs.borrow_mut().insert(key);
         Ok(())
     }
     fn remove_path(&mut self, path: &Path) -> Result<(), IoError> {
@@ -214,6 +266,7 @@ impl SystemIo for FuzzSystemIo {
         }
         if program == "fusermount" && out.success() {
             self.unix_up.set(false);
+            self.stale_mounts.borrow_mut().remove("/tmp/fgk-mnt");
         }
         let _ = joined;
         Ok(out)
@@ -234,6 +287,15 @@ impl SystemIo for FuzzSystemIo {
         let mut rng = self.rng.borrow_mut();
         if rng.chance(6) {
             return Err(IoError("spawn fuse-server: No such file or directory (os error 2)".into()));
+        }
+        if program.contains("fuse-server")
+            && !self.dirs.borrow().contains("/tmp/fgk-mnt")
+            && self.stale_mounts.borrow().contains("/tmp/fgk-mnt")
+        {
+            // The spawn-time ordering witness: spawning while the
+            // mountpoint is a DEAD MOUNT (never cleared, never
+            // created). Recorded, asserted in drive().
+            self.spawned_without_mountpoint.set(true);
         }
         self.spawns.borrow_mut().push((
             program.to_string(),
@@ -400,13 +462,12 @@ fn drive(seed: u64) {
             }
         }
     }
+    assert!(
+        !io.spawned_without_mountpoint.get(),
+        "seed {seed}: fuse-server spawned while the mountpoint was an uncleared dead mount"
+    );
     let first_spawn = spawns.iter().position(|(p, _)| p.contains("fuse-server"));
     if let Some(i) = first_spawn {
-        let dirs = io.dirs.borrow();
-        assert!(
-            dirs.contains("/tmp/fgk-mnt"),
-            "seed {seed}: fuse-server spawned before the mountpoint was ensured"
-        );
         for (p, args) in spawns.iter().skip(i) {
             if p.contains("fuse-server") {
                 let sock = args
