@@ -92,16 +92,17 @@ pub(crate) fn compute_pid_hash(
     state: &ServerState,
     pid: u32,
 ) -> (Option<String>, Option<String>) {
-    // Resolved once at construction (immutable field): production
-    // keeps the ambient env->default resolution; in-process harnesses
-    // pin it pre-share (#69).
-    let socket = state.hashd_sock.clone();
-    match fuse_protocol::hashd::ask(&socket, pid) {
+    // Resolved once at construction (immutable field, borrowed for
+    // the whole call — no guard to own it out of): production keeps
+    // the ambient env->default resolution; in-process harnesses pin
+    // it pre-share (#69).
+    let socket = state.hashd_sock.as_str();
+    match fuse_protocol::hashd::ask(socket, pid) {
         Ok(h) => (Some(h), None),
         Err(hashd_err) => {
             let hash_error = fuse_protocol::hashd::actionable_error(
                 &hashd_err,
-                &socket,
+                socket,
                 sibling_hashd_binary().as_deref(),
             );
             warn!("hashd ({socket}) could not hash pid {pid}: {hashd_err}");
