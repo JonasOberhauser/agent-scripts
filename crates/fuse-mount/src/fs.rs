@@ -259,6 +259,12 @@ impl Store {
         if let Some(Node::File { fino, .. }) = s.tree.remove(&path) {
             s.identities.remove(&fino);
         }
+        // The flat view's one bijection entry, cleaned by its FULL
+        // key (the seed-53 leak, found by #72's control-channel
+        // fuzzer: a REMOVED secret's map entry survived and listed
+        // forever). Carried here — retargeted to root_labels —
+        // because main does not yet have #72.
+        s.root_labels.remove_by_left(name);
         while let Some(label) = path.file_name().map(|n| n.to_string_lossy().into_owned()) {
             if !path.pop() {
                 break;
@@ -895,6 +901,26 @@ pub fn run_control_loop(store: Store, oracle_socket: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn removed_secrets_root_bijection_entry_is_gone() {
+        // The seed-53 regression, pinned at its observable surface:
+        // the ROOT bijection the map walks. A leaked entry there
+        // lists a REMOVED secret forever. (child() cross-checks the
+        // tree and self-heals — asserting through it would be
+        // vacuous, the #50 lesson.)
+        let s = Store::default();
+        s.serve("deep/one/two/three/f", "abcd", 0o400);
+        assert_eq!(
+            s.0.lock().unwrap().root_labels.get_by_left("deep/one/two/three/f").map(String::as_str),
+            Some("abcd")
+        );
+        s.remove("deep/one/two/three/f");
+        assert!(
+            s.0.lock().unwrap().root_labels.get_by_left("deep/one/two/three/f").is_none(),
+            "a removed secret's bijection entry leaked (stale in the map)"
+        );
+    }
 
     #[test]
     fn container_speaks_inner_labels_only() {
