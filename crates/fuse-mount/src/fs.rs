@@ -52,13 +52,10 @@ enum Node {
         mode: u32,
     },
     Dir {
-        /// Child labels keyed by the OUTER (host) name.
+        /// Child names keyed by the OUTER (host) name — emptiness
+        /// bookkeeping for the prune walk in `remove` (structural
+        /// dirs are never visible in the flat container view).
         children: BTreeMap<String, ()>,
-        /// Issue #47: the outer<->inner label bijection (review on
-        /// #58: an off-the-shelf bimap, not two hand-rolled maps).
-        /// Only the ROOT's map is consulted — the container view is
-        /// flat.
-        labels: bimap::BiBTreeMap<String, String>,
     },
 }
 
@@ -86,6 +83,14 @@ struct StoreInner {
     next_fino: u64,
     /// The frozen tree, keyed by outer path ("" = root).
     tree: BTreeMap<PathBuf, Node>,
+    /// Issue #47: THE outer<->inner label bijection — one map for
+    /// the whole flat container view, keyed by the FULL outer path
+    /// (review on #58: an off-the-shelf bimap). Root-only by
+    /// construction: per-component maps were the pre-#47 nested
+    /// scheme, never populated since, and their vestige (the walk in
+    /// `remove` that looked like it cleaned labels) misled the
+    /// seed-53 leak analysis — removed.
+    root_labels: bimap::BiBTreeMap<String, String>,
     identities: HashMap<FuseIno, FinoRecord>,
 }
 
@@ -103,9 +108,9 @@ impl StoreInner {
                 PathBuf::new(),
                 Node::Dir {
                     children: BTreeMap::new(),
-                    labels: bimap::BiBTreeMap::new(),
                 },
             )]),
+            root_labels: bimap::BiBTreeMap::new(),
             identities: HashMap::new(),
         }
     }
@@ -182,7 +187,6 @@ impl Store {
                         prefix.clone(),
                         Node::Dir {
                             children: BTreeMap::new(),
-                            labels: bimap::BiBTreeMap::new(),
                         },
                     );
                 }
@@ -222,7 +226,8 @@ impl Store {
         if let Some(Node::Dir { children, .. }) = s.tree.get_mut(&prefix) {
             children.insert(last.clone(), ());
         }
-        if let Some(Node::Dir { labels, .. }) = s.tree.get_mut(Path::new("")) {
+        {
+            let labels = &mut s.root_labels;
             let outer_full = comps.join("/");
             // A bimap is bijective by construction: insert removes the
             // previous pairing on BOTH sides (relabel is a rename),
@@ -259,10 +264,9 @@ impl Store {
                 break;
             }
             let now_empty = {
-                let Some(Node::Dir { children, labels }) = s.tree.get_mut(&path) else {
+                let Some(Node::Dir { children }) = s.tree.get_mut(&path) else {
                     break;
                 };
-                labels.remove_by_left(&label);
                 children.remove(&label);
                 children.is_empty() && !path.as_os_str().is_empty()
             };
@@ -286,10 +290,7 @@ impl Store {
         let label = label.to_string_lossy().into_owned();
         let s = self.0.lock()
             .expect("store lock: never held across a panic — poisoning means a data-daemon bug");
-        let Node::Dir { labels, .. } = s.tree.get(Path::new(""))? else {
-            return None;
-        };
-        let outer_full = labels.get_by_right(&label)?;
+        let outer_full = s.root_labels.get_by_right(&label)?;
         let ino = match s.tree.get(Path::new(outer_full.as_str()))? {
             Node::File { fino, .. } => *fino,
             _ => return None,
@@ -344,11 +345,8 @@ impl Store {
     fn dir_children(&self, _dir: FuseIno) -> Option<Vec<(FuseIno, bool, String)>> {
         let s = self.0.lock()
             .expect("store lock: never held across a panic — poisoning means a data-daemon bug");
-        let Node::Dir { labels, .. } = s.tree.get(Path::new(""))? else {
-            return None;
-        };
         let mut out = Vec::new();
-        for (outer_full, inner) in labels.iter() {
+        for (outer_full, inner) in s.root_labels.iter() {
             if let Some(Node::File { fino, .. }) = s.tree.get(Path::new(outer_full.as_str())) {
                 out.push((*fino, false, inner.clone()));
             }
