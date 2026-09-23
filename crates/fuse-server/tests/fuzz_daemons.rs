@@ -13,7 +13,7 @@
 //!     hash still works exactly once: the one-read semantics and the
 //!     hash gate survive arbitrary client behavior.
 
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+#![cfg_attr(test, allow(clippy::unwrap_used))]
 use fuse_protocol::oracle::OracleReply;
 use fuse_protocol::Command;
 use fuse_server::oracle_service::{run_oracle_server, OracleHub};
@@ -23,6 +23,17 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+/// #69 discipline: a dead per-run hashd socket, so a hashd running on
+/// THIS machine (production /run/fuse-hashd.sock) is never asked to
+/// hash the fuzzed random pids. Assigned on the `mut` local before the
+/// state is shared, exactly as the oracle_service harness does.
+fn dead_hashd_sock() -> String {
+    std::env::temp_dir().join(format!(
+        "fuzz-hashd-dead-{}.sock",
+        std::process::id()
+    )).display().to_string()
+}
 
 // ── deterministic RNG (splitmix64, same as the orchestrator tier) ──
 struct Rng(u64);
@@ -91,9 +102,12 @@ fn daemon_chaos_marathon() {
     let mut seed = 0u64;
     while Instant::now() < stop {
         let mut rng = Rng(seed | 1);
-        let state = ServerState::new();
-        let host = std::env::temp_dir().join(format!("fuzz-m-host-{seed}"));
-        std::fs::write(&host, b"FUZZ-DATA").unwrap();
+        let mut state = ServerState::new();
+        state.hashd_sock = dead_hashd_sock();
+        // ONE host file reused across seeds (zero disk footprint — a
+        // per-seed file filled a disk in an earlier marathon).
+        let host = std::env::temp_dir().join("fuzz-m-host-reused");
+        let _ = std::fs::write(&host, b"FUZZ-DATA");
         state.add("s", &host, 9, "sha256-real");
         let hub = OracleHub::new();
         for _ in 0..24 {
@@ -119,7 +133,8 @@ fn command_socket_chaos_never_panics_and_never_authorizes() {
     std::fs::write(&host, b"FUZZ-DATA").unwrap();
     for seed in 0..512u64 {
         let mut rng = Rng(seed | 1);
-        let state = ServerState::new();
+        let mut state = ServerState::new();
+        state.hashd_sock = dead_hashd_sock();
         // NON-wildcard: only "sha256-real" may ever grant.
         state.add("s", &host, 9, "sha256-real");
         let hub = OracleHub::new();
@@ -185,11 +200,13 @@ fn send_line(path: &Path, line: &str) -> Option<String> {
 fn oracle_socket_random_access_stays_alive_and_contained() {
     for seed in 0..40u64 {
         let mut rng = Rng(seed.wrapping_mul(7919) | 1);
-        let state = Arc::new(ServerState::new());
+        let mut st = ServerState::new();
+        st.hashd_sock = dead_hashd_sock();
+        let state = Arc::new(st);
         // Short pendings: a wrong-hash ask BLOCKS as a pending (the
-        // product) — 1s keeps the containment probe fast while the
-        // block itself remains exercised.
-        *state.pending_timeout.lock().unwrap() = Duration::from_secs(1);
+        // product) — 150ms keeps the containment probe fast while the
+        // pend-out-and-deny flow remains exercised.
+        *state.pending_timeout.lock().unwrap() = Duration::from_millis(150);
         let host = std::env::temp_dir().join("fuzz-oracle-host-reused");
         std::fs::write(&host, b"FUZZ-DATA").unwrap();
         state.add("s", &host, 9, "sha256-real"); // non-wildcard

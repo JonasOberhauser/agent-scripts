@@ -973,18 +973,30 @@ mod tests {
     }
 
     #[test]
-    fn removed_secrets_inner_label_stops_resolving() {
-        // The fuzzer-found bug as a pinned regression: the flat
-        // container label lives in the ROOT bijection under the FULL
-        // outer path; remove must clean it, or a removed secret's
-        // inner name keeps resolving (stale name service).
+    fn removed_secrets_root_bijection_entry_is_gone() {
+        // The fuzzer-found bug (seed 53) as a pinned regression,
+        // asserted at its observable surface: the ROOT bijection that
+        // the map walks. A leaked entry there lists a REMOVED secret
+        // forever. (Not via child(): lookup cross-checks the tree and
+        // self-heals — the first version of this test passed with the
+        // bug present, exactly the #50 lesson.)
         let s = Store::default();
         s.serve("deep/one/two/three/f", "abcd", 0o400);
-        assert!(s.child(FuseIno::ROOT, std::ffi::OsStr::new("abcd")).is_some());
+        {
+            let st = s.0.lock().unwrap();
+            let Node::Dir { labels, .. } = st.tree.get(Path::new("")).unwrap() else {
+                panic!("root vanished");
+            };
+            assert_eq!(labels.get_by_left("deep/one/two/three/f").map(String::as_str), Some("abcd"));
+        }
         s.remove("deep/one/two/three/f");
+        let st = s.0.lock().unwrap();
+        let Node::Dir { labels, .. } = st.tree.get(Path::new("")).unwrap() else {
+            panic!("root vanished");
+        };
         assert!(
-            s.child(FuseIno::ROOT, std::ffi::OsStr::new("abcd")).is_none(),
-            "a removed secret's inner label must stop resolving"
+            labels.get_by_left("deep/one/two/three/f").is_none(),
+            "a removed secret's bijection entry leaked (stale in the map)"
         );
     }
 

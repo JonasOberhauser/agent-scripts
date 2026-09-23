@@ -82,6 +82,7 @@ const STDOUT_CORPUS: &[&str] = &[
 ];
 
 struct FuzzSystemIo {
+    seed: u64,
     rng: RefCell<Rng>,
     files: RefCell<BTreeMap<String, Vec<u8>>>,
     dirs: RefCell<BTreeSet<String>>,
@@ -110,6 +111,7 @@ impl FuzzSystemIo {
         files.insert("/home/user/secrets.yaml".into(), b"KEY: fuzzed\n".to_vec());
         files.insert("/tmp/fused".into(), b"#!/bin/sh\n".to_vec());
         Self {
+            seed,
             rng: RefCell::new(Rng(seed.wrapping_mul(0x2545F4914F6CDD1D) | 1)),
             files: RefCell::new(files),
             dirs: RefCell::new(BTreeSet::new()),
@@ -154,10 +156,6 @@ impl FuzzSystemIo {
     /// The taxonomy, as one draw: spawn failure, or a status from the
     /// real-world distribution with a plausible stdout/stderr pairing.
     fn draw_command(&self, program: &str) -> Result<CommandOutput, IoError> {
-        {
-            let mut rng = self.rng.borrow_mut();
-            let _ = &mut rng;
-        }
         self.inject_daemon_death();
         let mut rng = self.rng.borrow_mut();
         if rng.chance(8) {
@@ -248,8 +246,11 @@ impl SystemIo for FuzzSystemIo {
         let left = self.budget.get();
         assert!(
             left > 0,
-            "COMMAND BUDGET EXHAUSTED — run_agent did not terminate under fuzz chaos \
-             (an infinite rebuild/recycle loop); see this test's seed"
+            "seed {}: COMMAND BUDGET EXHAUSTED — run_agent did not terminate under \
+             fuzz chaos (an infinite rebuild/recycle loop); reproduce with \
+             FUZZ_SEED={} cargo test -p run-agent --test fuzz_orchestrator \
+             orchestrator_chaos_single_seed_repro",
+            self.seed, self.seed
         );
         self.budget.set(left - 1);
         self.commands.borrow_mut().push((
@@ -258,9 +259,8 @@ impl SystemIo for FuzzSystemIo {
         ));
         let out = self.draw_command(program)?;
         // Command chaos moves the world: a successful pkill of the
-        // stack takes the rendezvous down; a successful server spawn
-        // brings it up. (spawn_independent sets it up itself.)
-        let joined = args.join(" ");
+        // stack takes the rendezvous down; a successful lazy unmount
+        // clears the stale mount. (spawn_independent sets it up itself.)
         if program == "pkill" && out.success() {
             self.unix_up.set(false);
         }
@@ -268,7 +268,6 @@ impl SystemIo for FuzzSystemIo {
             self.unix_up.set(false);
             self.stale_mounts.borrow_mut().remove("/tmp/fgk-mnt");
         }
-        let _ = joined;
         Ok(out)
     }
     fn spawn_detached(&mut self, program: &str, args: &[&str]) -> Result<u32, IoError> {
@@ -412,17 +411,14 @@ fn fuzz_config() -> AgentConfig {
     }
 }
 
-/// Drive one seeded world; assert the fuzz-tier properties.
-fn drive(seed: u64) {
-    let mut io = FuzzSystemIo::new(seed);
-    let cfg = fuzz_config();
-    // The send closure is ALSO fuzzed transport: mostly healthy, with
-    // connection drops and non-parseable replies mixed in — the client
-    // must fail fast or cope, never wedge. Its draw state lives in a
-    // Cell so the closure stays `Fn` (run_agent's signature demands it)
-    // while staying deterministic per seed.
+/// The fuzzed send-transport closure: mostly healthy, with connection
+/// drops and non-parseable replies mixed in — the client must fail
+/// fast or cope, never wedge. Its draw state lives in a Cell so the
+/// closure stays `Fn` (run_agent's signature demands it) while staying
+/// deterministic per seed.
+fn fuzz_send(seed: u64) -> impl Fn(&str, &str) -> Result<String, String> {
     let send_state = Cell::new(seed ^ 0xA5A5A5A5A5A5A5A5);
-    let send = |name: &str, _args: &str| -> Result<String, String> {
+    move |name: &str, _args: &str| -> Result<String, String> {
         let mut rng = Rng(send_state.get());
         let r = rng.next() % 100;
         send_state.set(rng.0);
@@ -433,34 +429,37 @@ fn drive(seed: u64) {
             ("add", 15..=17) => Ok("{\"type\":\"error\"}".into()),
             _ => Ok(String::new()),
         }
-    };
+    }
+}
+
+/// Drive one seeded world; assert the fuzz-tier properties.
+fn drive(seed: u64) {
+    let mut io = FuzzSystemIo::new(seed);
+    let cfg = fuzz_config();
+    let send = fuzz_send(seed);
     let _ = run_agent(&mut io, &cfg, &send, false);
 
     // Property 3: structural invariants over the observed chaos.
     let commands = io.commands.borrow();
     let spawns = io.spawns.borrow();
-    // #62/#65's precise rule, encoded: `pkill -f` is legal ONLY with
-    // THIS stack's socket path as the pattern (the unique-rendezvous
-    // scope) — a bare daemon-name substring (`fuse-server`, `fused`)
-    // is the incident class and must never appear, under any chaos.
+    // #62/#65's precise rule, encoded EXACTLY (review on #72): the
+    // one legal shape is teardown_server's `pkill -f "--socket <this
+    // stack's rendezvous>"`. So ANY pkill — flagless, -f, -x, or
+    // otherwise — must carry the rendezvous scope; and even a scoped
+    // pattern must not name a daemon (over-match). This catches the
+    // bare `pkill fuse-server` sweep and `pkill -x fuse-server`,
+    // which a flags-only check silently lets through.
     for (prog, args) in commands.iter() {
         if prog != "pkill" { continue; }
-        if let Some(pos) = args.iter().position(|a| a == "-f" || a == "-x") {
-            let mode = &args[pos];
-            let pat = args.get(pos + 1).cloned().unwrap_or_default();
-            let scoped = pat.contains("/tmp/fgk.sock");
-            let bare_name = pat.contains("fuse-server") || pat.contains("fused") && !scoped;
-            assert!(
-                !bare_name,
-                "seed {seed}: banned name-based sweep `pkill {mode} {pat}`: {args:?}"
-            );
-            if mode.as_str() == "-f" {
-                assert!(
-                    scoped,
-                    "seed {seed}: `pkill -f` with a non-rendezvous pattern: {args:?}"
-                );
-            }
-        }
+        let joined = args.join(" ");
+        assert!(
+            joined.contains("--socket") && joined.contains("/tmp/fgk.sock"),
+            "seed {seed}: pkill without THIS stack's rendezvous scope: {args:?}"
+        );
+        assert!(
+            !(joined.contains("fuse-server") || joined.contains("fused")),
+            "seed {seed}: pkill pattern names a daemon (over-match): {args:?}"
+        );
     }
     assert!(
         !io.spawned_without_mountpoint.get(),
@@ -509,19 +508,7 @@ fn orchestrator_chaos_trace() {
     for seed in 0..n {
         let mut io = FuzzSystemIo::new(seed);
         let cfg = fuzz_config();
-        let send_state = Cell::new(seed ^ 0xA5A5A5A5A5A5A5A5);
-        let send = |name: &str, _args: &str| -> Result<String, String> {
-            let mut rng = Rng(send_state.get());
-            let r = rng.next() % 100;
-            send_state.set(rng.0);
-            match (name, r) {
-                (_, 0..=9) => Err("server closed the connection".into()),
-                ("version", 10..=14) => Ok("not json".into()),
-                ("add", 10..=14) => Ok("{\"type\":\"added\",\"inner\":\"stub-x\"}".into()),
-                ("add", 15..=17) => Ok("{\"type\":\"error\"}".into()),
-                _ => Ok(String::new()),
-            }
-        };
+        let send = fuzz_send(seed);
         let _ = run_agent(&mut io, &cfg, &send, false);
         // Digest: command/spawn/interactive streams + the budget left.
         let mut acc = format!("seed={seed} budget={}", io.budget.get());
