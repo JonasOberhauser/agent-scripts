@@ -335,8 +335,10 @@ where
                 // Try lazy unmount to clear any stale FUSE mount.
                 lazy_unmount(io, &mount_str, wrapper);
 
-                // Wait for lazy unmount, then remove + recreate.
-                std::thread::sleep(std::time::Duration::from_millis(200));
+                // Wait for lazy unmount, then remove + recreate. The
+                // seam (not thread::sleep) so the fuzz tier and mocks
+                // own time.
+                io.sleep_ms(200);
                 let _ = io.remove_path(&config.mount_point);
 
                 io.create_dir_all(&config.mount_point).map_err(|e| format!(
@@ -443,7 +445,7 @@ where
                         "fuse-server socket did not appear within 10s (pid {pid} may have crashed){detail}"
                     ));
                 }
-                std::thread::sleep(Duration::from_millis(100));
+                io.sleep_ms(100);
             }
             info!("Socket ready at {}", socket.display());
         }
