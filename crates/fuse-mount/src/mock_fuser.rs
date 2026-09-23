@@ -6,18 +6,21 @@
 //! packet boundary matches /dev/fuse's one-request-per-read
 //! semantics). This module is the OTHER end: a userspace "kernel"
 //! that accepts JSON-line operations on a control socket, encodes
-//! them into genuine Linux FUSE wire requests (the layouts are the
-//! kernel UAPI's, held as code in the [`wire`] module below and
-//! pinned by tests), feeds them to the session, and decodes the
-//! replies back to JSON.
+//! them into genuine Linux FUSE wire requests, feeds them to the
+//! session, and decodes the replies back to JSON.
+//!
+//! The wire types are `fuse_backend_rs::abi::fuse_abi` — the
+//! maintained public mirror of `include/uapi/linux/fuse.h` (v7.31),
+//! from the virtiofsd lineage; fuser keeps its own mirror private.
+//! fuser is built with the `abi-7-9` feature so the layouts it
+//! SERIALIZES match fbrs's full ones byte-for-byte on every struct
+//! this module decodes (exact-length `ByteValued` decoding).
 //!
 //! This is the e2e substrate for environments without a FUSE device
 //! (CI containers, the authoring sandbox, fuzz tiers): every layer
 //! above the kernel is real — the fused binary process, its control
 //! loop against the real oracle protocol, MR4 fd passing, one-read
-//! adjudication, MR5 persistence. The `raw` op additionally lets a
-//! driver speak hand-crafted wire bytes directly, so a later fuzz
-//! tier can attack the parser itself.
+//! adjudication, MR5 persistence.
 
 use std::io::{BufRead, BufReader, Write};
 use std::io::Read as _;
@@ -25,104 +28,48 @@ use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 
+use fuse_backend_rs::abi::fuse_abi as abi;
 use serde_json::{json, Value};
-
-// Linux FUSE kernel UAPI (include/uapi/linux/fuse.h) — the stable
-// wire contract the kernel itself speaks. fuser does not re-export
-// its internal ABI tables, and it should not have to: the protocol
-// below is the kernel's, not fuser's.
-mod opcode {
-    pub const LOOKUP: u32 = 1;
-    pub const FORGET: u32 = 2;
-    pub const GETATTR: u32 = 3;
-    pub const OPEN: u32 = 14;
-    pub const READ: u32 = 15;
-    pub const STATFS: u32 = 17;
-    pub const RELEASE: u32 = 18;
-    pub const FLUSH: u32 = 25;
-    pub const INIT: u32 = 26;
-    pub const OPENDIR: u32 = 27;
-    pub const READDIR: u32 = 28;
-    pub const RELEASEDIR: u32 = 29;
-}
 
 use crate::fs::FusedFs;
 
-/// The wire facts this mock depends on, AS CODE (not comments): the
-/// layouts of include/uapi/linux/fuse.h as OUR fuser build serializes
-/// them — Linux, default features (no abi-7-9 tail, no macOS fields).
-/// Every encoder emits exactly its `*_IN_LEN`; every decoder reads
-/// through these offsets; the tests pin both sides together.
-mod wire {
-    // fuse_in_header / fuse_out_header
-    pub const IN_HEADER_LEN: usize = 40;
-    pub const OUT_HEADER_LEN: usize = 16;
-    /// The wire carries -errno in out_header.error.
-    pub fn errno_from_wire(raw: i32) -> i32 {
-        -raw
-    }
-
-    // Request payload sizes (the encoders below emit exactly these).
-    pub const GETATTR_IN_LEN: usize = 16;
-    pub const OPEN_IN_LEN: usize = 8;
-    pub const READ_IN_LEN: usize = 40;
-    pub const RELEASE_IN_LEN: usize = 24;
-    pub const FLUSH_IN_LEN: usize = 24;
-    pub const INIT_IN_LEN: usize = 16;
-    pub const FORGET_ONE_LEN: usize = 16;
-
-    // Reply layouts.
-    /// fuse_entry_out: nodeid..attr_valid (4×u64) + two nsec u32s,
-    /// then the attr — offset 40.
-    pub const ENTRY_OUT_ATTR_OFF: usize = 40;
-    /// fuse_attr_out: attr_valid u64, nsec u32, dummy u32 — attr at 16.
-    pub const ATTR_OUT_ATTR_OFF: usize = 16;
-    /// fuse_open_out: fh u64, open_flags u32, padding u32.
-    pub const OPEN_OUT_FH_OFF: usize = 0;
-    /// fuse_statfs_out wraps fuse_kstatfs directly; `files` is the
-    /// 4th u64.
-    pub const STATFS_FILES_OFF: usize = 24;
-    pub const STATFS_BSIZE_OFF: usize = 40;
-    pub const STATFS_MIN_LEN: usize = 52;
-
-    /// A typed view over `fuse_attr` as serialized by our build:
-    /// ino,size,blocks,atime,mtime,ctime (6×u64), atime/mtime/ctimensec
-    /// (3×u32), mode,nlink,uid,gid,rdev (5×u32) — 80 bytes, mode at 60.
-    /// (fuser's declared struct also lists cfg'd-out fields — macOS's
-    /// crtime/flags and abi-7-9's blksize — which are NOT on our wire.)
-    pub struct AttrView<'a> {
-        pub bytes: &'a [u8],
-    }
-
-    impl AttrView<'_> {
-        pub const MIN_LEN: usize = 80;
-        const INO: usize = 0;
-        const SIZE: usize = 8;
-        const MODE: usize = 60;
-        const NLINK: usize = 64;
-
-        pub fn new(bytes: &[u8]) -> Option<AttrView<'_>> {
-            (bytes.len() >= Self::MIN_LEN).then_some(AttrView { bytes })
+/// Decode an exact-length POD from a byte slice: copy into an ALIGNED
+/// stack array first (vm-memory's `from_slice` needs both exact size
+/// and alignment; reply buffers are `Vec<u8>`).
+macro_rules! decode_pod {
+    ($t:ty, $bytes:expr) => {{
+        fn decode<T: vm_memory::ByteValued>(b: &[u8]) -> Option<T> {
+            if b.len() != std::mem::size_of::<T>() {
+                return None;
+            }
+            let mut tmp = vec![0u8; std::mem::size_of::<T>()];
+            tmp.copy_from_slice(b);
+            // The copy is heap-aligned (≥ the struct's alignment on
+            // every platform we target); ByteValued::from_slice then
+            // borrows it as the POD view.
+            vm_memory::ByteValued::from_slice(&tmp).copied()
         }
-        pub fn ino(&self) -> u64 {
-            u64::from_le_bytes(self.bytes[Self::INO..Self::INO + 8].try_into().unwrap_or([0; 8]))
-        }
-        pub fn size(&self) -> u64 {
-            u64::from_le_bytes(self.bytes[Self::SIZE..Self::SIZE + 8].try_into().unwrap_or([0; 8]))
-        }
-        pub fn mode(&self) -> u32 {
-            u32::from_le_bytes(self.bytes[Self::MODE..Self::MODE + 4].try_into().unwrap_or([0; 4]))
-        }
-        pub fn nlink(&self) -> u32 {
-            u32::from_le_bytes(self.bytes[Self::NLINK..Self::NLINK + 4].try_into().unwrap_or([0; 4]))
-        }
-    }
+        decode::<$t>($bytes)
+    }};
 }
 
-/// One FUSE wire request: header (40 bytes, little-endian) plus the
-/// opcode-specific payload, name bytes NUL-padded to 8 where present.
+/// Serialize a POD ABI value to bytes. vm-memory 0.17's
+/// `ByteValued::as_bytes` is a &mut VolatileSlice (its writer-side
+/// API); for plain serialization the POD contract — "any data is
+/// valid for this type" — makes a byte-view cast sound.
+fn pod_bytes<T: vm_memory::ByteValued>(v: &T) -> Vec<u8> {
+    // SAFETY: ByteValued is only implemented for POD types whose any
+    // bit pattern is valid; reading size_of::<T>() bytes at the value
+    // is exactly its wire form (repr(C), field-declared padding).
+    unsafe {
+        std::slice::from_raw_parts(v as *const T as *const u8, std::mem::size_of::<T>())
+    }
+    .to_vec()
+}
+
+/// One FUSE wire request: header + opcode-specific payload.
 fn encode_request(
-    opcode: u32,
+    opcode: abi::Opcode,
     unique: u64,
     nodeid: u64,
     uid: u32,
@@ -130,90 +77,22 @@ fn encode_request(
     pid: u32,
     payload: &[u8],
 ) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(wire::IN_HEADER_LEN + payload.len());
-    put_u32(&mut buf, (wire::IN_HEADER_LEN + payload.len()) as u32);
-    put_u32(&mut buf, opcode);
-    put_u64(&mut buf, unique);
-    put_u64(&mut buf, nodeid);
-    put_u32(&mut buf, uid);
-    put_u32(&mut buf, gid);
-    put_u32(&mut buf, pid);
-    put_u32(&mut buf, 0); // padding
+    let header = abi::InHeader {
+        len: (std::mem::size_of::<abi::InHeader>() + payload.len()) as u32,
+        opcode: opcode as u32,
+        unique,
+        nodeid,
+        uid,
+        gid,
+        pid,
+        padding: 0,
+    };
+    let mut buf = pod_bytes(&header);
     buf.extend_from_slice(payload);
     buf
 }
 
-fn put_u32(b: &mut Vec<u8>, v: u32) {
-    b.extend_from_slice(&v.to_le_bytes());
-}
-fn put_u64(b: &mut Vec<u8>, v: u64) {
-    b.extend_from_slice(&v.to_le_bytes());
-}
-fn put_i64(b: &mut Vec<u8>, v: i64) {
-    b.extend_from_slice(&v.to_le_bytes());
-}
-
-fn encode_getattr_in(fh: u64) -> Vec<u8> {
-    let mut p = Vec::with_capacity(wire::GETATTR_IN_LEN);
-    put_u32(&mut p, 0); // getattr_flags
-    put_u32(&mut p, 0); // dummy
-    put_u64(&mut p, fh);
-    p
-}
-
-fn encode_open_in(flags: u32) -> Vec<u8> {
-    let mut p = Vec::with_capacity(wire::OPEN_IN_LEN);
-    put_u32(&mut p, flags);
-    put_u32(&mut p, 0); // unused
-    p
-}
-
-fn encode_read_in(fh: u64, offset: i64, size: u32) -> Vec<u8> {
-    let mut p = Vec::with_capacity(wire::READ_IN_LEN);
-    put_u64(&mut p, fh);
-    put_i64(&mut p, offset);
-    put_u32(&mut p, size);
-    put_u32(&mut p, 0); // read_flags
-    put_u64(&mut p, 0); // lock_owner
-    put_u32(&mut p, 0); // flags
-    put_u32(&mut p, 0); // padding
-    p
-}
-
-fn encode_release_in(fh: u64) -> Vec<u8> {
-    let mut p = Vec::with_capacity(wire::RELEASE_IN_LEN);
-    put_u64(&mut p, fh);
-    put_u32(&mut p, 0); // flags
-    put_u32(&mut p, 0); // release_flags
-    put_u64(&mut p, 0); // lock_owner
-    p
-}
-
-fn encode_flush_in(fh: u64) -> Vec<u8> {
-    let mut p = Vec::with_capacity(wire::FLUSH_IN_LEN);
-    put_u64(&mut p, fh);
-    put_u32(&mut p, 0); // flags
-    put_u32(&mut p, 0); // padding
-    put_u64(&mut p, 0); // lock_owner
-    p
-}
-
-fn encode_init_in() -> Vec<u8> {
-    let mut p = Vec::with_capacity(wire::INIT_IN_LEN);
-    put_u32(&mut p, 7); // FUSE_KERNEL_VERSION
-    put_u32(&mut p, 8); // minor
-    put_u32(&mut p, 128 * 1024); // max_readahead
-    put_u32(&mut p, 0); // flags: none — let the session pick
-    p
-}
-
-fn encode_forget_one(nodeid: u64, count: u64) -> Vec<u8> {
-    let mut p = Vec::with_capacity(wire::FORGET_ONE_LEN);
-    put_u64(&mut p, nodeid);
-    put_u64(&mut p, count);
-    p
-}
-
+/// Variable-length LOOKUP payload: the name, NUL-padded to 8.
 fn encode_lookup_name(name: &str) -> Vec<u8> {
     let mut p = Vec::new();
     p.extend_from_slice(name.as_bytes());
@@ -222,19 +101,6 @@ fn encode_lookup_name(name: &str) -> Vec<u8> {
         p.push(0);
     }
     p
-}
-
-fn get_u32(b: &[u8], off: usize) -> u32 {
-    u32::from_le_bytes(b[off..off + 4].try_into().unwrap_or([0; 4]))
-}
-fn get_u64(b: &[u8], off: usize) -> u64 {
-    u64::from_le_bytes(b[off..off + 8].try_into().unwrap_or([0; 8]))
-}
-fn get_i32(b: &[u8], off: usize) -> i32 {
-    i32::from_le_bytes(b[off..off + 4].try_into().unwrap_or([0; 4]))
-}
-fn get_i64(b: &[u8], off: usize) -> i64 {
-    i64::from_le_bytes(b[off..off + 8].try_into().unwrap_or([0; 8]))
 }
 
 /// The userspace kernel. `sock` is the DRIVER-side handle to the
@@ -255,10 +121,10 @@ struct MockKernel {
     open_fhs: Vec<u64>,
 }
 
-/// A decoded FUSE reply: `error != 0` carries the errno, else `data`
-/// is the payload after the out_header.
+/// A decoded FUSE reply: `error != 0` carries the POSITIVE errno (the
+/// wire carries -errno in out_header.error), else `data` is the
+/// payload after the out_header.
 struct WireReply {
-    /// POSITIVE errno (the wire carries -errno in out_header.error).
     error: i32,
     unique: u64,
     data: Vec<u8>,
@@ -272,14 +138,19 @@ impl MockKernel {
     /// replies arrive; failures are logged, not fatal.
     fn driver_exit(&mut self) {
         for fh in std::mem::take(&mut self.open_fhs) {
-            let payload = encode_release_in(fh);
+            let payload = abi::ReleaseIn {
+                fh,
+                flags: 0,
+                release_flags: 0,
+                lock_owner: 0,
+            };
             let res = self.request(
-                opcode::RELEASE,
+                abi::Opcode::Release,
                 fuser::FUSE_ROOT_ID,
                 0,
                 0,
                 0,
-                &payload,
+                &pod_bytes(&payload),
             );
             match res {
                 Ok(r) if r.error != 0 => {
@@ -302,7 +173,7 @@ impl MockKernel {
 
     fn request(
         &mut self,
-        opcode: u32,
+        opcode: abi::Opcode,
         nodeid: u64,
         uid: u32,
         gid: u32,
@@ -320,13 +191,15 @@ impl MockKernel {
             .read(&mut buf)
             .map_err(|e| format!("read wire reply: {e}"))?;
         buf.truncate(n);
-        if n < wire::OUT_HEADER_LEN {
+        if n < std::mem::size_of::<abi::OutHeader>() {
             return Err(format!("short reply frame: {n} bytes"));
         }
+        let out = decode_pod!(abi::OutHeader, &buf[..std::mem::size_of::<abi::OutHeader>()])
+            .ok_or_else(|| format!("bad out_header in {n}-byte frame"))?;
         let reply = WireReply {
-            error: wire::errno_from_wire(get_i32(&buf, 4)),
-            unique: get_u64(&buf, 8),
-            data: buf[wire::OUT_HEADER_LEN..].to_vec(),
+            error: -out.error,
+            unique: out.unique,
+            data: buf[std::mem::size_of::<abi::OutHeader>()..].to_vec(),
         };
         if reply.unique != unique {
             return Err(format!(
@@ -340,21 +213,22 @@ impl MockKernel {
     /// FORGET is the one opcode the kernel never expects a reply to.
     fn forget(&mut self, nodeid: u64, count: u64) -> Result<(), String> {
         let unique = self.next_unique();
-        let payload = encode_forget_one(nodeid, count);
-        let frame =
-            encode_request(opcode::FORGET, unique, nodeid, 0, 0, std::process::id(), &payload);
+        let payload = abi::ForgetOne { nodeid, nlookup: count };
+        let frame = encode_request(
+            abi::Opcode::Forget,
+            unique,
+            nodeid,
+            0,
+            0,
+            std::process::id(),
+            &pod_bytes(&payload),
+        );
         self.sock
             .write_all(&frame)
             .map_err(|e| format!("write FORGET: {e}"))?;
         Ok(())
     }
-
 }
-
-
-
-
-
 
 /// Caller credentials the kernel stamps on every request; drivers
 /// may override them per line (fodder for the fuzz tier).
@@ -491,48 +365,91 @@ impl DriverOp {
     /// The kernel-side encoding of one op: opcode, target node, and
     /// the payload bytes — the per-variant match that makes the wire
     /// semantics live ON the ADT (review on #76).
-    fn encode(&self) -> (u32, u64, Vec<u8>) {
+    fn encode(&self) -> (abi::Opcode, u64, Vec<u8>) {
         let root = |ino: u64| if ino == 0 { fuser::FUSE_ROOT_ID } else { ino };
         match self {
-            DriverOp::Init(_) => (opcode::INIT, 0, encode_init_in()),
-            DriverOp::Lookup(Lookup { name, ino }) => {
-                (opcode::LOOKUP, root(*ino), encode_lookup_name(name))
-            }
-            DriverOp::Getattr(Getattr { ino, fh }) => {
-                (opcode::GETATTR, root(*ino), encode_getattr_in(fh.unwrap_or(0)))
-            }
-            DriverOp::Open(Open { ino, flags }) => {
-                (opcode::OPEN, root(*ino), encode_open_in(*flags))
-            }
-            DriverOp::Opendir(Opendir { ino }) => (opcode::OPENDIR, root(*ino), encode_open_in(0)),
-            DriverOp::Read(Read { fh, offset, size }) => {
-                (opcode::READ, fuser::FUSE_ROOT_ID, encode_read_in(*fh, *offset, *size))
-            }
-            DriverOp::Readdir(Readdir { ino, fh, offset, size }) => (
-                opcode::READDIR,
-                root(*ino),
-                encode_read_in(*fh, *offset, *size),
+            DriverOp::Init(_) => (
+                abi::Opcode::Init,
+                0,
+                pod_bytes(&abi::InitIn {
+                    major: 7,
+                    minor: 8,
+                    max_readahead: 128 * 1024,
+                    flags: 0,
+                }),
             ),
-            DriverOp::Release(Release { ino, fh }) => {
-                (opcode::RELEASE, root(*ino), encode_release_in(*fh))
+            DriverOp::Lookup(Lookup { name, ino }) => {
+                (abi::Opcode::Lookup, root(*ino), encode_lookup_name(name))
             }
-            DriverOp::Releasedir(Releasedir { ino, fh }) => {
-                (opcode::RELEASEDIR, root(*ino), encode_release_in(*fh))
-            }
-            DriverOp::Flush(Flush { fh }) => {
-                (opcode::FLUSH, fuser::FUSE_ROOT_ID, encode_flush_in(*fh))
-            }
-            DriverOp::Statfs(Statfs { ino }) => (opcode::STATFS, root(*ino), Vec::new()),
-            DriverOp::Forget(Forget { ino, count }) => {
-                (opcode::FORGET, root(*ino), encode_forget_one(root(*ino), *count))
-            }
+            DriverOp::Getattr(Getattr { ino, fh }) => (
+                abi::Opcode::Getattr,
+                root(*ino),
+                pod_bytes(&abi::GetattrIn { flags: 0, dummy: 0, fh: fh.unwrap_or(0) }),
+            ),
+            DriverOp::Open(Open { ino, flags }) => (
+                abi::Opcode::Open,
+                root(*ino),
+                pod_bytes(&abi::OpenIn { flags: *flags, fuse_flags: 0 }),
+            ),
+            DriverOp::Opendir(Opendir { ino }) => (
+                abi::Opcode::Opendir,
+                root(*ino),
+                pod_bytes(&abi::OpenIn { flags: 0, fuse_flags: 0 }),
+            ),
+            DriverOp::Read(Read { fh, offset, size }) => (
+                abi::Opcode::Read,
+                fuser::FUSE_ROOT_ID,
+                pod_bytes(&abi::ReadIn {
+                    fh: *fh,
+                    offset: *offset as u64,
+                    size: *size,
+                    read_flags: 0,
+                    lock_owner: 0,
+                    flags: 0,
+                    padding: 0,
+                }),
+            ),
+            DriverOp::Readdir(Readdir { ino, fh, offset, size }) => (
+                abi::Opcode::Readdir,
+                root(*ino),
+                pod_bytes(&abi::ReadIn {
+                    fh: *fh,
+                    offset: *offset as u64,
+                    size: *size,
+                    read_flags: 0,
+                    lock_owner: 0,
+                    flags: 0,
+                    padding: 0,
+                }),
+            ),
+            DriverOp::Release(Release { ino, fh }) => (
+                abi::Opcode::Release,
+                root(*ino),
+                pod_bytes(&abi::ReleaseIn { fh: *fh, flags: 0, release_flags: 0, lock_owner: 0 }),
+            ),
+            DriverOp::Releasedir(Releasedir { ino, fh }) => (
+                abi::Opcode::Releasedir,
+                root(*ino),
+                pod_bytes(&abi::ReleaseIn { fh: *fh, flags: 0, release_flags: 0, lock_owner: 0 }),
+            ),
+            DriverOp::Flush(Flush { fh }) => (
+                abi::Opcode::Flush,
+                fuser::FUSE_ROOT_ID,
+                pod_bytes(&abi::FlushIn { fh: *fh, unused: 0, padding: 0, lock_owner: 0 }),
+            ),
+            DriverOp::Statfs(Statfs { ino }) => (abi::Opcode::Statfs, root(*ino), Vec::new()),
+            DriverOp::Forget(Forget { ino, count }) => (
+                abi::Opcode::Forget,
+                root(*ino),
+                pod_bytes(&abi::ForgetOne { nodeid: root(*ino), nlookup: *count }),
+            ),
         }
     }
 }
 
 /// The typed reply, one variant per op — the answer shape the ADT
-/// promises (review on #76). `Ok`/`Errno` are the shapeless replies
-/// (release-like ops answer nothing but success).
+/// promises (review on #76). `Ok` is the shapeless reply (release-like
+/// ops answer nothing but success).
 #[derive(serde::Serialize)]
 #[serde(untagged)]
 enum OpReply {
@@ -541,7 +458,7 @@ enum OpReply {
     Attr(AttrJson),
     Open { fh: u64, flags: u32 },
     Read { len: usize, data_hex: String },
-    Entries(Vec<(u64, i64, u32, String)>),
+    Entries(Vec<(u64, u64, u32, String)>),
     Statfs { blocks: u64, bfree: u64, bavail: u64, files: u64, ffree: u64, bsize: u32, namelen: u32, frsize: u32 },
     Ok(usize),
     Errno { errno: i32, what: String },
@@ -555,53 +472,52 @@ struct AttrJson {
     nlink: u32,
 }
 
+fn attr_json(a: &abi::Attr) -> AttrJson {
+    AttrJson { ino: a.ino, size: a.size, mode: a.mode, nlink: a.nlink }
+}
+
+fn errno_reply(errno: i32) -> OpReply {
+    OpReply::Errno { errno, what: std::io::Error::from_raw_os_error(errno).to_string() }
+}
+
 /// The wire reply → the typed [`OpReply`] matching the op — decoding
 /// is its OWN function, not interleaved with dispatch (review on #76).
 fn decode_reply(op: &DriverOp, r: &WireReply) -> Result<OpReply, String> {
-    let errno = |r: &WireReply| OpReply::Errno {
-        errno: r.error,
-        what: std::io::Error::from_raw_os_error(r.error).to_string(),
-    };
     if r.error != 0 {
-        return Ok(errno(r));
+        return Ok(errno_reply(r.error));
     }
-    let attr_json = |a: &[u8]| -> Result<AttrJson, String> {
-        let v = wire::AttrView::new(a).ok_or("short attr")?;
-        Ok(AttrJson { ino: v.ino(), size: v.size(), mode: v.mode(), nlink: v.nlink() })
-    };
     match op {
         DriverOp::Init(_) => {
+            // The init reply's layout is feature-dependent on the
+            // SERVING side (fuser compiles a subset); the prefix
+            // major,minor,max_readahead,flags is ABI-stable since
+            // 7.1, so read it directly.
             if r.data.len() < 16 {
                 return Err("short init reply".into());
             }
+            let g = |off: usize| u32::from_le_bytes(r.data[off..off + 4].try_into().unwrap_or([0; 4]));
             Ok(OpReply::Init {
-                major: get_u32(&r.data, 0),
-                minor: get_u32(&r.data, 4),
-                max_write: get_u32(&r.data, 12),
-                flags: get_u32(&r.data, 8),
+                major: g(0),
+                minor: g(4),
+                max_write: g(12),
+                flags: g(8),
             })
         }
         DriverOp::Lookup(_) => {
-            if r.data.len() < wire::ENTRY_OUT_ATTR_OFF {
-                return Err("short entry_out".into());
-            }
+            let e = decode_pod!(abi::EntryOut, &r.data).ok_or("entry_out size mismatch")?;
             Ok(OpReply::Entry {
-                nodeid: get_u64(&r.data, 0),
-                generation: get_u64(&r.data, 8),
-                attr: attr_json(&r.data[wire::ENTRY_OUT_ATTR_OFF..])?,
+                nodeid: e.nodeid,
+                generation: e.generation,
+                attr: attr_json(&e.attr),
             })
         }
         DriverOp::Getattr(_) => {
-            if r.data.len() < wire::ATTR_OUT_ATTR_OFF {
-                return Err("short attr_out".into());
-            }
-            Ok(OpReply::Attr(attr_json(&r.data[wire::ATTR_OUT_ATTR_OFF..])?))
+            let a = decode_pod!(abi::AttrOut, &r.data).ok_or("attr_out size mismatch")?;
+            Ok(OpReply::Attr(attr_json(&a.attr)))
         }
         DriverOp::Open(_) | DriverOp::Opendir(_) => {
-            if r.data.len() < 8 {
-                return Err("short open_out".into());
-            }
-            Ok(OpReply::Open { fh: get_u64(&r.data, wire::OPEN_OUT_FH_OFF), flags: get_u32(&r.data, 8) })
+            let o = decode_pod!(abi::OpenOut, &r.data).ok_or("open_out size mismatch")?;
+            Ok(OpReply::Open { fh: o.fh, flags: o.open_flags })
         }
         DriverOp::Read(_) => {
             let hex: String = r.data.iter().map(|b| format!("{b:02x}")).collect();
@@ -609,18 +525,16 @@ fn decode_reply(op: &DriverOp, r: &WireReply) -> Result<OpReply, String> {
         }
         DriverOp::Readdir(_) => Ok(OpReply::Entries(dirents(&r.data))),
         DriverOp::Statfs(_) => {
-            if r.data.len() < wire::STATFS_MIN_LEN {
-                return Err("short statfs_out".into());
-            }
+            let s = decode_pod!(abi::StatfsOut, &r.data).ok_or("statfs_out size mismatch")?;
             Ok(OpReply::Statfs {
-                blocks: get_u64(&r.data, 0),
-                bfree: get_u64(&r.data, 8),
-                bavail: get_u64(&r.data, 16),
-                files: get_u64(&r.data, wire::STATFS_FILES_OFF),
-                ffree: get_u64(&r.data, 32),
-                bsize: get_u32(&r.data, wire::STATFS_BSIZE_OFF),
-                namelen: get_u32(&r.data, 44),
-                frsize: get_u32(&r.data, 48),
+                blocks: s.st.blocks,
+                bfree: s.st.bfree,
+                bavail: s.st.bavail,
+                files: s.st.files,
+                ffree: s.st.ffree,
+                bsize: s.st.bsize,
+                namelen: s.st.namelen,
+                frsize: s.st.frsize,
             })
         }
         DriverOp::Release(_) | DriverOp::Releasedir(_) | DriverOp::Flush(_)
@@ -629,17 +543,22 @@ fn decode_reply(op: &DriverOp, r: &WireReply) -> Result<OpReply, String> {
 }
 
 /// fuse_dirent stream → (ino, off, kind, name) tuples.
-fn dirents(data: &[u8]) -> Vec<(u64, i64, u32, String)> {
+fn dirents(data: &[u8]) -> Vec<(u64, u64, u32, String)> {
+    let hdr = std::mem::size_of::<abi::Dirent>();
     let mut out = Vec::new();
     let mut off = 0usize;
-    while off + 24 <= data.len() {
-        let namelen = get_u32(data, off + 16) as usize;
-        if off + 24 + namelen > data.len() {
+    while off + hdr <= data.len() {
+        let Some(d) = decode_pod!(abi::Dirent, &data[off..off + hdr]) else {
+            break;
+        };
+        let namelen = d.namelen as usize;
+        if off + hdr + namelen > data.len() {
             break;
         }
-        let name = String::from_utf8_lossy(&data[off + 24..off + 24 + namelen]).into_owned();
-        out.push((get_u64(data, off), get_i64(data, off + 8), get_u32(data, off + 20), name));
-        let entry_len = 24 + namelen;
+        let name =
+            String::from_utf8_lossy(&data[off + hdr..off + hdr + namelen]).into_owned();
+        out.push((d.ino, d.off, d.type_, name));
+        let entry_len = hdr + namelen;
         off += entry_len.div_ceil(8) * 8;
     }
     out
@@ -667,24 +586,20 @@ fn run_op(k: &mut MockKernel, line: &DriverLine) -> Value {
         }
         let (opcode, nodeid, payload) = line.op.encode();
         let wire = k.request(opcode, nodeid, uid, gid, pid, &payload)?;
-        match decode_reply(&line.op, &wire) {
-            Ok(reply) => {
-                // The registry: fhs this driver holds until RELEASE.
-                if let (DriverOp::Open(_), OpReply::Open { fh, .. }) = (&line.op, &reply) {
-                    if *fh != 0 {
-                        k.open_fhs.push(*fh);
-                    }
-                }
-                if let DriverOp::Release(Release { fh, .. }) = &line.op {
-                    k.open_fhs.retain(|f| f != fh);
-                }
-                if let DriverOp::Releasedir(Releasedir { fh, .. }) = &line.op {
-                    k.open_fhs.retain(|f| f != fh);
-                }
-                Ok(reply)
+        let reply = decode_reply(&line.op, &wire)?;
+        // The registry: fhs this driver holds until RELEASE.
+        if let (DriverOp::Open(_), OpReply::Open { fh, .. }) = (&line.op, &reply) {
+            if *fh != 0 {
+                k.open_fhs.push(*fh);
             }
-            Err(e) => Err(e),
         }
+        if let DriverOp::Release(Release { fh, .. }) = &line.op {
+            k.open_fhs.retain(|f| f != fh);
+        }
+        if let DriverOp::Releasedir(Releasedir { fh, .. }) = &line.op {
+            k.open_fhs.retain(|f| f != fh);
+        }
+        Ok(reply)
     })();
 
     match res {
@@ -707,8 +622,7 @@ fn run_op(k: &mut MockKernel, line: &DriverLine) -> Value {
 /// FUSE wire (different framing: lines vs SEQPACKET packets), stamps
 /// caller credentials, and matches replies by unique. Handing the
 /// session a driver connection directly would fuse the session's
-/// lifetime to one driver AND force drivers to speak binary FUSE;
-/// the `raw` op already offers that for parser-level work.
+/// lifetime to one driver AND force drivers to speak binary FUSE.
 pub fn serve(fs: FusedFs, control: &Path) {
     let _ = std::fs::remove_file(control);
     let listener = match UnixListener::bind(control) {
@@ -783,74 +697,70 @@ pub fn serve(fs: FusedFs, control: &Path) {
 }
 
 #[cfg(test)]
-mod wire_tests {
+mod codec_tests {
     use super::*;
 
     #[test]
-    fn encoders_emit_exactly_the_wire_sizes() {
-        assert_eq!(encode_getattr_in(7).len(), wire::GETATTR_IN_LEN);
-        assert_eq!(encode_open_in(0).len(), wire::OPEN_IN_LEN);
-        assert_eq!(encode_read_in(1, 2, 3).len(), wire::READ_IN_LEN);
-        assert_eq!(encode_release_in(9).len(), wire::RELEASE_IN_LEN);
-        assert_eq!(encode_flush_in(9).len(), wire::FLUSH_IN_LEN);
-        assert_eq!(encode_init_in().len(), wire::INIT_IN_LEN);
-        assert_eq!(encode_forget_one(1, 1).len(), wire::FORGET_ONE_LEN);
+    fn header_frame_round_trips_through_the_abi() {
+        let frame = encode_request(abi::Opcode::Statfs, 7, 5, 1, 2, 3, &[]);
+        let h = decode_pod!(abi::InHeader, &frame).expect("exact-size header");
+        assert_eq!(frame.len(), std::mem::size_of::<abi::InHeader>());
+        assert_eq!(h.len as usize, frame.len());
+        assert_eq!(h.opcode, abi::Opcode::Statfs as u32);
+        assert_eq!(h.unique, 7);
+        assert_eq!(h.nodeid, 5);
+        assert_eq!(h.uid, 1);
+        assert_eq!(h.gid, 2);
+        assert_eq!(h.pid, 3);
+        assert_eq!(h.padding, 0);
+    }
+
+    #[test]
+    fn payloads_round_trip_through_the_abi() {
+        let r = abi::ReadIn {
+            fh: 9,
+            offset: 4096,
+            size: 128,
+            read_flags: 0,
+            lock_owner: 0,
+            flags: 0,
+            padding: 0,
+        };
+        let bytes = pod_bytes(&r);
+        let back = decode_pod!(abi::ReadIn, &bytes).expect("read_in round trip");
+        assert_eq!(back.fh, 9);
+        assert_eq!(back.size, 128);
+        // The ABI crate owns the layouts; we only assert OUR use of
+        // them (round trip + frame composition), not offset tables.
+        assert_eq!(
+            bytes.len(),
+            std::mem::size_of::<abi::ReadIn>(),
+            "as_bytes covers the whole struct"
+        );
+    }
+
+    #[test]
+    fn lookup_name_is_nul_padded_to_8() {
         assert_eq!(encode_lookup_name("a").len(), 8);
         assert_eq!(encode_lookup_name("abcdefgh").len(), 16, "NUL + pad");
     }
 
     #[test]
-    fn attr_view_reads_the_documented_layout() {
-        // A hand-built attr: mode S_IFREG|0o400 at offset 60, nlink 1
-        // at 64 — the two offsets that misled this module twice.
-        let mut a = vec![0u8; wire::AttrView::MIN_LEN];
-        a[8..16].copy_from_slice(&17u64.to_le_bytes()); // size
-        a[60..64].copy_from_slice(&0o100400u32.to_le_bytes()); // mode
-        a[64..68].copy_from_slice(&1u32.to_le_bytes()); // nlink
-        let v = wire::AttrView::new(&a).expect("min-length attr");
-        assert_eq!(v.size(), 17);
-        assert_eq!(v.mode(), 0o100400);
-        assert_eq!(v.nlink(), 1);
-        assert!(wire::AttrView::new(&a[..79]).is_none(), "short attr rejected");
-    }
-
-    #[test]
-    fn header_encoder_matches_the_uapi() {
-        // fuse_in_header: len, opcode, unique, nodeid, uid, gid, pid,
-        // padding — all little-endian.
-        let frame = encode_request(opcode::STATFS, 7, 5, 1, 2, 3, &[]);
-        assert_eq!(frame.len(), wire::IN_HEADER_LEN);
-        assert_eq!(get_u32(&frame, 0), wire::IN_HEADER_LEN as u32);
-        assert_eq!(get_u32(&frame, 4), opcode::STATFS);
-        assert_eq!(get_u64(&frame, 8), 7);
-        assert_eq!(get_u64(&frame, 16), 5);
-        assert_eq!(get_u32(&frame, 24), 1);
-        assert_eq!(get_u32(&frame, 28), 2);
-        assert_eq!(get_u32(&frame, 32), 3);
-        assert_eq!(get_u32(&frame, 36), 0);
-    }
-
-    #[test]
     fn dirent_stream_walks_padded_entries() {
-        // Two entries: "a" (1-byte name → 24+1 → padded to 32) and
-        // "bcdefgh" (7 bytes → 24+7 → padded to 32; the kernel pads
-        // every dirent to a multiple of 8 — so does this buffer).
-        let mut d = Vec::new();
-        put_u64(&mut d, 11);
-        put_i64(&mut d, 1);
-        put_u32(&mut d, 1);
-        put_u32(&mut d, 4);
+        // Two entries: "a" (1-byte name → padded to 32) and
+        // "bcdefgh" (7 bytes → padded to 32; the kernel pads every
+        // dirent to a multiple of 8 — so does this buffer).
+        let hdr = std::mem::size_of::<abi::Dirent>();
+        let mut d = pod_bytes(&abi::Dirent { ino: 11, off: 1, namelen: 1, type_: 4 });
         d.extend_from_slice(b"a");
         d.extend_from_slice(&[0u8; 7]);
-        put_u64(&mut d, 12);
-        put_i64(&mut d, 2);
-        put_u32(&mut d, 7);
-        put_u32(&mut d, 4);
+        d.extend_from_slice(&pod_bytes(&abi::Dirent { ino: 12, off: 2, namelen: 7, type_: 4 }));
         d.extend_from_slice(b"bcdefgh");
         d.push(0);
         let v = dirents(&d);
+        assert_eq!(v.len(), 2);
         assert_eq!(v[0].3, "a");
         assert_eq!(v[1].3, "bcdefgh");
-        assert_eq!(v.len(), 2);
+        assert_eq!(hdr, 24);
     }
 }
