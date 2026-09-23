@@ -78,10 +78,12 @@ convenience tier.
 
 Limits every contributor must know:
 
-- the container still sees the anonymized tree's STRUCTURE (depth,
-  fan-out, file sizes and modes) — only component labels are hidden;
-  losing the policy store (corrupt-aside fresh start) loses the salt
-  and rotates every inner name until the next run-agent re-links.
+- the container sees the FLAT anonymized view (one directory, one
+  whole-path salted hash per secret — #47/#58): no host layout, depth,
+  or fan-out leaks; what remains visible is the NUMBER of secrets and
+  their sizes and modes; losing the policy store (corrupt-aside fresh
+  start) loses the salt and rotates every inner name until the next
+  run-agent re-links.
 - grant-forever authorizes a package **class**, not the verified
   instance: whoever can later execute the same executable + libraries
   inherits the access.
