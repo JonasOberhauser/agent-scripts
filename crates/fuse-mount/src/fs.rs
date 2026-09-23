@@ -751,8 +751,6 @@ impl Filesystem for FusedFs {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        // The kernel never uses an fh after RELEASE: closing the fd is
-        // safe and its number may be recycled by a future open.
         // SAFETY: fh was issued by our open as a live fd.
         unsafe { libc::close(fh as i32) };
         reply.ok();

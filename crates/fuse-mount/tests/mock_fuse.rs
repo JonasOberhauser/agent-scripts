@@ -43,6 +43,7 @@ fn spawn_fused(dir: &Path, oracle: &Path) -> Fused {
         .open(dir.join("fused.log"))
         .unwrap();
     #[allow(clippy::zombie_processes)]
+    #[allow(clippy::zombie_processes)]
     let child = Command::new(env!("CARGO_BIN_EXE_fused"))
         .arg("--mount-point")
         .arg(dir.join("mnt"))
@@ -182,7 +183,7 @@ fn fused_serves_a_full_read_path_over_the_mock_kernel() {
     let data = driver.op(
         serde_json::json!({"op": "read", "fh": fh, "offset": 0, "size": 4096}),
     );
-    assert_eq!(read_hex(&data), b"MOCK-FUSE-CONTENT");
+    assert_eq!(read_hex(&data), b"MOCK-FUSE-CONTENT", "read reply: {data}");
 
     // EOF read returns empty, not an error.
     let eof = driver.op(
@@ -222,6 +223,88 @@ fn fused_serves_a_full_read_path_over_the_mock_kernel() {
     assert!(sync.get("files").is_some(), "session alive after forget: {sync}");
 
     drop(driver);
+    drop(fused);
+}
+
+/// Count the fused process's open descriptors: the kernel-faithful
+/// driver-exit cleanup (synthetic RELEASEs for outstanding fhs) is
+/// observable as the fd count returning to baseline after a driver
+/// abandons an open file.
+fn fd_count(pid: u32) -> usize {
+    std::fs::read_dir(format!("/proc/{pid}/fd"))
+        .map(|rd| rd.count())
+        .unwrap_or(0)
+}
+
+/// Quiescent fd count: the control loop's oracle polls open transient
+/// connections, so single samples race them — take the minimum over a
+/// short window (transients close, the steady state stays).
+fn quiescent_fd_count(pid: u32) -> usize {
+    let mut min = usize::MAX;
+    let deadline = Instant::now() + Duration::from_millis(1500);
+    while Instant::now() < deadline {
+        min = min.min(fd_count(pid));
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    min
+}
+
+#[test]
+fn a_driver_abandoning_an_open_fh_leaks_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let (oracle, _state, hub) = oracle_env(dir.path());
+    let fused = spawn_fused(dir.path(), &oracle);
+    hub.serve("s", "ab12cd34ef56", 0o400);
+
+    // Wait until the control loop has served the secret, then take
+    // the fd baseline with no driver connected.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let ino = loop {
+        let mut d = Driver::connect(&fused.control);
+        d.op(serde_json::json!({"op": "init"}));
+        let entry = d.op(serde_json::json!({"op": "lookup", "ino": 1, "name": "ab12cd34ef56"}));
+        if let Some(ino) = entry["nodeid"].as_u64() {
+            break ino;
+        }
+        assert!(Instant::now() < deadline, "Serve never arrived");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    // Steady state WITH one connected driver (the connection itself
+    // holds fds; only the DELTA across the open is meaningful).
+    let mut d = Driver::connect(&fused.control);
+    d.op(serde_json::json!({"op": "init"}));
+    d.op(serde_json::json!({"op": "statfs"}));
+    let baseline = quiescent_fd_count(fused.child.id());
+
+    // Open (the host fd is now fused's to hold until RELEASE)…
+    let opened = d.op(serde_json::json!({"op": "open", "ino": ino, "flags": 0}));
+    assert!(opened["fh"].is_u64(), "open: {opened}");
+    let during = quiescent_fd_count(fused.child.id());
+    assert_eq!(during, baseline + 1, "the passed host fd must be open");
+
+    // …and hang up WITHOUT releasing — process death, the hostile
+    // path. The mock must synthesize the RELEASEs the real kernel
+    // sends when a process exits with files open.
+    drop(d);
+    let mut next = Driver::connect(&fused.control);
+    next.op(serde_json::json!({"op": "init"}));
+    // The cleanup runs at the PREVIOUS loop's exit; the reconnect can
+    // overtake it via the accept queue, so poll to the steady state.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if quiescent_fd_count(fused.child.id()) == baseline {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "driver death must close the abandoned host fd (kernel-faithful cleanup); \
+             steady state is one connected driver, before-open == after-cleanup"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let _ = next.op(serde_json::json!({"op": "statfs"}));
+
+    drop(next);
     drop(fused);
 }
 

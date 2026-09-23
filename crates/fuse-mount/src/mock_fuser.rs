@@ -245,6 +245,13 @@ fn get_i64(b: &[u8], off: usize) -> i64 {
 struct MockKernel {
     sock: UnixStream,
     unique: u64,
+    /// fhs issued to THIS driver by successful OPENs, not yet
+    /// RELEASEd — the registry for the kernel-faithful cleanup the
+    /// router position enables: on driver disconnect, the real
+    /// kernel closes the dying process's files and RELEASEs each fh;
+    /// the mock synthesizes the same frames (fh 0 — fuser's default
+    /// opendir placeholder — is never tracked: it is not a real fd).
+    open_fhs: Vec<u64>,
 }
 
 /// A decoded FUSE reply: `error != 0` carries the errno, else `data`
@@ -257,8 +264,34 @@ struct WireReply {
 }
 
 impl MockKernel {
+    /// The dying-driver path: the real kernel closes the process's
+    /// files and a RELEASE arrives for each outstanding fh — the
+    /// paired host fd in fused gets closed instead of orphaned. Best
+    /// effort: the session is alive (the channel is daemon-owned), so
+    /// replies arrive; failures are logged, not fatal.
+    fn driver_exit(&mut self) {
+        for fh in std::mem::take(&mut self.open_fhs) {
+            let payload = encode_release_in(fh);
+            let res = self.request(
+                opcode::RELEASE,
+                fuser::FUSE_ROOT_ID,
+                0,
+                0,
+                0,
+                &payload,
+            );
+            match res {
+                Ok(r) if r.error != 0 => {
+                    tracing::warn!("driver exit: RELEASE fh={fh} answered errno {}", r.error);
+                }
+                Err(e) => tracing::warn!("driver exit: RELEASE fh={fh}: {e}"),
+                Ok(_) => {}
+            }
+        }
+    }
+
     fn new(sock: UnixStream) -> Self {
-        Self { sock, unique: 0 }
+        Self { sock, unique: 0, open_fhs: Vec::new() }
     }
 
     fn next_unique(&mut self) -> u64 {
@@ -547,10 +580,11 @@ fn run_op(k: &mut MockKernel, line: &DriverLine) -> Value {
                         if r.data.len() < 8 {
                             return Err("short open_out".into());
                         }
-                        Ok(json!({
-                            "fh": get_u64(&r.data, wire::OPEN_OUT_FH_OFF),
-                            "flags": get_u32(&r.data, 8),
-                        }))
+                        let fh = get_u64(&r.data, wire::OPEN_OUT_FH_OFF);
+                        if fh != 0 {
+                            k.open_fhs.push(fh);
+                        }
+                        Ok(json!({"fh": fh, "flags": get_u32(&r.data, 8)}))
                     }
                     Err(e) => Err(e),
                 }
@@ -579,6 +613,7 @@ fn run_op(k: &mut MockKernel, line: &DriverLine) -> Value {
                 }
             }
             DriverOp::Release { ino, fh } | DriverOp::Releasedir { ino, fh } => {
+                k.open_fhs.retain(|f| *f != *fh);
                 let p = encode_release_in(*fh);
                 let opcode = match &line.op {
                     DriverOp::Release { .. } => opcode::RELEASE,
@@ -716,6 +751,13 @@ pub fn serve(fs: FusedFs, control: &Path) {
                 }
             }
         }
+        // Driver gone (EOF or transport error): the kernel-faithful
+        // cleanup — RELEASE every fh this driver still holds, so the
+        // paired host fds close instead of orphaning. OUTSIDE the op
+        // loop: once per CONNECTION end, never mid-conversation (a
+        // mid-loop insertion bug here once closed a just-opened
+        // secret fd — EBADF on the next read).
+        kernel.driver_exit();
     }
 }
 
