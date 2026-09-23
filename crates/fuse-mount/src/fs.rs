@@ -263,7 +263,7 @@ impl Store {
         // key (the seed-53 leak, found by #72's control-channel
         // fuzzer: a REMOVED secret's map entry survived and listed
         // forever).
-        s.root_labels.remove_by_left(name);
+        let _old = s.root_labels.remove_by_left(name);
         while let Some(label) = path.file_name().map(|n| n.to_string_lossy().into_owned()) {
             if !path.pop() {
                 break;
