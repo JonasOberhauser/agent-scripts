@@ -12,8 +12,8 @@
 //! Fixtures, not SUT: a binary missing from PATH skips that test with
 //! a message (unlike the podman suites, where skipping would hide
 //! regressions of the system under test itself).
+#![allow(clippy::unwrap_used, clippy::panic, unused_results)]
 
-#![cfg_attr(test, allow(clippy::unwrap_used))]
 
 use std::io::Write;
 use std::net::{TcpListener, TcpStream};

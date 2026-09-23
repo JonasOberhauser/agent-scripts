@@ -10,8 +10,8 @@
 //! root hashd was connectable by root only — every unprivileged
 //! fuse-server got EACCES. It needs root to drop privileges, so it is
 //! #[ignore]-gated like the other environment-dependent suites.
+#![allow(clippy::unwrap_used, clippy::panic, unused_results)]
 
-#![cfg_attr(test, allow(clippy::unwrap_used))]
 
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::os::unix::net::UnixStream;

@@ -201,6 +201,11 @@ impl Salt {
     /// A fresh 32-byte salt from the OS entropy source. A salt must
     /// come from the OS — hashing time/pid/addresses quietly degrades
     /// every anonymized name. Refuse rather than degrade.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `/dev/urandom` cannot be opened or short-reads:
+    /// anonymization must not quietly degrade.
     pub fn generate() -> Salt {
         let mut buf = [0u8; 32];
         let mut f = std::fs::File::open("/dev/urandom")

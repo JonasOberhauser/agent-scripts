@@ -132,7 +132,7 @@ fn mint_fino(
         "fino {:?} already exists",
         fino
     );
-    s.identities.insert(
+    let _prev = s.identities.insert(
         fino,
         FinoRecord { identity, path: path.to_path_buf() },
     );
@@ -167,7 +167,7 @@ impl Store {
         for comp in comps.iter().take(comps.len() - 1) {
             match s.tree.get_mut(&prefix) {
                 Some(Node::Dir { children, .. }) => {
-                    children.insert(comp.clone(), ());
+                    let _new = children.insert(comp.clone(), ());
                 }
                 Some(Node::File { .. }) => {
                     warn!("cannot serve \"{name}\": \"{}\" is already a file", prefix.display());
@@ -183,7 +183,7 @@ impl Store {
                     return;
                 }
                 None => {
-                    s.tree.insert(
+                    let _prev = s.tree.insert(
                         prefix.clone(),
                         Node::Dir {
                             children: BTreeMap::new(),
@@ -217,14 +217,14 @@ impl Store {
             }
             None => {
                 let fino = mint_fino(&mut s, &path, None);
-                s.tree.insert(path.clone(), Node::File { fino, mode });
+                let _prev = s.tree.insert(path.clone(), Node::File { fino, mode });
             }
         }
         // Flat container label: link the whole-path hash into the
         // ROOT's bijection — the only place inner names resolve.
         let last = &comps[comps.len() - 1];
         if let Some(Node::Dir { children, .. }) = s.tree.get_mut(&prefix) {
-            children.insert(last.clone(), ());
+            let _new = children.insert(last.clone(), ());
         }
         {
             let labels = &mut s.root_labels;
@@ -242,8 +242,8 @@ impl Store {
                     return;
                 }
             }
-            labels.remove_by_left(&outer_full);
-            labels.insert(outer_full, inner.to_string());
+            let _old = labels.remove_by_left(&outer_full);
+            let _old = labels.insert(outer_full, inner.to_string());
         }
     }
 
@@ -257,7 +257,7 @@ impl Store {
             return;
         }
         if let Some(Node::File { fino, .. }) = s.tree.remove(&path) {
-            s.identities.remove(&fino);
+            let _old = s.identities.remove(&fino);
         }
         // The flat view's one bijection entry, cleaned by its FULL
         // key (the seed-53 leak, found by #72's control-channel
@@ -272,7 +272,7 @@ impl Store {
                 let Some(Node::Dir { children }) = s.tree.get_mut(&path) else {
                     break;
                 };
-                children.remove(&label);
+                let _old = children.remove(&label);
                 children.is_empty() && !path.as_os_str().is_empty()
             };
             if !now_empty {
@@ -370,7 +370,7 @@ impl Store {
             .expect("store lock: never held across a panic — poisoning means a data-daemon bug");
         let path = &s.identities.get(&ino)?.path;
         let mut parent = path.clone();
-        parent.pop();
+        let _popped = parent.pop();
         if parent.as_os_str().is_empty() {
             return Some(FuseIno::ROOT);
         }
@@ -418,7 +418,7 @@ pub fn stat_secret(socket: &str, name: &str) -> Result<OracleReply, String> {
         .map_err(|e| e.to_string())?;
     let mut line = String::new();
     let mut r = BufReader::new(s);
-    r.read_line(&mut line).map_err(|e| e.to_string())?;
+    let _n = r.read_line(&mut line).map_err(|e| e.to_string())?;
     serde_json::from_str(line.trim()).map_err(|e| e.to_string())
 }
 
@@ -615,8 +615,10 @@ impl Filesystem for FusedFs {
             if let Some(fh) = fh {
                 // SAFETY: fstat writes into the provided zeroed struct.
                 let mut st: libc::stat = unsafe { std::mem::zeroed() };
+                let fd = fh as i32;
                 // SAFETY: fh is a live descriptor this daemon issued.
-                if unsafe { libc::fstat(fh as i32, &mut st) } == 0 {
+                let fstat_ok = unsafe { libc::fstat(fd, &mut st) };
+                if fstat_ok == 0 {
                     let attr = self.file_attr(
                         ino,
                         st.st_size as u64,
@@ -719,15 +721,12 @@ impl Filesystem for FusedFs {
         let mut out = vec![0u8; size as usize];
         let mut filled = 0usize;
         while filled < size as usize {
+            let fd = fh as i32;
+            let dst = out[filled..].as_mut_ptr() as *mut libc::c_void;
+            let len = size as usize - filled;
+            let at = offset + filled as i64;
             // SAFETY: pread writes only into the remaining slice.
-            let n = unsafe {
-                libc::pread(
-                    fh as i32,
-                    out[filled..].as_mut_ptr() as *mut libc::c_void,
-                    size as usize - filled,
-                    offset + filled as i64,
-                )
-            };
+            let n = unsafe { libc::pread(fd, dst, len, at) };
             if n < 0 {
                 reply.error(libc::EIO);
                 return;
@@ -752,7 +751,9 @@ impl Filesystem for FusedFs {
         reply: ReplyEmpty,
     ) {
         // SAFETY: fh was issued by our open as a live fd.
-        unsafe { libc::close(fh as i32) };
+        let fd = fh as i32;
+        // SAFETY: `fd` is the kernel handle being released here.
+        let _closed = unsafe { libc::close(fd) };
         reply.ok();
     }
 
@@ -886,7 +887,7 @@ pub fn run_control_loop(store: Store, oracle_socket: String) {
                 match reader.read_line(&mut line) {
                     Ok(0) | Err(_) => break,
                     Ok(_) => {
-                        apply_control_line(&store, &line);
+                        let _applied = apply_control_line(&store, &line);
                     }
                 }
             }

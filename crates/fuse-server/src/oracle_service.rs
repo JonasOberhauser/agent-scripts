@@ -161,7 +161,7 @@ fn send_reply_with_fd(
     use std::os::unix::io::AsRawFd;
     let iov = [std::io::IoSlice::new(line.as_bytes())];
     let cmsg = nix::sys::socket::ControlMessage::ScmRights(fds);
-    nix::sys::socket::sendmsg::<()>(
+    let _sent = nix::sys::socket::sendmsg::<()>(
         stream.as_raw_fd(),
         &iov,
         &[cmsg],
@@ -424,7 +424,7 @@ pub fn run_oracle_server(socket_path: &std::path::Path, state: Arc<ServerState>,
     for conn in listener.incoming().flatten() {
         let state = Arc::clone(&state);
         let hub = hub.clone();
-        std::thread::spawn(move || handle_conn(&state, &hub, conn));
+        let _conn_thread = std::thread::spawn(move || handle_conn(&state, &hub, conn));
     }
     Ok(())
 }
@@ -437,7 +437,7 @@ pub fn ask(socket_path: &std::path::Path, name: &str, pid: u32, offset: u64, siz
     conn.write_all(format!("{req}\n").as_bytes()).map_err(|e| e.to_string())?;
     let mut reader = BufReader::new(conn.try_clone().map_err(|e| e.to_string())?);
     let mut line = String::new();
-    reader.read_line(&mut line).map_err(|e| e.to_string())?;
+    let _n = reader.read_line(&mut line).map_err(|e| e.to_string())?;
     serde_json::from_str(line.trim()).map_err(|e| e.to_string())
 }
 

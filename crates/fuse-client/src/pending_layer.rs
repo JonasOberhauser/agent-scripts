@@ -752,7 +752,7 @@ pub(crate) fn spawn_worker(
     log: LogSink,
 ) -> WorkerTalk {
     let (tx, rx) = std::sync::mpsc::channel::<PanelRequest>();
-    std::thread::spawn(move || {
+    let _worker = std::thread::spawn(move || {
         for req in rx {
             let follow_up = matches!(req, PanelRequest::Action { .. });
             service(&socket, &snapshot, &secrets, &collapsed, &error, &log, req);
@@ -938,7 +938,7 @@ impl PendingPanelLayer {
             if let Command::Grant { id } | Command::GrantForever { id } | Command::Deny { id } =
                 &command
             {
-                self.in_flight.borrow_mut().insert(*id, Instant::now());
+                let _prev = self.in_flight.borrow_mut().insert(*id, Instant::now());
             }
             self.talk
                 .request(&self.pending, PanelRequest::Action { name, command });

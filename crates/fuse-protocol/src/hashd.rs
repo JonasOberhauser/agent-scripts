@@ -64,7 +64,7 @@ pub fn ask(socket: &str, pid: u32) -> Result<String, HashdError> {
             .map_err(|e| HashdError::Unreachable(e.to_string()))?,
     );
     let mut line = String::new();
-    reader.read_line(&mut line).map_err(|e| {
+    let _n = reader.read_line(&mut line).map_err(|e| {
         // The read timeout (500ms) surfaces as WouldBlock/errno 11:
         // hashd accepted us but is busy hashing something big and
         // answered nothing — NOT unreachable (#38).
@@ -254,29 +254,36 @@ mod tests {
     /// path we own; wrap with `UnixListener::from_raw_fd` to accept.
     fn tiny_backlog_listener(path: &std::path::Path) -> std::os::unix::io::RawFd {
         use std::os::unix::io::RawFd;
-        // SAFETY: plain socket(2)/bind(2)/listen(2) syscalls on a
-        // path we own in a per-test tempdir; a leaked fd in a test
-        // process is reclaimed at exit.
-        unsafe {
-            let fd: RawFd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
-            assert!(fd >= 0, "socket(2) failed");
-            let mut addr: libc::sockaddr_un = std::mem::zeroed();
-            addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
-            let bytes = path.as_os_str().as_encoded_bytes();
-            assert!(bytes.len() < addr.sun_path.len(), "tempdir path too long");
-            addr.sun_path[..bytes.len()]
-                .copy_from_slice(std::mem::transmute::<&[u8], &[libc::c_char]>(bytes));
-            assert!(
-                libc::bind(
-                    fd,
-                    &addr as *const _ as *const libc::sockaddr,
-                    std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
-                ) == 0,
-                "bind(2) failed"
-            );
-            assert!(libc::listen(fd, 1) == 0, "listen(2) failed");
-            fd
-        }
+        // Plain socket(2)/bind(2)/listen(2) syscalls on a path we
+        // own in a per-test tempdir; a leaked fd in a test process is
+        // reclaimed at exit. One unsafe op per block, operands hoisted.
+        let domain = libc::AF_UNIX;
+        let ty = libc::SOCK_STREAM;
+        let proto = 0;
+        // SAFETY: constants only; an fd leak in a test process is
+        // reclaimed at exit.
+        let fd: RawFd = unsafe { libc::socket(domain, ty, proto) };
+        assert!(fd >= 0, "socket(2) failed");
+        // SAFETY: all-zero bytes are a valid `sockaddr_un`.
+        let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        let bytes = path.as_os_str().as_encoded_bytes();
+        assert!(bytes.len() < addr.sun_path.len(), "tempdir path too long");
+        // SAFETY: `[u8]` and `[c_char]` have the same layout.
+        let char_bytes: &[libc::c_char] =
+            unsafe { std::mem::transmute::<&[u8], &[libc::c_char]>(bytes) };
+        addr.sun_path[..bytes.len()].copy_from_slice(char_bytes);
+        let addr_ptr = &addr as *const _ as *const libc::sockaddr;
+        let addr_len = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+        // SAFETY: `fd` and `addr_ptr`/`addr_len` describe the tempdir
+        // path owned by this test.
+        let bound = unsafe { libc::bind(fd, addr_ptr, addr_len) };
+        assert!(bound == 0, "bind(2) failed");
+        let backlog = 1;
+        // SAFETY: `fd` is the bound listener from the calls above.
+        let listened = unsafe { libc::listen(fd, backlog) };
+        assert!(listened == 0, "listen(2) failed");
+        fd
     }
 
     #[test]
@@ -321,7 +328,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("slow.sock");
         let fd = tiny_backlog_listener(&sock);
-        std::thread::spawn(move || {
+        let _server = std::thread::spawn(move || {
             use std::io::{BufRead, BufReader, Write};
             use std::os::fd::FromRawFd;
             // SAFETY: the fd was created by tiny_backlog_listener and
@@ -451,7 +458,7 @@ mod tests {
             let (mut conn, _) = listener.accept().unwrap();
             let mut reader = BufReader::new(conn.try_clone().unwrap());
             let mut line = String::new();
-            reader.read_line(&mut line).unwrap();
+            let _n = reader.read_line(&mut line).unwrap();
             let reply = if line.trim() == "hash 7" {
                 format!("ok {}\n", "b".repeat(64))
             } else {

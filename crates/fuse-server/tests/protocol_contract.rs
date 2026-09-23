@@ -9,7 +9,7 @@
 //! parsed as `missing field type` — destroying the reason and costing
 //! a day of debugging.
 
-#![cfg_attr(test, allow(clippy::unwrap_used))]
+#![allow(clippy::unwrap_used, clippy::panic, unused_results)]
 
 use std::sync::Arc;
 use std::time::Duration;

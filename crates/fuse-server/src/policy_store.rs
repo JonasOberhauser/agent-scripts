@@ -184,7 +184,7 @@ pub fn load(state: &mut ServerState, hub: &OracleHub) -> LoadReport {
         } else {
             report.restored += 1;
         }
-        state.secrets.insert(
+        let _prev = state.secrets.insert(
             s.name.clone(),
             std::sync::Arc::new(std::sync::Mutex::new(SecretRecord {
                 host_path: s.host_path.clone(),
@@ -223,6 +223,10 @@ pub struct LoadReport {
 /// grant that fails to persist is lost on restart, but failing the
 /// operation would turn a full disk into "you may not approve
 /// anything".
+///
+/// # Panics
+///
+/// Panics if the persist lock was poisoned by a panicking mutation.
 pub fn persist(state: &ServerState) {
     let _pl = state
         .persist_lock
@@ -297,7 +301,8 @@ fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     tmp.as_file().sync_all()?;
     // persist() renames over the target; on any failure the temp is
     // dropped (unlinked) — no leaked `.tmp-*` litter (review).
-    tmp.persist(path)
+    let _file = tmp
+        .persist(path)
         .map_err(|e| e.error)?;
     // Directory fsync: durability of the rename by construction
     // instead of per-filesystem arguments (review). Some filesystems

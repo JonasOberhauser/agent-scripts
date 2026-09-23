@@ -104,7 +104,7 @@ fn teardown_server<S: SystemIo>(io: &mut S, config: &AgentConfig) {
     // match killed a `cargo test` runner; a name sweep kills every
     // policy daemon on a multi-stack machine).
     let pat = format!("--socket {}", config.socket_path.to_string_lossy());
-    run_wrapped(io, wrapper, "pkill", &["-f", &pat]);
+    let _stopped = run_wrapped(io, wrapper, "pkill", &["-f", &pat]);
     io.sleep_ms(500);
     if io.file_exists(&config.socket_path) {
         let _ = io.remove_path(&config.socket_path);
@@ -180,7 +180,7 @@ fn ensure_mount_point<S: SystemIo>(
     }
 
     // Dead mount: clear it, wait for the lazy unmount, re-probe.
-    lazy_unmount(io, &mount_point.to_string_lossy(), wrapper);
+    let _unmounted = lazy_unmount(io, &mount_point.to_string_lossy(), wrapper);
     io.sleep_ms(200);
     match io.path_state(mount_point) {
         PathState::Dir | PathState::Missing => {
@@ -333,7 +333,7 @@ where
                 let wrapper = config.runtime_wrapper.as_deref();
 
                 // Try lazy unmount to clear any stale FUSE mount.
-                lazy_unmount(io, &mount_str, wrapper);
+                let _unmounted = lazy_unmount(io, &mount_str, wrapper);
 
                 // Wait for lazy unmount, then remove + recreate. The
                 // seam (not thread::sleep) so the fuzz tier and mocks
@@ -730,7 +730,7 @@ fn secret_name(host: &Path) -> String {
             std::path::Component::CurDir => {}
             std::path::Component::ParentDir => {
                 // lexical normalization: `a/../b` -> `b`
-                comps.pop();
+                let _popped = comps.pop();
             }
             std::path::Component::Normal(part) => {
                 let raw = part.to_string_lossy();
@@ -894,13 +894,16 @@ fn run_with_wrapper<S: SystemIo>(
 fn prompt_yes_no(prompt: &str) -> bool {
     // SAFETY: isatty(2) is a pure FFI probe on a constant fd with no
     // preconditions and no failure mode beyond a negative return.
-    if unsafe { libc::isatty(libc::STDIN_FILENO) } != 1 {
+    let stdin_fd = libc::STDIN_FILENO;
+    // SAFETY: querying the tty-ness of our own stdin.
+    let is_tty = unsafe { libc::isatty(stdin_fd) };
+    if is_tty != 1 {
         return false;
     }
     eprint!("{prompt} [y/N] (default N in 10s): ");
     let _ = std::io::stderr().flush();
     let (tx, rx) = std::sync::mpsc::channel::<String>();
-    std::thread::spawn(move || {
+    let _watcher = std::thread::spawn(move || {
         let mut line = String::new();
         let _ = std::io::stdin().read_line(&mut line);
         let _ = tx.send(line);

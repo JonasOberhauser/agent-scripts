@@ -87,8 +87,8 @@ fn parse_maps_line(line: &str) -> Result<Option<(String, PathBuf)>, String> {
     if perms.len() != 4 {
         return Err(BAD(line));
     }
-    fields.next().ok_or_else(|| BAD(line))?; // offset
-    fields.next().ok_or_else(|| BAD(line))?; // dev:major:minor
+    let _offset = fields.next().ok_or_else(|| BAD(line))?; // offset
+    let _dev = fields.next().ok_or_else(|| BAD(line))?; // dev:major:minor
     let inode = fields.next().ok_or_else(|| BAD(line))?;
     if inode.is_empty() || !inode.chars().all(|c| c.is_ascii_digit()) {
         return Err(BAD(line));
@@ -207,7 +207,8 @@ impl SystemIo for RealSystemIo {
     ) -> Result<u32, IoError> {
         use std::os::unix::process::CommandExt;
         let mut cmd = std::process::Command::new(program);
-        cmd.args(args)
+        let _cmd = cmd
+            .args(args)
             .stdin(std::process::Stdio::null())
             .process_group(0);
 
@@ -218,24 +219,28 @@ impl SystemIo for RealSystemIo {
                     .append(true)
                     .open(path)
                     .map_err(|e| IoError(format!("open log {path:?}: {e}")))?;
-                cmd.stdout(std::process::Stdio::from(f.try_clone().map_err(|e| IoError(e.to_string()))?))
+                let _cmd = cmd
+                    .stdout(std::process::Stdio::from(f.try_clone().map_err(|e| IoError(e.to_string()))?))
                     .stderr(std::process::Stdio::from(f));
             }
             None => {
-                cmd.stdout(std::process::Stdio::null())
+                let _cmd = cmd
+                    .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null());
             }
         }
 
-        // SAFETY: `pre_exec` callbacks run between fork(2) and execve(2)
-        // and must be async-signal-safe; the closure only calls
-        // setsid(2) — no allocation, no locks, no libc state touched.
-        unsafe {
-            cmd.pre_exec(|| {
-                libc::setsid();
-                Ok(())
-            });
+        fn child_setsid() -> std::io::Result<()> {
+            // SAFETY: runs between fork(2) and execve(2) and must be
+            // async-signal-safe; setsid(2) only — no allocation, no
+            // locks, no libc state touched.
+            let _sid = unsafe { libc::setsid() };
+            Ok(())
         }
+        let cmd_mut = &mut cmd;
+        let setsid_cb = child_setsid;
+        // SAFETY: the callback is async-signal-safe (see above).
+        let _cmd = unsafe { cmd_mut.pre_exec(setsid_cb) };
         let child = cmd
             .spawn()
             .map_err(|e| IoError(format!("spawn_independent {program}: {e}")))?;
@@ -366,7 +371,7 @@ impl SystemIo for RealSystemIo {
         stream.flush()?;
         let mut reader = BufReader::new(&stream);
         let mut line = String::new();
-        reader.read_line(&mut line)?;
+        let _n = reader.read_line(&mut line)?;
         Ok(line.into_bytes())
     }
 }
@@ -462,22 +467,22 @@ impl MockSystemIo {
     }
 
     pub fn with_file(mut self, path: &str, content: &[u8]) -> Self {
-        self.files.insert(path.to_string(), content.to_vec());
+        let _prev = self.files.insert(path.to_string(), content.to_vec());
         self
     }
 
     pub fn with_dir(mut self, path: &str) -> Self {
-        self.dirs.insert(path.to_string());
+        let _new = self.dirs.insert(path.to_string());
         self
     }
 
     pub fn with_file_hash(mut self, path: &str, hash: &str) -> Self {
-        self.file_hashes.insert(path.to_string(), hash.to_string());
+        let _prev = self.file_hashes.insert(path.to_string(), hash.to_string());
         self
     }
 
     pub fn with_process_hash(mut self, pid: u32, hash: &str) -> Self {
-        self.process_hashes.insert(pid, hash.to_string());
+        let _prev = self.process_hashes.insert(pid, hash.to_string());
         self
     }
 
@@ -489,7 +494,7 @@ impl MockSystemIo {
     /// Make `remove_path(path)` fail with an error (simulates EBUSY on a
     /// mounted FUSE filesystem, or EPERM on a root-owned file).
     pub fn with_busy_path(mut self, path: &str) -> Self {
-        self.busy_paths.get_mut().insert(path.to_string());
+        let _new = self.busy_paths.get_mut().insert(path.to_string());
         self
     }
 
@@ -502,7 +507,7 @@ impl MockSystemIo {
     ///
     /// See the honesty note on [`MockSystemIo::stale_mounts`].
     pub fn with_stale_mount(mut self, path: &str) -> Self {
-        self.stale_mounts.get_mut().insert(path.to_string());
+        let _new = self.stale_mounts.get_mut().insert(path.to_string());
         self
     }
 
@@ -515,7 +520,7 @@ impl MockSystemIo {
     /// Set a per-program exit status for `run_command`.  `Some(0)` = success,
     /// `Some(non-zero)` = failure, `None` = command not found.
     pub fn with_command_result(mut self, program: &str, status: Option<i32>) -> Self {
-        self.command_results.insert(program.to_string(), status);
+        let _prev = self.command_results.insert(program.to_string(), status);
         self
     }
 
@@ -606,7 +611,8 @@ impl SystemIo for MockSystemIo {
     }
 
     fn write_file(&mut self, path: &Path, data: &[u8]) -> Result<(), IoError> {
-        self.files
+        let _prev = self
+            .files
             .insert(path.to_string_lossy().to_string(), data.to_vec());
         Ok(())
     }
@@ -685,7 +691,8 @@ impl SystemIo for MockSystemIo {
     }
 
     fn create_symlink(&mut self, original: &Path, link: &Path) -> Result<(), IoError> {
-        self.symlinks
+        let _prev = self
+            .symlinks
             .insert(link.to_string_lossy().to_string(), original.to_string_lossy().to_string());
         Ok(())
     }
@@ -730,7 +737,7 @@ impl SystemIo for MockSystemIo {
                 .cloned()
                 .collect();
             for p in cleared {
-                stale.remove(&p);
+                let _removed = stale.remove(&p);
                 self.created_dirs.borrow_mut().push(p);
             }
         }
@@ -839,10 +846,10 @@ impl SystemIo for MockSystemIo {
         let from_key = from.to_string_lossy().to_string();
         let to_key = to.to_string_lossy().to_string();
         if let Some(data) = self.files.remove(&from_key) {
-            self.files.insert(to_key, data);
+            let _prev = self.files.insert(to_key, data);
             Ok(())
         } else if let Some(target) = self.symlinks.remove(&from_key) {
-            self.symlinks.insert(to_key, target);
+            let _prev = self.symlinks.insert(to_key, target);
             Ok(())
         } else {
             Err(IoError(format!("rename: source not found: {from_key}")))
@@ -869,7 +876,7 @@ mod tests {
         let io = super::RealSystemIo::new();
         let mut child = std::process::Command::new("true").spawn().unwrap();
         let pid = child.id();
-        child.wait().unwrap();
+        let _status = child.wait().unwrap();
         let err = io.sha256_process_package(pid).unwrap_err();
         assert!(err.0.contains(&format!("/proc/{pid}/exe")), "{}", err.0);
         assert!(err.0.contains("PID namespace"), "{}", err.0);
@@ -1021,7 +1028,7 @@ mod tests {
     #[test]
     fn mock_interactive_calls_recorded() {
         let mock = MockSystemIo::new();
-        mock.run_interactive("sudo", &["-v"]).unwrap();
+        let _out = mock.run_interactive("sudo", &["-v"]).unwrap();
         let calls = mock.interactive_calls.borrow();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, "sudo");
@@ -1128,7 +1135,7 @@ mod tests {
     #[test]
     fn mock_spawn_contains_helper() {
         let mut mock = MockSystemIo::new();
-        mock.spawn_independent("flatpak-spawn", &["--host", "sudo", "-n", "fuse-server"], None).unwrap();
+        let _out = mock.spawn_independent("flatpak-spawn", &["--host", "sudo", "-n", "fuse-server"], None).unwrap();
         assert!(mock.spawn_contains(0, &["sudo", "-n"]));
         assert!(mock.spawn_contains(0, &["fuse-server"]));
     }

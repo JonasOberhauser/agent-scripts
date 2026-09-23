@@ -3,7 +3,7 @@
 //! content forwarding to (fake) data daemons, and snapshot replay for
 //! late joiners.
 
-#![cfg_attr(test, allow(clippy::unwrap_used))]
+#![allow(clippy::unwrap_used, clippy::panic, unused_results)]
 
 use std::io::{BufRead, BufReader, Read as _, Write};
 use std::sync::Arc;

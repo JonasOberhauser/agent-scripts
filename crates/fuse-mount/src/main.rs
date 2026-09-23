@@ -5,7 +5,7 @@
 //! content updates arrive on the same socket's control channel. Either
 //! half alone is useless — compromise of fused yields no authorization,
 //! compromise of the policy daemon yields no bytes.
-#![cfg_attr(test, allow(clippy::unwrap_used))]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::panic, unused_results))]
 
 use std::path::PathBuf;
 
@@ -54,7 +54,8 @@ fn main() {
     {
         let store = store.clone();
         let oracle = cli.oracle_socket.clone();
-        std::thread::spawn(move || fuse_mount::fs::run_control_loop(store, oracle));
+        let _control_loop =
+            std::thread::spawn(move || fuse_mount::fs::run_control_loop(store, oracle));
     }
 
     info!(
