@@ -495,6 +495,55 @@ fn orchestrator_survives_command_chaos() {
     }
 }
 
+/// Determinism probe (opt-in, FUZZ_TRACE=1): prints one line per seed
+/// with a digest of everything the world OBSERVED — every command
+/// (program + argv), every spawn, every outcome class. Two runs with
+/// identical output = the fuzz tier is reproducible, seed for seed.
+#[test]
+#[ignore = "determinism probe: FUZZ_TRACE=1 FUZZ_SEEDS=<n> -- --ignored"]
+fn orchestrator_chaos_trace() {
+    let n: u64 = std::env::var("FUZZ_SEEDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(64);
+    for seed in 0..n {
+        let mut io = FuzzSystemIo::new(seed);
+        let cfg = fuzz_config();
+        let send_state = Cell::new(seed ^ 0xA5A5A5A5A5A5A5A5);
+        let send = |name: &str, _args: &str| -> Result<String, String> {
+            let mut rng = Rng(send_state.get());
+            let r = rng.next() % 100;
+            send_state.set(rng.0);
+            match (name, r) {
+                (_, 0..=9) => Err("server closed the connection".into()),
+                ("version", 10..=14) => Ok("not json".into()),
+                ("add", 10..=14) => Ok("{\"type\":\"added\",\"inner\":\"stub-x\"}".into()),
+                ("add", 15..=17) => Ok("{\"type\":\"error\"}".into()),
+                _ => Ok(String::new()),
+            }
+        };
+        let _ = run_agent(&mut io, &cfg, &send, false);
+        // Digest: command/spawn/interactive streams + the budget left.
+        let mut acc = format!("seed={seed} budget={}", io.budget.get());
+        for (p, a) in io.commands.borrow().iter() {
+            acc.push_str("|c:");
+            acc.push_str(p);
+            acc.push_str(&a.join(" "));
+        }
+        for (p, a) in io.spawns.borrow().iter() {
+            acc.push_str("|s:");
+            acc.push_str(p);
+            acc.push_str(&a.join(" "));
+        }
+        for (p, a) in io.interactive.borrow().iter() {
+            acc.push_str("|i:");
+            acc.push_str(p);
+            acc.push_str(&a.join(" "));
+        }
+        println!("{acc}");
+    }
+}
+
 #[test]
 #[ignore = "marathon: opt-in via FUZZ_MINUTES; runs the sweep until the budget expires"]
 fn orchestrator_chaos_marathon() {
