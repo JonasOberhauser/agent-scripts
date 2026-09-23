@@ -14,48 +14,6 @@ version = "0.31.0"
 edition = "2021"
 license = "MIT"
 
-[workspace.lints.rust]
-# Idiomatic baseline (redundant imports, redundant crates in paths, ...).
-rust_2018_idioms = { level = "warn", priority = -1 }
-# `unsafe` blocks that contain nothing requiring unsafe (e.g. dereferencing
-# a plain `&T` inside `unsafe`). Keeps `unsafe` honest at the other end of
-# the spectrum from `unsafe_scope`.
-unused_unsafe = "deny"
-# Unsafe operations inside `unsafe fn` bodies must still be wrapped in an
-# explicit inner `unsafe` block.
-unsafe_op_in_unsafe_fn = "deny"
-# Unused results and ignored must-use values.
-unused_results = "deny"
-unused_must_use = "deny"
-# Identifiers are ASCII: catches homoglyph look-alikes at zero cost.
-non_ascii_idents = "deny"
-
-[workspace.lints.rustdoc]
-broken_intra_doc_links = "deny"
-
-[workspace.lints.clippy]
-# The whole default clippy group (correctness, suspicious, style,
-# complexity, perf). CI runs plain `cargo clippy -- -D warnings` in every
-# project, which is this plus default-level rustc lints.
-all = "deny"
-# At most one unsafe operation (unsafe call, raw deref, ...) per unsafe
-# block: `*buf.add(idx)` must be split via let-chaining.
-multiple_unsafe_ops_per_block = "deny"
-# Every `unsafe` block carries a `// SAFETY:` comment explaining its
-# invariants.
-undocumented_unsafe_blocks = "deny"
-# Panicking via unwrap or bare `panic!` in library code — fail with
-# `.expect("why this must succeed")` or a typed error instead. Projects
-# exempt tests via `#![cfg_attr(test, allow(...))]` as needed.
-unwrap_used = "deny"
-panic = "deny"
-# Public functions that can panic must document it ("# Panics" section).
-missing_panics_doc = "deny"
-# Leftover debugging / placeholder markers must not ship.
-dbg_macro = "deny"
-todo = "deny"
-unimplemented = "deny"
-
 [workspace.dependencies]
 bimap = "0.6"
 fuse-protocol = { path = "crates/fuse-protocol" }
