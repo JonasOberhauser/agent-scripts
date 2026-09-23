@@ -46,6 +46,77 @@ mod opcode {
 
 use crate::fs::FusedFs;
 
+/// The wire facts this mock depends on, AS CODE (not comments): the
+/// layouts of include/uapi/linux/fuse.h as OUR fuser build serializes
+/// them — Linux, default features (no abi-7-9 tail, no macOS fields).
+/// Every encoder emits exactly its `*_IN_LEN`; every decoder reads
+/// through these offsets; the tests pin both sides together.
+mod wire {
+    // fuse_in_header / fuse_out_header
+    pub const IN_HEADER_LEN: usize = 40;
+    pub const OUT_HEADER_LEN: usize = 16;
+    /// The wire carries -errno in out_header.error.
+    pub fn errno_from_wire(raw: i32) -> i32 {
+        -raw
+    }
+
+    // Request payload sizes (the encoders below emit exactly these).
+    pub const GETATTR_IN_LEN: usize = 16;
+    pub const OPEN_IN_LEN: usize = 8;
+    pub const READ_IN_LEN: usize = 40;
+    pub const RELEASE_IN_LEN: usize = 24;
+    pub const FLUSH_IN_LEN: usize = 24;
+    pub const INIT_IN_LEN: usize = 16;
+    pub const FORGET_ONE_LEN: usize = 16;
+
+    // Reply layouts.
+    /// fuse_entry_out: nodeid..attr_valid (4×u64) + two nsec u32s,
+    /// then the attr — offset 40.
+    pub const ENTRY_OUT_ATTR_OFF: usize = 40;
+    /// fuse_attr_out: attr_valid u64, nsec u32, dummy u32 — attr at 16.
+    pub const ATTR_OUT_ATTR_OFF: usize = 16;
+    /// fuse_open_out: fh u64, open_flags u32, padding u32.
+    pub const OPEN_OUT_FH_OFF: usize = 0;
+    /// fuse_statfs_out wraps fuse_kstatfs directly; `files` is the
+    /// 4th u64.
+    pub const STATFS_FILES_OFF: usize = 24;
+    pub const STATFS_BSIZE_OFF: usize = 40;
+    pub const STATFS_MIN_LEN: usize = 52;
+
+    /// A typed view over `fuse_attr` as serialized by our build:
+    /// ino,size,blocks,atime,mtime,ctime (6×u64), atime/mtime/ctimensec
+    /// (3×u32), mode,nlink,uid,gid,rdev (5×u32) — 80 bytes, mode at 60.
+    /// (fuser's declared struct also lists cfg'd-out fields — macOS's
+    /// crtime/flags and abi-7-9's blksize — which are NOT on our wire.)
+    pub struct AttrView<'a> {
+        pub bytes: &'a [u8],
+    }
+
+    impl AttrView<'_> {
+        pub const MIN_LEN: usize = 80;
+        const INO: usize = 0;
+        const SIZE: usize = 8;
+        const MODE: usize = 60;
+        const NLINK: usize = 64;
+
+        pub fn new(bytes: &[u8]) -> Option<AttrView<'_>> {
+            (bytes.len() >= Self::MIN_LEN).then_some(AttrView { bytes })
+        }
+        pub fn ino(&self) -> u64 {
+            u64::from_le_bytes(self.bytes[Self::INO..Self::INO + 8].try_into().unwrap_or([0; 8]))
+        }
+        pub fn size(&self) -> u64 {
+            u64::from_le_bytes(self.bytes[Self::SIZE..Self::SIZE + 8].try_into().unwrap_or([0; 8]))
+        }
+        pub fn mode(&self) -> u32 {
+            u32::from_le_bytes(self.bytes[Self::MODE..Self::MODE + 4].try_into().unwrap_or([0; 4]))
+        }
+        pub fn nlink(&self) -> u32 {
+            u32::from_le_bytes(self.bytes[Self::NLINK..Self::NLINK + 4].try_into().unwrap_or([0; 4]))
+        }
+    }
+}
+
 /// One FUSE wire request: header (40 bytes, little-endian) plus the
 /// opcode-specific payload, name bytes NUL-padded to 8 where present.
 fn encode_request(
@@ -57,8 +128,8 @@ fn encode_request(
     pid: u32,
     payload: &[u8],
 ) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(40 + payload.len());
-    put_u32(&mut buf, (40 + payload.len()) as u32);
+    let mut buf = Vec::with_capacity(wire::IN_HEADER_LEN + payload.len());
+    put_u32(&mut buf, (wire::IN_HEADER_LEN + payload.len()) as u32);
     put_u32(&mut buf, opcode);
     put_u64(&mut buf, unique);
     put_u64(&mut buf, nodeid);
@@ -78,6 +149,77 @@ fn put_u64(b: &mut Vec<u8>, v: u64) {
 }
 fn put_i64(b: &mut Vec<u8>, v: i64) {
     b.extend_from_slice(&v.to_le_bytes());
+}
+
+fn encode_getattr_in(fh: u64) -> Vec<u8> {
+    let mut p = Vec::with_capacity(wire::GETATTR_IN_LEN);
+    put_u32(&mut p, 0); // getattr_flags
+    put_u32(&mut p, 0); // dummy
+    put_u64(&mut p, fh);
+    p
+}
+
+fn encode_open_in(flags: u32) -> Vec<u8> {
+    let mut p = Vec::with_capacity(wire::OPEN_IN_LEN);
+    put_u32(&mut p, flags);
+    put_u32(&mut p, 0); // unused
+    p
+}
+
+fn encode_read_in(fh: u64, offset: i64, size: u32) -> Vec<u8> {
+    let mut p = Vec::with_capacity(wire::READ_IN_LEN);
+    put_u64(&mut p, fh);
+    put_i64(&mut p, offset);
+    put_u32(&mut p, size);
+    put_u32(&mut p, 0); // read_flags
+    put_u64(&mut p, 0); // lock_owner
+    put_u32(&mut p, 0); // flags
+    put_u32(&mut p, 0); // padding
+    p
+}
+
+fn encode_release_in(fh: u64) -> Vec<u8> {
+    let mut p = Vec::with_capacity(wire::RELEASE_IN_LEN);
+    put_u64(&mut p, fh);
+    put_u32(&mut p, 0); // flags
+    put_u32(&mut p, 0); // release_flags
+    put_u64(&mut p, 0); // lock_owner
+    p
+}
+
+fn encode_flush_in(fh: u64) -> Vec<u8> {
+    let mut p = Vec::with_capacity(wire::FLUSH_IN_LEN);
+    put_u64(&mut p, fh);
+    put_u32(&mut p, 0); // flags
+    put_u32(&mut p, 0); // padding
+    put_u64(&mut p, 0); // lock_owner
+    p
+}
+
+fn encode_init_in() -> Vec<u8> {
+    let mut p = Vec::with_capacity(wire::INIT_IN_LEN);
+    put_u32(&mut p, 7); // FUSE_KERNEL_VERSION
+    put_u32(&mut p, 8); // minor
+    put_u32(&mut p, 128 * 1024); // max_readahead
+    put_u32(&mut p, 0); // flags: none — let the session pick
+    p
+}
+
+fn encode_forget_one(nodeid: u64, count: u64) -> Vec<u8> {
+    let mut p = Vec::with_capacity(wire::FORGET_ONE_LEN);
+    put_u64(&mut p, nodeid);
+    put_u64(&mut p, count);
+    p
+}
+
+fn encode_lookup_name(name: &str) -> Vec<u8> {
+    let mut p = Vec::new();
+    p.extend_from_slice(name.as_bytes());
+    p.push(0);
+    while !p.len().is_multiple_of(8) {
+        p.push(0);
+    }
+    p
 }
 
 fn get_u32(b: &[u8], off: usize) -> u32 {
@@ -139,13 +281,13 @@ impl MockKernel {
             .read(&mut buf)
             .map_err(|e| format!("read wire reply: {e}"))?;
         buf.truncate(n);
-        if n < 16 {
+        if n < wire::OUT_HEADER_LEN {
             return Err(format!("short reply frame: {n} bytes"));
         }
         let reply = WireReply {
-            error: -get_i32(&buf, 4),
+            error: wire::errno_from_wire(get_i32(&buf, 4)),
             unique: get_u64(&buf, 8),
-            data: buf[16..].to_vec(),
+            data: buf[wire::OUT_HEADER_LEN..].to_vec(),
         };
         if reply.unique != unique {
             return Err(format!(
@@ -159,9 +301,7 @@ impl MockKernel {
     /// FORGET is the one opcode the kernel never expects a reply to.
     fn forget(&mut self, nodeid: u64, count: u64) -> Result<(), String> {
         let unique = self.next_unique();
-        let mut payload = Vec::with_capacity(16);
-        put_u64(&mut payload, nodeid);
-        put_u64(&mut payload, count);
+        let payload = encode_forget_one(nodeid, count);
         let frame =
             encode_request(opcode::FORGET, unique, nodeid, 0, 0, std::process::id(), &payload);
         self.sock
@@ -187,9 +327,9 @@ impl MockKernel {
             .map_err(|e| format!("read raw reply: {e}"))?;
         buf.truncate(n);
         Ok(WireReply {
-            error: -get_i32(&buf, 4),
+            error: wire::errno_from_wire(get_i32(&buf, 4)),
             unique: get_u64(&buf, 8),
-            data: buf[16..].to_vec(),
+            data: buf[wire::OUT_HEADER_LEN..].to_vec(),
         })
     }
 }
@@ -201,35 +341,31 @@ impl MockKernel {
 /// atime/mtime/ctimensec (3×u32), mode,nlink,uid,gid (4×u32), rdev
 /// (u32) — 80 bytes, mode at offset 60.
 fn attr_to_json(a: &[u8]) -> Result<Value, i32> {
-    if a.len() < 80 {
-        return Err(libc::EIO);
-    }
+    let attr = wire::AttrView::new(a).ok_or(libc::EIO)?;
     Ok(json!({
-        "ino": get_u64(a, 0),
-        "size": get_u64(a, 8),
-        "mode": get_u32(a, 60),
-        "nlink": get_u32(a, 64),
+        "ino": attr.ino(),
+        "size": attr.size(),
+        "mode": attr.mode(),
+        "nlink": attr.nlink(),
     }))
 }
 
 fn entry_payload(data: &[u8]) -> Result<Value, i32> {
-    // fuse_entry_out: nodeid,generation,entry_valid,attr_valid
-    // (4×u64) + entry/attr_valid_nsec (2×u32) — attr at offset 40.
-    if data.len() < 40 {
+    if data.len() < wire::ENTRY_OUT_ATTR_OFF {
         return Err(libc::EIO);
     }
     Ok(json!({
         "nodeid": get_u64(data, 0),
         "generation": get_u64(data, 8),
-        "attr": attr_to_json(&data[40..])?,
+        "attr": attr_to_json(&data[wire::ENTRY_OUT_ATTR_OFF..])?,
     }))
 }
 
 fn attr_payload(data: &[u8]) -> Result<Value, i32> {
-    if data.len() < 16 {
+    if data.len() < wire::ATTR_OUT_ATTR_OFF {
         return Err(libc::EIO);
     }
-    attr_to_json(&data[16..])
+    attr_to_json(&data[wire::ATTR_OUT_ATTR_OFF..])
 }
 
 fn dirent_stream(data: &[u8]) -> Value {
@@ -256,19 +392,16 @@ fn dirent_stream(data: &[u8]) -> Value {
 }
 
 fn statfs_payload(data: &[u8]) -> Result<Value, i32> {
-    // fuse_statfs_out is fuse_kstatfs directly: blocks,bfree,bavail,
-    // files,ffree (5×u64) then bsize,namelen,frsize (3×u32) — the
-    // fields read below end at 52; the full struct pads to 80.
-    if data.len() < 52 {
+    if data.len() < wire::STATFS_MIN_LEN {
         return Err(libc::EIO);
     }
     Ok(json!({
         "blocks": get_u64(data, 0),
         "bfree": get_u64(data, 8),
         "bavail": get_u64(data, 16),
-        "files": get_u64(data, 24),
+        "files": get_u64(data, wire::STATFS_FILES_OFF),
         "ffree": get_u64(data, 32),
-        "bsize": get_u32(data, 40),
+        "bsize": get_u32(data, wire::STATFS_BSIZE_OFF),
         "namelen": get_u32(data, 44),
         "frsize": get_u32(data, 48),
     }))
@@ -299,11 +432,7 @@ fn run_op(k: &mut MockKernel, op: &Value) -> Value {
         }
         match name {
             "init" => {
-                let mut p = Vec::new();
-                put_u32(&mut p, 7); // FUSE_KERNEL_VERSION
-                put_u32(&mut p, 8); // minor
-                put_u32(&mut p, 128 * 1024);
-                put_u32(&mut p, 0); // flags: none — let the session pick
+                let p = encode_init_in();
                 match k.request(opcode::INIT, 0, 0, 0, 0, &p) {
                     Ok(r) if r.error != 0 => Ok(json!({"errno": r.error})),
                     Ok(r) => {
@@ -321,13 +450,7 @@ fn run_op(k: &mut MockKernel, op: &Value) -> Value {
                 }
             }
             "lookup" => {
-                let inner = op["name"].as_str().unwrap_or("");
-                let mut p = Vec::new();
-                p.extend_from_slice(inner.as_bytes());
-                p.push(0);
-                while p.len() % 8 != 0 {
-                    p.push(0);
-                }
+                let p = encode_lookup_name(op["name"].as_str().unwrap_or(""));
                 match k.request(opcode::LOOKUP, nodeid, uid, gid, pid, &p) {
                     Ok(r) if r.error != 0 => Ok(json!({
                         "errno": r.error,
@@ -339,10 +462,7 @@ fn run_op(k: &mut MockKernel, op: &Value) -> Value {
                 }
             }
             "getattr" => {
-                let mut p = Vec::new();
-                put_u32(&mut p, op["fh"].is_u64().into()); // FUSE_GETATTR_FH
-                put_u32(&mut p, 0); // dummy
-                put_u64(&mut p, op["fh"].as_u64().unwrap_or(0));
+                let p = encode_getattr_in(op["fh"].as_u64().unwrap_or(0));
                 match k.request(opcode::GETATTR, nodeid, uid, gid, pid, &p) {
                     Ok(r) if r.error != 0 => Ok(json!({
                         "errno": r.error,
@@ -354,9 +474,7 @@ fn run_op(k: &mut MockKernel, op: &Value) -> Value {
                 }
             }
             "open" | "opendir" => {
-                let mut p = Vec::new();
-                p.extend_from_slice(&(op["flags"].as_i64().unwrap_or(0) as u32).to_le_bytes());
-                put_u32(&mut p, 0);
+                let p = encode_open_in(op["flags"].as_i64().unwrap_or(0) as u32);
                 let opcode = if name == "open" { opcode::OPEN } else { opcode::OPENDIR };
                 match k.request(opcode, nodeid, uid, gid, pid, &p) {
                     Ok(r) if r.error != 0 => Ok(json!({
@@ -367,20 +485,20 @@ fn run_op(k: &mut MockKernel, op: &Value) -> Value {
                         if r.data.len() < 8 {
                             return Err("short open_out".into());
                         }
-                        Ok(json!({"fh": get_u64(&r.data, 0), "flags": get_u32(&r.data, 8)}))
+                        Ok(json!({
+                            "fh": get_u64(&r.data, wire::OPEN_OUT_FH_OFF),
+                            "flags": get_u32(&r.data, 8),
+                        }))
                     }
                     Err(e) => Err(e),
                 }
             }
             "read" | "readdir" => {
-                let mut p = Vec::new();
-                put_u64(&mut p, op["fh"].as_u64().unwrap_or(0));
-                put_i64(&mut p, op["offset"].as_i64().unwrap_or(0));
-                put_u32(&mut p, op["size"].as_u64().unwrap_or(4096) as u32);
-                put_u32(&mut p, 0); // read_flags
-                put_u64(&mut p, 0); // lock_owner
-                put_u32(&mut p, 0); // flags
-                put_u32(&mut p, 0); // padding
+                let p = encode_read_in(
+                    op["fh"].as_u64().unwrap_or(0),
+                    op["offset"].as_i64().unwrap_or(0),
+                    op["size"].as_u64().unwrap_or(4096) as u32,
+                );
                 let opcode = if name == "read" { opcode::READ } else { opcode::READDIR };
                 match k.request(opcode, nodeid, uid, gid, pid, &p) {
                     Ok(r) if r.error != 0 => Ok(json!({
@@ -400,21 +518,13 @@ fn run_op(k: &mut MockKernel, op: &Value) -> Value {
                 }
             }
             "release" | "releasedir" => {
-                let mut p = Vec::new();
-                put_u64(&mut p, op["fh"].as_u64().unwrap_or(0));
-                put_u32(&mut p, 0); // flags
-                put_u32(&mut p, 0); // release_flags
-                put_u64(&mut p, 0); // lock_owner
+                let p = encode_release_in(op["fh"].as_u64().unwrap_or(0));
                 let opcode =
                     if name == "release" { opcode::RELEASE } else { opcode::RELEASEDIR };
                 wire!(opcode, &p)
             }
             "flush" => {
-                let mut p = Vec::new();
-                put_u64(&mut p, op["fh"].as_u64().unwrap_or(0));
-                put_u32(&mut p, 0); // flags
-                put_u32(&mut p, 0); // padding
-                put_u64(&mut p, 0); // lock_owner
+                let p = encode_flush_in(op["fh"].as_u64().unwrap_or(0));
                 wire!(opcode::FLUSH, &p)
             }
             "statfs" => match k.request(opcode::STATFS, nodeid, uid, gid, pid, &[]) {
@@ -438,7 +548,7 @@ fn run_op(k: &mut MockKernel, op: &Value) -> Value {
                     })),
                     Ok(r) => {
                         let hex: String = r.data.iter().map(|b| format!("{b:02x}")).collect();
-                        Ok(json!({"len": 16 + r.data.len(), "data_hex": hex}))
+                        Ok(json!({"len": wire::OUT_HEADER_LEN + r.data.len(), "data_hex": hex}))
                     }
                     Err(e) => Err(e),
                 }
@@ -534,12 +644,40 @@ mod wire_tests {
     use super::*;
 
     #[test]
+    fn encoders_emit_exactly_the_wire_sizes() {
+        assert_eq!(encode_getattr_in(7).len(), wire::GETATTR_IN_LEN);
+        assert_eq!(encode_open_in(0).len(), wire::OPEN_IN_LEN);
+        assert_eq!(encode_read_in(1, 2, 3).len(), wire::READ_IN_LEN);
+        assert_eq!(encode_release_in(9).len(), wire::RELEASE_IN_LEN);
+        assert_eq!(encode_flush_in(9).len(), wire::FLUSH_IN_LEN);
+        assert_eq!(encode_init_in().len(), wire::INIT_IN_LEN);
+        assert_eq!(encode_forget_one(1, 1).len(), wire::FORGET_ONE_LEN);
+        assert_eq!(encode_lookup_name("a").len(), 8);
+        assert_eq!(encode_lookup_name("abcdefgh").len(), 16, "NUL + pad");
+    }
+
+    #[test]
+    fn attr_view_reads_the_documented_layout() {
+        // A hand-built attr: mode S_IFREG|0o400 at offset 60, nlink 1
+        // at 64 — the two offsets that misled this module twice.
+        let mut a = vec![0u8; wire::AttrView::MIN_LEN];
+        a[8..16].copy_from_slice(&17u64.to_le_bytes()); // size
+        a[60..64].copy_from_slice(&0o100400u32.to_le_bytes()); // mode
+        a[64..68].copy_from_slice(&1u32.to_le_bytes()); // nlink
+        let v = wire::AttrView::new(&a).expect("min-length attr");
+        assert_eq!(v.size(), 17);
+        assert_eq!(v.mode(), 0o100400);
+        assert_eq!(v.nlink(), 1);
+        assert!(wire::AttrView::new(&a[..79]).is_none(), "short attr rejected");
+    }
+
+    #[test]
     fn header_encoder_matches_the_uapi() {
         // fuse_in_header: len, opcode, unique, nodeid, uid, gid, pid,
-        // padding — 40 bytes total, all little-endian.
+        // padding — all little-endian.
         let frame = encode_request(opcode::STATFS, 7, 5, 1, 2, 3, &[]);
-        assert_eq!(frame.len(), 40);
-        assert_eq!(get_u32(&frame, 0), 40);
+        assert_eq!(frame.len(), wire::IN_HEADER_LEN);
+        assert_eq!(get_u32(&frame, 0), wire::IN_HEADER_LEN as u32);
         assert_eq!(get_u32(&frame, 4), opcode::STATFS);
         assert_eq!(get_u64(&frame, 8), 7);
         assert_eq!(get_u64(&frame, 16), 5);
