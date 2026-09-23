@@ -22,7 +22,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // ── deterministic RNG (splitmix64, same as the orchestrator tier) ──
 struct Rng(u64);
@@ -80,12 +80,46 @@ fn random_line(rng: &mut Rng) -> String {
 // ── gap 2: the cmd socket (fuse-client's surface), in-process ──
 
 #[test]
+#[ignore = "marathon: opt-in via FUZZ_MINUTES; runs until the budget expires"]
+fn daemon_chaos_marathon() {
+    let minutes: u64 = std::env::var("FUZZ_MINUTES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    assert!(minutes > 0, "set FUZZ_MINUTES (the marathon is opt-in)");
+    let stop = std::time::Instant::now() + Duration::from_secs(60 * minutes);
+    let mut seed = 0u64;
+    while Instant::now() < stop {
+        let mut rng = Rng(seed | 1);
+        let state = ServerState::new();
+        let host = std::env::temp_dir().join(format!("fuzz-m-host-{seed}"));
+        std::fs::write(&host, b"FUZZ-DATA").unwrap();
+        state.add("s", &host, 9, "sha256-real");
+        let hub = OracleHub::new();
+        for _ in 0..24 {
+            let line = random_line(&mut rng);
+            if let Ok(cmd) = serde_json::from_str::<Command>(&line) {
+                let _ = fuse_server::handler::handle_command(cmd, &state, &hub);
+            }
+        }
+        if matches!(state.attempt_read("s", 4242, Some("sha256-wrong"), 0, 4), ReadOutcome::Granted)
+        {
+            panic!("seed {seed}: chaos AUTHORIZED a wrong-hash read");
+        }
+        seed += 1;
+    }
+    eprintln!("cmd-socket marathon: {seed} seeds in {minutes} minutes (all held)");
+}
+
+#[test]
 fn command_socket_chaos_never_panics_and_never_authorizes() {
+    // ONE host file reused across seeds (zero disk footprint — the
+    // first marathon leaked one file per seed until the disk filled).
+    let host = std::env::temp_dir().join("fuzz-cmd-host-reused");
+    std::fs::write(&host, b"FUZZ-DATA").unwrap();
     for seed in 0..512u64 {
         let mut rng = Rng(seed | 1);
         let state = ServerState::new();
-        let host = std::env::temp_dir().join(format!("fuzz-cmd-host-{seed}"));
-        std::fs::write(&host, b"FUZZ-DATA").unwrap();
         // NON-wildcard: only "sha256-real" may ever grant.
         state.add("s", &host, 9, "sha256-real");
         let hub = OracleHub::new();
@@ -156,7 +190,7 @@ fn oracle_socket_random_access_stays_alive_and_contained() {
         // product) — 1s keeps the containment probe fast while the
         // block itself remains exercised.
         *state.pending_timeout.lock().unwrap() = Duration::from_secs(1);
-        let host = std::env::temp_dir().join(format!("fuzz-oracle-host-{seed}"));
+        let host = std::env::temp_dir().join("fuzz-oracle-host-reused");
         std::fs::write(&host, b"FUZZ-DATA").unwrap();
         state.add("s", &host, 9, "sha256-real"); // non-wildcard
         let sock = oracle_env(&seed.to_string(), Arc::clone(&state));

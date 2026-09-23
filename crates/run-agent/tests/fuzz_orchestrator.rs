@@ -496,6 +496,25 @@ fn orchestrator_survives_command_chaos() {
 }
 
 #[test]
+#[ignore = "marathon: opt-in via FUZZ_MINUTES; runs the sweep until the budget expires"]
+fn orchestrator_chaos_marathon() {
+    // FUZZ_MINUTES=<n> cargo test -p run-agent --test fuzz_orchestrator
+    //   orchestrator_chaos_marathon -- --ignored
+    let minutes: u64 = std::env::var("FUZZ_MINUTES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    assert!(minutes > 0, "set FUZZ_MINUTES (the marathon is opt-in)");
+    let stop = std::time::Instant::now() + std::time::Duration::from_secs(60 * minutes);
+    let mut seed = 0u64;
+    while std::time::Instant::now() < stop {
+        drive(seed);
+        seed += 1;
+    }
+    eprintln!("marathon: {seed} seeds in {minutes} minutes (all held)");
+}
+
+#[test]
 fn orchestrator_chaos_single_seed_repro() {
     // The one-line reproducer hook: FUZZ_SEED=<n> cargo test -p run-agent \
     //   --test fuzz_orchestrator orchestrator_chaos_single_seed_repro
