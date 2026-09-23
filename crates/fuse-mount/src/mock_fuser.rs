@@ -19,7 +19,8 @@
 //! driver speak hand-crafted wire bytes directly, so a later fuzz
 //! tier can attack the parser itself.
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
+use std::io::Read as _;
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
@@ -348,98 +349,12 @@ impl MockKernel {
         Ok(())
     }
 
-    /// Hand-crafted bytes, straight onto the wire (parser-attack
-    /// surface for the fuzz tier). `expect_reply`: some frames
-    /// (FORGET-shaped ones) legitimately answer nothing.
-    fn raw(&mut self, bytes: &[u8], expect_reply: bool) -> Result<WireReply, String> {
-        self.sock
-            .write_all(bytes)
-            .map_err(|e| format!("write raw frame: {e}"))?;
-        if !expect_reply {
-            return Ok(WireReply { error: 0, unique: 0, data: Vec::new() });
-        }
-        let mut buf = vec![0u8; 1 << 20];
-        let n = self
-            .sock
-            .read(&mut buf)
-            .map_err(|e| format!("read raw reply: {e}"))?;
-        buf.truncate(n);
-        Ok(WireReply {
-            error: wire::errno_from_wire(get_i32(&buf, 4)),
-            unique: get_u64(&buf, 8),
-            data: buf[wire::OUT_HEADER_LEN..].to_vec(),
-        })
-    }
 }
 
-/// JSON projection of a reply attr; the layout facts live on
-/// [`wire::AttrView`] — documented once, where they are enforced.
-fn attr_to_json(a: &[u8]) -> Result<Value, i32> {
-    let attr = wire::AttrView::new(a).ok_or(libc::EIO)?;
-    Ok(json!({
-        "ino": attr.ino(),
-        "size": attr.size(),
-        "mode": attr.mode(),
-        "nlink": attr.nlink(),
-    }))
-}
 
-fn entry_payload(data: &[u8]) -> Result<Value, i32> {
-    if data.len() < wire::ENTRY_OUT_ATTR_OFF {
-        return Err(libc::EIO);
-    }
-    Ok(json!({
-        "nodeid": get_u64(data, 0),
-        "generation": get_u64(data, 8),
-        "attr": attr_to_json(&data[wire::ENTRY_OUT_ATTR_OFF..])?,
-    }))
-}
 
-fn attr_payload(data: &[u8]) -> Result<Value, i32> {
-    if data.len() < wire::ATTR_OUT_ATTR_OFF {
-        return Err(libc::EIO);
-    }
-    attr_to_json(&data[wire::ATTR_OUT_ATTR_OFF..])
-}
 
-fn dirent_stream(data: &[u8]) -> Value {
-    // fuse_dirent: ino u64, off i64, namelen u32, type u32, name…
-    // padded to a multiple of 8.
-    let mut out = Vec::new();
-    let mut off = 0usize;
-    while off + 24 <= data.len() {
-        let namelen = get_u32(data, off + 16) as usize;
-        if off + 24 + namelen > data.len() {
-            break;
-        }
-        let name = String::from_utf8_lossy(&data[off + 24..off + 24 + namelen]).into_owned();
-        out.push(json!({
-            "ino": get_u64(data, off),
-            "off": get_i64(data, off + 8),
-            "kind": get_u32(data, off + 20),
-            "name": name,
-        }));
-        let entry_len = 24 + namelen;
-        off += entry_len.div_ceil(8) * 8;
-    }
-    Value::Array(out)
-}
 
-fn statfs_payload(data: &[u8]) -> Result<Value, i32> {
-    if data.len() < wire::STATFS_MIN_LEN {
-        return Err(libc::EIO);
-    }
-    Ok(json!({
-        "blocks": get_u64(data, 0),
-        "bfree": get_u64(data, 8),
-        "bavail": get_u64(data, 16),
-        "files": get_u64(data, wire::STATFS_FILES_OFF),
-        "ffree": get_u64(data, 32),
-        "bsize": get_u32(data, wire::STATFS_BSIZE_OFF),
-        "namelen": get_u32(data, 44),
-        "frsize": get_u32(data, 48),
-    }))
-}
 
 /// Caller credentials the kernel stamps on every request; drivers
 /// may override them per line (fodder for the fuzz tier).
@@ -457,30 +372,111 @@ impl Caller {
     }
 }
 
-/// The driver protocol as an ADT (review on #76: not an untyped
-/// data model) — unknown ops and wrong field types are PARSE errors,
-/// and the dispatcher is an exhaustive match, not string matching.
+/// The driver protocol as an ADT (review on #76): each op is a
+/// payload struct, and the enum gives it the wire semantics —
+/// [`DriverOp::encode`] turns a variant into its FUSE frame payload
+/// (per-variant, in one place), [`decode_reply`] turns the raw reply
+/// back into the typed [`OpReply`] that matches the op.
+#[derive(serde::Deserialize)]
+struct Init;
+
+#[derive(serde::Deserialize)]
+struct Lookup {
+    name: String,
+    #[serde(default)]
+    ino: u64,
+}
+
+#[derive(serde::Deserialize)]
+struct Getattr {
+    #[serde(default)]
+    ino: u64,
+    #[serde(default)]
+    fh: Option<u64>,
+}
+
+#[derive(serde::Deserialize)]
+struct Open {
+    #[serde(default)]
+    ino: u64,
+    #[serde(default)]
+    flags: u32,
+}
+
+#[derive(serde::Deserialize)]
+struct Opendir {
+    #[serde(default)]
+    ino: u64,
+}
+
+#[derive(serde::Deserialize)]
+struct Read {
+    fh: u64,
+    #[serde(default)]
+    offset: i64,
+    #[serde(default = "default_read_size")]
+    size: u32,
+}
+
+#[derive(serde::Deserialize)]
+struct Readdir {
+    #[serde(default)]
+    ino: u64,
+    fh: u64,
+    #[serde(default)]
+    offset: i64,
+    #[serde(default = "default_read_size")]
+    size: u32,
+}
+
+#[derive(serde::Deserialize)]
+struct Release {
+    #[serde(default)]
+    ino: u64,
+    fh: u64,
+}
+
+#[derive(serde::Deserialize)]
+struct Releasedir {
+    #[serde(default)]
+    ino: u64,
+    fh: u64,
+}
+
+#[derive(serde::Deserialize)]
+struct Flush {
+    fh: u64,
+}
+
+#[derive(serde::Deserialize)]
+struct Statfs {
+    #[serde(default)]
+    ino: u64,
+}
+
+#[derive(serde::Deserialize)]
+struct Forget {
+    #[serde(default)]
+    ino: u64,
+    #[serde(default = "default_one")]
+    count: u64,
+}
+
 #[derive(serde::Deserialize)]
 #[serde(tag = "op", rename_all = "lowercase")]
 enum DriverOp {
-    Init,
-    /// `ino` defaults to the root (0 resolves to FUSE_ROOT_ID).
-    Lookup { name: String, #[serde(default)] ino: u64 },
-    Getattr { #[serde(default)] ino: u64, #[serde(default)] fh: Option<u64> },
-    Open { #[serde(default)] ino: u64, #[serde(default)] flags: u32 },
-    Opendir { #[serde(default)] ino: u64 },
-    Read { fh: u64, #[serde(default)] offset: i64, #[serde(default = "default_read_size")] size: u32 },
-    Readdir { #[serde(default)] ino: u64, fh: u64, #[serde(default)] offset: i64, #[serde(default = "default_read_size")] size: u32 },
-    Release { #[serde(default)] ino: u64, fh: u64 },
-    Releasedir { #[serde(default)] ino: u64, fh: u64 },
-    Flush { fh: u64 },
-    Statfs { #[serde(default)] ino: u64 },
-    Forget { #[serde(default)] ino: u64, #[serde(default = "default_one")] count: u64 },
-    Raw { bytes: String, #[serde(default = "default_true")] expect_reply: bool },
-}
-
-fn default_true() -> bool {
-    true
+    Init(Init),
+    Lookup(Lookup),
+    Getattr(Getattr),
+    Open(Open),
+    Opendir(Opendir),
+    Read(Read),
+    Readdir(Readdir),
+    Release(Release),
+    Releasedir(Releasedir),
+    Flush(Flush),
+    Statfs(Statfs),
+    Forget(Forget),
 }
 
 fn default_one() -> u64 {
@@ -489,6 +485,164 @@ fn default_one() -> u64 {
 
 fn default_read_size() -> u32 {
     4096
+}
+
+impl DriverOp {
+    /// The kernel-side encoding of one op: opcode, target node, and
+    /// the payload bytes — the per-variant match that makes the wire
+    /// semantics live ON the ADT (review on #76).
+    fn encode(&self) -> (u32, u64, Vec<u8>) {
+        let root = |ino: u64| if ino == 0 { fuser::FUSE_ROOT_ID } else { ino };
+        match self {
+            DriverOp::Init(_) => (opcode::INIT, 0, encode_init_in()),
+            DriverOp::Lookup(Lookup { name, ino }) => {
+                (opcode::LOOKUP, root(*ino), encode_lookup_name(name))
+            }
+            DriverOp::Getattr(Getattr { ino, fh }) => {
+                (opcode::GETATTR, root(*ino), encode_getattr_in(fh.unwrap_or(0)))
+            }
+            DriverOp::Open(Open { ino, flags }) => {
+                (opcode::OPEN, root(*ino), encode_open_in(*flags))
+            }
+            DriverOp::Opendir(Opendir { ino }) => (opcode::OPENDIR, root(*ino), encode_open_in(0)),
+            DriverOp::Read(Read { fh, offset, size }) => {
+                (opcode::READ, fuser::FUSE_ROOT_ID, encode_read_in(*fh, *offset, *size))
+            }
+            DriverOp::Readdir(Readdir { ino, fh, offset, size }) => (
+                opcode::READDIR,
+                root(*ino),
+                encode_read_in(*fh, *offset, *size),
+            ),
+            DriverOp::Release(Release { ino, fh }) => {
+                (opcode::RELEASE, root(*ino), encode_release_in(*fh))
+            }
+            DriverOp::Releasedir(Releasedir { ino, fh }) => {
+                (opcode::RELEASEDIR, root(*ino), encode_release_in(*fh))
+            }
+            DriverOp::Flush(Flush { fh }) => {
+                (opcode::FLUSH, fuser::FUSE_ROOT_ID, encode_flush_in(*fh))
+            }
+            DriverOp::Statfs(Statfs { ino }) => (opcode::STATFS, root(*ino), Vec::new()),
+            DriverOp::Forget(Forget { ino, count }) => {
+                (opcode::FORGET, root(*ino), encode_forget_one(root(*ino), *count))
+            }
+        }
+    }
+}
+
+/// The typed reply, one variant per op — the answer shape the ADT
+/// promises (review on #76). `Ok`/`Errno` are the shapeless replies
+/// (release-like ops answer nothing but success).
+#[derive(serde::Serialize)]
+#[serde(untagged)]
+enum OpReply {
+    Init { major: u32, minor: u32, max_write: u32, flags: u32 },
+    Entry { nodeid: u64, generation: u64, attr: AttrJson },
+    Attr(AttrJson),
+    Open { fh: u64, flags: u32 },
+    Read { len: usize, data_hex: String },
+    Entries(Vec<(u64, i64, u32, String)>),
+    Statfs { blocks: u64, bfree: u64, bavail: u64, files: u64, ffree: u64, bsize: u32, namelen: u32, frsize: u32 },
+    Ok(usize),
+    Errno { errno: i32, what: String },
+}
+
+#[derive(serde::Serialize)]
+struct AttrJson {
+    ino: u64,
+    size: u64,
+    mode: u32,
+    nlink: u32,
+}
+
+/// The wire reply → the typed [`OpReply`] matching the op — decoding
+/// is its OWN function, not interleaved with dispatch (review on #76).
+fn decode_reply(op: &DriverOp, r: &WireReply) -> Result<OpReply, String> {
+    let errno = |r: &WireReply| OpReply::Errno {
+        errno: r.error,
+        what: std::io::Error::from_raw_os_error(r.error).to_string(),
+    };
+    if r.error != 0 {
+        return Ok(errno(r));
+    }
+    let attr_json = |a: &[u8]| -> Result<AttrJson, String> {
+        let v = wire::AttrView::new(a).ok_or("short attr")?;
+        Ok(AttrJson { ino: v.ino(), size: v.size(), mode: v.mode(), nlink: v.nlink() })
+    };
+    match op {
+        DriverOp::Init(_) => {
+            if r.data.len() < 16 {
+                return Err("short init reply".into());
+            }
+            Ok(OpReply::Init {
+                major: get_u32(&r.data, 0),
+                minor: get_u32(&r.data, 4),
+                max_write: get_u32(&r.data, 12),
+                flags: get_u32(&r.data, 8),
+            })
+        }
+        DriverOp::Lookup(_) => {
+            if r.data.len() < wire::ENTRY_OUT_ATTR_OFF {
+                return Err("short entry_out".into());
+            }
+            Ok(OpReply::Entry {
+                nodeid: get_u64(&r.data, 0),
+                generation: get_u64(&r.data, 8),
+                attr: attr_json(&r.data[wire::ENTRY_OUT_ATTR_OFF..])?,
+            })
+        }
+        DriverOp::Getattr(_) => {
+            if r.data.len() < wire::ATTR_OUT_ATTR_OFF {
+                return Err("short attr_out".into());
+            }
+            Ok(OpReply::Attr(attr_json(&r.data[wire::ATTR_OUT_ATTR_OFF..])?))
+        }
+        DriverOp::Open(_) | DriverOp::Opendir(_) => {
+            if r.data.len() < 8 {
+                return Err("short open_out".into());
+            }
+            Ok(OpReply::Open { fh: get_u64(&r.data, wire::OPEN_OUT_FH_OFF), flags: get_u32(&r.data, 8) })
+        }
+        DriverOp::Read(_) => {
+            let hex: String = r.data.iter().map(|b| format!("{b:02x}")).collect();
+            Ok(OpReply::Read { len: r.data.len(), data_hex: hex })
+        }
+        DriverOp::Readdir(_) => Ok(OpReply::Entries(dirents(&r.data))),
+        DriverOp::Statfs(_) => {
+            if r.data.len() < wire::STATFS_MIN_LEN {
+                return Err("short statfs_out".into());
+            }
+            Ok(OpReply::Statfs {
+                blocks: get_u64(&r.data, 0),
+                bfree: get_u64(&r.data, 8),
+                bavail: get_u64(&r.data, 16),
+                files: get_u64(&r.data, wire::STATFS_FILES_OFF),
+                ffree: get_u64(&r.data, 32),
+                bsize: get_u32(&r.data, wire::STATFS_BSIZE_OFF),
+                namelen: get_u32(&r.data, 44),
+                frsize: get_u32(&r.data, 48),
+            })
+        }
+        DriverOp::Release(_) | DriverOp::Releasedir(_) | DriverOp::Flush(_)
+        | DriverOp::Forget(_) => Ok(OpReply::Ok(0)),
+    }
+}
+
+/// fuse_dirent stream → (ino, off, kind, name) tuples.
+fn dirents(data: &[u8]) -> Vec<(u64, i64, u32, String)> {
+    let mut out = Vec::new();
+    let mut off = 0usize;
+    while off + 24 <= data.len() {
+        let namelen = get_u32(data, off + 16) as usize;
+        if off + 24 + namelen > data.len() {
+            break;
+        }
+        let name = String::from_utf8_lossy(&data[off + 24..off + 24 + namelen]).into_owned();
+        out.push((get_u64(data, off), get_i64(data, off + 8), get_u32(data, off + 20), name));
+        let entry_len = 24 + namelen;
+        off += entry_len.div_ceil(8) * 8;
+    }
+    out
 }
 
 /// One driver line: the op plus overridable caller credentials.
@@ -500,176 +654,43 @@ struct DriverLine {
     caller: Caller,
 }
 
-/// Run one driver op; answer with `{"ok":…}` or `{"errno":n,"what":…}`.
+/// Run one driver op: encode → wire → decode → JSON at the edge.
+/// Dispatch owns nothing but orchestration and the fh registry.
 fn run_op(k: &mut MockKernel, line: &DriverLine) -> Value {
     let uid = line.caller.uid;
     let gid = line.caller.gid;
     let pid = line.caller.pid();
 
-    let nodeid_for = |ino: u64| if ino == 0 { fuser::FUSE_ROOT_ID } else { ino };
-
-    let res: Result<Value, String> = (|| {
-        macro_rules! wire {
-            ($opcode:expr, $nodeid:expr, $payload:expr) => {
-                match k.request($opcode, $nodeid, uid, gid, pid, $payload) {
-                    Ok(r) if r.error != 0 => Ok(json!({
-                        "errno": r.error,
-                        "what": std::io::Error::from_raw_os_error(r.error).to_string(),
-                    })),
-                    Ok(r) => Ok(json!({ "ok": r.data.len() })),
-                    Err(e) => Err(e),
-                }
-            };
+    let res: Result<OpReply, String> = (|| {
+        if let DriverOp::Forget(Forget { ino, count }) = &line.op {
+            return k.forget(*ino, *count).map(|()| OpReply::Ok(0));
         }
-        match &line.op {
-            DriverOp::Init => {
-                let p = encode_init_in();
-                match k.request(opcode::INIT, 0, 0, 0, 0, &p) {
-                    Ok(r) if r.error != 0 => Ok(json!({"errno": r.error})),
-                    Ok(r) => {
-                        if r.data.len() < 16 {
-                            return Err("short init reply".into());
-                        }
-                        Ok(json!({
-                            "major": get_u32(&r.data, 0),
-                            "minor": get_u32(&r.data, 4),
-                            "max_write": get_u32(&r.data, 12),
-                            "flags": get_u32(&r.data, 8),
-                        }))
+        let (opcode, nodeid, payload) = line.op.encode();
+        let wire = k.request(opcode, nodeid, uid, gid, pid, &payload)?;
+        match decode_reply(&line.op, &wire) {
+            Ok(reply) => {
+                // The registry: fhs this driver holds until RELEASE.
+                if let (DriverOp::Open(_), OpReply::Open { fh, .. }) = (&line.op, &reply) {
+                    if *fh != 0 {
+                        k.open_fhs.push(*fh);
                     }
-                    Err(e) => Err(e),
                 }
-            }
-            DriverOp::Lookup { name, ino } => {
-                let p = encode_lookup_name(name);
-                match k.request(opcode::LOOKUP, nodeid_for(*ino), uid, gid, pid, &p) {
-                    Ok(r) if r.error != 0 => Ok(json!({
-                        "errno": r.error,
-                        "what": std::io::Error::from_raw_os_error(r.error).to_string(),
-                    })),
-                    Ok(r) => entry_payload(&r.data)
-                        .map_err(|e| format!("bad entry_out: {e}")),
-                    Err(e) => Err(e),
+                if let DriverOp::Release(Release { fh, .. }) = &line.op {
+                    k.open_fhs.retain(|f| f != fh);
                 }
-            }
-            DriverOp::Getattr { ino, fh } => {
-                let p = encode_getattr_in(fh.unwrap_or(0));
-                match k.request(opcode::GETATTR, nodeid_for(*ino), uid, gid, pid, &p) {
-                    Ok(r) if r.error != 0 => Ok(json!({
-                        "errno": r.error,
-                        "what": std::io::Error::from_raw_os_error(r.error).to_string(),
-                    })),
-                    Ok(r) => attr_payload(&r.data)
-                        .map_err(|e| format!("bad attr_out: {e}")),
-                    Err(e) => Err(e),
+                if let DriverOp::Releasedir(Releasedir { fh, .. }) = &line.op {
+                    k.open_fhs.retain(|f| f != fh);
                 }
+                Ok(reply)
             }
-            DriverOp::Open { ino, .. } | DriverOp::Opendir { ino } => {
-                let (flags, opcode) = match &line.op {
-                    DriverOp::Open { flags, .. } => (*flags, opcode::OPEN),
-                    DriverOp::Opendir { .. } => (0, opcode::OPENDIR),
-                    _ => unreachable!("matched Open|Opendir above"),
-                };
-                let p = encode_open_in(flags);
-                match k.request(opcode, nodeid_for(*ino), uid, gid, pid, &p) {
-                    Ok(r) if r.error != 0 => Ok(json!({
-                        "errno": r.error,
-                        "what": std::io::Error::from_raw_os_error(r.error).to_string(),
-                    })),
-                    Ok(r) => {
-                        if r.data.len() < 8 {
-                            return Err("short open_out".into());
-                        }
-                        let fh = get_u64(&r.data, wire::OPEN_OUT_FH_OFF);
-                        if fh != 0 {
-                            k.open_fhs.push(fh);
-                        }
-                        Ok(json!({"fh": fh, "flags": get_u32(&r.data, 8)}))
-                    }
-                    Err(e) => Err(e),
-                }
-            }
-            DriverOp::Read { fh, offset, size } | DriverOp::Readdir { fh, offset, size, .. } => {
-                let p = encode_read_in(*fh, *offset, *size);
-                let (ino, opcode, is_read) = match &line.op {
-                    DriverOp::Read { .. } => (0, opcode::READ, true),
-                    DriverOp::Readdir { ino, .. } => (*ino, opcode::READDIR, false),
-                    _ => unreachable!("matched Read|Readdir above"),
-                };
-                match k.request(opcode, nodeid_for(ino), uid, gid, pid, &p) {
-                    Ok(r) if r.error != 0 => Ok(json!({
-                        "errno": r.error,
-                        "what": std::io::Error::from_raw_os_error(r.error).to_string(),
-                    })),
-                    Ok(r) => {
-                        if is_read {
-                            let hex: String = r.data.iter().map(|b| format!("{b:02x}")).collect();
-                            Ok(json!({"len": r.data.len(), "data_hex": hex}))
-                        } else {
-                            Ok(json!({"entries": dirent_stream(&r.data)}))
-                        }
-                    }
-                    Err(e) => Err(e),
-                }
-            }
-            DriverOp::Release { ino, fh } | DriverOp::Releasedir { ino, fh } => {
-                k.open_fhs.retain(|f| *f != *fh);
-                let p = encode_release_in(*fh);
-                let opcode = match &line.op {
-                    DriverOp::Release { .. } => opcode::RELEASE,
-                    _ => opcode::RELEASEDIR,
-                };
-                wire!(opcode, nodeid_for(*ino), &p)
-            }
-            DriverOp::Flush { fh } => {
-                let p = encode_flush_in(*fh);
-                wire!(opcode::FLUSH, fuser::FUSE_ROOT_ID, &p)
-            }
-            DriverOp::Statfs { ino } => {
-                match k.request(opcode::STATFS, nodeid_for(*ino), uid, gid, pid, &[]) {
-                    Ok(r) if r.error != 0 => Ok(json!({
-                        "errno": r.error,
-                        "what": std::io::Error::from_raw_os_error(r.error).to_string(),
-                    })),
-                    Ok(r) => statfs_payload(&r.data).map_err(|e| format!("bad statfs_out: {e}")),
-                    Err(e) => Err(e),
-                }
-            }
-            DriverOp::Forget { ino, count } => k
-                .forget(nodeid_for(*ino), *count)
-                .map(|()| json!({"ok": 0})),
-            DriverOp::Raw { bytes, expect_reply } => {
-                let bytes = hex_decode(bytes)?;
-                match k.raw(&bytes, *expect_reply) {
-                    Ok(r) if r.error != 0 => Ok(json!({
-                        "errno": r.error,
-                        "what": std::io::Error::from_raw_os_error(r.error).to_string(),
-                    })),
-                    Ok(r) => {
-                        let hex: String = r.data.iter().map(|b| format!("{b:02x}")).collect();
-                        Ok(json!({"len": wire::OUT_HEADER_LEN + r.data.len(), "data_hex": hex}))
-                    }
-                    Err(e) => Err(e),
-                }
-            }
+            Err(e) => Err(e),
         }
     })();
 
     match res {
-        Ok(v) => v,
-        Err(e) => json!({"transport": e}),
+        Ok(reply) => serde_json::to_value(reply).unwrap_or_else(|_| json!({"encode": "reply"})),
+        Err(e) => json!({ "transport": e }),
     }
-}
-
-fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
-    if !s.len().is_multiple_of(2) {
-        return Err("raw bytes must be hex".into());
-    }
-    (0..s.len() / 2)
-        .map(|i| {
-            u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).map_err(|e| format!("bad hex: {e}"))
-        })
-        .collect()
 }
 
 /// Serve `fs` over the mock kernel; driver connections on `control`.
@@ -827,9 +848,9 @@ mod wire_tests {
         put_u32(&mut d, 4);
         d.extend_from_slice(b"bcdefgh");
         d.push(0);
-        let v = dirent_stream(&d);
-        assert_eq!(v[0]["name"], "a");
-        assert_eq!(v[1]["name"], "bcdefgh");
-        assert_eq!(v.as_array().map(Vec::len), Some(2));
+        let v = dirents(&d);
+        assert_eq!(v[0].3, "a");
+        assert_eq!(v[1].3, "bcdefgh");
+        assert_eq!(v.len(), 2);
     }
 }

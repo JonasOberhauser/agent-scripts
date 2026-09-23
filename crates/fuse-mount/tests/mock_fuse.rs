@@ -150,9 +150,9 @@ fn fused_serves_a_full_read_path_over_the_mock_kernel() {
             serde_json::json!({"op": "readdir", "ino": 1, "fh": fh, "size": 4096}),
         );
         driver.op(serde_json::json!({"op": "releasedir", "ino": 1, "fh": fh}));
-        let names: Vec<&str> = out["entries"]
+        let names: Vec<&str> = out
             .as_array()
-            .map(|a| a.iter().filter_map(|e| e["name"].as_str()).collect())
+            .map(|a| a.iter().filter_map(|e| e.get(3).and_then(|n| n.as_str())).collect())
             .unwrap_or_default();
         if names.iter().copied().any(|n| n == "ab12cd34ef56") {
             break true;
@@ -193,7 +193,7 @@ fn fused_serves_a_full_read_path_over_the_mock_kernel() {
 
     // RELEASE closes the fd.
     let rel = driver.op(serde_json::json!({"op": "release", "ino": ino, "fh": fh}));
-    assert!(rel.get("ok").is_some(), "release: {rel}");
+    assert!(rel.is_u64(), "release: {rel}");
 
     // ONE-READ semantics, end to end: the budget lives in the policy
     // daemon; a second OPEN pends out its 150ms and is denied — never
@@ -218,7 +218,7 @@ fn fused_serves_a_full_read_path_over_the_mock_kernel() {
     // FORGET is oneway; follow it with a cheap sync (STATFS) so the
     // session never sees two requests queued at once.
     let forg = driver.op(serde_json::json!({"op": "forget", "ino": ino, "count": 1}));
-    assert!(forg.get("ok").is_some(), "forget: {forg}");
+    assert!(forg.is_u64(), "forget: {forg}");
     let sync = driver.op(serde_json::json!({"op": "statfs"}));
     assert!(sync.get("files").is_some(), "session alive after forget: {sync}");
 
