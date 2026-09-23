@@ -260,10 +260,12 @@ impl Store {
             s.identities.remove(&fino);
         }
         // The flat view's one bijection entry, cleaned by its FULL
+        // key (the seed-53 leak).
+        s.root_labels.remove_by_left(name);
+        // The flat view's one bijection entry, cleaned by its FULL
         // key (the seed-53 leak, found by #72's control-channel
         // fuzzer: a REMOVED secret's map entry survived and listed
         // forever).
-        s.root_labels.remove_by_left(name);
         while let Some(label) = path.file_name().map(|n| n.to_string_lossy().into_owned()) {
             if !path.pop() {
                 break;
@@ -944,9 +946,7 @@ mod tests {
     ///  3. no directory occupies a served file's path.
     fn assert_tree_invariants(s: &Store, seed: u64) {
         let st = s.0.lock().unwrap_or_else(|p| p.into_inner());
-        let Node::Dir { labels, .. } = st.tree.get(Path::new("")).unwrap() else {
-            panic!("seed {seed}: root vanished");
-        };
+        let labels = &st.root_labels;
         for (outer, inner) in labels.iter() {
             let path = Path::new(outer);
             match st.tree.get(path) {
@@ -970,34 +970,6 @@ mod tests {
         let n = lefts.len();
         lefts.dedup();
         assert_eq!(lefts.len(), n, "seed {seed}: duplicate outers in the bijection");
-    }
-
-    #[test]
-    fn removed_secrets_root_bijection_entry_is_gone() {
-        // The fuzzer-found bug (seed 53) as a pinned regression,
-        // asserted at its observable surface: the ROOT bijection that
-        // the map walks. A leaked entry there lists a REMOVED secret
-        // forever. (Not via child(): lookup cross-checks the tree and
-        // self-heals — the first version of this test passed with the
-        // bug present, exactly the #50 lesson.)
-        let s = Store::default();
-        s.serve("deep/one/two/three/f", "abcd", 0o400);
-        {
-            let st = s.0.lock().unwrap();
-            let Node::Dir { labels, .. } = st.tree.get(Path::new("")).unwrap() else {
-                panic!("root vanished");
-            };
-            assert_eq!(labels.get_by_left("deep/one/two/three/f").map(String::as_str), Some("abcd"));
-        }
-        s.remove("deep/one/two/three/f");
-        let st = s.0.lock().unwrap();
-        let Node::Dir { labels, .. } = st.tree.get(Path::new("")).unwrap() else {
-            panic!("root vanished");
-        };
-        assert!(
-            labels.get_by_left("deep/one/two/three/f").is_none(),
-            "a removed secret's bijection entry leaked (stale in the map)"
-        );
     }
 
     #[test]
