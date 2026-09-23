@@ -1,8 +1,9 @@
 //! E2E WITHOUT /dev/fuse: the REAL fused binary process against a
 //! REAL oracle (in-process policy daemon over the true wire protocol)
 //! — only the kernel end of the FUSE channel is the mock fuser
-//! (`--mock-fuse`). This is the tier that runs everywhere: CI
-//! containers, the authoring sandbox, fuzz hosts.
+//! (`--mock-fuse`), driven through the typed [`MockDriver`]. This is
+//! the tier that runs everywhere: CI containers, the authoring
+//! sandbox, fuzz hosts.
 //!
 //! The stack under test, in full: fused's control loop receiving
 //! Serve from the oracle hub, LOOKUP's live-stat identity minting,
@@ -12,13 +13,12 @@
 
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 
-use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use fuse_mount::mock_driver::MockDriver;
 use fuse_server::oracle_service::{run_oracle_server, OracleHub};
 use fuse_server::ServerState;
 
@@ -43,7 +43,6 @@ fn spawn_fused(dir: &Path, oracle: &Path) -> Fused {
         .open(dir.join("fused.log"))
         .unwrap();
     #[allow(clippy::zombie_processes)]
-    #[allow(clippy::zombie_processes)]
     let child = Command::new(env!("CARGO_BIN_EXE_fused"))
         .arg("--mount-point")
         .arg(dir.join("mnt"))
@@ -61,46 +60,9 @@ fn spawn_fused(dir: &Path, oracle: &Path) -> Fused {
         if control.exists() {
             return Fused { child, control };
         }
-        let _ = child;
         std::thread::sleep(Duration::from_millis(20));
     }
     panic!("fused never bound the mock control socket");
-}
-
-/// One driver connection to the mock kernel: JSON ops in, JSON
-/// outcomes out.
-struct Driver {
-    reader: BufReader<UnixStream>,
-    writer: UnixStream,
-}
-
-impl Driver {
-    fn connect(control: &Path) -> Self {
-        let sock = UnixStream::connect(control).expect("connect mock control socket");
-        Self {
-            reader: BufReader::new(sock.try_clone().unwrap()),
-            writer: sock,
-        }
-    }
-
-    fn op(&mut self, req: serde_json::Value) -> serde_json::Value {
-        writeln!(self.writer, "{req}").unwrap();
-        self.writer.flush().unwrap();
-        let mut line = String::new();
-        self.reader.read_line(&mut line).expect("read driver reply");
-        serde_json::from_str(line.trim()).expect("parse driver reply")
-    }
-}
-
-fn errno_of(reply: &serde_json::Value) -> Option<i64> {
-    reply["errno"].as_i64()
-}
-
-fn read_hex(reply: &serde_json::Value) -> Vec<u8> {
-    let hex = reply["data_hex"].as_str().unwrap_or("");
-    (0..hex.len() / 2)
-        .map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap())
-        .collect()
 }
 
 /// The in-process policy daemon: real wire protocol, dead hashd seam
@@ -138,91 +100,69 @@ fn fused_serves_a_full_read_path_over_the_mock_kernel() {
     // The control loop needs a moment to connect and receive Serve;
     // poll the listing until the inner name appears.
     hub.serve("s", "ab12cd34ef56", 0o400);
-    let mut driver = Driver::connect(&fused.control);
-    let init = driver.op(serde_json::json!({"op": "init"}));
-    assert!(init.get("minor").is_some(), "init must negotiate: {init}");
+    let mut d = MockDriver::connect(&fused.control).expect("connect driver");
+    d.init().expect("init handshake");
 
     let deadline = Instant::now() + Duration::from_secs(10);
-    let listed = loop {
-        let rd = driver.op(serde_json::json!({"op": "opendir", "ino": 1}));
-        let fh = rd["fh"].as_u64().unwrap_or(0);
-        let out = driver.op(
-            serde_json::json!({"op": "readdir", "ino": 1, "fh": fh, "size": 4096}),
-        );
-        driver.op(serde_json::json!({"op": "releasedir", "ino": 1, "fh": fh}));
-        let names: Vec<&str> = out
-            .as_array()
-            .map(|a| a.iter().filter_map(|e| e.get(3).and_then(|n| n.as_str())).collect())
-            .unwrap_or_default();
-        if names.iter().copied().any(|n| n == "ab12cd34ef56") {
-            break true;
+    let entry = loop {
+        let dh = d.opendir(fuser::FUSE_ROOT_ID).expect("opendir");
+        let entries = d.readdir(dh.fh, 4096).expect("readdir");
+        let _ = d.releasedir(fuser::FUSE_ROOT_ID, dh.fh);
+        if entries.iter().any(|(_, name)| name == "ab12cd34ef56") {
+            break d.lookup("ab12cd34ef56").expect("lookup after listing");
         }
-        assert!(Instant::now() < deadline, "Serve never reached the store: {out}");
+        assert!(Instant::now() < deadline, "Serve never reached the store");
         std::thread::sleep(Duration::from_millis(50));
     };
-    assert!(listed);
-
-    // LOOKUP mints the identity via live stat through the oracle.
-    let entry = driver.op(serde_json::json!({"op": "lookup", "ino": 1, "name": "ab12cd34ef56"}));
-    let nodeid = entry["nodeid"].as_u64();
-    let ino = nodeid.expect("lookup must answer a nodeid");
-    assert!(entry["attr"]["size"].is_u64(), "lookup: {entry}");
-    assert_eq!(entry["attr"]["size"], 17, "size comes from live stat: {entry}");
+    let ino = entry.nodeid;
+    assert_eq!(entry.attr.size, 17, "size comes from live stat");
+    assert_ne!(entry.attr.mode & libc::S_IFREG, 0, "a regular file");
 
     // GETATTR (path stat: identity check against the oracle).
-    let attr = driver.op(serde_json::json!({"op": "getattr", "ino": ino}));
-    assert_eq!(attr["size"], 17, "getattr: {attr}");
+    let attr = d.getattr(ino).expect("getattr");
+    assert_eq!(attr.attr.size, 17);
 
     // OPEN: the policy daemon adjudicates and passes a host fd —
     // one-read budget spent by this successful open.
-    let opened = driver.op(serde_json::json!({"op": "open", "ino": ino, "flags": 0}));
-    let fh_val = opened["fh"].as_u64();
-    let fh = fh_val.expect("open must answer an fh");
+    let opened = d.open(ino).expect("open");
 
     // READ: preads of the passed fd, through the mock kernel.
-    let data = driver.op(
-        serde_json::json!({"op": "read", "fh": fh, "offset": 0, "size": 4096}),
-    );
-    assert_eq!(read_hex(&data), b"MOCK-FUSE-CONTENT", "read reply: {data}");
+    let data = d.read(opened.fh, 0, 4096).expect("read");
+    assert_eq!(data, b"MOCK-FUSE-CONTENT");
 
     // EOF read returns empty, not an error.
-    let eof = driver.op(
-        serde_json::json!({"op": "read", "fh": fh, "offset": 17, "size": 16}),
-    );
-    assert_eq!(eof["len"], 0, "eof read: {eof}");
+    let eof = d.read(opened.fh, 17, 16).expect("eof read");
+    assert!(eof.is_empty(), "eof: {eof:?}");
 
     // RELEASE closes the fd.
-    let rel = driver.op(serde_json::json!({"op": "release", "ino": ino, "fh": fh}));
-    assert!(rel.is_u64(), "release: {rel}");
+    d.release(ino, opened.fh).expect("release");
 
     // ONE-READ semantics, end to end: the budget lives in the policy
     // daemon; a second OPEN pends out its 150ms and is denied — never
     // hangs, never grants.
     let t0 = Instant::now();
-    let second = driver.op(serde_json::json!({"op": "open", "ino": ino, "flags": 0}));
+    let second = d.open(ino).expect_err("second open must fail");
     let elapsed = t0.elapsed();
-    assert_eq!(errno_of(&second), Some(libc::EACCES as i64), "second open: {second}");
+    assert_eq!(second.0, libc::EACCES, "errno: {second}");
     assert!(
         elapsed >= Duration::from_millis(120),
         "the deny must come from a real pend-out, not a fast path: {elapsed:?}"
     );
 
     // STATFS: the served-file count.
-    let st = driver.op(serde_json::json!({"op": "statfs"}));
-    assert_eq!(st["files"], 2, "root + one secret: {st}");
+    let st = d.statfs().expect("statfs");
+    assert_eq!(st.st.files, 2, "root + one secret");
 
     // A lookup for a name that was never served: ENOENT.
-    let miss = driver.op(serde_json::json!({"op": "lookup", "ino": 1, "name": "nope"}));
-    assert_eq!(errno_of(&miss), Some(libc::ENOENT as i64), "lookup miss: {miss}");
+    let miss = d.lookup("nope").expect_err("lookup miss must fail");
+    assert_eq!(miss.0, libc::ENOENT);
 
     // FORGET is oneway; follow it with a cheap sync (STATFS) so the
     // session never sees two requests queued at once.
-    let forg = driver.op(serde_json::json!({"op": "forget", "ino": ino, "count": 1}));
-    assert!(forg.is_u64(), "forget: {forg}");
-    let sync = driver.op(serde_json::json!({"op": "statfs"}));
-    assert!(sync.get("files").is_some(), "session alive after forget: {sync}");
+    d.forget(ino, 1).expect("forget");
+    d.statfs().expect("session alive after forget");
 
-    drop(driver);
+    drop(d);
     drop(fused);
 }
 
@@ -256,29 +196,26 @@ fn a_driver_abandoning_an_open_fh_leaks_nothing() {
     let fused = spawn_fused(dir.path(), &oracle);
     hub.serve("s", "ab12cd34ef56", 0o400);
 
-    // Wait until the control loop has served the secret, then take
-    // the fd baseline with no driver connected.
     let deadline = Instant::now() + Duration::from_secs(10);
     let ino = loop {
-        let mut d = Driver::connect(&fused.control);
-        d.op(serde_json::json!({"op": "init"}));
-        let entry = d.op(serde_json::json!({"op": "lookup", "ino": 1, "name": "ab12cd34ef56"}));
-        if let Some(ino) = entry["nodeid"].as_u64() {
-            break ino;
+        let mut d = MockDriver::connect(&fused.control).expect("connect");
+        d.init().expect("init");
+        if let Ok(entry) = d.lookup("ab12cd34ef56") {
+            break entry.nodeid;
         }
         assert!(Instant::now() < deadline, "Serve never arrived");
         std::thread::sleep(Duration::from_millis(50));
     };
+
     // Steady state WITH one connected driver (the connection itself
     // holds fds; only the DELTA across the open is meaningful).
-    let mut d = Driver::connect(&fused.control);
-    d.op(serde_json::json!({"op": "init"}));
-    d.op(serde_json::json!({"op": "statfs"}));
+    let mut d = MockDriver::connect(&fused.control).expect("connect");
+    d.init().expect("init");
+    d.statfs().expect("statfs");
     let baseline = quiescent_fd_count(fused.child.id());
 
     // Open (the host fd is now fused's to hold until RELEASE)…
-    let opened = d.op(serde_json::json!({"op": "open", "ino": ino, "flags": 0}));
-    assert!(opened["fh"].is_u64(), "open: {opened}");
+    d.open(ino).expect("open");
     let during = quiescent_fd_count(fused.child.id());
     assert_eq!(during, baseline + 1, "the passed host fd must be open");
 
@@ -286,10 +223,10 @@ fn a_driver_abandoning_an_open_fh_leaks_nothing() {
     // path. The mock must synthesize the RELEASEs the real kernel
     // sends when a process exits with files open.
     drop(d);
-    let mut next = Driver::connect(&fused.control);
-    next.op(serde_json::json!({"op": "init"}));
-    // The cleanup runs at the PREVIOUS loop's exit; the reconnect can
-    // overtake it via the accept queue, so poll to the steady state.
+    let mut next = MockDriver::connect(&fused.control).expect("reconnect");
+    next.init().expect("init");
+    // The cleanup runs at the PREVIOUS bridge's exit; the reconnect
+    // can overtake it via the accept queue, so poll to the steady state.
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         if quiescent_fd_count(fused.child.id()) == baseline {
@@ -297,12 +234,11 @@ fn a_driver_abandoning_an_open_fh_leaks_nothing() {
         }
         assert!(
             Instant::now() < deadline,
-            "driver death must close the abandoned host fd (kernel-faithful cleanup); \
-             steady state is one connected driver, before-open == after-cleanup"
+            "driver death must close the abandoned host fd (kernel-faithful cleanup)"
         );
         std::thread::sleep(Duration::from_millis(20));
     }
-    let _ = next.op(serde_json::json!({"op": "statfs"}));
+    let _ = next.statfs();
 
     drop(next);
     drop(fused);
@@ -318,27 +254,22 @@ fn the_session_survives_driver_reconnects() {
     hub.serve("s", "ab12cd34ef56", 0o400);
 
     let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let mut d = Driver::connect(&fused.control);
-        d.op(serde_json::json!({"op": "init"}));
-        let entry = d.op(serde_json::json!({"op": "lookup", "ino": 1, "name": "ab12cd34ef56"}));
-        if entry["nodeid"].is_u64() {
-            break;
+    let ino = loop {
+        let mut d = MockDriver::connect(&fused.control).expect("connect");
+        d.init().expect("init");
+        if let Ok(entry) = d.lookup("ab12cd34ef56") {
+            break entry.nodeid;
         }
         assert!(Instant::now() < deadline, "Serve never arrived");
         std::thread::sleep(Duration::from_millis(50));
-    }
+    };
 
     // Budget reset through the POLICY daemon (the CLI's `reset`
     // path), then a fresh driver on the SAME session.
     state.reset(Some("s"));
 
-    let mut d2 = Driver::connect(&fused.control);
-    let init = d2.op(serde_json::json!({"op": "init"}));
-    assert!(init.get("minor").is_some());
-    let entry = d2.op(serde_json::json!({"op": "lookup", "ino": 1, "name": "ab12cd34ef56"}));
-    let nodeid = entry["nodeid"].as_u64();
-    let ino = nodeid.expect("relookup must answer a nodeid");
-    let opened = d2.op(serde_json::json!({"op": "open", "ino": ino, "flags": 0}));
-    assert!(opened["fh"].is_u64(), "reopen after reconnect: {opened}");
+    let mut d2 = MockDriver::connect(&fused.control).expect("reconnect");
+    d2.init().expect("init");
+    let opened = d2.open(ino).expect("reopen after reconnect");
+    let _ = opened;
 }
