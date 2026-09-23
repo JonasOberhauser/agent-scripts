@@ -236,8 +236,12 @@ fn get_i64(b: &[u8], off: usize) -> i64 {
     i64::from_le_bytes(b[off..off + 8].try_into().unwrap_or([0; 8]))
 }
 
-/// The userspace kernel: writes wire requests into the socketpair end
-/// the fuser session reads from, and reads its reply frames back.
+/// The userspace kernel. `sock` is the DRIVER-side handle to the
+/// kernel channel (the socketpair end whose other end the fuser
+/// SESSION thread — spawned in [`serve`] — owns and reads): every
+/// write here becomes one request the session parses and dispatches
+/// into the real `Filesystem` impl, and its reply frame (matched by
+/// `unique`) arrives back on this socket.
 struct MockKernel {
     sock: UnixStream,
     unique: u64,
@@ -404,20 +408,77 @@ fn statfs_payload(data: &[u8]) -> Result<Value, i32> {
     }))
 }
 
+/// Caller credentials the kernel stamps on every request; drivers
+/// may override them per line (fodder for the fuzz tier).
+#[derive(serde::Deserialize, Default)]
+#[serde(default)]
+struct Caller {
+    uid: u32,
+    gid: u32,
+    pid: Option<u32>,
+}
+
+impl Caller {
+    fn pid(&self) -> u32 {
+        self.pid.unwrap_or_else(std::process::id)
+    }
+}
+
+/// The driver protocol as an ADT (review on #76: not an untyped
+/// data model) — unknown ops and wrong field types are PARSE errors,
+/// and the dispatcher is an exhaustive match, not string matching.
+#[derive(serde::Deserialize)]
+#[serde(tag = "op", rename_all = "lowercase")]
+enum DriverOp {
+    Init,
+    /// `ino` defaults to the root (0 resolves to FUSE_ROOT_ID).
+    Lookup { name: String, #[serde(default)] ino: u64 },
+    Getattr { #[serde(default)] ino: u64, #[serde(default)] fh: Option<u64> },
+    Open { #[serde(default)] ino: u64, #[serde(default)] flags: u32 },
+    Opendir { #[serde(default)] ino: u64 },
+    Read { fh: u64, #[serde(default)] offset: i64, #[serde(default = "default_read_size")] size: u32 },
+    Readdir { #[serde(default)] ino: u64, fh: u64, #[serde(default)] offset: i64, #[serde(default = "default_read_size")] size: u32 },
+    Release { #[serde(default)] ino: u64, fh: u64 },
+    Releasedir { #[serde(default)] ino: u64, fh: u64 },
+    Flush { fh: u64 },
+    Statfs { #[serde(default)] ino: u64 },
+    Forget { #[serde(default)] ino: u64, #[serde(default = "default_one")] count: u64 },
+    Raw { bytes: String, #[serde(default = "default_true")] expect_reply: bool },
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_one() -> u64 {
+    1
+}
+
+fn default_read_size() -> u32 {
+    4096
+}
+
+/// One driver line: the op plus overridable caller credentials.
+#[derive(serde::Deserialize)]
+struct DriverLine {
+    #[serde(flatten)]
+    op: DriverOp,
+    #[serde(flatten)]
+    caller: Caller,
+}
+
 /// Run one driver op; answer with `{"ok":…}` or `{"errno":n,"what":…}`.
-fn run_op(k: &mut MockKernel, op: &Value) -> Value {
-    let name = op["op"].as_str().unwrap_or("");
-    // The kernel stamps caller credentials on every request; the
-    // driver may override them per-op (fodder for the fuzz tier).
-    let uid = op["uid"].as_u64().unwrap_or(0) as u32;
-    let gid = op["gid"].as_u64().unwrap_or(0) as u32;
-    let pid = op["pid"].as_u64().unwrap_or(std::process::id() as u64) as u32;
-    let nodeid = op["ino"].as_u64().unwrap_or(fuser::FUSE_ROOT_ID);
+fn run_op(k: &mut MockKernel, line: &DriverLine) -> Value {
+    let uid = line.caller.uid;
+    let gid = line.caller.gid;
+    let pid = line.caller.pid();
+
+    let nodeid_for = |ino: u64| if ino == 0 { fuser::FUSE_ROOT_ID } else { ino };
 
     let res: Result<Value, String> = (|| {
         macro_rules! wire {
-            ($opcode:expr, $payload:expr) => {
-                match k.request($opcode, nodeid, uid, gid, pid, $payload) {
+            ($opcode:expr, $nodeid:expr, $payload:expr) => {
+                match k.request($opcode, $nodeid, uid, gid, pid, $payload) {
                     Ok(r) if r.error != 0 => Ok(json!({
                         "errno": r.error,
                         "what": std::io::Error::from_raw_os_error(r.error).to_string(),
@@ -427,8 +488,8 @@ fn run_op(k: &mut MockKernel, op: &Value) -> Value {
                 }
             };
         }
-        match name {
-            "init" => {
+        match &line.op {
+            DriverOp::Init => {
                 let p = encode_init_in();
                 match k.request(opcode::INIT, 0, 0, 0, 0, &p) {
                     Ok(r) if r.error != 0 => Ok(json!({"errno": r.error})),
@@ -446,9 +507,9 @@ fn run_op(k: &mut MockKernel, op: &Value) -> Value {
                     Err(e) => Err(e),
                 }
             }
-            "lookup" => {
-                let p = encode_lookup_name(op["name"].as_str().unwrap_or(""));
-                match k.request(opcode::LOOKUP, nodeid, uid, gid, pid, &p) {
+            DriverOp::Lookup { name, ino } => {
+                let p = encode_lookup_name(name);
+                match k.request(opcode::LOOKUP, nodeid_for(*ino), uid, gid, pid, &p) {
                     Ok(r) if r.error != 0 => Ok(json!({
                         "errno": r.error,
                         "what": std::io::Error::from_raw_os_error(r.error).to_string(),
@@ -458,9 +519,9 @@ fn run_op(k: &mut MockKernel, op: &Value) -> Value {
                     Err(e) => Err(e),
                 }
             }
-            "getattr" => {
-                let p = encode_getattr_in(op["fh"].as_u64().unwrap_or(0));
-                match k.request(opcode::GETATTR, nodeid, uid, gid, pid, &p) {
+            DriverOp::Getattr { ino, fh } => {
+                let p = encode_getattr_in(fh.unwrap_or(0));
+                match k.request(opcode::GETATTR, nodeid_for(*ino), uid, gid, pid, &p) {
                     Ok(r) if r.error != 0 => Ok(json!({
                         "errno": r.error,
                         "what": std::io::Error::from_raw_os_error(r.error).to_string(),
@@ -470,10 +531,14 @@ fn run_op(k: &mut MockKernel, op: &Value) -> Value {
                     Err(e) => Err(e),
                 }
             }
-            "open" | "opendir" => {
-                let p = encode_open_in(op["flags"].as_i64().unwrap_or(0) as u32);
-                let opcode = if name == "open" { opcode::OPEN } else { opcode::OPENDIR };
-                match k.request(opcode, nodeid, uid, gid, pid, &p) {
+            DriverOp::Open { ino, .. } | DriverOp::Opendir { ino } => {
+                let (flags, opcode) = match &line.op {
+                    DriverOp::Open { flags, .. } => (*flags, opcode::OPEN),
+                    DriverOp::Opendir { .. } => (0, opcode::OPENDIR),
+                    _ => unreachable!("matched Open|Opendir above"),
+                };
+                let p = encode_open_in(flags);
+                match k.request(opcode, nodeid_for(*ino), uid, gid, pid, &p) {
                     Ok(r) if r.error != 0 => Ok(json!({
                         "errno": r.error,
                         "what": std::io::Error::from_raw_os_error(r.error).to_string(),
@@ -490,21 +555,20 @@ fn run_op(k: &mut MockKernel, op: &Value) -> Value {
                     Err(e) => Err(e),
                 }
             }
-            "read" | "readdir" => {
-                let p = encode_read_in(
-                    op["fh"].as_u64().unwrap_or(0),
-                    op["offset"].as_i64().unwrap_or(0),
-                    op["size"].as_u64().unwrap_or(4096) as u32,
-                );
-                let opcode = if name == "read" { opcode::READ } else { opcode::READDIR };
-                match k.request(opcode, nodeid, uid, gid, pid, &p) {
+            DriverOp::Read { fh, offset, size } | DriverOp::Readdir { fh, offset, size, .. } => {
+                let p = encode_read_in(*fh, *offset, *size);
+                let (ino, opcode, is_read) = match &line.op {
+                    DriverOp::Read { .. } => (0, opcode::READ, true),
+                    DriverOp::Readdir { ino, .. } => (*ino, opcode::READDIR, false),
+                    _ => unreachable!("matched Read|Readdir above"),
+                };
+                match k.request(opcode, nodeid_for(ino), uid, gid, pid, &p) {
                     Ok(r) if r.error != 0 => Ok(json!({
                         "errno": r.error,
                         "what": std::io::Error::from_raw_os_error(r.error).to_string(),
                     })),
                     Ok(r) => {
-                        if name == "read" {
-                            // Raw bytes, hex-encoded in the reply.
+                        if is_read {
                             let hex: String = r.data.iter().map(|b| format!("{b:02x}")).collect();
                             Ok(json!({"len": r.data.len(), "data_hex": hex}))
                         } else {
@@ -514,31 +578,34 @@ fn run_op(k: &mut MockKernel, op: &Value) -> Value {
                     Err(e) => Err(e),
                 }
             }
-            "release" | "releasedir" => {
-                let p = encode_release_in(op["fh"].as_u64().unwrap_or(0));
-                let opcode =
-                    if name == "release" { opcode::RELEASE } else { opcode::RELEASEDIR };
-                wire!(opcode, &p)
+            DriverOp::Release { ino, fh } | DriverOp::Releasedir { ino, fh } => {
+                let p = encode_release_in(*fh);
+                let opcode = match &line.op {
+                    DriverOp::Release { .. } => opcode::RELEASE,
+                    _ => opcode::RELEASEDIR,
+                };
+                wire!(opcode, nodeid_for(*ino), &p)
             }
-            "flush" => {
-                let p = encode_flush_in(op["fh"].as_u64().unwrap_or(0));
-                wire!(opcode::FLUSH, &p)
+            DriverOp::Flush { fh } => {
+                let p = encode_flush_in(*fh);
+                wire!(opcode::FLUSH, fuser::FUSE_ROOT_ID, &p)
             }
-            "statfs" => match k.request(opcode::STATFS, nodeid, uid, gid, pid, &[]) {
-                Ok(r) if r.error != 0 => Ok(json!({
-                    "errno": r.error,
-                    "what": std::io::Error::from_raw_os_error(r.error).to_string(),
-                })),
-                Ok(r) => statfs_payload(&r.data).map_err(|e| format!("bad statfs_out: {e}")),
-                Err(e) => Err(e),
-            },
-            "forget" => k
-                .forget(nodeid, op["count"].as_u64().unwrap_or(1))
+            DriverOp::Statfs { ino } => {
+                match k.request(opcode::STATFS, nodeid_for(*ino), uid, gid, pid, &[]) {
+                    Ok(r) if r.error != 0 => Ok(json!({
+                        "errno": r.error,
+                        "what": std::io::Error::from_raw_os_error(r.error).to_string(),
+                    })),
+                    Ok(r) => statfs_payload(&r.data).map_err(|e| format!("bad statfs_out: {e}")),
+                    Err(e) => Err(e),
+                }
+            }
+            DriverOp::Forget { ino, count } => k
+                .forget(nodeid_for(*ino), *count)
                 .map(|()| json!({"ok": 0})),
-            "raw" => {
-                let bytes = hex_decode(op["bytes"].as_str().unwrap_or(""))?;
-                let expect = op["expect_reply"].as_bool().unwrap_or(true);
-                match k.raw(&bytes, expect) {
+            DriverOp::Raw { bytes, expect_reply } => {
+                let bytes = hex_decode(bytes)?;
+                match k.raw(&bytes, *expect_reply) {
                     Ok(r) if r.error != 0 => Ok(json!({
                         "errno": r.error,
                         "what": std::io::Error::from_raw_os_error(r.error).to_string(),
@@ -550,7 +617,6 @@ fn run_op(k: &mut MockKernel, op: &Value) -> Value {
                     Err(e) => Err(e),
                 }
             }
-            other => Err(format!("unknown op {other:?}")),
         }
     })();
 
@@ -574,6 +640,19 @@ fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
 /// Serve `fs` over the mock kernel; driver connections on `control`.
 /// Blocks until the process is killed (same lifetime contract as
 /// `fuser::mount2`).
+///
+/// Why TWO sockets (review on #76): the socketpair below is the
+/// mock /dev/fuse — the KERNEL channel, owned by the session for its
+/// entire lifetime. `control` is the DRIVER surface, which accepts
+/// many connections over that lifetime (a driver hangs up; the next
+/// reconnects — the session must NOT die with any one driver, the
+/// same way /dev/fuse outlives every process reading the mount).
+/// Between them sits the mock kernel: it translates JSON ops into
+/// FUSE wire (different framing: lines vs SEQPACKET packets), stamps
+/// caller credentials, and matches replies by unique. Handing the
+/// session a driver connection directly would fuse the session's
+/// lifetime to one driver AND force drivers to speak binary FUSE;
+/// the `raw` op already offers that for parser-level work.
 pub fn serve(fs: FusedFs, control: &Path) {
     let _ = std::fs::remove_file(control);
     let listener = match UnixListener::bind(control) {
@@ -583,8 +662,10 @@ pub fn serve(fs: FusedFs, control: &Path) {
             std::process::exit(1);
         }
     };
-    // The session end of the channel: SOCK_SEQPACKET preserves the
-    // one-request-per-read framing /dev/fuse guarantees on streams.
+    // The KERNEL channel (the mock /dev/fuse): SOCK_SEQPACKET preserves
+    // the one-request-per-read framing /dev/fuse guarantees. fds[0]
+    // is read by the session thread below for the process's lifetime;
+    // fds[1] by the MockKernel this loop drives per driver connection.
     let mut fds = [0i32; 2];
     // SAFETY: socketpair(2) writes two fresh descriptors into fds; on
     // failure nothing is written.
@@ -622,12 +703,14 @@ pub fn serve(fs: FusedFs, control: &Path) {
             match lines.read_line(&mut line) {
                 Ok(0) | Err(_) => break,
                 Ok(_) => {
-                    let Ok(op) = serde_json::from_str::<Value>(line.trim()) else {
-                        let _ = writeln!(writer, "{}", json!({"protocol": "send JSON ops"}));
+                    let Ok(parsed) = serde_json::from_str::<DriverLine>(line.trim()) else {
+                        let _ = writeln!(writer, "{}", json!({
+                            "protocol": "send one JSON op per line; unknown ops and wrong field types do not parse"
+                        }));
                         let _ = writer.flush();
                         continue;
                     };
-                    let reply = run_op(&mut kernel, &op);
+                    let reply = run_op(&mut kernel, &parsed);
                     let _ = writeln!(writer, "{reply}");
                     let _ = writer.flush();
                 }
