@@ -42,6 +42,7 @@ jobs:
         run: |
           cargo test -p fuse-protocol
           cargo test -p hashd
+          cargo test -p fuse-mount --test mock_fuse
           cargo test -p fuse-server --test protocol_contract
           cargo test -p fuse-server --test e2e_client
           cargo test -p fuse-server --test fuse_e2e -- --include-ignored
