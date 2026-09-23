@@ -163,7 +163,7 @@ pub fn install_commands() -> String {
 }
 
 /// Error text fit for a pending shown to a human: unlike plain
-/// [`Display`], it embeds the commands that FIX the failure.
+/// [`std::fmt::Display`], it embeds the commands that FIX the failure.
 ///
 /// * [`HashdError::Unreachable`] — nothing is listening: name the
 ///   runnable start command (and, for the default socket, the

@@ -557,7 +557,7 @@ impl MockSystemIo {
         self
     }
 
-    /// Like [`with_command_result_when`], but the rule expires after `n`
+    /// Like [`Self::with_command_result_when`], but the rule expires after `n`
     /// matching calls (later calls fall through to broader rules/defaults).
     pub fn with_command_result_when_n(
         self,
