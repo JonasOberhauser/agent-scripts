@@ -73,7 +73,6 @@ jobs:
           cargo test -p run-agent --test e2e_stub_fuse --test e2e_empty_os -- --include-ignored
 
   lint-policy:
-    # Shared Servyi policy (servyi/lints): verifies the committed
-    # [workspace.lints] table matches servyi-lints.toml, clippy under
-    # the table's own levels, the unsafe_scope driver, rustdoc links.
+    # Shared Servyi policy (servyi/lints): clippy under the shared
+    # flag list, the unsafe_scope driver, rustdoc links.
     uses: servyi/lints/.github/workflows/lint-policy.yml@main
