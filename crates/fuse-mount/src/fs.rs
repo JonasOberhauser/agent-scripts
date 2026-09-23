@@ -260,12 +260,10 @@ impl Store {
             s.identities.remove(&fino);
         }
         // The flat view's one bijection entry, cleaned by its FULL
-        // key (the seed-53 leak).
-        s.root_labels.remove_by_left(name);
-        // The flat view's one bijection entry, cleaned by its FULL
         // key (the seed-53 leak, found by #72's control-channel
         // fuzzer: a REMOVED secret's map entry survived and listed
         // forever).
+        s.root_labels.remove_by_left(name);
         while let Some(label) = path.file_name().map(|n| n.to_string_lossy().into_owned()) {
             if !path.pop() {
                 break;
@@ -901,6 +899,8 @@ pub fn run_control_loop(store: Store, oracle_socket: String) {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     // ── fuzz: the control channel (the real daemon code, in-process) ──
 
     /// splitmix64, same as the other fuzz tiers.
@@ -1014,9 +1014,6 @@ mod tests {
             assert_tree_invariants(&s, seed);
         }
     }
-
-
-    use super::*;
 
     #[test]
     fn removed_secrets_root_bijection_entry_is_gone() {
