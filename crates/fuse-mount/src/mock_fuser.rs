@@ -6,9 +6,10 @@
 //! packet boundary matches /dev/fuse's one-request-per-read
 //! semantics). This module is the OTHER end: a userspace "kernel"
 //! that accepts JSON-line operations on a control socket, encodes
-//! them into genuine Linux FUSE wire requests (the layouts are
-//! fuser's `ll::fuse_abi` structs, pinned by size assertions), feeds
-//! them to the session, and decodes the replies back to JSON.
+//! them into genuine Linux FUSE wire requests (the layouts are the
+//! kernel UAPI's, held as code in the [`wire`] module below and
+//! pinned by tests), feeds them to the session, and decodes the
+//! replies back to JSON.
 //!
 //! This is the e2e substrate for environments without a FUSE device
 //! (CI containers, the authoring sandbox, fuzz tiers): every layer
@@ -334,12 +335,8 @@ impl MockKernel {
     }
 }
 
-/// Decode `fuse_attr` as OUR fuser build serializes it (Linux,
-/// default features — read from fuser's `fuse_attr_from_attr`): the
-/// macOS-only crtime/flags and the abi-7-9 blksize tail are compiled
-/// out, leaving ino,size,blocks,atime,mtime,ctime (6×u64),
-/// atime/mtime/ctimensec (3×u32), mode,nlink,uid,gid (4×u32), rdev
-/// (u32) — 80 bytes, mode at offset 60.
+/// JSON projection of a reply attr; the layout facts live on
+/// [`wire::AttrView`] — documented once, where they are enforced.
 fn attr_to_json(a: &[u8]) -> Result<Value, i32> {
     let attr = wire::AttrView::new(a).ok_or(libc::EIO)?;
     Ok(json!({
