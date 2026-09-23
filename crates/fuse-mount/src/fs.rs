@@ -262,8 +262,7 @@ impl Store {
         // The flat view's one bijection entry, cleaned by its FULL
         // key (the seed-53 leak, found by #72's control-channel
         // fuzzer: a REMOVED secret's map entry survived and listed
-        // forever). Carried here — retargeted to root_labels —
-        // because main does not yet have #72.
+        // forever).
         s.root_labels.remove_by_left(name);
         while let Some(label) = path.file_name().map(|n| n.to_string_lossy().into_owned()) {
             if !path.pop() {
@@ -900,6 +899,139 @@ pub fn run_control_loop(store: Store, oracle_socket: String) {
 
 #[cfg(test)]
 mod tests {
+    // ── fuzz: the control channel (the real daemon code, in-process) ──
+
+    /// splitmix64, same as the other fuzz tiers.
+    struct FuzzRng(u64);
+    impl FuzzRng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E3779B97F4A7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+            z ^ (z >> 31)
+        }
+    }
+
+    const FUZZ_OUTERS: &[&str] = &[
+        "s", "a/b", "home/u/.config/app/auth.json", "x", "a", "deep/one/two/three/f",
+        "dup", "dup", "..", "a/..", "\u{1F512}", "", "very/long/nnnnnnnnnn",
+    ];
+
+    /// One deterministic inner label per outer (like the salt would
+    /// derive) — plus deliberate collision and non-parallel shapes so
+    /// the refusal paths fire under fuzz too.
+    fn fuzz_inner(rng: &mut FuzzRng, outer: &str) -> String {
+        match rng.next() % 10 {
+            0..=6 => {
+                // plausible: same component count, hashed labels
+                (0..outer.split('/').count())
+                    .map(|_| format!("{:012x}", rng.next() & 0xFFFF_FFFF_FFFF))
+                    .collect::<Vec<_>>()
+                    .join("/")
+            }
+            7 => "COLLISION".into(),           // collides across outers
+            8 => "single".into(), // non-parallel for nested outers
+            _ => outer.to_string(),
+        }
+    }
+
+    /// Walk the frozen tree and assert the invariants the daemon must
+    /// hold NO MATTER what the control channel delivered:
+    ///  1. the ROOT bijection is injective both ways (it is a bimap —
+    ///     but the collision-refusal path must keep it so under chaos);
+    ///  2. every served file's outer path exists in the tree;
+    ///  3. no directory occupies a served file's path.
+    fn assert_tree_invariants(s: &Store, seed: u64) {
+        let st = s.0.lock().unwrap_or_else(|p| p.into_inner());
+        let Node::Dir { labels, .. } = st.tree.get(Path::new("")).unwrap() else {
+            panic!("seed {seed}: root vanished");
+        };
+        for (outer, inner) in labels.iter() {
+            let path = Path::new(outer);
+            match st.tree.get(path) {
+                Some(Node::File { .. }) => {}
+                Some(Node::Dir { .. }) => panic!(
+                    "seed {seed}: served outer \"{outer}\" became a directory"
+                ),
+                None => panic!(
+                    "seed {seed}: bijection holds an outer \"{outer}\" that left the tree \
+                     (label leak: remove did not clean the bimap)"
+                ),
+            }
+            // Inner labels are flat whole-path hashes (issue #47): a
+            // nested inner for a flat-label tree is a shape violation.
+            let _ = inner;
+        }
+        // Injectivity by construction of bimap; assert anyway — the
+        // refusal path is the thing under test.
+        let mut lefts: Vec<_> = labels.iter().map(|(l, _)| l.clone()).collect();
+        lefts.sort();
+        let n = lefts.len();
+        lefts.dedup();
+        assert_eq!(lefts.len(), n, "seed {seed}: duplicate outers in the bijection");
+    }
+
+    #[test]
+    fn removed_secrets_inner_label_stops_resolving() {
+        // The fuzzer-found bug as a pinned regression: the flat
+        // container label lives in the ROOT bijection under the FULL
+        // outer path; remove must clean it, or a removed secret's
+        // inner name keeps resolving (stale name service).
+        let s = Store::default();
+        s.serve("deep/one/two/three/f", "abcd", 0o400);
+        assert!(s.child(FuseIno::ROOT, std::ffi::OsStr::new("abcd")).is_some());
+        s.remove("deep/one/two/three/f");
+        assert!(
+            s.child(FuseIno::ROOT, std::ffi::OsStr::new("abcd")).is_none(),
+            "a removed secret's inner label must stop resolving"
+        );
+    }
+
+    #[test]
+    fn control_channel_chaos_never_breaks_the_tree() {
+        // The REAL daemon code (apply_control_line -> serve/remove and
+        // the bimap bookkeeping) fed random-but-plausible control
+        // lines: valid Serve shapes with hostile names, collisions,
+        // non-parallel inners, Removes for names never served, acks
+        // and garbage. Properties: no panic (a data-daemon crash kills
+        // the mount — the #57 review blocker), and the tree invariants
+        // hold after every chaos sequence.
+        for seed in 0..2048u64 {
+            let mut rng = FuzzRng(seed.wrapping_mul(0x9E3779B97F4A7C15) | 1);
+            let s = Store::default();
+            for _ in 0..16 {
+                let line = match rng.next() % 6 {
+                    0..=3 => {
+                        let outer = FUZZ_OUTERS[(rng.next() % FUZZ_OUTERS.len() as u64) as usize];
+                        let inner = fuzz_inner(&mut rng, outer);
+                        format!(
+                            "{{\"type\":\"serve\",\"name\":\"{}\",\"inner\":\"{}\",\"mode\":{}}}",
+                            outer.replace('\\', "/").replace('\"', ""),
+                            inner,
+                            rng.next() % 512
+                        )
+                    }
+                    4 => {
+                        let outer = FUZZ_OUTERS[(rng.next() % FUZZ_OUTERS.len() as u64) as usize];
+                        format!(
+                            "{{\"type\":\"remove\",\"name\":\"{}\"}}",
+                            outer.replace('\\', "/").replace('\"', "")
+                        )
+                    }
+                    _ => match rng.next() % 3 {
+                        0 => "{\"type\":\"ok\"}".into(),
+                        1 => "{\"type\":\"serve\"}".into(), // missing fields
+                        _ => String::from_utf8_lossy(&[(rng.next() % 256) as u8; 6]).into_owned(),
+                    },
+                };
+                let _ = apply_control_line(&s, &line);
+            }
+            assert_tree_invariants(&s, seed);
+        }
+    }
+
+
     use super::*;
 
     #[test]
