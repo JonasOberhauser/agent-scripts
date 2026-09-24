@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -74,6 +74,9 @@ pub enum ReadOutcome {
     Granted,
     AlreadyAccessed,
     HashMismatch { got: String, expected: String },
+    /// Issue #66: the lockdown is armed — refuse immediately, no
+    /// pending, no wait. Current grants keep flowing.
+    DeniedLocked,
     NotFound,
 }
 
@@ -86,6 +89,9 @@ impl ReadOutcome {
             ReadOutcome::AlreadyAccessed => Some("exceeded access limit".to_string()),
             ReadOutcome::HashMismatch { got, expected } => {
                 Some(format!("hash mismatch: got {got}, expected {expected}"))
+            }
+            ReadOutcome::DeniedLocked => {
+                Some("lockdown armed: new unauthorized access is refused".to_string())
             }
             ReadOutcome::Granted | ReadOutcome::NotFound => None,
         }
@@ -117,6 +123,10 @@ pub struct ServerState {
     pub pending: DashMap<u64, PendingAccess>,
     pub next_pending_id: AtomicU64,
     pub pending_timeout: Mutex<Duration>,
+    /// Issue #66: retro-active lockdown armed — every future
+    /// unauthorized ask is denied immediately instead of pending.
+    /// Loaded from / armed into the policy store.
+    lockdown: AtomicBool,
     /// Hashd socket this daemon hashes through, resolved ONCE at
     /// construction (FUSE_HASHD_SOCK env, then /run/fuse-hashd.sock)
     /// and immutable thereafter: production never re-points it at
@@ -152,7 +162,8 @@ impl Default for ServerState {
             secrets: DashMap::new(),
             pending: DashMap::new(),
             next_pending_id: AtomicU64::new(1),
-            pending_timeout: Mutex::new(Duration::from_secs(300)),
+            pending_timeout: Mutex::new(Duration::from_secs(10)),
+            lockdown: AtomicBool::new(false),
             hashd_sock: std::env::var(fuse_protocol::ENV_HASHD_SOCK)
                 .unwrap_or_else(|_| fuse_protocol::hashd::DEFAULT_SOCK.to_string()),
             log_path: String::new(),
@@ -330,6 +341,9 @@ impl ServerState {
             None => rec.allowed_hashes.iter().any(|ph| ph.hash == "*"),
         };
 
+        if !hash_ok && self.lockdown() {
+            return ReadOutcome::DeniedLocked;
+        }
         if hash_ok {
             rec.access_count += 1;
             rec.reading_pid = Some(pid);
@@ -352,6 +366,31 @@ impl ServerState {
                     .join(" | "),
             }
         }
+    }
+
+    /// Issue #66: is the retro-active lockdown armed?
+    pub fn lockdown(&self) -> bool {
+        self.lockdown.load(Ordering::SeqCst)
+    }
+
+    /// Arm the retro-active lockdown (issue #66): current grants keep
+    /// working; every future unauthorized ask is refused immediately.
+    /// Persisted — the state survives restarts.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the persist lock was poisoned by a panicking mutation.
+    pub fn arm_lockdown(&self) {
+        let _pl = self.persist_lock
+                .lock()
+                .expect("persist lock: mutations never panic while holding it");
+        self.lockdown.store(true, Ordering::SeqCst);
+        crate::policy_store::persist_locked(self);
+    }
+
+    /// Policy-store load applies the persisted lockdown (issue #66).
+    pub fn set_lockdown_from_load(&self, armed: bool) {
+        self.lockdown.store(armed, Ordering::SeqCst);
     }
 
     /// Reset the access bookkeeping of one secret (or all when
@@ -488,8 +527,14 @@ impl ServerState {
 
     /// A pending that vanished without a grant was denied: the blocked
     /// reader must be released immediately, not wait out its timeout.
+    /// An EXPIRED pending counts as denied too (issue #66 keeps
+    /// hash-bearing expiries listed for the panel — the blocked reader
+    /// is still released, the entry lives on as a remembered denial).
     pub fn is_pending_denied(&self, id: u64) -> bool {
-        !self.pending.contains_key(&id)
+        match self.pending.get(&id) {
+            None => true,
+            Some(p) => p.expires_at <= Instant::now(),
+        }
     }
 
     /// The reader pid of a live pending that still lacks a package
@@ -532,7 +577,10 @@ impl ServerState {
                 .pending
                 .get(&id)
                 .ok_or_else(|| format!("pending access {id} not found"))?;
-            if entry.expires_at <= std::time::Instant::now() {
+            if entry.expires_at <= std::time::Instant::now() && entry.pid_hash.is_none() {
+                // Issue #66: an expired ask WITHOUT a hash stays
+                // ungrantable (nothing to whitelist); one WITH a hash
+                // is a remembered denial — grant-forever still works.
                 return Err(format!("pending access {id} expired"));
             }
             let hash = entry
@@ -575,8 +623,15 @@ impl ServerState {
         } else {
             return Err(format!("secret {secret_name} no longer exists"));
         }
-        // Serve the waiting reader.
-        if !self.grant_pending(id) {
+        // Serve the waiting reader. A REMEMBERED denial (issue #66:
+        // expired ask with a hash) has no waiting reader — its ask
+        // already timed out — so an expired entry here is success,
+        // not failure: the whitelist is what the operator asked for.
+        let expired_remembered = self
+            .pending
+            .get(&id)
+            .is_some_and(|p| p.expires_at <= std::time::Instant::now());
+        if !self.grant_pending(id) && !expired_remembered {
             return Err(format!("pending access {id} not found or expired"));
         }
         crate::policy_store::persist_locked(self);
@@ -599,7 +654,10 @@ impl ServerState {
 
     pub fn cleanup_expired(&self) {
         let now = Instant::now();
-        self.pending.retain(|_, p| p.expires_at > now);
+        // Issue #66: an expired ask WITH a package hash stays listed
+        // as a remembered denial (grant disabled, forever+deny live);
+        // without a hash there is nothing to learn — drop it.
+        self.pending.retain(|_, p| p.expires_at > now || p.pid_hash.is_some());
     }
 
     pub fn list_pending(&self) -> Vec<fuse_protocol::PendingAccessInfo> {
@@ -612,9 +670,15 @@ impl ServerState {
 
         self.pending
             .iter()
-            .filter(|p| p.expires_at > now)
             .map(|p| {
-                let remaining = p.expires_at.duration_since(now).as_secs();
+                // Issue #66: expired-but-hash-bearing entries are the
+                // remembered denials — listed with grant disabled.
+                let expired = p.expires_at <= now;
+                let remaining = p
+                    .expires_at
+                    .checked_duration_since(now)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
                 fuse_protocol::PendingAccessInfo {
                     id: p.id,
                     secret_name: p.secret_name.clone(),
@@ -624,6 +688,7 @@ impl ServerState {
                     pid_hash_error: p.hash_error.clone(),
                     reason: p.reason.clone(),
                     expires_at: unix_now + remaining,
+                    expired,
                 }
             })
             .collect()
@@ -709,6 +774,125 @@ mod tests {
         let entry = s.secrets.get(name).unwrap();
         let rec = lock_secret(entry.value(), name);
         (rec.access_count, rec.reading_pid, rec.read_progress)
+    }
+
+
+    // ── issue #66: shorter pending + retro-active lockdown ───────
+
+    #[test]
+    fn default_pending_timeout_is_ten_seconds() {
+        // The issue's number: agents hang for minutes on denials that
+        // are never coming; the budget is now 10s.
+        assert_eq!(
+            *ServerState::new().pending_timeout.lock().unwrap(),
+            std::time::Duration::from_secs(10)
+        );
+    }
+
+    #[test]
+    fn lockdown_refuses_new_access_immediately_but_keeps_grants() {
+        let s = sample_state();
+        // Current authorization: the whitelisted hash still grants.
+        assert_eq!(
+            s.attempt_read("secrets.yaml", 1, Some("abc123"), 0, 4),
+            ReadOutcome::Granted
+        );
+        s.arm_lockdown();
+        // A whitelisted package keeps working after the lockdown.
+        assert_eq!(
+            s.attempt_read("secrets.yaml", 2, Some("abc123"), 0, 4),
+            ReadOutcome::AlreadyAccessed, // budget semantics unchanged
+        );
+        // NEW unauthorized access: refused on the spot — no pending,
+        // no wait.
+        s.reset(Some("secrets.yaml"));
+        assert_eq!(
+            s.attempt_read("secrets.yaml", 3, Some("rogue-hash"), 0, 4),
+            ReadOutcome::DeniedLocked
+        );
+        assert!(
+            s.pending.is_empty(),
+            "lockdown must not create pendings — the ask is answered"
+        );
+    }
+
+    #[test]
+    fn lockdown_survives_a_store_round_trip() {
+        // MR5 write-through: the armed state is policy, not memory.
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = ServerState::new();
+        s.policy_path = Some(dir.path().join("policy.json"));
+        s.add("secrets.yaml", "/tmp/host/secrets.yaml", 9, "abc123");
+        crate::policy_store::persist(&s);
+        s.arm_lockdown();
+        assert!(s.lockdown());
+
+        // A fresh daemon loads the same store: still armed.
+        let mut s2 = ServerState::new();
+        s2.policy_path = Some(dir.path().join("policy.json"));
+        let _ = crate::policy_store::load(&mut s2, &crate::oracle_service::OracleHub::new());
+        assert!(
+            s2.lockdown(),
+            "the lockdown is persisted policy — armed across restarts"
+        );
+        assert_eq!(
+            s2.attempt_read("secrets.yaml", 9, Some("rogue"), 0, 1),
+            ReadOutcome::DeniedLocked
+        );
+    }
+
+    #[test]
+    fn expired_ask_with_hash_stays_listed_and_grant_forever_still_works() {
+        // The remembered denial (issue #66): the ask timed out and was
+        // auto-denied, but the process had a package hash — it stays
+        // listed with grant dead, forever and deny live.
+        let s = sample_state();
+        let id = s.create_pending(
+            "secrets.yaml",
+            4242,
+            Some("late-observed-hash"),
+            "hash mismatch",
+            Some("goose"),
+        );
+        // Force expiry in place.
+        s.pending.get_mut(&id).unwrap().expires_at =
+            std::time::Instant::now() - std::time::Duration::from_secs(1);
+
+        // The blocked reader is released (expired == denied).
+        assert!(s.is_pending_denied(id));
+        // The listing keeps it, marked expired.
+        let listed = s.list_pending();
+        let entry = listed.iter().find(|p| p.id == id).expect("remembered");
+        assert!(entry.expired);
+        assert_eq!(entry.pid_hash.as_deref(), Some("late-observed-hash"));
+        // Grant on it is dead.
+        assert!(!s.grant_pending(id));
+        // Grant-forever still whitelists the observed hash — the
+        // retro-active escape hatch.
+        s.grant_pending_forever(id).expect("retro grant-forever works");
+        // And deny removes it from the panel.
+        let id2 = s.create_pending(
+            "secrets.yaml",
+            4243,
+            Some("another-hash"),
+            "hash mismatch",
+            None,
+        );
+        s.pending.get_mut(&id2).unwrap().expires_at =
+            std::time::Instant::now() - std::time::Duration::from_secs(1);
+        assert!(s.deny_pending(id2));
+        assert!(!s.list_pending().iter().any(|p| p.id == id2));
+    }
+
+    #[test]
+    fn expired_ask_without_hash_is_dropped() {
+        // Nothing to learn from an anonymous expired ask — it must not
+        // clutter the panel forever.
+        let s = sample_state();
+        let id = s.create_pending("secrets.yaml", 1, None, "denied", None);
+        s.pending.get_mut(&id).unwrap().expires_at =
+            std::time::Instant::now() - std::time::Duration::from_secs(1);
+        assert!(s.list_pending().iter().all(|p| p.id != id));
     }
 
     // ── idempotent re-add: persistence of user approvals ──────────

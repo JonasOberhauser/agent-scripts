@@ -439,7 +439,7 @@ fn restart_server(app: &App, log_path: Option<&str>) {
         Ok((_, raw)) => serde_json::from_slice::<Response>(&raw)
             .ok()
             .and_then(|r| match r {
-                Response::Status { secrets } => {
+                Response::Status { secrets, .. } => {
                     let names: Vec<&str> = secrets.iter().map(|s| s.name.as_str()).collect();
                     Some(format!("{} secret(s): {}", secrets.len(), names.join(", ")))
                 }
@@ -542,7 +542,7 @@ fn ask_reset_anyway() {
             mount_point: String::new(),
             socket: "/tmp/fuse-gatekeeper.sock".into(),
             log_level: "info".into(),
-            pending_timeout: 300,
+            pending_timeout: 10,
             runtime_wrapper: None,
             oracle_socket: None,
             secrets: vec![],
@@ -588,7 +588,7 @@ mod tests {
             mount_point: "/m".into(),
             socket: "/s".into(),
             log_level: "info".into(),
-            pending_timeout: 300,
+            pending_timeout: 10,
             runtime_wrapper: None,
             oracle_socket: Some("/tmp/.tmpABC/oracle.sock".into()),
             secrets: vec![],

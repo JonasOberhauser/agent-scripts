@@ -587,6 +587,13 @@ fn grid_row_line_styled_collapsed(
     let deny = if all { Button::DenyAll } else { Button::Deny { id: 0 } };
     let grant = if all { Button::GrantAll } else { Button::Grant { id: 0 } };
     let sel = if disabled { None } else { sel_here };
+    // Issue #66: remembered denials (expired asks) render grant dim —
+    // forever and deny stay live buttons.
+    let grant_dim = match row {
+        GridRow::Request(req) => req.expired,
+        GridRow::All => false,
+    };
+    let grant_sel = if grant_dim { None } else { sel.filter(|s| *s == Sel::Grant) };
     if let GridRow::Request(_) = row {
         spans.extend(button_spans_styled(
             Button::GrantForever { id: 0 },
@@ -595,7 +602,7 @@ fn grid_row_line_styled_collapsed(
         ));
         spans.push(Span::raw(" "));
     }
-    spans.extend(button_spans_styled(grant, sel == Some(Sel::Grant), disabled));
+    spans.extend(button_spans_styled(grant, grant_sel.is_some(), disabled || grant_dim));
     spans.push(Span::raw(" "));
     spans.extend(button_spans_styled(deny, sel == Some(Sel::Deny), disabled));
     Line::from(spans)
@@ -909,6 +916,19 @@ impl PendingPanelLayer {
     /// Press a button: dispatch its commands through the (non-blocking)
     /// talk, then advance the cursor to the next request.
     fn press(&mut self, row: usize, button: Button) {
+        // Issue #66: a remembered denial (expired ask) has no grant —
+        // forever and deny remain live, grant is refused where it is
+        // dispatched, not just where the cursor steps.
+        if let Button::Grant { id } = button {
+            let expired = self
+                .slots
+                .get(row)
+                .and_then(|s| s.as_ref())
+                .is_some_and(|r| r.id == id && r.expired);
+            if expired {
+                return;
+            }
+        }
         // A decision already in flight must not be dispatched again
         // (issue #24): the server has it; the row stays grayed until
         // the poll confirms consumption.  All-row buttons expand over
@@ -1231,7 +1251,20 @@ impl DisplayLayer for PendingPanelLayer {
                         // all-row toggles its grant/deny pair.
                         let left = matches!(k.code, KeyCode::Left);
                         self.cursor = match self.cursor {
-                            Cursor::Request { slot, sel } => Cursor::Request { slot, sel: sel.step(left) },
+                            Cursor::Request { slot, sel } => {
+                                let expired = self
+                                    .slots
+                                    .get(slot)
+                                    .and_then(|s| s.as_ref())
+                                    .is_some_and(|r| r.expired);
+                                let mut next = sel.step(left);
+                                if expired && next == Sel::Grant {
+                                    // Issue #66: remembered denials
+                                    // carry no grant — step past it.
+                                    next = next.step(left);
+                                }
+                                Cursor::Request { slot, sel: next }
+                            }
                             Cursor::All { .. } => Cursor::All { grant: left },
                         };
                         EventResult::Swallow
@@ -1886,6 +1919,7 @@ mod tests {
             pid_hash_error: None,
             reason: "read request".into(),
             expires_at: 0,
+            expired: false,
         }
     }
 

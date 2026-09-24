@@ -31,6 +31,11 @@ use crate::oracle_service::OracleHub;
 #[derive(Serialize, Deserialize)]
 struct PolicyFile {
     version: String,
+    /// Issue #66: the retro-active lockdown is armed — refuse all
+    /// future unauthorized access immediately. Absent in pre-#66
+    /// files: off.
+    #[serde(default)]
+    lockdown: bool,
     /// Per-install anonymization salt (issue #47), hex. Absent in
     /// pre-#47 files: minted on first save after the load.
     #[serde(default)]
@@ -165,6 +170,12 @@ pub fn load(state: &mut ServerState, hub: &OracleHub) -> LoadReport {
         tracing::info!("policy store: no salt stored — keeping the freshly minted one (issue #47)");
         persist_locked(state);
     }
+    // Issue #66: the retro-active lockdown is policy — armed state
+    // survives restarts.
+    if file.lockdown {
+        state.set_lockdown_from_load(true);
+        tracing::info!("policy store: lockdown ARMED (issue #66) — refusing new unauthorized access");
+    }
     let mut report = LoadReport::default();
     for s in file.secrets {
         // A live host file re-registers with its CURRENT identity
@@ -245,6 +256,7 @@ pub(crate) fn persist_locked(state: &ServerState) {
     let mut file = PolicyFile {
         version: fuse_protocol::VERSION.to_string(),
         salt: bytes_to_hex(state.anon_salt.as_bytes()),
+        lockdown: state.lockdown(),
         secrets: Vec::new(),
     };
     for entry in state.secrets.iter() {
