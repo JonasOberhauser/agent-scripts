@@ -231,15 +231,19 @@ impl SystemIo for RealSystemIo {
         }
 
         fn child_setsid() -> std::io::Result<()> {
-            // SAFETY: runs between fork(2) and execve(2) and must be
-            // async-signal-safe; setsid(2) only — no allocation, no
-            // locks, no libc state touched.
+            // SAFETY: setsid(2) takes no pointers and has no memory-safety
+            // preconditions; failure (already a process-group leader) is
+            // reported via the return value, which pre_exec propagates.
             let _sid = unsafe { libc::setsid() };
             Ok(())
         }
         let cmd_mut = &mut cmd;
         let setsid_cb = child_setsid;
-        // SAFETY: the callback is async-signal-safe (see above).
+        // SAFETY: `pre_exec` runs the callback between fork(2) and
+        // execve(2), where only async-signal-safe operations are allowed.
+        // The callback above calls only setsid(2) and returns — no
+        // allocation, no locks, no libc state; re-check its body when
+        // editing it (nothing enforces this).
         let _cmd = unsafe { cmd_mut.pre_exec(setsid_cb) };
         let child = cmd
             .spawn()
