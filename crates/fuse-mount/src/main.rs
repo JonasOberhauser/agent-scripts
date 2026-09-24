@@ -12,7 +12,6 @@ use std::path::PathBuf;
 use clap::Parser;
 use tracing::{error, info};
 
-mod fs;
 
 #[derive(Parser)]
 #[command(name = "fused", about = "FUSE gatekeeper DATA daemon: secret bytes + mount; access decided by the policy daemon")]
@@ -22,6 +21,12 @@ struct Cli {
     /// Policy daemon's oracle socket (adjudication + content updates).
     #[arg(short, long, default_value = "/tmp/fuse-gatekeeper-oracle.sock")]
     oracle_socket: String,
+    /// Serve a MOCK kernel instead of mounting: JSON-line ops on this
+    /// unix socket become real FUSE wire requests into the same
+    /// session code the kernel drives. Runs (and fuzzes) fused
+    /// without /dev/fuse — every layer above the kernel stays real.
+    #[arg(long)]
+    mock_fuse: Option<PathBuf>,
     #[arg(long, default_value = "info")]
     log_level: String,
 }
@@ -42,14 +47,14 @@ fn main() {
         }
     }
 
-    let store = fs::Store::default();
+    let store = fuse_mount::fs::Store::default();
 
     // Content sync runs beside the mount; it reconnects on policy
     // daemon restarts (data daemon survives them — the mount stays).
     {
         let store = store.clone();
         let oracle = cli.oracle_socket.clone();
-        std::thread::spawn(move || fs::run_control_loop(store, oracle));
+        std::thread::spawn(move || fuse_mount::fs::run_control_loop(store, oracle));
     }
 
     info!(
@@ -58,7 +63,13 @@ fn main() {
         cli.mount_point.display(),
         cli.oracle_socket
     );
-    let fuser_fs = fs::FusedFs::new(store, &cli.oracle_socket);
+    let fuser_fs = fuse_mount::fs::FusedFs::new(store, &cli.oracle_socket);
+    if let Some(control) = cli.mock_fuse {
+        // The DI branch: same FusedFs, same session dispatch — the
+        // kernel end of the channel is our mock instead of /dev/fuse.
+        fuse_mount::mock_fuser::serve(fuser_fs, &control);
+        return;
+    }
     let options = vec![fuser::MountOption::FSName("gatekeeper".into())];
     match fuser::mount2(fuser_fs, &cli.mount_point, &options) {
         Ok(()) => info!("FUSE unmounted cleanly."),

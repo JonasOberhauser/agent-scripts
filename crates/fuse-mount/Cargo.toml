@@ -11,8 +11,11 @@ path = "src/main.rs"
 
 [dependencies]
 fuse-protocol = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
-fuser = "0.15"
+fuser = { version = "0.15", features = ["abi-7-9"] }
+fuse-backend-rs = "0.14"
+vm-memory = "0.17"
 libc = "0.2"
 nix = { workspace = true }
 bimap = { workspace = true }
@@ -22,6 +25,7 @@ clap = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+fuse-server = { path = "../fuse-server" }
 
 [lints]
 workspace = true
