@@ -146,6 +146,12 @@ impl Store {
     /// A secret enters the frozen tree (MR4 Serve): no content — the
     /// current fino follows the host identity, allocating a fresh one
     /// when the incarnation changed since last Serve/stat.
+    ///
+    /// # Panics
+    /// Never in operation: the parent-chain `unreachable!()` guards
+    /// an internal construction invariant (parents are dirs because
+    /// this method creates them), and the store lock cannot be
+    /// poisoned without a daemon bug (see the expect message).
     pub fn serve(&self, name: &str, inner: &str, mode: u32) {
         let mut s = self.0.lock()
             .expect("store lock: never held across a panic — poisoning means a data-daemon bug");
@@ -247,6 +253,10 @@ impl Store {
         }
     }
 
+    /// # Panics
+    /// Never in operation — same lock-poisoning reasoning as
+    /// [`Store::serve`].
+    ///
     /// Remove a secret: prune the tree node and its fino entry, then
     /// childless structural ancestors vanish with it.
     pub fn remove(&self, name: &str) {
@@ -407,6 +417,10 @@ fn send_line(sock: &str, line: &str) -> Result<UnixStream, String> {
 }
 
 /// Stat a secret by name: live identity + attrs, no adjudication.
+///
+/// # Panics
+/// Never: the sole `expect` serializes an internal serde enum —
+/// infallible by construction.
 pub fn stat_secret(socket: &str, name: &str) -> Result<OracleReply, String> {
     let s = send_line(
         socket,
@@ -861,6 +875,11 @@ fn apply_control_line(store: &Store, line: &str) -> bool {
 /// then apply every Serve/Remove it pushes. Reconnects on loss.
 /// Content sync no longer exists — Serve only shapes the frozen tree;
 /// bytes reach readers as fds at open time.
+///
+/// # Panics
+/// Never in operation: the `expect`s clone a live connection and
+/// serialize internal enums — both infallible on a healthy loop
+/// iteration; transport errors return through `Result` paths instead.
 pub fn run_control_loop(store: Store, oracle_socket: String) {
     loop {
         if let Ok(conn) = UnixStream::connect(&oracle_socket) {
@@ -1169,7 +1188,7 @@ mod tests {
         let path = listener.local_addr().unwrap().as_pathname().unwrap().to_path_buf();
         // Accept, swallow the request, then never answer and never
         // close — the worst case.
-        std::thread::spawn(move || {
+        let _worst_case_peer = std::thread::spawn(move || {
             if let Ok((mut conn, _)) = listener.accept() {
                 let mut line = String::new();
                 let _ = std::io::BufRead::read_line(
@@ -1202,7 +1221,7 @@ mod tests {
         // hang — the production caller maps it to EIO.
         let listener = tmp_listener("eof");
         let path = listener.local_addr().unwrap().as_pathname().unwrap().to_path_buf();
-        std::thread::spawn(move || {
+        let _worst_case_peer = std::thread::spawn(move || {
             if let Ok((mut conn, _)) = listener.accept() {
                 let mut line = String::new();
                 let _ = std::io::BufRead::read_line(

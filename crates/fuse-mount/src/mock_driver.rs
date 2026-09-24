@@ -60,32 +60,46 @@ impl MockDriver {
     pub fn connect(path: &Path) -> std::io::Result<Self> {
         // SAFETY: socket(2)/connect(2) on a caller-owned path; the fd
         // is wrapped in UnixStream on success and closed by it.
-        let sock = unsafe {
-            let fd = libc::socket(libc::AF_UNIX, libc::SOCK_SEQPACKET, 0);
-            if fd < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            let mut addr: libc::sockaddr_un = std::mem::zeroed();
-            addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
-            let bytes = path.as_os_str().as_encoded_bytes();
-            if bytes.len() >= addr.sun_path.len() {
-                libc::close(fd);
-                return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "path too long"));
-            }
+        // SAFETY: socket(2) returns a fresh fd (or -1, checked).
+        let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_SEQPACKET, 0) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: zeroed sockaddr_un is a valid all-zero struct.
+        let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        let bytes = path.as_os_str().as_encoded_bytes();
+        if bytes.len() >= addr.sun_path.len() {
+            // SAFETY: close(2) on our own fd; the result only reports
+            // double-close, which the ownership rules exclude.
+            let _closed = unsafe { libc::close(fd) };
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "path too long"));
+        }
+        // SAFETY: &[u8] and &[c_char] have the same layout; the
+        // length was bounds-checked above.
+        unsafe {
             addr.sun_path[..bytes.len()]
                 .copy_from_slice(std::mem::transmute::<&[u8], &[libc::c_char]>(bytes));
-            if libc::connect(
+        }
+        // SAFETY: connect(2) on a caller-owned path with the
+        // fully-initialized addr above.
+        let rc = unsafe {
+            libc::connect(
                 fd,
                 &addr as *const _ as *const libc::sockaddr,
                 std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
-            ) != 0
-            {
-                let e = std::io::Error::last_os_error();
-                libc::close(fd);
-                return Err(e);
-            }
-            UnixStream::from_raw_fd(fd)
+            )
         };
+        if rc != 0 {
+            let e = std::io::Error::last_os_error();
+            // SAFETY: close(2) on our own fd; the result only reports
+            // double-close, which the ownership rules exclude.
+            let _closed = unsafe { libc::close(fd) };
+            return Err(e);
+        }
+        // SAFETY: fd is a fresh connected descriptor owned from here;
+        // UnixStream closes it on drop.
+        let sock = unsafe { UnixStream::from_raw_fd(fd) };
         Ok(Self { sock, unique: 0, creds: Creds::default() })
     }
 

@@ -206,35 +206,47 @@ fn request_opcode(frame: &[u8]) -> Option<u32> {
 /// Bind a SOCK_SEQPACKET listener at `path` — std's UnixListener is
 /// stream-only, and frames must survive the driver hop whole.
 fn bind_seqpacket_listener(path: &Path) -> std::io::Result<OwnedFd> {
-    // SAFETY: plain socket(2)/bind(2)/listen(2) on a path the caller
-    // owns; the fd is wrapped in OwnedFd on success and closed by it.
+    // SAFETY: socket(2) returns a fresh fd (or -1, checked).
+    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_SEQPACKET, 0) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: zeroed sockaddr_un is a valid all-zero struct.
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    let bytes = path.as_os_str().as_encoded_bytes();
+    if bytes.len() >= addr.sun_path.len() {
+        // SAFETY: close(2) on our own fd; the result only reports
+        // double-close, which the ownership rules exclude.
+        let _closed = unsafe { libc::close(fd) };
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "path too long"));
+    }
+    // SAFETY: &[u8] and &[c_char] have the same layout; the length
+    // was bounds-checked above.
     unsafe {
-        let fd = libc::socket(libc::AF_UNIX, libc::SOCK_SEQPACKET, 0);
-        if fd < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        let mut addr: libc::sockaddr_un = std::mem::zeroed();
-        addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
-        let bytes = path.as_os_str().as_encoded_bytes();
-        if bytes.len() >= addr.sun_path.len() {
-            libc::close(fd);
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "path too long"));
-        }
         addr.sun_path[..bytes.len()]
             .copy_from_slice(std::mem::transmute::<&[u8], &[libc::c_char]>(bytes));
-        if libc::bind(
+    }
+    // SAFETY: bind(2) on a caller-owned path with the initialized addr.
+    let bound = unsafe {
+        libc::bind(
             fd,
             &addr as *const _ as *const libc::sockaddr,
             std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
-        ) != 0
-            || libc::listen(fd, 16) != 0
-        {
-            let e = std::io::Error::last_os_error();
-            libc::close(fd);
-            return Err(e);
-        }
-        Ok(OwnedFd::from_raw_fd(fd))
+        )
+    };
+    // SAFETY: listen(2) on the bound fd.
+    let listening = unsafe { libc::listen(fd, 16) };
+    if bound != 0 || listening != 0 {
+        let e = std::io::Error::last_os_error();
+        // SAFETY: close(2) on our own fd; the result only reports
+        // double-close, which the ownership rules exclude.
+        let _closed = unsafe { libc::close(fd) };
+        return Err(e);
     }
+    // SAFETY: fd is a fresh listening descriptor owned from here;
+    // OwnedFd closes it on drop.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
 pub fn serve(fs: FusedFs, control: &Path) {
@@ -263,7 +275,7 @@ pub fn serve(fs: FusedFs, control: &Path) {
     // SAFETY: fds[1] likewise; the Bridge socket owns it.
     let kernel_sock = unsafe { UnixStream::from_raw_fd(fds[1]) };
 
-    std::thread::spawn(move || {
+    let _session_thread = std::thread::spawn(move || {
         let mut session =
             fuser::Session::from_fd(fs, session_fd, fuser::SessionACL::All);
         match session.run() {
