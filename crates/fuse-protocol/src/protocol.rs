@@ -56,6 +56,11 @@ pub struct PendingAccessInfo {
     #[serde(default)]
     pub pid_hash_error: Option<String>,
     pub reason: String,
+    /// The ask timed out and was auto-denied, but the process had a
+    /// package hash: it stays listed for grant-forever/deny (issue
+    /// #66) with grant disabled. Additive field: old servers omit it.
+    #[serde(default)]
+    pub expired: bool,
     /// Unix timestamp (seconds) when this request expires.
     pub expires_at: u64,
 }
@@ -318,6 +323,12 @@ pub enum Command {
     GrantForever { id: u64 },
     /// Deny a pending access request by ID (immediate rejection).
     Deny { id: u64 },
+    /// Lock in the CURRENT authorizations and deny all future
+    /// unauthorized access immediately (issue #66): whitelisted
+    /// packages and live read budgets keep working; anything that
+    /// would pend is refused on the spot. Persisted in the policy
+    /// store — armed across restarts.
+    LockDown,
     /// Request the server's protocol version.
     //
     // IMPORTANT: Do NOT change this variant's name or serde tag.
@@ -338,7 +349,15 @@ pub enum Response {
     Added { inner: String },
     Ok,
     Error { message: String },
-    Status { secrets: Vec<SecretStatus> },
+    #[serde(alias = "Status")]
+    Status {
+        secrets: Vec<SecretStatus>,
+        /// Issue #66: the retro-active lockdown is armed — new
+        /// unauthorized access is refused immediately. Additive
+        /// (defaulted) so old clients still parse.
+        #[serde(default)]
+        lockdown: bool,
+    },
     MountList { mounts: Vec<MountEntry> },
     PendingList { pending: Vec<PendingAccessInfo> },
     /// Server protocol version.
@@ -504,6 +523,7 @@ fn an_empty_salt_is_unrepresentable() {
             pid_hash_error: Some("read /proc/7/maps: Permission denied".into()),
             reason: "r".into(),
             expires_at: 1,
+            expired: false,
         };
         let json = serde_json::to_string(&info).unwrap();
         let back: PendingAccessInfo = serde_json::from_str(&json).unwrap();

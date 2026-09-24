@@ -385,6 +385,34 @@ fn deny_unblocks_the_reader_immediately_with_eperm() {
     );
 }
 
+#[test]
+fn lockdown_asks_are_refused_immediately_without_pending() {
+    // Issue #66: with the lockdown armed, an unauthorized ask is
+    // answered on the spot — EACCES, no pending entry, and no
+    // pend-out delay to measure.
+    let (path, state, _t) = oracle_env();
+    state.add("s", "/tmp/host/s", 1, "some_hash");
+    state.arm_lockdown();
+
+    let t0 = std::time::Instant::now();
+    match ask(&path, "s", 30, 0, 1) {
+        OracleReply::Deny { errno, reason } => {
+            assert_eq!(errno, libc::EACCES, "{reason}");
+            assert!(reason.contains("lockdown"), "names the cause: {reason}");
+        }
+        other => panic!("expected immediate deny under lockdown, got {other:?}"),
+    }
+    assert!(
+        t0.elapsed() < Duration::from_millis(500),
+        "must be immediate, not a pend-out: {:?}",
+        t0.elapsed()
+    );
+    assert!(
+        state.pending.is_empty(),
+        "no pending may be created under lockdown"
+    );
+}
+
 /// The OTHER branch of the hashd seam, deterministically: a stub
 /// hashd answers `ok <hash>` on the state's pinned socket, so the
 /// pending must carry the pid hash and NO error — regardless of

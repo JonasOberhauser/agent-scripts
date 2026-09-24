@@ -1154,7 +1154,7 @@ fn write_state_file<S: SystemIo>(
         mount_point: config.mount_point.to_string_lossy().to_string(),
         socket: config.socket_path.to_string_lossy().to_string(),
         log_level: config.log_level.clone(),
-        pending_timeout: 300,
+        pending_timeout: 10,
         runtime_wrapper: config.runtime_wrapper.clone(),
         oracle_socket: config
             .oracle_socket

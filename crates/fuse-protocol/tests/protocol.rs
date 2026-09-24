@@ -87,7 +87,8 @@ mod tests {
                 size: 42,
                 unlimited: false,
             }],
-        };
+        lockdown: false,
+    };
         let json = serde_json::to_string(&resp).unwrap();
         let back: Response = serde_json::from_str(&json).unwrap();
         assert_eq!(resp, back);

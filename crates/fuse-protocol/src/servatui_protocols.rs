@@ -13,7 +13,10 @@ pub fn print_response(resp: &Response, out: &mut dyn Console) {
             out.print_line(&format!("added — container view: /fuse/{inner}"))
         }
         Response::Error { message } => out.print_error(message),
-        Response::Status { secrets } => {
+        Response::Status { secrets, lockdown } => {
+            if *lockdown {
+                out.print_line("lockdown: ON — new unauthorized access is refused");
+            }
             if secrets.is_empty() {
                 out.print_line("No secrets configured.");
             } else {
@@ -152,6 +155,7 @@ pub fn pending_info(id: u64) -> PendingAccessInfo {
         pid_hash_error: None,
         reason: "read request".into(),
         expires_at: 0,
+        expired: false,
     }
 }
 
@@ -246,6 +250,9 @@ fn parse_grant_forever(args: &str) -> Result<Command, String> {
     args.trim().parse::<u64>().map(|id| Command::GrantForever { id })
         .map_err(|_| "Usage: grant-forever ID (ID must be a number)".into())
 }
+fn parse_lockdown(_: &str) -> Result<Command, String> {
+    Ok(Command::LockDown)
+}
 fn parse_deny(args: &str) -> Result<Command, String> {
     args.trim().parse::<u64>().map(|id| Command::Deny { id })
         .map_err(|_| "Usage: deny ID (ID must be a number)".into())
@@ -272,6 +279,7 @@ pub const COMMAND_TABLE: &[CommandSpec] = &[
     CommandSpec { name: "grant", help: "Grant a pending access request", parse: parse_grant, complete: Completer::PendingIds, offline: None },
     CommandSpec { name: "grant-forever", help: "Grant a pending access permanently (whitelists the observed package hash)", parse: parse_grant_forever, complete: Completer::PendingIds, offline: None },
     CommandSpec { name: "deny", help: "Deny a pending access request", parse: parse_deny, complete: Completer::PendingIds, offline: None },
+    CommandSpec { name: "lockdown", help: "Lock in current grants; deny all future unauthorized access immediately (persisted)", parse: parse_lockdown, complete: NO_COMPLETE, offline: None },
     CommandSpec { name: "show-map", help: "Show the outer -> anonymized container-view name map", parse: parse_show_map, complete: NO_COMPLETE, offline: None },
     CommandSpec { name: "version", help: "Show server version", parse: parse_version, complete: NO_COMPLETE, offline: Some(offline_version) },
     CommandSpec { name: "logpath", help: "Show server log file path", parse: parse_logpath, complete: NO_COMPLETE, offline: None },
@@ -440,7 +448,7 @@ pub fn poll_pending_info(socket: &std::path::Path) -> Result<Vec<PendingAccessIn
 /// the live source for reset/remove/rotate completion.
 pub fn poll_secret_names(socket: &std::path::Path) -> Result<Vec<String>, String> {
     match run_command_once(socket, "status", &Command::Status)? {
-        crate::Response::Status { secrets } => {
+        crate::Response::Status { secrets, .. } => {
             Ok(secrets.into_iter().map(|s| s.name).collect())
         }
         other => Err(format!("unexpected response to status: {other:?}")),
@@ -492,6 +500,7 @@ mod tests {
                 size: 9,
                 unlimited: false,
             }],
+            lockdown: false,
         };
         let mut cap = Cap(Vec::new());
         print_response(&resp, &mut cap);
@@ -546,6 +555,7 @@ mod tests {
                     unlimited: false,
                 },
             ],
+            lockdown: false,
         };
         let mut cap = Cap(Vec::new());
         print_response(&resp, &mut cap);
@@ -589,6 +599,7 @@ mod tests {
                     unlimited: false,
                 },
             ],
+            lockdown: false,
         };
         let mut cap = Cap(Vec::new());
         print_response(&resp, &mut cap);
@@ -779,6 +790,7 @@ mod tests {
                     pid_hash_error: None,
                     reason: "r".into(),
                     expires_at: 0,
+                    expired: false,
                 }],
             };
             writeln!(w, "{}", serde_json::to_string(&resp).unwrap()).unwrap();

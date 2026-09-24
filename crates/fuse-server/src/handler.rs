@@ -13,8 +13,13 @@ pub fn handle_command(cmd: Command, state: &ServerState, hub: &crate::oracle_ser
             }
         }
 
+        Command::LockDown => {
+            state.arm_lockdown();
+            tracing::info!("lockdown armed (issue #66): current grants keep working; new unauthorized access is refused");
+            Response::Ok
+        }
         Command::Status => {
-            Response::Status { secrets: state.status() }
+            Response::Status { secrets: state.status(), lockdown: state.lockdown() }
         }
 
         Command::ShowMap => Response::Map {
@@ -178,7 +183,7 @@ mod tests {
         s.attempt_read("a.yaml", 1, Some("hash_a"), 0, 1024);
         let resp = handle_command(Command::Status, &s, &hub());
         match resp {
-            Response::Status { secrets } => {
+            Response::Status { secrets, .. } => {
                 let a = secrets.iter().find(|e| e.name == "a.yaml").unwrap();
                 assert_eq!(a.access_count, 1);
                 assert_eq!(a.allowed_hashes.iter().map(|h| h.hash.as_str()).collect::<Vec<_>>(), vec!["hash_a"]);

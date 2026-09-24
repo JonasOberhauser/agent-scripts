@@ -261,6 +261,10 @@ fn adjudicate(state: &ServerState, name: &str, pid: u32, offset: usize, size: us
     let (pid_hash, hash_error) = compute_pid_hash(state, pid);
     match state.attempt_read(name, pid, pid_hash.as_deref(), offset, size) {
         ReadOutcome::Granted => OracleReply::Allow,
+        ReadOutcome::DeniedLocked => OracleReply::Deny {
+            errno: libc::EACCES,
+            reason: "lockdown armed: new unauthorized access is refused".into(),
+        },
         ReadOutcome::NotFound => OracleReply::Deny {
             errno: libc::ENOENT,
             reason: "secret not found".into(),
@@ -303,19 +307,23 @@ fn adjudicate(state: &ServerState, name: &str, pid: u32, offset: usize, size: us
                         reason: "secret vanished while granted".into(),
                     };
                 }
+                // Expiry FIRST (issue #66): the honest reason at the
+                // boundary is "expired", and the entry is RETAINED —
+                // a hash-bearing one becomes a remembered denial for
+                // the panel; cleanup drops the anonymous ones.
+                if Instant::now() > deadline {
+                    warn!("Pending access {id} timed out");
+                    return OracleReply::Deny { errno: libc::EACCES, reason: format!("pending {id} expired: {reason}") };
+                }
                 if state.is_pending_denied(id) {
-                    // A deny releases the blocked reader AT ONCE — waiting
-                    // out the timeout would pin the reading process for
-                    // minutes after the decision was already made.
+                    // An operator deny releases the blocked reader AT
+                    // ONCE — waiting out the timeout would pin the
+                    // reading process for minutes after the decision
+                    // was already made.
                     return OracleReply::Deny {
                         errno: libc::EPERM,
                         reason: format!("pending {id} denied: {reason}"),
                     };
-                }
-                if Instant::now() > deadline {
-                    state.remove_pending(id);
-                    warn!("Pending access {id} timed out");
-                    return OracleReply::Deny { errno: libc::EACCES, reason: format!("pending {id} expired: {reason}") };
                 }
                 std::thread::sleep(Duration::from_millis(25));
             }
