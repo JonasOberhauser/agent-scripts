@@ -3,7 +3,7 @@
 //! content forwarding to (fake) data daemons, and snapshot replay for
 //! late joiners.
 
-#![cfg_attr(test, allow(clippy::unwrap_used))]
+#![allow(clippy::unwrap_used, clippy::panic, unused_results)]
 
 use std::io::{BufRead, BufReader, Read as _, Write};
 use std::sync::Arc;
@@ -556,17 +556,14 @@ fn a_stuck_data_daemon_does_not_wedge_the_policy_daemon() {
     // so filling it is deterministic.
     use std::os::unix::io::AsRawFd;
     let mut stuck = std::os::unix::net::UnixStream::connect(&oracle).unwrap();
+    let sz: libc::c_int = 4096;
+    let sfd = stuck.as_raw_fd();
+    let sol = libc::SOL_SOCKET;
+    let rcvbuf = libc::SO_RCVBUF;
+    let arg = &sz as *const _ as *const libc::c_void;
+    let arglen = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
     // SAFETY: setsockopt(2) on our own fd with a c_int operand.
-    unsafe {
-        let sz: libc::c_int = 4096;
-        libc::setsockopt(
-            stuck.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_RCVBUF,
-            &sz as *const _ as *const libc::c_void,
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        );
-    }
+    let _buf = unsafe { libc::setsockopt(sfd, sol, rcvbuf, arg, arglen) };
     stuck.write_all(b"{\"type\":\"hello\"}\n").unwrap();
     std::thread::sleep(Duration::from_millis(200)); // registered
 

@@ -8,12 +8,8 @@ license.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
-thiserror = { workspace = true }
 libc = "0.2"
 servyi-servatui = { workspace = true }
-
-[lints]
-workspace = true
 
 [dev-dependencies]
 tempfile = "3"

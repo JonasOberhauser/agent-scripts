@@ -62,7 +62,7 @@ fn spawn_fused(dir: &Path, oracle: &Path) -> Fused {
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    panic!("fused never bound the mock control socket");
+    unreachable!("fused never bound the mock control socket within 10s");
 }
 
 /// The in-process policy daemon: real wire protocol, dead hashd seam
@@ -78,7 +78,7 @@ fn oracle_env(dir: &Path) -> (std::path::PathBuf, Arc<ServerState>, OracleHub) {
     let hub = OracleHub::new();
     let path = dir.join("oracle.sock");
     let (s2, hub2, p2) = (Arc::clone(&state), hub.clone(), path.clone());
-    std::thread::spawn(move || {
+    let _oracle_thread = std::thread::spawn(move || {
         run_oracle_server(&p2, s2, hub2).unwrap();
     });
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -101,7 +101,7 @@ fn fused_serves_a_full_read_path_over_the_mock_kernel() {
     // poll the listing until the inner name appears.
     hub.serve("s", "ab12cd34ef56", 0o400);
     let mut d = MockDriver::connect(&fused.control).expect("connect driver");
-    d.init().expect("init handshake");
+    let _init = d.init().expect("init handshake");
 
     let deadline = Instant::now() + Duration::from_secs(10);
     let entry = loop {
@@ -160,7 +160,7 @@ fn fused_serves_a_full_read_path_over_the_mock_kernel() {
     // FORGET is oneway; follow it with a cheap sync (STATFS) so the
     // session never sees two requests queued at once.
     d.forget(ino, 1).expect("forget");
-    d.statfs().expect("session alive after forget");
+    let _st = d.statfs().expect("session alive after forget");
 
     drop(d);
     drop(fused);
@@ -199,7 +199,7 @@ fn a_driver_abandoning_an_open_fh_leaks_nothing() {
     let deadline = Instant::now() + Duration::from_secs(10);
     let ino = loop {
         let mut d = MockDriver::connect(&fused.control).expect("connect");
-        d.init().expect("init");
+        let _ = d.init().expect("init");
         if let Ok(entry) = d.lookup("ab12cd34ef56") {
             break entry.nodeid;
         }
@@ -210,12 +210,12 @@ fn a_driver_abandoning_an_open_fh_leaks_nothing() {
     // Steady state WITH one connected driver (the connection itself
     // holds fds; only the DELTA across the open is meaningful).
     let mut d = MockDriver::connect(&fused.control).expect("connect");
-    d.init().expect("init");
-    d.statfs().expect("statfs");
+    let _ = d.init().expect("init");
+    let _ = d.statfs().expect("statfs");
     let baseline = quiescent_fd_count(fused.child.id());
 
     // Open (the host fd is now fused's to hold until RELEASE)…
-    d.open(ino).expect("open");
+    let _open = d.open(ino).expect("open");
     let during = quiescent_fd_count(fused.child.id());
     assert_eq!(during, baseline + 1, "the passed host fd must be open");
 
@@ -224,7 +224,7 @@ fn a_driver_abandoning_an_open_fh_leaks_nothing() {
     // sends when a process exits with files open.
     drop(d);
     let mut next = MockDriver::connect(&fused.control).expect("reconnect");
-    next.init().expect("init");
+    let _ = next.init().expect("init");
     // The cleanup runs at the PREVIOUS bridge's exit; the reconnect
     // can overtake it via the accept queue, so poll to the steady state.
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -256,7 +256,7 @@ fn the_session_survives_driver_reconnects() {
     let deadline = Instant::now() + Duration::from_secs(10);
     let ino = loop {
         let mut d = MockDriver::connect(&fused.control).expect("connect");
-        d.init().expect("init");
+        let _ = d.init().expect("init");
         if let Ok(entry) = d.lookup("ab12cd34ef56") {
             break entry.nodeid;
         }
@@ -266,10 +266,10 @@ fn the_session_survives_driver_reconnects() {
 
     // Budget reset through the POLICY daemon (the CLI's `reset`
     // path), then a fresh driver on the SAME session.
-    state.reset(Some("s"));
+    let _reset = state.reset(Some("s"));
 
     let mut d2 = MockDriver::connect(&fused.control).expect("reconnect");
-    d2.init().expect("init");
+    let _ = d2.init().expect("init");
     let opened = d2.open(ino).expect("reopen after reconnect");
     let _ = opened;
 }

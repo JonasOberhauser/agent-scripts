@@ -12,8 +12,8 @@
 //!     with the wrong package hash is denied and a read with the right
 //!     hash still works exactly once: the one-read semantics and the
 //!     hash gate survive arbitrary client behavior.
+#![allow(clippy::unwrap_used, clippy::panic, unused_results)]
 
-#![cfg_attr(test, allow(clippy::unwrap_used))]
 use fuse_protocol::oracle::OracleReply;
 use fuse_protocol::Command;
 use fuse_server::oracle_service::{run_oracle_server, OracleHub};

@@ -49,13 +49,12 @@ const FRAME_BUF: usize = 1 << 20;
 /// API); for plain serialization the POD contract — "any data is
 /// valid for this type" — makes a byte-view cast sound.
 pub(crate) fn pod_bytes<T: vm_memory::ByteValued>(v: &T) -> Vec<u8> {
+    let p = v as *const T as *const u8;
+    let n = std::mem::size_of::<T>();
     // SAFETY: ByteValued is only implemented for POD types whose any
-    // bit pattern is valid; reading size_of::<T>() bytes at the value
-    // is exactly its wire form (repr(C), field-declared padding).
-    unsafe {
-        std::slice::from_raw_parts(v as *const T as *const u8, std::mem::size_of::<T>())
-    }
-    .to_vec()
+    // bit pattern is valid; reading n bytes at the value is exactly
+    // its wire form (repr(C), field-declared padding).
+    unsafe { std::slice::from_raw_parts(p, n) }.to_vec()
 }
 
 /// Decode an exact-length POD from a byte slice: copy into an ALIGNED
@@ -206,35 +205,47 @@ fn request_opcode(frame: &[u8]) -> Option<u32> {
 /// Bind a SOCK_SEQPACKET listener at `path` — std's UnixListener is
 /// stream-only, and frames must survive the driver hop whole.
 fn bind_seqpacket_listener(path: &Path) -> std::io::Result<OwnedFd> {
-    // SAFETY: plain socket(2)/bind(2)/listen(2) on a path the caller
-    // owns; the fd is wrapped in OwnedFd on success and closed by it.
-    unsafe {
-        let fd = libc::socket(libc::AF_UNIX, libc::SOCK_SEQPACKET, 0);
-        if fd < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        let mut addr: libc::sockaddr_un = std::mem::zeroed();
-        addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
-        let bytes = path.as_os_str().as_encoded_bytes();
-        if bytes.len() >= addr.sun_path.len() {
-            libc::close(fd);
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "path too long"));
-        }
-        addr.sun_path[..bytes.len()]
-            .copy_from_slice(std::mem::transmute::<&[u8], &[libc::c_char]>(bytes));
-        if libc::bind(
-            fd,
-            &addr as *const _ as *const libc::sockaddr,
-            std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
-        ) != 0
-            || libc::listen(fd, 16) != 0
-        {
-            let e = std::io::Error::last_os_error();
-            libc::close(fd);
-            return Err(e);
-        }
-        Ok(OwnedFd::from_raw_fd(fd))
+    let af_unix = libc::AF_UNIX;
+    let seqpacket = libc::SOCK_SEQPACKET;
+    let zero = 0;
+    // SAFETY: socket(2) returns a fresh fd (or -1, checked).
+    let fd = unsafe { libc::socket(af_unix, seqpacket, zero) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
     }
+    // SAFETY: zeroed sockaddr_un is a valid all-zero struct.
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    let bytes = path.as_os_str().as_encoded_bytes();
+    if bytes.len() >= addr.sun_path.len() {
+        // SAFETY: close(2) on our own fd; the result only reports
+        // double-close, which the ownership rules exclude.
+        let _closed = unsafe { libc::close(fd) };
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "path too long"));
+    }
+    let dst = addr.sun_path.as_mut_ptr() as *mut u8;
+    let src = bytes.as_ptr();
+    let n = bytes.len();
+    // SAFETY: &[u8] and &[c_char] have the same layout; the length
+    // was bounds-checked above; one memcpy, no overlap.
+    unsafe { std::ptr::copy(src, dst, n) };
+    let p = &addr as *const _ as *const libc::sockaddr;
+    let len = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+    // SAFETY: bind(2) on a caller-owned path with the initialized addr.
+    let bound = unsafe { libc::bind(fd, p, len) };
+    let backlog = 16;
+    // SAFETY: listen(2) on the bound fd.
+    let listening = unsafe { libc::listen(fd, backlog) };
+    if bound != 0 || listening != 0 {
+        let e = std::io::Error::last_os_error();
+        // SAFETY: close(2) on our own fd; the result only reports
+        // double-close, which the ownership rules exclude.
+        let _closed = unsafe { libc::close(fd) };
+        return Err(e);
+    }
+    // SAFETY: fd is a fresh listening descriptor owned from here;
+    // OwnedFd closes it on drop.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
 pub fn serve(fs: FusedFs, control: &Path) {
@@ -251,19 +262,26 @@ pub fn serve(fs: FusedFs, control: &Path) {
     // is read by the session thread below for the process's lifetime;
     // fds[1] by the Bridge this loop drives per driver connection.
     let mut fds = [0i32; 2];
+    let af_unix = libc::AF_UNIX;
+    let seqpacket = libc::SOCK_SEQPACKET;
+    let zero = 0;
+    let pfds = fds.as_mut_ptr();
     // SAFETY: socketpair(2) writes two fresh descriptors into fds; on
     // failure nothing is written.
-    if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_SEQPACKET, 0, fds.as_mut_ptr()) } != 0 {
+    let sp = unsafe { libc::socketpair(af_unix, seqpacket, zero, pfds) };
+    if sp != 0 {
         tracing::error!("mock fuser: socketpair failed");
         std::process::exit(1);
     }
+    let f0 = fds[0];
+    let f1 = fds[1];
     // SAFETY: fds[0] is a fresh, exclusively owned descriptor from
     // socketpair above; OwnedFd closes it on drop.
-    let session_fd = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+    let session_fd = unsafe { OwnedFd::from_raw_fd(f0) };
     // SAFETY: fds[1] likewise; the Bridge socket owns it.
-    let kernel_sock = unsafe { UnixStream::from_raw_fd(fds[1]) };
+    let kernel_sock = unsafe { UnixStream::from_raw_fd(f1) };
 
-    std::thread::spawn(move || {
+    let _session_thread = std::thread::spawn(move || {
         let mut session =
             fuser::Session::from_fd(fs, session_fd, fuser::SessionACL::All);
         match session.run() {
@@ -274,8 +292,11 @@ pub fn serve(fs: FusedFs, control: &Path) {
 
     tracing::info!("mock fuser: forwarding FUSE frames at {}", control.display());
     loop {
+        let lfd = listener.as_raw_fd();
+        let no_addr: *mut libc::sockaddr = std::ptr::null_mut();
+        let no_len: *mut libc::socklen_t = std::ptr::null_mut();
         // SAFETY: accept(2) on the listener above; a fresh owned fd.
-        let cfd = unsafe { libc::accept(listener.as_raw_fd(), std::ptr::null_mut(), std::ptr::null_mut()) };
+        let cfd = unsafe { libc::accept(lfd, no_addr, no_len) };
         if cfd < 0 {
             let e = std::io::Error::last_os_error();
             tracing::error!("mock fuser: accept failed: {e}");

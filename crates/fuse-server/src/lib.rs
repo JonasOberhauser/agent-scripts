@@ -1,4 +1,4 @@
-#![cfg_attr(test, allow(clippy::unwrap_used))]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::panic, unused_results))]
 pub mod handler;
 pub mod oracle_service;
 pub mod policy_store;

@@ -41,7 +41,7 @@
 //! ```sh
 //! sudo systemd-run --unit=fuse-hashd <path-to-this-binary> --socket <sock>
 //! ```
-#![cfg_attr(test, allow(clippy::unwrap_used))]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::panic, unused_results))]
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
@@ -207,7 +207,7 @@ fn serve_conns(
 ) {
     for conn in listener.incoming().flatten() {
         let handler = std::sync::Arc::clone(&handler);
-        std::thread::spawn(move || handler(conn));
+        let _conn_thread = std::thread::spawn(move || handler(conn));
     }
 }
 

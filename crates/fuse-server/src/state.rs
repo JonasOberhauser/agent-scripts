@@ -209,6 +209,10 @@ impl ServerState {
     /// heuristic is a guess, and anything stronger would plant a
     /// secret-derived fingerprint in the policy daemon, against the
     /// "holds NO secret bytes" rule.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the persist lock was poisoned by a panicking mutation.
     pub fn add_with_mode(
         &self,
         name: impl Into<String>,
@@ -246,7 +250,7 @@ impl ServerState {
             crate::policy_store::persist_locked(self);
             return;
         }
-        self.secrets.insert(
+        let _prev = self.secrets.insert(
             name,
             Arc::new(Mutex::new(SecretRecord {
                 host_path: host_path.into(),
@@ -262,6 +266,11 @@ impl ServerState {
         crate::policy_store::persist_locked(self);
     }
 
+    /// Remove a secret; returns whether it existed.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the persist lock was poisoned by a panicking mutation.
     pub fn remove(&self, name: &str) -> bool {
         let _pl = self.persist_lock
                 .lock()
@@ -273,6 +282,12 @@ impl ServerState {
         existed
     }
 
+    /// Policy-check one read: forward-only within a streaming read,
+    /// unlimited after grant-forever, `NotFound` for unknown secrets.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the persist lock was poisoned by a panicking mutation.
     pub fn attempt_read(
         &self,
         name: &str,
@@ -339,6 +354,12 @@ impl ServerState {
         }
     }
 
+    /// Reset the access bookkeeping of one secret (or all when
+    /// `None`); returns how many were reset.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the persist lock was poisoned by a panicking mutation.
     pub fn reset(&self, name: Option<&str>) -> usize {
         let _pl = self.persist_lock
                 .lock()
@@ -380,6 +401,10 @@ impl ServerState {
 
     /// Replace the permitted-hash set with a single hash — the
     /// explicit policy path (`rotate`); re-adds APPEND instead.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the persist lock was poisoned by a panicking mutation.
     pub fn rotate_hash(&self, name: &str, new_hash: &str) -> bool {
         let _pl = self.persist_lock
                 .lock()
@@ -419,6 +444,9 @@ impl ServerState {
 
     /// Like [`Self::create_pending`], recording why a failed package-hash
     /// inspection left `pid_hash` empty (surfaced by grant-forever).
+    /// # Panics
+    ///
+    /// Panics if the persist lock was poisoned by a panicking mutation.
     #[allow(clippy::too_many_arguments)]
     pub fn create_pending_with_hash_error(
         &self,
@@ -430,7 +458,7 @@ impl ServerState {
         process_name: Option<&str>,
     ) -> u64 {
         let id = self.next_pending_id.fetch_add(1, Ordering::SeqCst);
-        self.pending.insert(id, PendingAccess {
+        let _prev = self.pending.insert(id, PendingAccess {
             id,
             secret_name: secret_name.to_string(),
             process_name: process_name.map(|s| s.to_string()),
@@ -491,6 +519,10 @@ impl ServerState {
     /// Grant a pending access permanently: the observed package hash
     /// becomes the secret's allowed hash and the read limit is lifted.
     /// The waiting reader is served like a normal grant.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the persist lock was poisoned by a panicking mutation.
     pub fn grant_pending_forever(&self, id: u64) -> Result<(), String> {
         let _pl = self.persist_lock
                 .lock()
@@ -562,7 +594,7 @@ impl ServerState {
     }
 
     pub fn remove_pending(&self, id: u64) {
-        self.pending.remove(&id);
+        let _revoked = self.pending.remove(&id);
     }
 
     pub fn cleanup_expired(&self) {
@@ -600,6 +632,10 @@ impl ServerState {
     /// Post-grant adjudication: a pending that was just granted may be
     /// served regardless of hash — record the access (forward-only
     /// progress by offset/size) and confirm the secret still exists.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the persist lock was poisoned by a panicking mutation.
     pub fn granted_read(&self, name: &str, pid: u32, offset: usize, size: usize) -> bool {
         let _pl = self.persist_lock
                 .lock()

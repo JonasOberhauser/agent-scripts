@@ -2,7 +2,7 @@
 //!
 //! No /dev/fuse needed — the socket server runs independently from the FUSE mount.
 
-#![cfg_attr(test, allow(clippy::unwrap_used))]
+#![allow(clippy::unwrap_used, clippy::panic, unused_results)]
 
 use std::path::{Path, PathBuf};
 use std::os::unix::net::UnixStream;

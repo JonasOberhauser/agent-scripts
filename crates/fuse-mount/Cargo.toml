@@ -27,5 +27,3 @@ clap = { workspace = true }
 tempfile = "3"
 fuse-server = { path = "../fuse-server" }
 
-[lints]
-workspace = true

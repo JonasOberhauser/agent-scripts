@@ -10,7 +10,7 @@
 //!
 //! Run under a mount-capable context (e.g. the userns wrapper).
 
-#![cfg_attr(test, allow(clippy::unwrap_used))]
+#![allow(clippy::unwrap_used, clippy::panic, unused_results)]
 
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::path::{Path, PathBuf};
@@ -364,8 +364,10 @@ fn inner_name_of(store: &Path, name: &str) -> String {
 /// the split-invariant tests (#50): kill -9 leaves no cleanup hooks —
 /// stale sockets and dead mounts are exactly what the survivors see.
 fn kill9(c: &mut Child) {
+    let pid = c.id() as i32;
+    let sig = libc::SIGKILL;
     // SAFETY: a plain signal to one child pid we own.
-    unsafe { libc::kill(c.id() as i32, libc::SIGKILL); }
+    unsafe { libc::kill(pid, sig) };
     let _ = c.wait();
 }
 
@@ -435,9 +437,11 @@ fn mounted_fuse(path: &Path) -> bool {
     // SAFETY: libc::statfs is a struct of plain integers/arrays with no
     // invalid zero bit patterns; zero-init is a valid value.
     let mut st = unsafe { std::mem::zeroed::<libc::statfs>() };
+    let path_ptr = c.as_ptr();
     // SAFETY: the path is a valid NUL-terminated CString owned by `c`
     // and `st` is a valid, aligned out-pointer for the duration of the call.
-    unsafe { libc::statfs(c.as_ptr(), &mut st) == 0 && st.f_type == libc::FUSE_SUPER_MAGIC }
+    let stat_ok = unsafe { libc::statfs(path_ptr, &mut st) };
+    stat_ok == 0 && st.f_type == libc::FUSE_SUPER_MAGIC
 }
 
 fn log_tail(path: Option<&Path>) -> String {

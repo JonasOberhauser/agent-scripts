@@ -1,4 +1,4 @@
-#![cfg_attr(test, allow(clippy::unwrap_used))]
+#![allow(clippy::unwrap_used, clippy::panic, unused_results)]
 
 #[cfg(test)]
 mod tests {

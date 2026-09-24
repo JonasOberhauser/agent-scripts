@@ -24,6 +24,7 @@
 //!
 //! Deterministic: splitmix64 seeded per case; failures print their
 //! seed for a one-line repro (`FUZZ_SEED=<n> cargo test fuzz_`).
+#![allow(clippy::unwrap_used, clippy::panic, unused_results)]
 
 use fuse_protocol::io::{CommandOutput, PathState, SystemIo};
 use fuse_protocol::IoError;

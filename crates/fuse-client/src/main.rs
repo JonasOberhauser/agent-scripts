@@ -1,4 +1,4 @@
-#![cfg_attr(test, allow(clippy::unwrap_used))]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::panic, unused_results))]
 use std::path::PathBuf;
 
 use clap::Parser;
@@ -153,7 +153,7 @@ fn main() {
                     .expect("panel log sink lock: TUI callback, single consumer")
                     .push(line.to_string());
             }));
-            display.add_layer(Box::new(panel));
+            let _layer_id = display.add_layer(Box::new(panel));
             display.set_log_sink(log_sink);
             if let Err(e) = display.run(&cli.socket, &protocols) {
                 eprintln!("Error: {e}");
@@ -222,7 +222,7 @@ fn check_version_or_restart(app: &App) {
 
     eprintln!("Version mismatch: client={}, server={}", CLIENT_VERSION, server_version);
     eprint!("Restart server to update? [y/N] ");
-    std::io::Write::flush(&mut std::io::stdout()).ok();
+    let _flushed = std::io::Write::flush(&mut std::io::stdout()).ok();
     let mut input = String::new();
     if std::io::stdin().read_line(&mut input).is_err() {
         return;
@@ -237,7 +237,7 @@ fn check_version_or_restart(app: &App) {
     let log_path = log_path.unwrap_or_else(|| {
         eprintln!("Old server doesn't support log path discovery.");
         eprint!("Log file path (Enter=/tmp/fuse-gatekeeper.log): ");
-        std::io::Write::flush(&mut std::io::stdout()).ok();
+        let _flushed = std::io::Write::flush(&mut std::io::stdout()).ok();
         let mut s = String::new();
         let _ = std::io::stdin().read_line(&mut s);
         let t = s.trim();
@@ -373,14 +373,22 @@ fn start_server_from_state(app: &App, state: &ServerStateFile, log_path: Option<
 
     use std::os::unix::process::CommandExt;
     let mut cmd = std::process::Command::new(&spawn_prog);
-    cmd.args(&spawn_args)
+    let _cmd = cmd
+        .args(&spawn_args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::from(log_file))
         .stderr(std::process::Stdio::from(log_file2));
-    // SAFETY: `pre_exec` callbacks run between fork(2) and execve(2) and
-    // must be async-signal-safe; the closure only calls setsid(2) — no
-    // allocation, no locks, no libc state touched.
-    unsafe { cmd.pre_exec(|| { libc::setsid(); Ok(()) }); }
+    fn child_setsid() -> std::io::Result<()> {
+        // SAFETY: runs between fork(2) and execve(2) and must be
+        // async-signal-safe; setsid(2) only — no allocation, no locks,
+        // no libc state touched.
+        let _sid = unsafe { libc::setsid() };
+        Ok(())
+    }
+    let cmd_mut = &mut cmd;
+    let setsid_cb = child_setsid;
+    // SAFETY: the callback is async-signal-safe (see above).
+    let _cmd = unsafe { cmd_mut.pre_exec(setsid_cb) };
     match cmd.spawn() {
         Ok(child) => eprintln!("  Spawned pid {}", child.id()),
         Err(e) => {
@@ -445,9 +453,10 @@ fn restart_server(app: &App, log_path: Option<&str>) {
             // passed: signal exactly this process.
             // SAFETY: a plain signal to one verified pid; no
             // process-group or pattern semantics involved.
-            unsafe {
-                libc::kill(pid, libc::SIGTERM);
-            }
+            let sig = libc::SIGTERM;
+            // SAFETY: a plain signal to one verified pid; no
+            // process-group or pattern semantics involved.
+            let _killed = unsafe { libc::kill(pid, sig) };
         }
         ServerKillSpec::OrphanBySocket { socket } => {
             // Unnamed or pid-reused: match orphans by the stack's OWN
@@ -493,7 +502,7 @@ fn restart_server(app: &App, log_path: Option<&str>) {
 
 fn check_start_server(app: &App) {
     eprint!("Server is not running. Start it? [y/N] ");
-    std::io::Write::flush(&mut std::io::stdout()).ok();
+    let _flushed = std::io::Write::flush(&mut std::io::stdout()).ok();
     let mut input = String::new();
     if std::io::stdin().read_line(&mut input).is_err() { return; }
     if input.trim().to_lowercase() != "y" { return; }
@@ -512,7 +521,7 @@ fn check_start_server(app: &App) {
 fn ask_reset_anyway() {
     eprintln!("Failed to get current secret list for restore.");
     eprint!("Reset server anyways (all secrets will be lost)? [y/N] ");
-    std::io::Write::flush(&mut std::io::stdout()).ok();
+    let _flushed = std::io::Write::flush(&mut std::io::stdout()).ok();
     let mut input = String::new();
     let _ = std::io::stdin().read_line(&mut input);
     if input.trim().to_lowercase() == "y" {
@@ -537,8 +546,9 @@ fn ask_reset_anyway() {
         let st = state.as_ref().unwrap_or(&st);
         match server_kill_spec(st) {
             ServerKillSpec::NamedPid { pid, .. } => {
+                let sig = libc::SIGTERM;
                 // SAFETY: one verified pid, plain SIGTERM.
-                unsafe { libc::kill(pid, libc::SIGTERM) };
+                let _killed = unsafe { libc::kill(pid, sig) };
             }
             ServerKillSpec::OrphanBySocket { socket } => {
                 let pat = format!("--socket {socket}");

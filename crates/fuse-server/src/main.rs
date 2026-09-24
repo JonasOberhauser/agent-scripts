@@ -5,7 +5,7 @@
 //! fuse-client, and the oracle endpoint the data daemon (`fused`)
 //! connects to. It holds NO secret bytes in split mode: content goes to
 //! the data daemon through the oracle hub, metadata stays here.
-#![cfg_attr(test, allow(clippy::unwrap_used))]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::panic, unused_results))]
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
@@ -46,18 +46,21 @@ static CLEANUP_SOCKETS: OnceLock<(std::ffi::CString, std::ffi::CString)> = OnceL
 
 extern "C" fn shutdown_handler(_sig: libc::c_int) {
     if let Some((cmd, oracle)) = CLEANUP_SOCKETS.get() {
-        // SAFETY: signal-handler context — only unlink(2) (async-signal-
-        // safe) on CStrings precomputed before the handler was armed; no
-        // allocation, locks, or Rust runtime calls.
-        unsafe {
-            libc::unlink(cmd.as_ptr());
-            libc::unlink(oracle.as_ptr());
-        }
+        // Signal-handler context — only unlink(2) (async-signal-safe)
+        // on CStrings precomputed before the handler was armed; no
+        // allocation, locks, or Rust runtime calls. One op per block.
+        let cmd_ptr = cmd.as_ptr();
+        // SAFETY: see above.
+        let _unlinked = unsafe { libc::unlink(cmd_ptr) };
+        let oracle_ptr = oracle.as_ptr();
+        // SAFETY: see above.
+        let _unlinked = unsafe { libc::unlink(oracle_ptr) };
     }
+    let code = 130;
     // SAFETY: _exit(2) is the async-signal-safe way out of a handler; it
     // intentionally skips atexit/destructors to avoid non-signal-safe
     // cleanup in this context.
-    unsafe { libc::_exit(130); }
+    unsafe { libc::_exit(code) }
 }
 
 /// Supervised data daemon (kept alive by being our child; killed when
@@ -106,7 +109,7 @@ fn main() {
                     .spawn();
                 match child {
                     Ok(c) => {
-                        SUPERVISED_FUSED
+                        let _replaced = SUPERVISED_FUSED
                             .lock()
                             .expect("supervised-fused lock: set once at spawn")
                             .replace(c);
@@ -136,16 +139,22 @@ fn main() {
         std::ffi::CString::new(cli.socket.to_string_lossy().as_bytes()),
         std::ffi::CString::new(cli.oracle_socket.to_string_lossy().as_bytes()),
     ) {
-        CLEANUP_SOCKETS.set((a, b)).ok();
+        let _set = CLEANUP_SOCKETS.set((a, b)).ok();
     }
     // SAFETY: the registered handler performs only async-signal-safe
     // operations (see its own SAFETY note); signal(2) stores the raw
     // handler address, which outlives the process lifetime (a static
     // extern "C" fn).
-    unsafe {
-        libc::signal(libc::SIGINT, shutdown_handler as *const () as usize);
-        libc::signal(libc::SIGTERM, shutdown_handler as *const () as usize);
-    }
+    let handler = shutdown_handler as *const () as usize;
+    let sigint = libc::SIGINT;
+    // SAFETY: the registered handler performs only async-signal-safe
+    // operations (see its own SAFETY note); signal(2) stores the raw
+    // handler address, which outlives the process lifetime (a static
+    // extern "C" fn).
+    let _prev = unsafe { libc::signal(sigint, handler) };
+    let sigterm = libc::SIGTERM;
+    // SAFETY: as above.
+    let _prev = unsafe { libc::signal(sigterm, handler) };
 
     // ── State: metadata here, content pushed to the data daemon ──
     let mut state = ServerState::new();
@@ -203,7 +212,7 @@ fn main() {
     // ── Command socket (fuse-client / servatui) ──────────────────
     let socket_path = cli.socket.clone();
     let socket_state = Arc::clone(&state);
-    std::thread::spawn(move || {
+    let _socket_server = std::thread::spawn(move || {
         if let Err(e) = fuse_server::run_socket_server(&socket_path, socket_state) {
             error!("Socket server error: {e}");
             std::process::exit(1);

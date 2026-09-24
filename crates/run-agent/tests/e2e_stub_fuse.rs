@@ -32,7 +32,7 @@
 //! cargo test -p run-agent --test e2e_stub_fuse -- --nocapture
 //! ```
 
-#![cfg_attr(test, allow(clippy::unwrap_used))]
+#![allow(clippy::unwrap_used, clippy::panic, unused_results)]
 
 use std::io::{Read, Write as _};
 use std::path::{Path, PathBuf};

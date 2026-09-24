@@ -71,3 +71,16 @@ jobs:
           # there).
           podman system migrate || true
           cargo test -p run-agent --test e2e_stub_fuse --test e2e_empty_os -- --include-ignored
+
+  lint-policy:
+    # Shared Servyi policy (servyi/lints): clippy under the shared
+    # flag list, the unsafe_scope driver, rustdoc links — in this
+    # job's environment, with this project's native deps.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install native deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libfuse3-dev
+      - uses: servyi/lints/.github/actions/lint-policy@main

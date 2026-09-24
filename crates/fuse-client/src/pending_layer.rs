@@ -525,7 +525,7 @@ fn fit_requester_and_secret(req: &PendingAccessInfo, collapsed: Option<&str>, ma
 /// Hover (#25): the button under the mouse renders with the same
 /// reverse-video highlight as the keyboard selection.
 fn grid_row_line_hover(
-    row: GridRow,
+    row: GridRow<'_>,
     width: u16,
     sel_here: Option<Sel>,
     hovered: Option<&Button>,
@@ -541,12 +541,12 @@ fn grid_row_line_hover(
 }
 
 #[cfg(test)]
-fn grid_row_line(row: GridRow, width: u16, sel_here: Option<Sel>) -> Line<'static> {
+fn grid_row_line(row: GridRow<'_>, width: u16, sel_here: Option<Sel>) -> Line<'static> {
     grid_row_line_styled(row, width, sel_here, false)
 }
 
 fn grid_row_line_styled(
-    row: GridRow,
+    row: GridRow<'_>,
     width: u16,
     sel_here: Option<Sel>,
     disabled: bool,
@@ -555,7 +555,7 @@ fn grid_row_line_styled(
 }
 
 fn grid_row_line_styled_collapsed(
-    row: GridRow,
+    row: GridRow<'_>,
     width: u16,
     sel_here: Option<Sel>,
     disabled: bool,
@@ -752,7 +752,7 @@ pub(crate) fn spawn_worker(
     log: LogSink,
 ) -> WorkerTalk {
     let (tx, rx) = std::sync::mpsc::channel::<PanelRequest>();
-    std::thread::spawn(move || {
+    let _worker = std::thread::spawn(move || {
         for req in rx {
             let follow_up = matches!(req, PanelRequest::Action { .. });
             service(&socket, &snapshot, &secrets, &collapsed, &error, &log, req);
@@ -938,7 +938,7 @@ impl PendingPanelLayer {
             if let Command::Grant { id } | Command::GrantForever { id } | Command::Deny { id } =
                 &command
             {
-                self.in_flight.borrow_mut().insert(*id, Instant::now());
+                let _prev = self.in_flight.borrow_mut().insert(*id, Instant::now());
             }
             self.talk
                 .request(&self.pending, PanelRequest::Action { name, command });
@@ -948,7 +948,7 @@ impl PendingPanelLayer {
 }
 
 impl DisplayLayer for PendingPanelLayer {
-    fn on_overlay(&mut self, ctx: &mut LayerCtx, widgets: &mut Vec<WidgetEntry>) -> StackIntent {
+    fn on_overlay(&mut self, ctx: &mut LayerCtx<'_>, widgets: &mut Vec<WidgetEntry>) -> StackIntent {
         // Self-polling: the panel owns the 1s poll cadence (the frame
         // loop ticks every ~100ms, so a fresh request appears within one
         // interval). The request itself never blocks the frame.
@@ -1159,7 +1159,7 @@ impl DisplayLayer for PendingPanelLayer {
         intent
     }
 
-    fn on_event(&mut self, ev: &Event, _ctx: &LayerCtx) -> EventResult {
+    fn on_event(&mut self, ev: &Event, _ctx: &LayerCtx<'_>) -> EventResult {
         match ev {
             Event::Mouse(m) => match m.kind {
                 MouseEventKind::Down(_) => {
@@ -1322,7 +1322,7 @@ mod tests {
         })
     }
 
-    fn frame_with_pending(display: &mut servatui_display::Display) {
+    fn frame_with_pending(display: &mut servatui_display::Display<'_>) {
         let mut widgets = vec![WidgetEntry {
             name: servyi_servatui::WIDGET_INPUT,
             widget: Box::new(Paragraph::new("")),
