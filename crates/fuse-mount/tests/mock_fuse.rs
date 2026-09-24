@@ -62,7 +62,7 @@ fn spawn_fused(dir: &Path, oracle: &Path) -> Fused {
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    panic!("fused never bound the mock control socket");
+    unreachable!("fused never bound the mock control socket within 10s");
 }
 
 /// The in-process policy daemon: real wire protocol, dead hashd seam

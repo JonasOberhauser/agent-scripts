@@ -969,10 +969,10 @@ mod tests {
             let path = Path::new(outer);
             match st.tree.get(path) {
                 Some(Node::File { .. }) => {}
-                Some(Node::Dir { .. }) => panic!(
+                Some(Node::Dir { .. }) => unreachable!(
                     "seed {seed}: served outer \"{outer}\" became a directory"
                 ),
-                None => panic!(
+                None => unreachable!(
                     "seed {seed}: bijection holds an outer \"{outer}\" that left the tree \
                      (label leak: remove did not clean the bimap)"
                 ),
