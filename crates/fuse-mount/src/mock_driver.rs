@@ -60,8 +60,11 @@ impl MockDriver {
     pub fn connect(path: &Path) -> std::io::Result<Self> {
         // SAFETY: socket(2)/connect(2) on a caller-owned path; the fd
         // is wrapped in UnixStream on success and closed by it.
+        let af_unix = libc::AF_UNIX;
+        let seqpacket = libc::SOCK_SEQPACKET;
+        let zero = 0;
         // SAFETY: socket(2) returns a fresh fd (or -1, checked).
-        let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_SEQPACKET, 0) };
+        let fd = unsafe { libc::socket(af_unix, seqpacket, zero) };
         if fd < 0 {
             return Err(std::io::Error::last_os_error());
         }
@@ -75,21 +78,17 @@ impl MockDriver {
             let _closed = unsafe { libc::close(fd) };
             return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "path too long"));
         }
-        // SAFETY: &[u8] and &[c_char] have the same layout; the
-        // length was bounds-checked above.
-        unsafe {
-            addr.sun_path[..bytes.len()]
-                .copy_from_slice(std::mem::transmute::<&[u8], &[libc::c_char]>(bytes));
-        }
+        let dst = addr.sun_path.as_mut_ptr() as *mut u8;
+        let src = bytes.as_ptr();
+        let n = bytes.len();
+        // SAFETY: &[u8] and &[c_char] have the same layout; the length
+        // was bounds-checked above; one memcpy, no overlap.
+        unsafe { std::ptr::copy(src, dst, n) };
+        let p = &addr as *const _ as *const libc::sockaddr;
+        let len = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
         // SAFETY: connect(2) on a caller-owned path with the
         // fully-initialized addr above.
-        let rc = unsafe {
-            libc::connect(
-                fd,
-                &addr as *const _ as *const libc::sockaddr,
-                std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
-            )
-        };
+        let rc = unsafe { libc::connect(fd, p, len) };
         if rc != 0 {
             let e = std::io::Error::last_os_error();
             // SAFETY: close(2) on our own fd; the result only reports
