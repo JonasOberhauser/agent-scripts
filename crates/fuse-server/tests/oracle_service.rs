@@ -525,3 +525,72 @@ fn control_channel_replays_snapshot_and_pushes_updates() {
     let cmd: OracleCommand = serde_json::from_str(line.trim()).unwrap();
     assert_eq!(cmd, OracleCommand::Serve { name: "seed".into(), inner: "d2".into(), mode: 0o600 });
 }
+
+#[test]
+fn a_stuck_data_daemon_does_not_wedge_the_policy_daemon() {
+    // Issue #77: a control connection whose peer STOPPED READING
+    // (stuck-but-alive data daemon) must not block broadcast forever
+    // — it wedges the hub lock and with it every AddSecret/Remove on
+    // the command socket. The dead-peer case (EPIPE) is handled; the
+    // full-buffer case is the bug. A stuck peer must be dropped like
+    // a dead one.
+    let dir = tempfile::tempdir().unwrap();
+    let oracle = dir.path().join("stuck.sock");
+    let state = Arc::new(ServerState::new());
+    *state.pending_timeout.lock().unwrap() = Duration::from_secs(1);
+    let host = dir.path().join("host");
+    std::fs::write(&host, b"X").unwrap();
+    state.add("s", &host, 1, "*");
+    let hub = OracleHub::new();
+    {
+        let (st, hb, p) = (Arc::clone(&state), hub.clone(), oracle.clone());
+        std::thread::spawn(move || { let _ = run_oracle_server(&p, st, hb); });
+    }
+    for _ in 0..200 {
+        if oracle.exists() { break; }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    // The stuck daemon: connects, says Hello (becomes a control
+    // connection), then NEVER reads. Clamp its receive buffer small
+    // so filling it is deterministic.
+    use std::os::unix::io::AsRawFd;
+    let mut stuck = std::os::unix::net::UnixStream::connect(&oracle).unwrap();
+    // SAFETY: setsockopt(2) on our own fd with a c_int operand.
+    unsafe {
+        let sz: libc::c_int = 4096;
+        libc::setsockopt(
+            stuck.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            &sz as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+    }
+    stuck.write_all(b"{\"type\":\"hello\"}\n").unwrap();
+    std::thread::sleep(Duration::from_millis(200)); // registered
+
+    // Fill the stuck peer's buffer (big names, ~1MB total), then one
+    // more broadcast and a state mutation — all must COMPLETE. Run
+    // under a watchdog: the bug manifests as an unbounded block.
+    let hb2 = hub.clone();
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        let big = "n".repeat(64 * 1024);
+        for _ in 0..16 {
+            hb2.serve(&big, "x", 0o400);
+        }
+        hb2.serve("final", "x", 0o400);
+        let _ = tx.send(());
+    });
+    rx.recv_timeout(Duration::from_secs(8))
+        .expect("broadcast wedged on a stuck control peer — the hub lock \
+                 is held and the command socket is frozen (issue #77)");
+
+    // And the policy daemon still answers work afterwards.
+    assert_eq!(
+        state.attempt_read("s", 7, Some("*"), 0, 1),
+        ReadOutcome::Granted
+    );
+    drop(stuck);
+}
