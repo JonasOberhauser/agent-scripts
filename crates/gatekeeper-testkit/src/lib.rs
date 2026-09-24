@@ -88,10 +88,10 @@ fn take_lease(tag: &str) -> Lease {
         .lock()
         .unwrap_or_else(|p| p.into_inner());
     let duplicate = !set.insert(tag.to_string());
-    // The guard is DROPPED before the panic — the lock must not be
+    // The guard is DROPPED before the abort — the lock must not be
     // held across it (the first version poisoned it and cascaded).
     if duplicate {
-        panic!(
+        unreachable!(
             "testkit: stack tag {tag:?} is already leased by another live stack in \
              this test binary — two tests colliding, or a stack not yet dropped. \
              Tags may repeat across binaries (random roots), never within one."
