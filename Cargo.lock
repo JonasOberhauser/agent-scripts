@@ -419,6 +419,7 @@ dependencies = [
  "nix 0.29.0",
  "serde",
  "serde_json",
+ "servyi-servatui",
  "tempfile",
  "tracing",
  "tracing-subscriber",

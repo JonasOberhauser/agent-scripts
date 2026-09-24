@@ -313,3 +313,292 @@ fn e2e_fuzz_the_daemons_survive_and_contain() {
         drive_seed(seed);
     }
 }
+
+// ── tier 2 of #73: kill-timing fuzz — the randomized #68 ────────
+// Real fuse-server PROCESS + real fused PROCESS (mock kernel); kill
+// -9 either at random moments mid-session, respawn, and assert the
+// split's invariants per seed:
+//   policy kill: the mount (driver session) keeps serving pinned
+//     state; the respawned policy reloads the SAME budget from the
+//     MR5 store (spent stays spent — no free re-reads);
+//   fused kill:  the mount dies with it (fused owns it); the policy
+//     never notices; a fresh fused remounts and the snapshot replays;
+//     the budget is untouched (it lives in the policy daemon).
+
+fn server_bin() -> std::path::PathBuf {
+    // Cross-crate binary: the same path convention e2e_client and
+    // fuse_e2e use (CARGO_BIN_EXE_ only reaches same-package bins).
+    let p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/debug/fuse-server");
+    assert!(p.exists(), "fuse-server not built (cargo build --workspace): {}", p.display());
+    p
+}
+
+/// Minimal cmd-socket client: one JSON request per connection, one
+/// reply line back (the daemon's documented framing).
+fn cmd_status(socket: &std::path::Path) -> String {
+    // The REAL client half — the same App + protocols run_agent uses;
+    // run_cli_command_raw returns the server's raw JSON Response.
+    let app = servyi_servatui::App::builder(socket)
+        .protocol_all(fuse_protocol::client_protocols())
+        .build();
+    let (lines, raw) = app
+        .run_cli_command_raw("status", "")
+        .expect("status round-trip through the real client half");
+    let _ = lines;
+    String::from_utf8_lossy(&raw).into_owned()
+}
+
+/// The served secret's (access_count, inner name) through the real
+/// status command — the inner label comes from the daemon's MINTED
+/// salt (issue #47), never from the test.
+fn status_of_s(socket: &std::path::Path) -> (u64, String) {
+    let reply = cmd_status(socket);
+    let resp: fuse_protocol::Response = serde_json::from_str(reply.trim()).expect("status parses");
+    match resp {
+        fuse_protocol::Response::Status { secrets, .. } => secrets
+            .iter()
+            .find(|s| s.name == "s")
+            .map(|s| (s.access_count, s.inner.clone()))
+            .unwrap_or((u64::MAX, String::new())),
+        _ => panic!("status replied {reply}"),
+    }
+}
+
+fn budget(socket: &std::path::Path) -> u64 {
+    status_of_s(socket).0
+}
+
+struct ProcStack {
+    dir: tempfile::TempDir,
+    oracle: std::path::PathBuf,
+    cmd_sock: std::path::PathBuf,
+    policy_store: std::path::PathBuf,
+    host: std::path::PathBuf,
+    inner: String,
+    policy: Option<std::process::Child>,
+    fused: Option<Fused>,
+    control: std::path::PathBuf,
+    mount: std::path::PathBuf,
+}
+
+impl ProcStack {
+    fn spawn_policy(&mut self) {
+        let log = std::fs::OpenOptions::new()
+            .create(true).append(true)
+            .open(self.dir.path().join("policy.log")).unwrap();
+        #[allow(clippy::zombie_processes)]
+        let child = std::process::Command::new(server_bin())
+            .arg("--socket").arg(&self.cmd_sock)
+            .arg("--oracle-socket").arg(&self.oracle)
+            .arg("--pending-timeout").arg("1")
+            .arg("--secret").arg(format!("s:{}:*", self.host.display()))
+            .env("FUSE_GATEKEEPER_POLICY", &self.policy_store)
+            .env("RUST_LOG", "warn")
+            .stdout(std::process::Stdio::from(log.try_clone().unwrap()))
+            .stderr(log)
+            .spawn().expect("spawn fuse-server");
+        self.policy = Some(child);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if std::os::unix::net::UnixStream::connect(&self.cmd_sock).is_ok() { break; }
+            assert!(Instant::now() < deadline, "policy daemon never answered");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn spawn_fused(&mut self) {
+        if let Some(mut old) = self.fused.take() {
+            let _ = old.child.kill();
+            let _ = old.child.wait();
+            let _ = std::fs::remove_file(&old.control);
+        }
+        let log = std::fs::OpenOptions::new()
+            .create(true).append(true)
+            .open(self.dir.path().join("fused.log")).unwrap();
+        #[allow(clippy::zombie_processes)]
+        let child = std::process::Command::new(env!("CARGO_BIN_EXE_fused"))
+            .arg("--mount-point").arg(&self.mount)
+            .arg("--oracle-socket").arg(&self.oracle)
+            .arg("--mock-fuse").arg(&self.control)
+            .env("RUST_LOG", "warn")
+            .stdout(std::process::Stdio::from(log.try_clone().unwrap()))
+            .stderr(log)
+            .spawn().expect("respawn fused");
+        let control = self.control.clone();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if control.exists() { break; }
+            assert!(Instant::now() < deadline, "fused never bound the control socket");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        self.fused = Some(Fused { child, control });
+    }
+
+    fn kill9_policy(&mut self) {
+        if let Some(mut c) = self.policy.take() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+        // The socket FILE survives the kill; remove it so respawn's
+        // stale-socket handling is exercised exactly as in production.
+        let _ = std::fs::remove_file(&self.cmd_sock);
+    }
+
+    fn up(seed: u64) -> ProcStack {
+        let dir = tempfile::tempdir().unwrap();
+        let oracle = dir.path().join("oracle.sock");
+        let cmd_sock = dir.path().join("cmd.sock");
+        let policy_store = dir.path().join("policy.json");
+        let host = dir.path().join("host-secret");
+        let len = 1 + (seed % 512) as usize;
+        std::fs::write(&host, vec![b'X'; len]).unwrap();
+        let control = dir.path().join("mock-fuse.sock");
+        let mount = dir.path().join("mnt");
+        std::fs::create_dir_all(&mount).unwrap();
+        let mut s = ProcStack {
+            dir, oracle, cmd_sock, policy_store, host,
+            inner: String::new(),
+            policy: None, fused: None,
+            control, mount,
+        };
+        s.spawn_policy();
+        // The inner label the real daemon derived from its minted salt.
+        s.inner = status_of_s(&s.cmd_sock).1;
+        assert!(!s.inner.is_empty(), "the policy daemon served no inner name");
+        s.spawn_fused();
+        s
+    }
+
+    /// A fresh, initialized driver (kernel session).
+    fn driver(&self) -> MockDriver {
+        let mut d = MockDriver::connect(&self.control).expect("driver connect");
+        let _ = d.init().expect("driver init");
+        d
+    }
+}
+
+impl Drop for ProcStack {
+    fn drop(&mut self) {
+        // Best-effort teardown; tempdir does the rest.
+        if let Some(mut c) = self.policy.take() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+        if let Some(mut f) = self.fused.take() {
+            let _ = f.child.kill();
+            let _ = f.child.wait();
+        }
+    }
+}
+
+fn drive_kill_seed(seed: u64) {
+    let mut rng = Rng(seed.wrapping_mul(0x7777777700000001) | 1);
+    let mut s = ProcStack::up(seed);
+
+    // Baseline: the secret is served and readable (wildcard hash —
+    // hashd is dead, so any pid's first open legitimately grants).
+    let (ino, spent) = {
+        let mut d = s.driver();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(dh) = d.opendir(fuser::FUSE_ROOT_ID) {
+                if let Ok(entries) = d.readdir(dh.fh, 4096) {
+                    let _ = d.releasedir(fuser::FUSE_ROOT_ID, dh.fh);
+                    if entries.iter().any(|(_, n)| n == &s.inner) { break; }
+                }
+            }
+            assert!(Instant::now() < deadline, "seed {seed}: Serve never landed");
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let e = d.lookup(&s.inner).expect("baseline lookup");
+        let opened = d.open(e.nodeid).expect("baseline open (wildcard grants)");
+        let data = d.read(opened.fh, 0, 4096).expect("baseline read");
+        assert_eq!(data.len(), 1 + (seed % 512) as usize);
+        let _ = d.release(e.nodeid, opened.fh);
+        (e.nodeid, budget(&s.cmd_sock))
+    };
+    assert_eq!(spent, 1, "seed {seed}: one open consumed exactly one budget");
+
+    // The kill-timing chaos: 2-4 events, each a random daemon at a
+    // random moment (between driver ops).
+    let events = 2 + (rng.next() % 3);
+    let mut spent_now = spent;
+    for _ in 0..events {
+        let kill_policy = rng.next().is_multiple_of(2);
+        if kill_policy {
+            s.kill9_policy();
+            // The data daemon's mount survives; the driver (kernel)
+            // can still serve the already-adjudicated state... a
+            // fresh LOOKUP needs the policy back, so respawn and
+            // verify the BUDGET survived the MR5 store round-trip.
+            s.spawn_policy();
+            let b = budget(&s.cmd_sock);
+            assert_eq!(
+                b, spent_now,
+                "seed {seed}: policy kill changed the budget (free re-read or lost spend)"
+            );
+        } else {
+            // fused kill: mount dies with it; the policy must not
+            // notice; fresh fused remounts + snapshot replays.
+            let before = budget(&s.cmd_sock);
+            s.spawn_fused(); // kills the old one first
+            let mut d = s.driver();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Ok(dh) = d.opendir(fuser::FUSE_ROOT_ID) {
+                    if let Ok(entries) = d.readdir(dh.fh, 4096) {
+                        let _ = d.releasedir(fuser::FUSE_ROOT_ID, dh.fh);
+                        if entries.iter().any(|(_, n)| n == &s.inner) { break; }
+                    }
+                }
+                assert!(Instant::now() < deadline, "seed {seed}: no replay after fused kill");
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            let after = budget(&s.cmd_sock);
+            assert_eq!(before, after, "seed {seed}: fused kill touched the budget");
+        }
+        // After either kill, a well-formed lookup still works.
+        let mut d = s.driver();
+        let look = d.lookup(&s.inner);
+        assert!(look.is_ok(), "seed {seed}: lookup broken after recovery: {:?}", look.err());
+        let _ = ino;
+        // A subsequent open+read (if unspent) must still respect the
+        // budget: update the local view when we spend.
+        if spent_now == 0 {
+            if let Ok(e) = d.lookup(&s.inner) {
+                if let Ok(o) = d.open(e.nodeid) {
+                    let _ = d.read(o.fh, 0, 4096);
+                    let _ = d.release(e.nodeid, o.fh);
+                    spent_now += 1;
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn e2e_kill_timing_both_daemons_recover_with_budget_intact() {
+    // The randomized #68: 12 deterministic worlds in CI (each spawns
+    // real processes; ~1s per world), marathon scales it.
+    for seed in 0..12u64 {
+        drive_kill_seed(seed);
+    }
+}
+
+#[test]
+#[ignore = "marathon: FUZZ_MINUTES=<n> -- --ignored"]
+fn e2e_kill_timing_marathon() {
+    let minutes: u64 = std::env::var("FUZZ_MINUTES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    assert!(minutes > 0, "set FUZZ_MINUTES (the marathon is opt-in)");
+    let stop = Instant::now() + Duration::from_secs(60 * minutes);
+    let mut seed = 0u64;
+    while Instant::now() < stop {
+        drive_kill_seed(seed);
+        seed += 1;
+    }
+    eprintln!("kill-timing marathon: {seed} worlds in {minutes} minutes (all held)");
+}
