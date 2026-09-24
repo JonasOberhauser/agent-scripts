@@ -362,6 +362,16 @@ fn handle_conn(state: &Arc<ServerState>, hub: &OracleHub, conn: UnixStream) {
                 .expect("serializing replayed command: internal enum, infallible"));
         }
         let _ = stream.flush();
+        // Bound the hub's writes to this connection (issue #77): a
+        // stuck-but-alive data daemon — socket buffer full, peer not
+        // reading — would otherwise block broadcast FOREVER while it
+        // holds the hub lock, freezing every AddSecret/Remove on the
+        // command socket. A healthy local daemon drains its socket in
+        // microseconds; 2s is generous. On timeout the write errors
+        // and broadcast drops the connection exactly like a dead peer
+        // (logged below); the daemon's reconnect re-syncs from the
+        // snapshot.
+        let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(2)));
         hub.controls.lock()
             .expect("oracle hub lock: never held across a panic — poisoning means a server bug").push(stream);
         return;
