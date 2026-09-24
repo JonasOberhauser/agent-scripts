@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use fuse_mount::mock_driver::MockDriver;
-use fuse_server::oracle_service::{run_oracle_server, OracleHub};
+use fuse_server::oracle_service::OracleHub;
 use fuse_server::ServerState;
 
 struct Fused {
@@ -67,34 +67,30 @@ fn spawn_fused(dir: &Path, oracle: &Path) -> Fused {
 
 /// The in-process policy daemon: real wire protocol, dead hashd seam
 /// (#69), fast pendings, one secret with the wildcard hash.
-fn oracle_env(dir: &Path) -> (std::path::PathBuf, Arc<ServerState>, OracleHub) {
-    let mut st = ServerState::new();
-    st.hashd_sock = dir.join("hashd-dead.sock").display().to_string();
-    let state = Arc::new(st);
-    *state.pending_timeout.lock().unwrap() = Duration::from_millis(150);
-    let host = dir.join("host-secret");
-    std::fs::write(&host, b"MOCK-FUSE-CONTENT").unwrap();
-    state.add("s", &host, 1, "*");
-    let hub = OracleHub::new();
-    let path = dir.join("oracle.sock");
-    let (s2, hub2, p2) = (Arc::clone(&state), hub.clone(), path.clone());
-    let _oracle_thread = std::thread::spawn(move || {
-        run_oracle_server(&p2, s2, hub2).unwrap();
-    });
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        if path.exists() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    (path, state, hub)
+fn oracle_env(
+    _dir: &Path,
+) -> (std::path::PathBuf, Arc<ServerState>, OracleHub, gatekeeper_testkit::StackHandle) {
+    // The kit (issue #63): per-stack root, dead hashd seam (#69),
+    // 150ms pendings, the host secret under the root. Keep the
+    // HANDLE — dropping it tears the policy stack down.
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let tag = format!("mock-fuse-{}", N.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+    let stack = gatekeeper_testkit::Stack::new(&tag)
+        .pending_timeout(Duration::from_millis(150))
+        .secret("s", b"MOCK-FUSE-CONTENT", "*")
+        .spawn_in_process();
+    (
+        stack.oracle_socket().to_path_buf(),
+        stack.state().clone(),
+        stack.hub().clone(),
+        stack,
+    )
 }
 
 #[test]
 fn fused_serves_a_full_read_path_over_the_mock_kernel() {
     let dir = tempfile::tempdir().unwrap();
-    let (oracle, _state, hub) = oracle_env(dir.path());
+    let (oracle, _state, hub, _keep) = oracle_env(dir.path());
     let fused = spawn_fused(dir.path(), &oracle);
 
     // The control loop needs a moment to connect and receive Serve;
@@ -192,7 +188,7 @@ fn quiescent_fd_count(pid: u32) -> usize {
 #[test]
 fn a_driver_abandoning_an_open_fh_leaks_nothing() {
     let dir = tempfile::tempdir().unwrap();
-    let (oracle, _state, hub) = oracle_env(dir.path());
+    let (oracle, _state, hub, _keep) = oracle_env(dir.path());
     let fused = spawn_fused(dir.path(), &oracle);
     hub.serve("s", "ab12cd34ef56", 0o400);
 
@@ -249,7 +245,7 @@ fn a_driver_abandoning_an_open_fh_leaks_nothing() {
 #[test]
 fn the_session_survives_driver_reconnects() {
     let dir = tempfile::tempdir().unwrap();
-    let (oracle, state, hub) = oracle_env(dir.path());
+    let (oracle, state, hub, _keep) = oracle_env(dir.path());
     let fused = spawn_fused(dir.path(), &oracle);
     hub.serve("s", "ab12cd34ef56", 0o400);
 

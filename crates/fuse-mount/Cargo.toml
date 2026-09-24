@@ -24,6 +24,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { workspace = true }
 
 [dev-dependencies]
+gatekeeper-testkit = { path = "../gatekeeper-testkit" }
 tempfile = "3"
 fuse-server = { path = "../fuse-server" }
 

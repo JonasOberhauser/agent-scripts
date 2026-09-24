@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/fuse-protocol",
     "crates/fuse-server",
+    "crates/gatekeeper-testkit",
     "crates/fuse-client",
     "crates/run-agent",
     "crates/hashd",

@@ -16,7 +16,7 @@
 
 use fuse_protocol::oracle::OracleReply;
 use fuse_protocol::Command;
-use fuse_server::oracle_service::{run_oracle_server, OracleHub};
+use fuse_server::oracle_service::OracleHub;
 use fuse_server::{ReadOutcome, ServerState};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -169,21 +169,17 @@ fn command_socket_chaos_never_panics_and_never_authorizes() {
 // ── gap 3: the oracle socket (the container's random-access surface),
 // against a LIVE daemon over a real socket ──
 
-fn oracle_env(tag: &str, state: Arc<ServerState>) -> std::path::PathBuf {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.keep().join(format!("fuzz-oracle-{tag}.sock"));
-    let st = Arc::clone(&state);
-    let p2 = path.clone();
-    std::thread::spawn(move || {
-        let _ = run_oracle_server(&p2, st, OracleHub::new());
-    });
-    for _ in 0..200 {
-        if path.exists() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    path
+/// The kit-backed oracle environment (issue #63): per-stack root,
+/// real oracle wire. Keep the HANDLE — dropping it tears the stack
+/// (root and socket with it); the old harness keep()d its dir for
+/// exactly as long.
+fn oracle_env_kit(
+    tag: &str,
+    state: Arc<ServerState>,
+) -> (std::path::PathBuf, gatekeeper_testkit::StackHandle) {
+    let handle =
+        gatekeeper_testkit::Stack::from_state(tag, state, OracleHub::new());
+    (handle.oracle_socket().to_path_buf(), handle)
 }
 
 fn send_line(path: &Path, line: &str) -> Option<String> {
@@ -198,19 +194,23 @@ fn send_line(path: &Path, line: &str) -> Option<String> {
 
 #[test]
 fn oracle_socket_random_access_stays_alive_and_contained() {
+    // Host files for the seeds live under ONE kit root (teardown
+    // cleans it; no shared-temp fixed paths — issue #63).
+    let file_stack = gatekeeper_testkit::Stack::new("fuzz-oracle-files").spawn_in_process();
+    let oracle_scratch = file_stack.scratch("");
     for seed in 0..40u64 {
         let mut rng = Rng(seed.wrapping_mul(7919) | 1);
         let mut st = ServerState::new();
-        st.hashd_sock = dead_hashd_sock();
+        st.hashd_sock = gatekeeper_testkit::DEAD_HASHD.to_string();
         let state = Arc::new(st);
         // Short pendings: a wrong-hash ask BLOCKS as a pending (the
         // product) — 150ms keeps the containment probe fast while the
         // pend-out-and-deny flow remains exercised.
         *state.pending_timeout.lock().unwrap() = Duration::from_millis(150);
-        let host = std::env::temp_dir().join("fuzz-oracle-host-reused");
+        let host = oracle_scratch.join(format!("fuzz-oracle-host-{seed}"));
         std::fs::write(&host, b"FUZZ-DATA").unwrap();
         state.add("s", &host, 9, "sha256-real"); // non-wildcard
-        let sock = oracle_env(&seed.to_string(), Arc::clone(&state));
+        let (sock, _keep) = oracle_env_kit(&format!("fuzz-oracle-{seed}"), Arc::clone(&state));
 
         // Chaos: 32 random requests on fresh connections — the
         // container doing random accesses (valid-shaped Asks with

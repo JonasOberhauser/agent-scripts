@@ -14,39 +14,39 @@ use fuse_protocol::oracle::{OracleCommand, OracleReply, OracleRequest};
 use fuse_server::oracle_service::{run_oracle_server, OracleHub};
 use fuse_server::{ReadOutcome, ServerState};
 
-fn oracle_env() -> (std::path::PathBuf, Arc<ServerState>, std::thread::JoinHandle<()>) {
-    // keep()d for the test's lifetime (unique per test; tmp litter only)
-    let dir = tempfile::tempdir().unwrap().keep();
-    // #59 discipline, applied to the hashd seam (#69): pin it to a
-    // dead per-test path so a hashd running on the HOST (production
-    // /run/fuse-hashd.sock) can neither answer nor error. Tests that
-    // want a hashd bind their own stub and pin its path instead.
-    oracle_env_with_hashd(&dir.join("hashd.dead.sock").display().to_string())
+fn oracle_env() -> (std::path::PathBuf, Arc<ServerState>, gatekeeper_testkit::StackHandle) {
+    // The kit (issue #63): per-stack root, dead hashd seam (#69),
+    // 2s pendings — the #59 discipline built in. The handle in the
+    // third slot keeps the stack alive until the test ends (and
+    // tears the root down afterwards — the keep()d litter is gone).
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let tag = format!(
+        "oracle-env-{}",
+        N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    let mut st = ServerState::new();
+    st.hashd_sock = gatekeeper_testkit::DEAD_HASHD.to_string();
+    let state = Arc::new(st);
+    *state.pending_timeout.lock().unwrap() = Duration::from_secs(2);
+    let handle = gatekeeper_testkit::Stack::from_state(&tag, state, OracleHub::new());
+    (handle.oracle_socket().to_path_buf(), handle.state().clone(), handle)
 }
 
+#[allow(clippy::type_complexity)]
 fn oracle_env_with_hashd(
     hashd_sock: &str,
-) -> (std::path::PathBuf, Arc<ServerState>, std::thread::JoinHandle<()>) {
-    let dir = tempfile::tempdir().unwrap().keep();
-    let path = dir.join("oracle.sock");
-    // Same arming discipline as main()'s policy_path: assign the
-    // immutable socket on the mut local BEFORE the Arc is shared.
+) -> (std::path::PathBuf, Arc<ServerState>, gatekeeper_testkit::StackHandle) {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let tag = format!(
+        "oracle-env-h-{}",
+        N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
     let mut st = ServerState::new();
     st.hashd_sock = hashd_sock.to_string();
     let state = Arc::new(st);
     *state.pending_timeout.lock().unwrap() = Duration::from_secs(2);
-    let s2 = Arc::clone(&state);
-    let hub = OracleHub::new();
-    let (moved, wait_path) = (path.clone(), path.clone());
-    let t = std::thread::spawn(move || run_oracle_server(&moved, s2, hub).unwrap());
-    // wait for listener
-    for _ in 0..200 {
-        if wait_path.exists() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    (path, state, t)
+    let handle = gatekeeper_testkit::Stack::from_state(&tag, state, OracleHub::new());
+    (handle.oracle_socket().to_path_buf(), handle.state().clone(), handle)
 }
 
 fn ask(path: &std::path::Path, name: &str, pid: u32, offset: u64, size: u32) -> OracleReply {
