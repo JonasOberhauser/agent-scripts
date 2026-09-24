@@ -21,7 +21,7 @@
 //!  4. NO HANG — every driver op is bounded; a wedged daemon shows up
 //!     as a timeout failure naming the seed and op.
 
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -113,7 +113,9 @@ fn stack_up(seed: u64) -> Stack {
     let oracle = dir.path().join("oracle.sock");
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (s2, h2, p2, st2) = (Arc::clone(&state), hub.clone(), oracle.clone(), Arc::clone(&stop));
-    std::thread::spawn(move || {
+    // SAFETY per policy: the handle is intentionally un-joined — the
+    // Stack::drop poison pill stops the loop; explicit discard.
+    let _ = std::thread::spawn(move || {
         let _ = run_oracle_server_with_stop(&p2, s2, h2, &st2);
     });
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -246,7 +248,7 @@ fn drive_seed(seed: u64) {
                     "seed {seed}: fused died before the serve-wait probe ({e})\nfused.log:\n{log}"
                 );
             });
-            probe.init().unwrap_or_else(|e| {
+            let _ = probe.init().unwrap_or_else(|e| {
                 let log = std::fs::read_to_string(stack._dir.path().join("fused.log"))
                     .unwrap_or_default();
                 panic!("seed {seed}: init after spawn failed ({e:?})\nfused.log:\n{log}");
@@ -266,14 +268,16 @@ fn drive_seed(seed: u64) {
         // THE CHAOS SESSION.
         let names = fuzz_names(&inner);
         let mut d = MockDriver::connect(&stack.fused.control).unwrap();
-        d.init().expect("seed {seed}: init before chaos");
+        let _ = d.init().expect("seed {seed}: init before chaos");
         drive_session(seed, &mut d, &names);
         drop(d);
 
         // LIVENESS after chaos: a fresh driver session works.
         let mut fresh = MockDriver::connect(&stack.fused.control)
             .unwrap_or_else(|e| panic!("seed {seed}: wedged after chaos: {e}"));
-        fresh.init().unwrap_or_else(|e| panic!("seed {seed}: init failed after chaos: {e:?}"));
+        let _ = fresh
+            .init()
+            .unwrap_or_else(|e| panic!("seed {seed}: init failed after chaos: {e:?}"));
         let lookup = fresh.lookup(&inner);
         assert!(lookup.is_ok(), "seed {seed}: lookup after chaos failed: {:?}", lookup.err());
 
