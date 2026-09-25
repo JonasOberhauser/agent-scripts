@@ -14,40 +14,6 @@ use fuse_protocol::oracle::{OracleCommand, OracleReply, OracleRequest};
 use fuse_server::oracle_service::{run_oracle_server, OracleHub};
 use fuse_server::{ReadOutcome, ServerState};
 
-fn oracle_env() -> (std::path::PathBuf, Arc<ServerState>, gatekeeper_testkit::StackHandle) {
-    // The kit (issue #63): per-stack root, dead hashd seam (#69),
-    // 2s pendings — the #59 discipline built in. The handle in the
-    // third slot keeps the stack alive until the test ends (and
-    // tears the root down afterwards — the keep()d litter is gone).
-    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let tag = format!(
-        "oracle-env-{}",
-        N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    );
-    let mut st = ServerState::new();
-    st.hashd_sock = gatekeeper_testkit::DEAD_HASHD.to_string();
-    let state = Arc::new(st);
-    *state.pending_timeout.lock().unwrap() = Duration::from_secs(2);
-    let handle = gatekeeper_testkit::Stack::from_state(&tag, state, OracleHub::new());
-    (handle.oracle_socket().to_path_buf(), handle.state().clone(), handle)
-}
-
-#[allow(clippy::type_complexity)]
-fn oracle_env_with_hashd(
-    hashd_sock: &str,
-) -> (std::path::PathBuf, Arc<ServerState>, gatekeeper_testkit::StackHandle) {
-    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let tag = format!(
-        "oracle-env-h-{}",
-        N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    );
-    let mut st = ServerState::new();
-    st.hashd_sock = hashd_sock.to_string();
-    let state = Arc::new(st);
-    *state.pending_timeout.lock().unwrap() = Duration::from_secs(2);
-    let handle = gatekeeper_testkit::Stack::from_state(&tag, state, OracleHub::new());
-    (handle.oracle_socket().to_path_buf(), handle.state().clone(), handle)
-}
 
 fn ask(path: &std::path::Path, name: &str, pid: u32, offset: u64, size: u32) -> OracleReply {
     let mut conn = std::os::unix::net::UnixStream::connect(path).unwrap();
@@ -295,7 +261,9 @@ fn open_passes_an_fd_and_stats_flow() {
 
 #[test]
 fn star_hash_ask_is_allowed_and_serves_offsets() {
-    let (path, state, _t) = oracle_env();
+    let stack = gatekeeper_testkit::Stack::new().spawn_in_process();
+    let path = stack.oracle_socket().to_path_buf();
+    let state = stack.state().clone();
     state.add("s", "/tmp/host/s", 10, "*");
     assert_eq!(ask(&path, "s", 10, 2, 3), OracleReply::Allow);
     assert_eq!(state.status()[0].access_count, 1, "allow records the read");
@@ -303,7 +271,8 @@ fn star_hash_ask_is_allowed_and_serves_offsets() {
 
 #[test]
 fn unknown_secret_denies_enoent() {
-    let (path, _state, _t) = oracle_env();
+    let stack = gatekeeper_testkit::Stack::new().spawn_in_process();
+    let path = stack.oracle_socket().to_path_buf();
     match ask(&path, "nope", 1, 0, 4) {
         OracleReply::Deny { errno, .. } => assert_eq!(errno, libc::ENOENT),
         other => panic!("expected ENOENT deny, got {other:?}"),
@@ -312,7 +281,9 @@ fn unknown_secret_denies_enoent() {
 
 #[test]
 fn second_pid_pends_then_grant_allows() {
-    let (path, state, _t) = oracle_env();
+    let stack = gatekeeper_testkit::Stack::new().spawn_in_process();
+    let path = stack.oracle_socket().to_path_buf();
+    let state = stack.state().clone();
     state.add("s", "/tmp/host/s", 12, "*");
     assert_eq!(ask(&path, "s", 10, 0, 6), OracleReply::Allow);
     // The same pid streaming FORWARD: allowed (multi-chunk read).
@@ -336,7 +307,9 @@ fn second_pid_pends_then_grant_allows() {
 
 #[test]
 fn pending_expiry_denies_with_eacces() {
-    let (path, state, _t) = oracle_env();
+    let stack = gatekeeper_testkit::Stack::new().spawn_in_process();
+    let path = stack.oracle_socket().to_path_buf();
+    let state = stack.state().clone();
     *state.pending_timeout.lock().unwrap() = Duration::from_millis(300);
     state.add("s", "/tmp/host/s", 1, "*");
     assert_eq!(ask(&path, "s", 10, 0, 1), OracleReply::Allow);
@@ -354,7 +327,9 @@ fn pending_expiry_denies_with_eacces() {
 /// and kept the reader stuck until the full pending timeout.
 #[test]
 fn deny_unblocks_the_reader_immediately_with_eperm() {
-    let (path, state, _t) = oracle_env();
+    let stack = gatekeeper_testkit::Stack::new().spawn_in_process();
+    let path = stack.oracle_socket().to_path_buf();
+    let state = stack.state().clone();
     state.add("s", "/tmp/host/s", 1, "some_hash");
     // Long enough that a non-short-circuiting loop fails the time bound.
     *state.pending_timeout.lock().unwrap() = Duration::from_secs(15);
@@ -390,7 +365,9 @@ fn lockdown_asks_are_refused_immediately_without_pending() {
     // Issue #66: with the lockdown armed, an unauthorized ask is
     // answered on the spot — EACCES, no pending entry, and no
     // pend-out delay to measure.
-    let (path, state, _t) = oracle_env();
+    let stack = gatekeeper_testkit::Stack::new().spawn_in_process();
+    let path = stack.oracle_socket().to_path_buf();
+    let state = stack.state().clone();
     state.add("s", "/tmp/host/s", 1, "some_hash");
     state.arm_lockdown();
 
@@ -443,7 +420,11 @@ fn stub_hashd_answer_carries_the_pid_hash_not_an_error() {
             let _ = conn.flush();
         }
     });
-    let (path, state, _t) = oracle_env_with_hashd(&sock.display().to_string());
+    let stack = gatekeeper_testkit::Stack::new()
+        .hashd_stub(&sock)
+        .spawn_in_process();
+    let path = stack.oracle_socket().to_path_buf();
+    let state = stack.state().clone();
     state.add("s", "/tmp/host/s", 1, "some_hash");
     // Wait for the stub listener before asking.
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -474,7 +455,9 @@ fn stub_hashd_answer_carries_the_pid_hash_not_an_error() {
 
 #[test]
 fn wrong_hash_pends_and_carries_the_hash_error() {
-    let (path, state, _t) = oracle_env();
+    let stack = gatekeeper_testkit::Stack::new().spawn_in_process();
+    let path = stack.oracle_socket().to_path_buf();
+    let state = stack.state().clone();
     state.add("s", "/tmp/host/s", 1, "some_hash");
     // The ask blocks while the pending waits: run it on a thread so the
     // pending entry can be inspected before it expires.

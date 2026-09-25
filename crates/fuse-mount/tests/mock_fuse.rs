@@ -73,9 +73,7 @@ fn oracle_env(
     // The kit (issue #63): per-stack root, dead hashd seam (#69),
     // 150ms pendings, the host secret under the root. Keep the
     // HANDLE — dropping it tears the policy stack down.
-    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let tag = format!("mock-fuse-{}", N.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
-    let stack = gatekeeper_testkit::Stack::new(&tag)
+    let stack = gatekeeper_testkit::Stack::new()
         .pending_timeout(Duration::from_millis(150))
         .secret("s", b"MOCK-FUSE-CONTENT", "*")
         .spawn_in_process();

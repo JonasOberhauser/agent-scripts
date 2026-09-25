@@ -16,7 +16,7 @@
 //! use std::time::Duration;
 //! use gatekeeper_testkit::Stack;
 //!
-//! let stack = Stack::new("my-test")            // tag lease: unique per binary
+//! let stack = Stack::new()                       // identity minted internally
 //!     .pending_timeout(Duration::from_millis(150))
 //!     .secret("s", b"CONTENT", "*")             // host file + registration
 //!     .spawn_in_process();                      // real oracle wire, real state
@@ -45,9 +45,8 @@
 //! fuzz tier's stacks consolidate HERE rather than forking again.
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use fuse_server::oracle_service::{run_oracle_server, OracleHub};
@@ -62,50 +61,25 @@ const DEFAULT_PENDING_TIMEOUT: Duration = Duration::from_secs(2);
 /// nothing ever binds it, sharing it across stacks is harmless.
 pub const DEAD_HASHD: &str = "/tmp/gatekeeper-testkit-hashd-dead.sock";
 
-// ── tag leasing: uniqueness within one test binary ───────────────
+// ── stack identity: minted, never user-supplied ─────────────────
+//
+// (review on #82: uniqueness by CONSTRUCTION, not by hoping a
+// duplicate-tag check does not fire.) Stacks carry a process-global
+// monotonic id; combined with tempfile-random roots, two stacks
+// cannot share a root, an id, or anything derived from them — there
+// is nothing to check at runtime.
+type StateBuild = Box<dyn FnOnce(&Path) -> ServerState + Send>;
 
-fn leases() -> &'static Mutex<HashSet<String>> {
-    static LEASES: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-    LEASES.get_or_init(|| Mutex::new(HashSet::new()))
-}
-
-/// Releases the tag lease on drop.
-struct Lease(String);
-
-impl Drop for Lease {
-    fn drop(&mut self) {
-        let _released = leases()
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .remove(&self.0);
-    }
-}
-
-fn take_lease(tag: &str) -> Lease {
-    // Poison-recovering: a panicking test (e.g. the duplicate-lease
-    // probe below) must not brick every later stack in the binary.
-    let mut set = leases()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
-    let duplicate = !set.insert(tag.to_string());
-    // The guard is DROPPED before the abort — the lock must not be
-    // held across it (the first version poisoned it and cascaded).
-    if duplicate {
-        unreachable!(
-            "testkit: stack tag {tag:?} is already leased by another live stack in \
-             this test binary — two tests colliding, or a stack not yet dropped. \
-             Tags may repeat across binaries (random roots), never within one."
-        );
-    }
-    Lease(tag.to_string())
+fn next_id() -> u64 {
+    static IDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 // ── the builder ──────────────────────────────────────────────────
 
 /// Builder for a gatekeeper test stack. See the crate docs.
-#[derive(Debug, Clone)]
 pub struct Stack {
-    tag: String,
+    id: u64,
     pending_timeout: Duration,
     /// Arm MR5 write-through persistence to a store under the stack's
     /// root (off by default — hermetic stacks; #59).
@@ -114,6 +88,11 @@ pub struct Stack {
     /// production hashd on the host can never leak in. Pin a live
     /// stub socket with [`Stack::hashd_stub`].
     hashd_sock: Option<PathBuf>,
+    /// Harnesses that build their OWN `ServerState`: built WITH the
+    /// stack's root in hand, so every file-backed choice (the hashd
+    /// seam, the store) derives under the private root instead of a
+    /// shared convention path (review on #82).
+    custom_state: Option<StateBuild>,
     secrets: Vec<SecretSpec>,
 }
 
@@ -124,20 +103,25 @@ struct SecretSpec {
     hash: String,
 }
 
+impl Default for Stack {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Stack {
-    /// Begin a stack. The tag is leased process-globally: a duplicate
-    /// `Stack::new(tag)` among LIVE stacks in one test binary panics
-    /// (see the crate docs — the collision answer).
-    ///
-    /// # Panics
-    /// Panics if `tag` is already leased by a live stack in this
-    /// binary, or if the tag-lease lock was poisoned.
-    pub fn new(tag: &str) -> Self {
+    /// Begin a stack. Identity is minted internally (monotonic id +
+    /// random root) — callers never name stacks, so duplicates are
+    /// impossible by construction, not detected at runtime (review
+    /// on #82).
+    #[must_use]
+    pub fn new() -> Self {
         Self {
-            tag: tag.to_string(),
+            id: next_id(),
             pending_timeout: DEFAULT_PENDING_TIMEOUT,
             store: false,
             hashd_sock: None,
+            custom_state: None,
             secrets: Vec::new(),
         }
     }
@@ -160,10 +144,27 @@ impl Stack {
     }
 
     /// Pin a LIVE hashd socket (e.g. a test's stub listener). Default
-    /// is a dead per-stack path — the #69 discipline.
+    /// is a dead path under the stack's own root — the #69
+    /// discipline, private by construction (no fixed convention
+    /// path something else could bind; review on #82).
     #[must_use]
     pub fn hashd_stub(mut self, sock: impl Into<PathBuf>) -> Self {
         self.hashd_sock = Some(sock.into());
+        self
+    }
+
+    /// Build the policy state yourself — WITH the stack's root in
+    /// hand, so every file-backed choice (the hashd seam, the store)
+    /// derives under the private root. Replaces `from_state`: the
+    /// root is minted before the state exists, which is what makes
+    /// the default dead seam private BY CONSTRUCTION rather than by
+    /// a "nothing ever binds this fixed path" hope (review on #82).
+    #[must_use]
+    pub fn state_from(
+        mut self,
+        build: impl FnOnce(&Path) -> ServerState + Send + 'static,
+    ) -> Self {
+        self.custom_state = Some(Box::new(build));
         self
     }
 
@@ -181,64 +182,46 @@ impl Stack {
         self
     }
 
-    /// Spawn a policy server around an EXISTING state (the low-level
-    /// entry — the migration seam for harnesses that construct their
-    /// own `ServerState`): fresh per-stack root, real oracle wire,
-    /// socket bound under the root.
+    /// Spawn the IN-PROCESS policy stack: a real `run_oracle_server`
+    /// on a per-stack socket, a real [`ServerState`] — the substrate
+    /// the hand-rolled oracle-env copies used to duplicate.
+    ///
+    /// The root is minted FIRST; the state (custom or built) derives
+    /// every file-backed path under it.
     ///
     /// # Panics
-    /// Panics if the tag lease is duplicated or the oracle server
-    /// never binds within 5s.
-    pub fn from_state(tag: &str, state: Arc<ServerState>, hub: OracleHub) -> StackHandle {
-        let lease = take_lease(tag);
-        let root = tempfile::tempdir().expect("testkit: create stack root");
-        let oracle = root.path().join("oracle.sock");
-        let (s2, hub2, p2) = (Arc::clone(&state), hub.clone(), oracle.clone());
-        let _server_thread = std::thread::spawn(move || {
-            let _ = run_oracle_server(&p2, s2, hub2);
-        });
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while !oracle.exists() {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "testkit: oracle server never bound at {}",
-                oracle.display()
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        StackHandle {
-            _lease: lease,
-            _root: root,
-            oracle,
-            state,
-            hub,
-        }
-    }
-
-    /// Spawn the IN-PROCESS policy stack (step 1): a real
-    /// `run_oracle_server` on a per-stack socket, a real
-    /// [`ServerState`] — the same substrate the three `oracle_env`
-    /// copies hand-rolled.
-    ///
-    /// # Panics
-    /// Panics if the tag lease is duplicated, the oracle server never
-    /// binds within 5s, or a lock is poisoned.
+    /// Panics if the oracle server never binds within 5s.
     pub fn spawn_in_process(self) -> StackHandle {
-        let lease = take_lease(&self.tag);
         let root = tempfile::tempdir().expect("testkit: create stack root");
         let oracle = root.path().join("oracle.sock");
+        let dead_hashd = root.path().join("hashd-dead.sock").display().to_string();
 
-        let mut st = ServerState::new();
-        st.hashd_sock = self
-            .hashd_sock
-            .unwrap_or_else(|| root.path().join("hashd-dead.sock"))
-            .display()
-            .to_string();
-        st.pending_timeout = Mutex::new(self.pending_timeout);
-        if self.store {
-            st.policy_path = Some(root.path().join("policy.json"));
-        }
-        let state = Arc::new(st);
+        let state = match self.custom_state {
+            Some(build) => {
+                let mut st = build(root.path());
+                if st.hashd_sock == fuse_server::ServerState::new().hashd_sock {
+                    // The builder left the AMBIENT default (/run/fuse-
+                    // hashd.sock) — refuse it: the #69 discipline is a
+                    // kit invariant, and the ambient socket may host a
+                    // production hashd on this machine.
+                    st.hashd_sock = dead_hashd;
+                }
+                st
+            }
+            None => {
+                let mut st = ServerState::new();
+                st.hashd_sock = self
+                    .hashd_sock
+                    .map(|p| p.display().to_string())
+                    .unwrap_or(dead_hashd);
+                st.pending_timeout = Mutex::new(self.pending_timeout);
+                if self.store {
+                    st.policy_path = Some(root.path().join("policy.json"));
+                }
+                st
+            }
+        };
+        let state = Arc::new(state);
         for spec in &self.secrets {
             let host = root.path().join(format!("host-{}", spec.name));
             std::fs::write(&host, &spec.content).expect("testkit: write host file");
@@ -261,7 +244,7 @@ impl Stack {
         }
 
         StackHandle {
-            _lease: lease,
+            id: self.id,
             _root: root,
             oracle,
             state,
@@ -271,9 +254,9 @@ impl Stack {
 }
 
 /// A live stack: every surface a test tier needs. Dropping it tears
-/// down (root removed, sockets with it) and releases the tag lease.
+/// down (root removed, sockets with it).
 pub struct StackHandle {
-    _lease: Lease,
+    id: u64,
     _root: tempfile::TempDir,
     oracle: PathBuf,
     state: Arc<ServerState>,
@@ -281,6 +264,11 @@ pub struct StackHandle {
 }
 
 impl StackHandle {
+    /// The stack's minted id (informational — logs, diagnostics).
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
     /// The policy daemon's oracle socket (the real wire protocol).
     pub fn oracle_socket(&self) -> &Path {
         &self.oracle
@@ -312,7 +300,7 @@ mod tests {
 
     #[test]
     fn stack_serves_the_real_oracle_wire() {
-        let stack = Stack::new("kit-smoke")
+        let stack = Stack::new()
             .secret("s", b"CONTENT", "*")
             .spawn_in_process();
         let reply = fuse_server::oracle_service::ask(stack.oracle_socket(), "s", 4242, 0, 7)
@@ -321,33 +309,50 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_live_tags_panic_and_release_on_drop() {
-        let a = Stack::new("kit-lease").spawn_in_process();
-        let dup = std::panic::catch_unwind(|| {
-            let _b = Stack::new("kit-lease").spawn_in_process();
-        });
-        assert!(dup.is_err(), "a duplicate LIVE tag must panic");
-        drop(a);
-        // The lease died with the stack: re-taking is fine.
-        let _c = Stack::new("kit-lease").spawn_in_process();
+    fn ids_are_minted_monotonic_and_unique() {
+        // Duplication avoidance BY CONSTRUCTION (review on #82): ids
+        // are minted, never named by callers — two stacks cannot
+        // share one, and there is no runtime check to fire.
+        let a = Stack::new();
+        let b = Stack::new();
+        assert_ne!(a.id, b.id);
+        let ha = a.spawn_in_process();
+        let hb = Stack::new().spawn_in_process();
+        assert_ne!(ha.id(), hb.id());
     }
 
     #[test]
-    fn hashd_seam_is_dead_by_default_and_state_is_live() {
-        let stack = Stack::new("kit-seam").spawn_in_process();
-        let state = stack.state();
+    fn hashd_seam_is_dead_under_the_private_root_by_default() {
+        let stack = Stack::new().spawn_in_process();
+        let seam = &stack.state().hashd_sock;
+        let seam_path = std::path::Path::new(seam);
+        let root = stack.scratch("x").parent().unwrap().to_path_buf();
         assert!(
-            state.hashd_sock.ends_with("hashd-dead.sock"),
-            "the #69 seam: dead per-stack path, never ambient"
+            seam_path.starts_with(&root) && seam.ends_with("hashd-dead.sock"),
+            "the #69 seam: a dead path under the stack's OWN random \
+             root — private by construction, never a fixed convention \
+             path something else could bind (review on #82): {seam}"
         );
-        assert!(stack.oracle_socket().exists());
-        let scratch = stack.scratch("host.bin");
-        assert!(scratch.starts_with(stack.scratch(".").parent().unwrap()));
+    }
+
+    #[test]
+    fn custom_states_derive_paths_from_the_handed_root() {
+        // state_from gives the builder the root: file-backed choices
+        // derive under it; an ambient-default hashd seam is REFUSED
+        // and replaced by the root-private dead path.
+        let stack = Stack::new()
+            .state_from(|_root| ServerState::new())
+            .spawn_in_process();
+        let seam = &stack.state().hashd_sock;
+        assert!(
+            seam.ends_with("hashd-dead.sock"),
+            "custom states keep the #69 discipline: {seam}"
+        );
     }
 
     #[test]
     fn store_option_arms_persistence_under_the_root() {
-        let stack = Stack::new("kit-store").store().secret("s", b"X", "*").spawn_in_process();
+        let stack = Stack::new().store().secret("s", b"X", "*").spawn_in_process();
         let path = stack.state().policy_path.clone();
         let path = path.expect("store() arms the policy path");
         assert!(path.ends_with("policy.json"));
