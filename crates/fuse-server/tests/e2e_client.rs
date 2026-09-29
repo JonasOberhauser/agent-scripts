@@ -224,7 +224,7 @@ fn e2e_client_binary_against_server() {
     std::fs::write(&secret_file, b"TOPSECRET").unwrap();
 
     let (stdout, stderr, code) = run_client(&socket, &[
-        "add-secret", "new.yaml",
+        "add", "new.yaml",
         "--file", secret_file.to_str().unwrap(),
         "--hash", "abc123",
     ]);
@@ -242,19 +242,19 @@ fn e2e_client_binary_against_server() {
     assert!(stdout.contains("abc123"), "should show new hash: {stdout}");
 
     // ── 4. List mounts ──
-    let (stdout, stderr, code) = run_client(&socket, &["list-mounts"]);
+    let (stdout, stderr, code) = run_client(&socket, &["mounts"]);
     assert_eq!(code, 0, "list-mounts failed: {stderr}");
     assert!(stdout.contains("existing.yaml"), "mounts should list existing.yaml: {stdout}");
     assert!(stdout.contains("new.yaml"), "mounts should list new.yaml: {stdout}");
 
     // ── 5. Version check ──
-    let (stdout, stderr, code) = run_client(&socket, &["get-version"]);
+    let (stdout, stderr, code) = run_client(&socket, &["version"]);
     assert_eq!(code, 0, "get-version failed: {stderr}");
     assert!(stdout.contains(VERSION), "version should be {VERSION}: {stdout}");
 
     // ── 6. Rotate hash ──
     let (stdout, stderr, code) = run_client(&socket, &[
-        "rotate-hash", "new.yaml", "--hash", "newhash",
+        "rotate", "new.yaml", "--hash", "newhash",
     ]);
     assert_eq!(code, 0, "rotate-hash failed: {stderr}");
     assert!(stdout.contains("OK"), "rotate should print OK: {stdout}");
@@ -264,7 +264,7 @@ fn e2e_client_binary_against_server() {
     assert!(stdout.contains("newhash"), "status should show rotated hash: {stdout}");
 
     // ── 7. Remove secret ──
-    let (stdout, stderr, code) = run_client(&socket, &["remove-secret", "new.yaml"]);
+    let (stdout, stderr, code) = run_client(&socket, &["remove", "new.yaml"]);
     assert_eq!(code, 0, "remove-secret failed: {stderr}");
     assert!(stdout.contains("OK"), "remove should print OK: {stdout}");
 
@@ -292,11 +292,11 @@ fn e2e_client_binary_against_server() {
     assert!(stdout.contains("No pending"), "should have no pending: {stdout}");
 
     // ── 9. Log path ──
-    let (stdout, _, _) = run_client(&socket, &["get-log-path"]);
+    let (stdout, _, _) = run_client(&socket, &["logpath"]);
     assert!(stdout.contains("Log path"), "should show log path: {stdout}");
 
     // ── 10. Remove non-existent → should fail ──
-    let (stdout, stderr, code) = run_client(&socket, &["remove-secret", "nonexistent"]);
+    let (stdout, stderr, code) = run_client(&socket, &["remove", "nonexistent"]);
     assert_eq!(code, 1, "removing nonexistent should exit 1: {stdout} {stderr}");
     assert!(stderr.contains("not found") || stdout.contains("not found") || stderr.contains("Error"),
         "should report error for missing secret: {stdout} | {stderr}");

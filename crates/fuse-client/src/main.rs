@@ -1,55 +1,91 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::panic, unused_results))]
 use std::path::PathBuf;
 
-use clap::Parser;
 use fuse_protocol::{client_protocols, ServerStateFile, VERSION as CLIENT_VERSION};
 use servyi_servatui::App;
 
 mod pending_layer;
 
-#[derive(Parser)]
-#[command(name = "fuse-client", about = "Send CRUD commands to the fuse-server")]
-struct Cli {
-    #[arg(short, long, env = fuse_protocol::ENV_CMD_SOCKET, default_value = fuse_protocol::DEFAULT_CMD_SOCKET)]
-    socket: PathBuf,
-    /// Shell completion mode (also auto-engaged when COMP_LINE is set,
-    /// per bash's `complete -C`). The remaining argv (or COMP_LINE/
-    /// COMP_POINT) carry the words being completed. Hidden: it is a
-    /// protocol for the shell, not a user-facing command.
-    #[arg(long, hide = true)]
-    complete: bool,
-    #[command(subcommand)]
-    command: Option<Commands>,
+/// The CLI tree, DERIVED from `COMMAND_TABLE` — one source of truth
+/// for the wire parser, completion, and the command line (issue
+/// servyi/servatui#5). Only the client-local commands (`restart`,
+/// `completions`) and the two global options live here.
+fn build_cli() -> clap::Command {
+    let mut cli = clap::Command::new("fuse-client")
+        .about("Send CRUD commands to the fuse-server")
+        .arg(
+            clap::Arg::new("socket")
+                .short('s')
+                .long("socket")
+                .env(fuse_protocol::ENV_CMD_SOCKET)
+                .default_value(fuse_protocol::DEFAULT_CMD_SOCKET)
+                .value_parser(clap::value_parser!(PathBuf)),
+        )
+        .arg(
+            clap::Arg::new("complete")
+                .long("complete")
+                .hide(true)
+                .action(clap::ArgAction::SetTrue)
+                .help("Shell completion mode (also auto-engaged when COMP_LINE is set)"),
+        );
+    for spec in fuse_protocol::COMMAND_TABLE {
+        let mut sub = clap::Command::new(spec.name).about(spec.help);
+        for a in spec.cli_args {
+            let mut arg = if a.flag {
+                clap::Arg::new(a.name).long(a.name)
+            } else {
+                clap::Arg::new(a.name)
+            };
+            arg = arg.required(!a.optional);
+            sub = sub.arg(match a.kind {
+                fuse_protocol::ArgKind::U64 => {
+                    arg.value_parser(clap::value_parser!(u64))
+                }
+                fuse_protocol::ArgKind::Path => {
+                    arg.value_parser(clap::value_parser!(PathBuf))
+                }
+                fuse_protocol::ArgKind::Str => arg,
+            });
+        }
+        cli = cli.subcommand(sub);
+    }
+    cli.subcommand(
+        clap::Command::new("restart").about(
+            "Restart the fuse-server from the state file: stop the old \
+daemon (and its supervised data daemon), clean up socket and mount \
+point, respawn with the same configuration and re-add every secret \
+from the state file's host paths. This is the same flow the client \
+runs on a version mismatch, exposed as a one-word command; it asks \
+no questions.",
+        ),
+    )
+    .subcommand(
+        clap::Command::new("completions")
+            .about("Emit the delegating shell-completion scripts (bash | zsh | fish)")
+            .arg(clap::Arg::new("shell").required(true)),
+    )
 }
 
-#[derive(clap::Subcommand)]
-enum Commands {
-    Reset { #[arg(short, long)] name: Option<String> },
-    ResetAll,
-    Status,
-    AddSecret { name: String, #[arg(short, long)] file: PathBuf, #[arg(long)] hash: String },
-    RemoveSecret { name: String },
-    RotateHash { name: String, #[arg(long)] hash: String },
-    ListMounts,
-    Pending,
-    Grant { id: u64 },
-    /// Grant a pending access permanently (whitelists the package hash).
-    GrantForever { id: u64 },
-    Deny { id: u64 },
-    GetVersion,
-    GetLogPath,
-    /// Emit the delegating shell-completion scripts (issue servyi/
-    /// servatui#5). The scripts are dumb and static — they simply
-    /// invoke `fuse-client --complete`; the binary does the dynamic
-    /// work against the live server.
-    Completions { shell: String },
-    /// Restart the fuse-server from the state file: stop the old
-    /// daemon (and its supervised data daemon), clean up socket and
-    /// mount point, respawn with the same configuration and re-add
-    /// every secret from the state file's host paths.  This is the
-    /// same flow the client runs on a version mismatch, exposed as a
-    /// one-word command; it asks no questions.
-    Restart,
+/// Serialize matched subcommand values into the wire ARGS-STRING, in
+/// the row's declared `cli_args` order (positionals and flags alike:
+/// `add NAME FILE HASH` keeps its order whatever the user's flag
+/// order was). Optional values simply drop out.
+fn args_string(spec: &fuse_protocol::CommandSpec, sub: &clap::ArgMatches) -> String {
+    use fuse_protocol::ArgKind;
+    let mut parts: Vec<String> = Vec::new();
+    for a in spec.cli_args {
+        let value = match a.kind {
+            ArgKind::U64 => sub.get_one::<u64>(a.name).map(|v| v.to_string()),
+            ArgKind::Path => sub
+                .get_one::<std::path::PathBuf>(a.name)
+                .map(|p| p.display().to_string()),
+            ArgKind::Str => sub.get_one::<String>(a.name).cloned(),
+        };
+        if let Some(v) = value {
+            parts.push(v);
+        }
+    }
+    parts.join(" ")
 }
 
 fn main() {
@@ -80,27 +116,33 @@ fn main() {
         tracing_subscriber::fmt().with_env_filter(filter).init();
     }
 
-    let cli = Cli::parse();
+    let matches = build_cli().get_matches();
+    let socket = matches
+        .get_one::<PathBuf>("socket")
+        .cloned()
+        .expect("default_value guarantees a socket");
 
     // Shell completion comes FIRST: it must never hit the version
     // handshake, the log, or anything slow — a Tab press waits on it.
-    if cli.complete || std::env::var_os("COMP_LINE").is_some() {
-        complete_mode(&cli.socket);
+    if matches.get_flag("complete") || std::env::var_os("COMP_LINE").is_some() {
+        complete_mode(&socket);
         return;
     }
-    if let Some(Commands::Completions { shell }) = &cli.command {
-        print_completion_script(shell);
-        return;
+    if let Some((name, sub)) = matches.subcommand() {
+        if name == "completions" {
+            print_completion_script(sub.get_one::<String>("shell").expect("required"));
+            return;
+        }
     }
 
-    let app = App::builder(&cli.socket)
-        .protocol_all(client_protocols())
-        .build();
+    let app = App::builder(&socket).protocol_all(client_protocols()).build();
 
-    if let Some(Commands::Restart) = &cli.command {
-        let log_path = discover_log_path(&app);
-        restart_server(&app, log_path.as_deref());
-        return;
+    if let Some((name, _sub)) = matches.subcommand() {
+        if name == "restart" {
+            let log_path = discover_log_path(&app);
+            restart_server(&app, log_path.as_deref());
+            return;
+        }
     }
 
     if app.server_running() {
@@ -109,10 +151,14 @@ fn main() {
         check_start_server(&app);
     }
 
-    match &cli.command {
-        Some(cmd) => {
-            let (proto_name, args) = build_clap_command(cmd);
-            match app.run_cli_command(&proto_name, &args) {
+    match matches.subcommand() {
+        Some((name, sub)) => {
+            let spec = fuse_protocol::COMMAND_TABLE
+                .iter()
+                .find(|s| s.name == name)
+                .expect("every non-local subcommand is a table row");
+            let args = args_string(spec, sub);
+            match app.run_cli_command(name, &args) {
                 Ok(lines) => {
                     for line in lines {
                         println!("{line}");
@@ -154,7 +200,7 @@ fn main() {
             let log_sink: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
                 Default::default();
             let talk = pending_layer::spawn_worker(
-                cli.socket.clone(),
+                socket.clone(),
                 pending.clone(),
                 secrets,
                 collapsed_names.clone(),
@@ -177,34 +223,11 @@ fn main() {
             }));
             let _layer_id = display.add_layer(Box::new(panel));
             display.set_log_sink(log_sink);
-            if let Err(e) = display.run(&cli.socket, &protocols) {
+            if let Err(e) = display.run(&socket, &protocols) {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
             }
         }
-    }
-}
-
-fn build_clap_command(cmd: &Commands) -> (String, String) {
-    match cmd {
-        Commands::Reset { name } => ("reset".into(), name.clone().unwrap_or_default()),
-        Commands::ResetAll => ("reset-all".into(), "".into()),
-        Commands::Status => ("status".into(), "".into()),
-        Commands::AddSecret { name, file, hash } => {
-            ("add".into(), format!("{name} {} {hash}", file.display()))
-        }
-        Commands::RemoveSecret { name } => ("remove".into(), name.clone()),
-        Commands::RotateHash { name, hash } => ("rotate".into(), format!("{name} {hash}")),
-        Commands::ListMounts => ("mounts".into(), "".into()),
-        Commands::Pending => ("pending".into(), "".into()),
-        Commands::Grant { id } => ("grant".into(), id.to_string()),
-        Commands::GrantForever { id } => ("grant-forever".into(), id.to_string()),
-        Commands::Deny { id } => ("deny".into(), id.to_string()),
-        Commands::GetVersion => ("version".into(), "".into()),
-        Commands::GetLogPath => ("logpath".into(), "".into()),
-        // Handled before the App exists — never reaches the socket.
-        Commands::Completions { .. } => unreachable!("completions handled pre-App"),
-        Commands::Restart => unreachable!("restart runs its own local flow"),
     }
 }
 
