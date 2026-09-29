@@ -12,6 +12,12 @@ mod pending_layer;
 struct Cli {
     #[arg(short, long, env = fuse_protocol::ENV_CMD_SOCKET, default_value = fuse_protocol::DEFAULT_CMD_SOCKET)]
     socket: PathBuf,
+    /// Shell completion mode (also auto-engaged when COMP_LINE is set,
+    /// per bash's `complete -C`). The remaining argv (or COMP_LINE/
+    /// COMP_POINT) carry the words being completed. Hidden: it is a
+    /// protocol for the shell, not a user-facing command.
+    #[arg(long, hide = true)]
+    complete: bool,
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -32,6 +38,11 @@ enum Commands {
     Deny { id: u64 },
     GetVersion,
     GetLogPath,
+    /// Emit the delegating shell-completion scripts (issue servyi/
+    /// servatui#5). The scripts are dumb and static — they simply
+    /// invoke `fuse-client --complete`; the binary does the dynamic
+    /// work against the live server.
+    Completions { shell: String },
     /// Restart the fuse-server from the state file: stop the old
     /// daemon (and its supervised data daemon), clean up socket and
     /// mount point, respawn with the same configuration and re-add
@@ -70,6 +81,17 @@ fn main() {
     }
 
     let cli = Cli::parse();
+
+    // Shell completion comes FIRST: it must never hit the version
+    // handshake, the log, or anything slow — a Tab press waits on it.
+    if cli.complete || std::env::var_os("COMP_LINE").is_some() {
+        complete_mode(&cli.socket);
+        return;
+    }
+    if let Some(Commands::Completions { shell }) = &cli.command {
+        print_completion_script(shell);
+        return;
+    }
 
     let app = App::builder(&cli.socket)
         .protocol_all(client_protocols())
@@ -180,7 +202,195 @@ fn build_clap_command(cmd: &Commands) -> (String, String) {
         Commands::Deny { id } => ("deny".into(), id.to_string()),
         Commands::GetVersion => ("version".into(), "".into()),
         Commands::GetLogPath => ("logpath".into(), "".into()),
+        // Handled before the App exists — never reaches the socket.
+        Commands::Completions { .. } => unreachable!("completions handled pre-App"),
         Commands::Restart => unreachable!("restart runs its own local flow"),
+    }
+}
+
+// ── Shell completion (servyi/servatui#5) ───────────────────────
+
+/// Slice a completing line into (confirmed prior words, the word
+/// being completed). Pure — the unit tests pin the edge cases.
+fn split_completing(line_before_cursor: &str) -> (Vec<String>, String) {
+    let mut words: Vec<String> = line_before_cursor
+        .split_whitespace()
+        .map(|w| w.to_string())
+        .collect();
+    // A trailing (or doubled) space means a NEW empty word is being
+    // completed: "reset " → (["reset"], "").
+    let starting_new = line_before_cursor.ends_with(char::is_whitespace)
+        || line_before_cursor.is_empty();
+    let completing = if starting_new {
+        String::new()
+    } else {
+        words.pop().unwrap_or_default()
+    };
+    (words, completing)
+}
+
+/// One minimal servatui step round over the cmd socket, with a hard
+/// timeout: completion must never hang the shell. Mirrors
+/// `run_cli_command_raw`'s wire sequence exactly: the bare command
+/// NAME frame (a JSON string), the parsed-args frame, then the
+/// response line; the finalize sentinel closes the exchange.
+/// Connect failure (dead server) returns None — callers degrade to
+/// command names.
+fn one_shot_query(
+    socket: &std::path::Path,
+    name: &str,
+    command: &fuse_protocol::Command,
+) -> Option<String> {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
+    let mut c = UnixStream::connect(socket).ok()?;
+    let _ = c.set_read_timeout(Some(std::time::Duration::from_millis(200)));
+    let _ = c.set_write_timeout(Some(std::time::Duration::from_millis(200)));
+    let name_frame = serde_json::to_string(name).ok()?;
+    let args_frame = serde_json::to_string(command).ok()?;
+    c.write_all(format!("{name_frame}\n").as_bytes()).ok()?;
+    c.write_all(format!("{args_frame}\n").as_bytes()).ok()?;
+    let mut line = String::new();
+    {
+        let mut reader = BufReader::new(c.try_clone().ok()?);
+        reader.read_line(&mut line).ok()?;
+    }
+    // finalize sentinel — the daemon's step protocol expects it.
+    let _ = c.write_all(b"null\n");
+    let _ = c.flush();
+    Some(line)
+}
+
+/// The candidate VALUES for a command's first argument, from the live
+/// server — the single kind→query mapping (shared shape with the TUI
+/// completers): PendingIds → `pending`, SecretNames → `status`.
+fn live_candidates(socket: &std::path::Path, word: &str) -> Vec<String> {
+    use fuse_protocol::{Command, Completer, COMMAND_TABLE, Response};
+    let Some(spec) = COMMAND_TABLE.iter().find(|s| s.name == word) else {
+        return Vec::new();
+    };
+    match spec.complete {
+        Completer::None => Vec::new(),
+        Completer::PendingIds => one_shot_query(socket, "pending", &Command::ListPending)
+            .and_then(|reply| serde_json::from_str::<Response>(reply.trim()).ok())
+            .map(|resp| match resp {
+                Response::PendingList { pending } => {
+                    pending.iter().map(|p| p.id.to_string()).collect()
+                }
+                _ => Vec::new(),
+            })
+            .unwrap_or_default(),
+        // First-argument completion only — `rotate NAME HASH` must not
+        // complete into the hash position; the caller checks arity.
+        Completer::SecretNames { .. } => one_shot_query(socket, "status", &Command::Status)
+            .and_then(|reply| serde_json::from_str::<Response>(reply.trim()).ok())
+            .map(|resp| match resp {
+                Response::Status { secrets, .. } => {
+                    secrets.iter().map(|s| s.name.clone()).collect()
+                }
+                _ => Vec::new(),
+            })
+            .unwrap_or_default(),
+    }
+}
+
+/// Completion entry: print one candidate per line (bare words — both
+/// bash's `complete -C` and fish's `-a` expect position candidates).
+fn complete_mode(socket: &std::path::Path) {
+    use fuse_protocol::COMMAND_TABLE;
+    use std::io::Write;
+    let stdout = std::io::stdout();
+    let mut out = std::io::BufWriter::new(stdout.lock());
+
+    // bash: COMP_LINE/COMP_POINT. fish: argv after --complete.
+    let (prior, completing) = if let Some(line) = std::env::var_os("COMP_LINE") {
+        let line = line.to_string_lossy().into_owned();
+        let point = std::env::var("COMP_POINT")
+            .ok()
+            .and_then(|p| p.parse::<usize>().ok())
+            .unwrap_or(line.len())
+            .min(line.len());
+        split_completing(&line[..point])
+    } else {
+        // fish: everything AFTER --complete is the command line being
+        // completed (a custom --socket sits before the flag).
+        let argv: Vec<String> = std::env::args()
+            .skip_while(|a| a != "--complete")
+            .skip(1)
+            .collect();
+        split_completing(&argv.join(" "))
+    };
+
+    // bash's COMP_LINE (and fish's `commandline -cp`) include the
+    // program's own word first — drop it so "fuse-client sta"
+    // completes the COMMAND, not an argument of a command named
+    // "fuse-client".
+    let prog = std::env::args()
+        .next()
+        .and_then(|a| {
+            std::path::Path::new(&a)
+                .file_name()
+                .map(|f| f.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| "fuse-client".to_string());
+    let mut prior = prior;
+    if prior.first().map(|w| w == &prog).unwrap_or(false) {
+        prior.remove(0);
+    }
+
+    let candidates: Vec<String> = if prior.is_empty() {
+        // First word: command names (compile-time table — the command
+        // surface is not served over the wire, per the issue thread).
+        COMMAND_TABLE
+            .iter()
+            .map(|s| s.name.to_string())
+            .filter(|n| n.starts_with(&completing))
+            .collect()
+    } else {
+        // Argument position: only the FIRST argument completes (the
+        // SecretNames `rotate` hash guard falls out — arity check).
+        let is_first_arg = prior.len() == 1;
+        if !is_first_arg {
+            Vec::new()
+        } else {
+            live_candidates(socket, &prior[0])
+                .into_iter()
+                .filter(|c| c.starts_with(&completing))
+                .collect()
+        }
+    };
+    for c in candidates {
+        let _ = writeln!(out, "{c}");
+    }
+    let _ = out.flush();
+}
+
+/// The delegating shell scripts — dumb and static; the binary is the
+/// smart dynamic half. Hand-written (three ~4-line scripts) rather
+/// than a clap_complete dependency for the same protocol.
+/// None = unsupported shell (caller reports and exits nonzero).
+fn completion_script(shell: &str) -> Option<String> {
+    match shell {
+        "bash" => Some("complete -C fuse-client fuse-client\n".to_string()),
+        "zsh" => Some(
+            "autoload -U +X bashcompinit && bashcompinit\ncomplete -C fuse-client fuse-client\n"
+                .to_string(),
+        ),
+        "fish" => Some(
+            "complete -c fuse-client -f -a '(fuse-client --complete (commandline -cop))'\n"
+                .to_string(),
+        ),
+        _ => None,
+    }
+}
+
+fn print_completion_script(shell: &str) {
+    match completion_script(shell) {
+        Some(script) => print!("{script}"),
+        None => {
+            eprintln!("unsupported shell {shell:?} (bash | zsh | fish)");
+            std::process::exit(1);
+        }
     }
 }
 
@@ -570,6 +780,122 @@ fn ask_reset_anyway() {
     }
 }
 
+// ── completion unit tests ──────────────────────────────────────
+
+/// Minimal servatui step-protocol listener. Binds SYNCHRONOUSLY (the
+/// client's connect can never race an unbound socket), then serves
+/// one exchange — read request line, reply `resp`, consume the null
+/// sentinel — on a detached thread.
+#[cfg(test)]
+fn spawn_step_listener(socket: &std::path::Path, resp: &str) {
+    use std::io::{BufRead, BufReader, Write};
+    let _ = std::fs::remove_file(socket);
+    let l = std::os::unix::net::UnixListener::bind(socket).expect("bind fake");
+    let resp = resp.to_string();
+    std::thread::spawn(move || {
+        if let Ok((s, _)) = l.accept() {
+            // The real wire: name frame, then args frame, then reply,
+            // then the finalize sentinel.
+            let mut name = String::new();
+            let mut args = String::new();
+            let mut reader = BufReader::new(&s);
+            reader.read_line(&mut name).expect("read name");
+            reader.read_line(&mut args).expect("read args");
+            let _ = (&s).write_all(format!("{resp}\n").as_bytes());
+            let mut sentinel = String::new();
+            let _ = BufReader::new(&s).read_line(&mut sentinel);
+            assert_eq!(name.trim(), "\"status\"", "first frame is the name");
+        }
+    });
+}
+
+#[test]
+fn split_completing_slices_word_and_prefix() {
+    // mid-word
+    let (prior, w) = split_completing("fuse-client reset exi");
+    assert_eq!(prior, vec!["fuse-client", "reset"]);
+    assert_eq!(w, "exi");
+    // trailing space opens a NEW empty word
+    let (prior, w) = split_completing("fuse-client reset ");
+    assert_eq!(prior, vec!["fuse-client", "reset"]);
+    assert_eq!(w, "");
+    // cursor before the line end (bash COMP_POINT): at offset 13 one
+    // char into `reset` the completing word is "r"; at 17 (end of
+    // `reset`) it is the whole word.
+    let (prior, w) = split_completing("fuse-client reset existing.yaml");
+    let (p2, w2) = split_completing(&"fuse-client reset existing.yaml"[..13]);
+    let (p3, w3) = split_completing(&"fuse-client reset existing.yaml"[..17]);
+    assert_eq!(w, "existing.yaml");
+    assert_eq!(w2, "r");
+    assert_eq!(w3, "reset");
+    assert_eq!(prior.len(), 2);
+    assert_eq!(p2.len(), 1);
+    assert_eq!(p3.len(), 1);
+    // empty line
+    let (prior, w) = split_completing("");
+    assert!(prior.is_empty());
+    assert_eq!(w, "");
+    // first word mid-typing
+    let (prior, w) = split_completing("sta");
+    assert!(prior.is_empty());
+    assert_eq!(w, "sta");
+}
+
+#[test]
+fn live_candidates_reads_secret_names_from_status_reply() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let sock = dir.path().join("u1.sock");
+    let reply = r#"{"type":"status","secrets":[{"name":"a.yaml","access_count":0,"allowed_hashes":[],"inner":"h1","size":3,"unlimited":false}],"lockdown":false}"#;
+    spawn_step_listener(&sock, reply);
+    let got = live_candidates(&sock, "reset");
+    assert_eq!(got, vec!["a.yaml".to_string()]);
+}
+
+#[test]
+fn live_candidates_reads_pending_ids_from_pending_reply() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let sock = dir.path().join("u2.sock");
+    let reply = r#"{"type":"pending_list","pending":[{"id":7,"secret_name":"a.yaml","pid":42,"pid_hash":null,"reason":"one-read","expires_at":999}]}"#;
+    spawn_step_listener(&sock, reply);
+    let got = live_candidates(&sock, "grant");
+    assert_eq!(got, vec!["7".to_string()]);
+}
+
+#[test]
+fn live_candidates_degrades_to_empty_on_dead_socket_and_bad_replies() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let dead = dir.path().join("nope.sock");
+    assert!(live_candidates(&dead, "reset").is_empty());
+    assert!(live_candidates(&dead, "grant").is_empty());
+    // non-completing commands never query at all
+    assert!(live_candidates(&dead, "status").is_empty());
+    // unknown command word
+    assert!(live_candidates(&dead, "nonsense").is_empty());
+    let sock = dir.path().join("u3.sock");
+    spawn_step_listener(&sock, "not json at all");
+    // unparseable reply degrades to empty, never panics
+    assert!(live_candidates(&sock, "reset").is_empty());
+    // wrong response variant for the query degrades to empty
+    let sock2 = dir.path().join("u4.sock");
+    spawn_step_listener(&sock2, r#"{"type":"ok"}"#);
+    assert!(live_candidates(&sock2, "reset").is_empty());
+}
+
+#[test]
+fn completion_scripts_delegate_to_the_binary() {
+    // Scripts must delegate via `complete -C` / fish `-a` — nothing
+    // static about commands may live in the script.
+    let bash = completion_script("bash").expect("bash");
+    let zsh = completion_script("zsh").expect("zsh");
+    let fish = completion_script("fish").expect("fish");
+    assert!(bash.contains("complete -C fuse-client fuse-client"), "{bash}");
+    assert!(zsh.contains("bashcompinit") && zsh.contains("complete -C"), "{zsh}");
+    assert!(fish.contains("--complete"), "{fish}");
+    assert!(completion_script("tcsh").is_none());
+    assert!(completion_script("").is_none());
+}
+
+#[cfg(test)]
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -42,6 +42,25 @@ fn run_client(socket: &Path, args: &[&str]) -> (String, String, i32) {
     )
 }
 
+/// Run the real client binary as bash's `complete -C` would: the
+/// completing line and cursor offset arrive in the environment.
+fn run_client_completing(socket: &Path, line: &str) -> (String, i32) {
+    let bin = client_binary();
+    let point = line.len().to_string();
+    let output = Command::new(&bin)
+        .arg("--socket")
+        .arg(socket)
+        .arg("--complete")
+        .env("COMP_LINE", line)
+        .env("COMP_POINT", point)
+        .output()
+        .unwrap_or_else(|e| panic!("Failed to run fuse-client --complete: {e}"));
+    (
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        output.status.code().unwrap_or(-1),
+    )
+}
+
 /// Serializes tests that touch process-global env (ENV_STATE_FILE):
 /// cargo runs tests in one binary in parallel, and set_var is global.
 static STATE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -537,4 +556,82 @@ fn restart_respawns_on_the_state_files_oracle_rendezvous() {
     }
     let _ = sacrificial.kill();
     let _ = sacrificial.wait();
+}
+
+// ── Shell completion (servyi/servatui#5): dynamic against live state ──
+//
+// The completions binary path exercises the REAL socket server: first
+// words come from the compile-time command table, argument values
+// from live `status`/`pending` — the dynamic direction the issue
+// thread settled on.
+#[test]
+fn completion_is_dynamic_against_live_server_state() {
+    let dir = test_tempdir();
+    let socket = dir.path().join("complete.sock");
+
+    let state = Arc::new({
+        let s = ServerState::new();
+        s.add("existing.yaml", "/tmp/host/existing.yaml", 5, "hash1");
+        s
+    });
+    // One live pending so PendingIds completion has a real id.
+    state.create_pending("existing.yaml", 4242, Some("pkg_hash_x"), "hash mismatch", None);
+
+    let sock = socket.clone();
+    let st = Arc::clone(&state);
+    let _server = std::thread::spawn(move || {
+        let _ = run_socket_server(&sock, st);
+    });
+    wait_for_server(&socket);
+
+    // ── First word: command names, prefix-filtered, from the table ──
+    let (out, code) = run_client_completing(&socket, "fuse-client sta");
+    assert_eq!(code, 0, "completion must exit 0: {out}");
+    assert_eq!(out.trim_end(), "status", "prefix sta completes to status only: {out}");
+
+    // ── Secret-name argument from the LIVE status reply ──
+    let (out, code) = run_client_completing(&socket, "fuse-client reset exi");
+    assert_eq!(code, 0);
+    assert_eq!(out.trim_end(), "existing.yaml", "reset completes the real secret: {out}");
+
+    // Empty prefix after trailing space lists every candidate.
+    let (out, _) = run_client_completing(&socket, "fuse-client reset ");
+    assert_eq!(out.trim_end(), "existing.yaml", "empty prefix lists all secrets: {out}");
+
+    // ── Pending-id argument from the LIVE pending reply ──
+    let id = state.pending.iter().next().unwrap().id;
+    let (out, code) = run_client_completing(&socket, "fuse-client grant ");
+    assert_eq!(code, 0);
+    assert_eq!(out.trim_end(), id.to_string(), "grant completes the real pending id: {out}");
+
+    // ── Arity guard: the SECOND argument of rotate (the hash) never
+    //    completes into secret names ──
+    let (out, code) = run_client_completing(&socket, "fuse-client rotate existing.yaml ");
+    assert_eq!(code, 0);
+    assert_eq!(out, "", "hash position must not complete: {out}");
+
+    // ── Non-completing command: no argument candidates ──
+    let (out, code) = run_client_completing(&socket, "fuse-client status x");
+    assert_eq!(code, 0);
+    assert_eq!(out, "", "status has no argument completion: {out}");
+
+    // ── Offline degradation: dead socket → command names still work,
+    //    argument candidates vanish, exit stays 0 ──
+    let dead = dir.path().join("dead.sock");
+    let (out, code) = run_client_completing(&dead, "fuse-client re");
+    assert_eq!(code, 0, "offline completion must not fail the shell: {out}");
+    assert!(
+        out.lines().any(|l| l == "reset") && out.lines().any(|l| l == "remove"),
+        "offline first-word completes command names: {out}"
+    );
+    let (out, code) = run_client_completing(&dead, "fuse-client reset x");
+    assert_eq!(code, 0);
+    assert_eq!(out, "", "offline argument completion degrades to empty: {out}");
+
+    // ── The installed scripts delegate: `completions` emits them ──
+    let (out, stderr, code) = run_client(&socket, &["completions", "bash"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(out.contains("complete -C fuse-client fuse-client"), "{out}");
+    let (_, stderr, code) = run_client(&socket, &["completions", "tcsh"]);
+    assert_eq!(code, 1, "unsupported shell must exit 1: {stderr}");
 }
