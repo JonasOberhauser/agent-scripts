@@ -253,7 +253,9 @@ fn one_shot_query(
     let mut line = String::new();
     {
         let mut reader = BufReader::new(c.try_clone().ok()?);
-        reader.read_line(&mut line).ok()?;
+        if reader.read_line(&mut line).is_err() {
+            return None;
+        }
     }
     // finalize sentinel — the daemon's step protocol expects it.
     let _ = c.write_all(b"null\n");
@@ -335,7 +337,7 @@ fn complete_mode(socket: &std::path::Path) {
         .unwrap_or_else(|| "fuse-client".to_string());
     let mut prior = prior;
     if prior.first().map(|w| w == &prog).unwrap_or(false) {
-        prior.remove(0);
+        let _removed = prior.remove(0);
     }
 
     let candidates: Vec<String> = if prior.is_empty() {
