@@ -267,33 +267,19 @@ fn one_shot_query(
 /// server — the single kind→query mapping (shared shape with the TUI
 /// completers): PendingIds → `pending`, SecretNames → `status`.
 fn live_candidates(socket: &std::path::Path, word: &str) -> Vec<String> {
-    use fuse_protocol::{Command, Completer, COMMAND_TABLE, Response};
+    use fuse_protocol::{COMMAND_TABLE, Response};
     let Some(spec) = COMMAND_TABLE.iter().find(|s| s.name == word) else {
         return Vec::new();
     };
-    match spec.complete {
-        Completer::None => Vec::new(),
-        Completer::PendingIds => one_shot_query(socket, "pending", &Command::ListPending)
-            .and_then(|reply| serde_json::from_str::<Response>(reply.trim()).ok())
-            .map(|resp| match resp {
-                Response::PendingList { pending } => {
-                    pending.iter().map(|p| p.id.to_string()).collect()
-                }
-                _ => Vec::new(),
-            })
-            .unwrap_or_default(),
-        // First-argument completion only — `rotate NAME HASH` must not
-        // complete into the hash position; the caller checks arity.
-        Completer::SecretNames { .. } => one_shot_query(socket, "status", &Command::Status)
-            .and_then(|reply| serde_json::from_str::<Response>(reply.trim()).ok())
-            .map(|resp| match resp {
-                Response::Status { secrets, .. } => {
-                    secrets.iter().map(|s| s.name.clone()).collect()
-                }
-                _ => Vec::new(),
-            })
-            .unwrap_or_default(),
-    }
+    // The SINGLE kind→query mapping lives on Completer
+    // (`query`/`values_from`), shared with the TUI's poller wiring.
+    let Some((query_word, cmd)) = spec.complete.query() else {
+        return Vec::new();
+    };
+    one_shot_query(socket, query_word, &cmd)
+        .and_then(|reply| serde_json::from_str::<Response>(reply.trim()).ok())
+        .map(|resp| spec.complete.values_from(&resp))
+        .unwrap_or_default()
 }
 
 /// Completion entry: print one candidate per line (bare words — both

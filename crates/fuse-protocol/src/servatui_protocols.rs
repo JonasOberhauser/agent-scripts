@@ -179,6 +179,36 @@ pub enum Completer {
     },
 }
 
+impl Completer {
+    /// The one-shot query (wire word + command) whose response
+    /// carries this completer's values — the SINGLE kind→query
+    /// mapping (servyi/servatui#5): `--complete` asks it directly;
+    /// the TUI's pollers feed the same queries' results into the
+    /// snapshot completers.
+    pub fn query(self) -> Option<(&'static str, Command)> {
+        match self {
+            Completer::None => None,
+            Completer::SecretNames { .. } => Some(("status", Command::Status)),
+            Completer::PendingIds => Some(("pending", Command::ListPending)),
+        }
+    }
+
+    /// The candidate values this completer draws from a response to
+    /// [`Completer::query`]. Mismatched variants yield none.
+    pub fn values_from(self, resp: &Response) -> Vec<String> {
+        match (self, resp) {
+            (
+                Completer::SecretNames { .. },
+                Response::Status { secrets, .. },
+            ) => secrets.iter().map(|s| s.name.clone()).collect(),
+            (Completer::PendingIds, crate::Response::PendingList { pending }) => {
+                pending.iter().map(|p| p.id.to_string()).collect()
+            }
+            _ => Vec::new(),
+        }
+    }
+}
+
 /// Offline (server-not-running) fallback renderer for CLI use.
 pub type OfflineFn = fn(&str, &mut dyn Console) -> Result<(), String>;
 
@@ -461,6 +491,70 @@ pub fn poll_secret_names(socket: &std::path::Path) -> Result<Vec<String>, String
 /// messages from the transport layer.
 pub fn poll_pending_once(socket: &std::path::Path) -> Result<Vec<u64>, String> {
     Ok(poll_pending_info(socket)?.into_iter().map(|p| p.id).collect())
+}
+
+#[cfg(test)]
+mod completer_mapping_tests {
+    use super::*;
+    use crate::protocol::Response;
+
+    #[test]
+    fn the_kind_to_query_mapping_is_one_table() {
+        assert_eq!(Completer::None.query(), None);
+        // every query word is a registered table row
+        for c in [
+            Completer::PendingIds,
+            Completer::SecretNames { after_space: true },
+            Completer::SecretNames { after_space: false },
+        ] {
+            let (word, _cmd) = c.query().expect("completing kinds query");
+            assert!(
+                COMMAND_TABLE.iter().any(|s| s.name == word),
+                "query word {word:?} must be a table row"
+            );
+        }
+        assert_eq!(Completer::PendingIds.query().map(|(w, _)| w), Some("pending"));
+        assert_eq!(Completer::SecretNames { after_space: true }.query().map(|(w, _)| w), Some("status"));
+    }
+
+    #[test]
+    fn values_come_from_the_matching_response() {
+        let status = Response::Status {
+            secrets: vec![crate::protocol::SecretStatus {
+                name: "a.yaml".into(),
+                access_count: 0,
+                allowed_hashes: vec![],
+                inner: "h1".into(),
+                size: 3,
+                unlimited: false,
+            }],
+            lockdown: false,
+        };
+        assert_eq!(
+            Completer::SecretNames { after_space: true }.values_from(&status),
+            vec!["a.yaml".to_string()]
+        );
+        // wrong kind vs wrong response: no values, never a panic
+        assert!(Completer::PendingIds.values_from(&status).is_empty());
+        let pending = Response::PendingList {
+            pending: vec![PendingAccessInfo {
+                id: 7,
+                secret_name: "a.yaml".into(),
+                process_name: None,
+                pid: 42,
+                pid_hash: None,
+                pid_hash_error: None,
+                reason: "one-read".into(),
+                expired: false,
+                expires_at: 99,
+            }],
+        };
+        assert_eq!(
+            Completer::PendingIds.values_from(&pending),
+            vec!["7".to_string()]
+        );
+        assert!(Completer::SecretNames { after_space: false }.values_from(&pending).is_empty());
+    }
 }
 
 #[cfg(test)]

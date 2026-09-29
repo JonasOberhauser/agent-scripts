@@ -628,6 +628,24 @@ fn completion_is_dynamic_against_live_server_state() {
     assert_eq!(code, 0);
     assert_eq!(out, "", "offline argument completion degrades to empty: {out}");
 
+    // ── bash's REAL invocation: COMP_LINE in the environment, no
+    //    --complete flag on argv (complete -C spawns the bare binary) ──
+    let bin = client_binary();
+    let output = Command::new(&bin)
+        .arg("--socket")
+        .arg(&socket)
+        .env("COMP_LINE", "fuse-client grant ")
+        .env("COMP_POINT", "fuse-client grant ".len().to_string())
+        .output()
+        .expect("bare COMP_LINE completion");
+    let id = state.pending.iter().next().unwrap().id;
+    let bare = String::from_utf8_lossy(&output.stdout).to_string();
+    assert_eq!(
+        bare.trim_end(),
+        id.to_string(),
+        "COMP_LINE alone must complete the live pending id: {bare}"
+    );
+
     // ── The installed scripts delegate: `completions` emits them ──
     let (out, stderr, code) = run_client(&socket, &["completions", "bash"]);
     assert_eq!(code, 0, "{stderr}");
