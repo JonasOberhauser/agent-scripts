@@ -212,64 +212,17 @@ impl Completer {
 /// Offline (server-not-running) fallback renderer for CLI use.
 pub type OfflineFn = fn(&str, &mut dyn Console) -> Result<(), String>;
 
-/// The value shape of one CLI argument — drives the derived CLI's
-/// value parser (u64 ids, PathBuf files, plain strings).
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum ArgKind {
-    /// A free-form string (a name, a hash).
-    Str,
-    /// A decimal number (ids).
-    U64,
-    /// A filesystem path (a file to read, a socket).
-    Path,
-}
-
-/// One CLI argument of a command, declared in ARGS-STRING order:
-/// values serialize positionally in this order (`add NAME FILE
-/// HASH`), while `flag`-style args present as `--name` on the
-/// command line yet still serialize at their declared position.
-/// This is the vocabulary the derived clap tree reads — one table
-/// row drives the wire parser, completion, AND the CLI.
-#[derive(Clone, Copy)]
-pub struct CliArg {
-    pub name: &'static str,
-    pub kind: ArgKind,
-    pub optional: bool,
-    pub flag: bool,
-}
-
-impl CliArg {
-    /// A required positional argument.
-    pub const fn pos(name: &'static str, kind: ArgKind) -> Self {
-        Self { name, kind, optional: false, flag: false }
-    }
-    /// An optional positional argument.
-    pub const fn opt(name: &'static str, kind: ArgKind) -> Self {
-        Self { name, kind, optional: true, flag: false }
-    }
-    /// A required `--name` option.
-    pub const fn flag(name: &'static str, kind: ArgKind) -> Self {
-        Self { name, kind, optional: false, flag: true }
-    }
-    /// An optional `--name` option.
-    pub const fn opt_flag(name: &'static str, kind: ArgKind) -> Self {
-        Self { name, kind, optional: true, flag: true }
-    }
-}
-
 /// ONE definition per wire command.  The client registry derives
 /// parse/completion from here, the server registry derives its name
 /// dispatch from here, and `handle_command`'s exhaustive match makes
 /// the compiler enforce server logic for every variant.  Registry
 /// drift between the two sides is structurally unrepresentable.
-/// The CLI derives its argument tree from `cli_args`.
 pub struct CommandSpec {
     pub name: &'static str,
     pub help: &'static str,
     pub parse: fn(&str) -> Result<Command, String>,
     pub complete: Completer,
     pub offline: Option<OfflineFn>,
-    pub cli_args: &'static [CliArg],
 }
 
 const NO_COMPLETE: Completer = Completer::None;
@@ -345,21 +298,21 @@ fn offline_version(_args: &str, out: &mut dyn Console) -> Result<(), String> {
 
 /// The complete wire command set, in protocol order.
 pub const COMMAND_TABLE: &[CommandSpec] = &[
-    CommandSpec { name: "status", help: "Show all secrets and access counts", parse: parse_status, complete: NO_COMPLETE, offline: None, cli_args: &[] },
-    CommandSpec { name: "mounts", help: "List mounted secret files", parse: parse_mounts, complete: NO_COMPLETE, offline: None, cli_args: &[] },
-    CommandSpec { name: "reset", help: "Reset access counter for one or all secrets", parse: parse_reset, complete: Completer::SecretNames { after_space: true }, offline: None, cli_args: &[CliArg::opt_flag("name", ArgKind::Str)] },
-    CommandSpec { name: "reset-all", help: "Reset all access counters", parse: parse_reset_all, complete: NO_COMPLETE, offline: None, cli_args: &[] },
-    CommandSpec { name: "add", help: "Add a new secret from a file", parse: parse_add, complete: NO_COMPLETE, offline: None, cli_args: &[CliArg::pos("name", ArgKind::Str), CliArg::flag("file", ArgKind::Path), CliArg::flag("hash", ArgKind::Str)] },
-    CommandSpec { name: "remove", help: "Remove a secret", parse: parse_remove, complete: Completer::SecretNames { after_space: true }, offline: None, cli_args: &[CliArg::pos("name", ArgKind::Str)] },
-    CommandSpec { name: "rotate", help: "Change the allowed binary hash", parse: parse_rotate, complete: Completer::SecretNames { after_space: false }, offline: None, cli_args: &[CliArg::pos("name", ArgKind::Str), CliArg::flag("hash", ArgKind::Str)] },
-    CommandSpec { name: "pending", help: "Show pending access requests", parse: parse_pending, complete: NO_COMPLETE, offline: None, cli_args: &[] },
-    CommandSpec { name: "grant", help: "Grant a pending access request", parse: parse_grant, complete: Completer::PendingIds, offline: None, cli_args: &[CliArg::pos("id", ArgKind::U64)] },
-    CommandSpec { name: "grant-forever", help: "Grant a pending access permanently (whitelists the observed package hash)", parse: parse_grant_forever, complete: Completer::PendingIds, offline: None, cli_args: &[CliArg::pos("id", ArgKind::U64)] },
-    CommandSpec { name: "deny", help: "Deny a pending access request", parse: parse_deny, complete: Completer::PendingIds, offline: None, cli_args: &[CliArg::pos("id", ArgKind::U64)] },
-    CommandSpec { name: "lockdown", help: "Lock in current grants; deny all future unauthorized access immediately (persisted)", parse: parse_lockdown, complete: NO_COMPLETE, offline: None, cli_args: &[] },
-    CommandSpec { name: "show-map", help: "Show the outer -> anonymized container-view name map", parse: parse_show_map, complete: NO_COMPLETE, offline: None, cli_args: &[] },
-    CommandSpec { name: "version", help: "Show server version", parse: parse_version, complete: NO_COMPLETE, offline: Some(offline_version), cli_args: &[] },
-    CommandSpec { name: "logpath", help: "Show server log file path", parse: parse_logpath, complete: NO_COMPLETE, offline: None, cli_args: &[] },
+    CommandSpec { name: "status", help: "Show all secrets and access counts", parse: parse_status, complete: NO_COMPLETE, offline: None },
+    CommandSpec { name: "mounts", help: "List mounted secret files", parse: parse_mounts, complete: NO_COMPLETE, offline: None },
+    CommandSpec { name: "reset", help: "Reset access counter for one or all secrets", parse: parse_reset, complete: Completer::SecretNames { after_space: true }, offline: None },
+    CommandSpec { name: "reset-all", help: "Reset all access counters", parse: parse_reset_all, complete: NO_COMPLETE, offline: None },
+    CommandSpec { name: "add", help: "Add a new secret from a file", parse: parse_add, complete: NO_COMPLETE, offline: None },
+    CommandSpec { name: "remove", help: "Remove a secret", parse: parse_remove, complete: Completer::SecretNames { after_space: true }, offline: None },
+    CommandSpec { name: "rotate", help: "Change the allowed binary hash", parse: parse_rotate, complete: Completer::SecretNames { after_space: false }, offline: None },
+    CommandSpec { name: "pending", help: "Show pending access requests", parse: parse_pending, complete: NO_COMPLETE, offline: None },
+    CommandSpec { name: "grant", help: "Grant a pending access request", parse: parse_grant, complete: Completer::PendingIds, offline: None },
+    CommandSpec { name: "grant-forever", help: "Grant a pending access permanently (whitelists the observed package hash)", parse: parse_grant_forever, complete: Completer::PendingIds, offline: None },
+    CommandSpec { name: "deny", help: "Deny a pending access request", parse: parse_deny, complete: Completer::PendingIds, offline: None },
+    CommandSpec { name: "lockdown", help: "Lock in current grants; deny all future unauthorized access immediately (persisted)", parse: parse_lockdown, complete: NO_COMPLETE, offline: None },
+    CommandSpec { name: "show-map", help: "Show the outer -> anonymized container-view name map", parse: parse_show_map, complete: NO_COMPLETE, offline: None },
+    CommandSpec { name: "version", help: "Show server version", parse: parse_version, complete: NO_COMPLETE, offline: Some(offline_version) },
+    CommandSpec { name: "logpath", help: "Show server log file path", parse: parse_logpath, complete: NO_COMPLETE, offline: None },
 ];
 
 pub fn client_protocols() -> Vec<Protocol> {

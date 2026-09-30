@@ -532,7 +532,7 @@ fn e2e_re_add_unchanged_content_preserves_state_end_to_end() {
     let src = tempfile::tempdir().unwrap();
     let f = src.path().join("s");
     std::fs::write(&f, b"KEEP").unwrap();
-    let out = split.client(&["add", "--file", f.to_str().unwrap(), "--hash", "*", "s"]);
+    let out = split.client(&["add", "s", f.to_str().unwrap(), "*"]);
     assert!(out.status.success(), "re-add failed: {}", write_out(&out));
 
     // Read state persisted: still consumed, not a fresh cycle.
@@ -594,7 +594,7 @@ fn e2e_grants_survive_a_policy_daemon_kill() {
     assert_eq!(err.raw_os_error(), Some(libc::EACCES), "spent budget survives kill -9: {err}");
 
     // The explicit path clears it, and the fresh read works.
-    let out = split.client(&["reset", "--name", "s"]);
+    let out = split.client(&["reset", "s"]);
     assert!(out.status.success(), "reset failed: {}", write_out(&out));
     match split.read("s") {
         Ok(b) => assert_eq!(b, b"KEEP"),
@@ -649,7 +649,7 @@ fn e2e_fused_kill9_policy_untouched_a_fresh_data_daemon_remounts() {
     assert_eq!(err.raw_os_error(), Some(libc::EACCES), "budget must survive the data daemon's death: {err}");
 
     // And the explicit reset restores reads through the new mount.
-    let out = split.client(&["reset", "--name", "s"]);
+    let out = split.client(&["reset", "s"]);
     assert!(out.status.success(), "reset after remount: {}", write_out(&out));
     assert_eq!(split.read("s").unwrap(), b"DK");
 }
@@ -700,7 +700,7 @@ fn e2e_host_edit_is_visible_on_next_open() {
     let split = Split::new("fresh", &[("s", b"OLD-BYTES", "*")]);
     assert_eq!(split.read("s").unwrap(), b"OLD-BYTES");
     std::fs::write(split.source_path("s"), b"NEW-BYTES").unwrap();
-    let out = split.client(&["reset", "--name", "s"]);
+    let out = split.client(&["reset", "s"]);
     assert!(out.status.success(), "reset failed: {}", write_out(&out));
     match split.read("s") {
         Ok(b) => assert_eq!(b, b"NEW-BYTES", "fresh bytes must serve"),
@@ -718,7 +718,7 @@ fn e2e_ghost_opens_to_enoent() {
     let split = Split::new("ghost", &[("s", b"G", "*")]);
     assert_eq!(split.read("s").unwrap(), b"G");
     std::fs::remove_file(split.source_path("s")).unwrap();
-    let out = split.client(&["reset", "--name", "s"]);
+    let out = split.client(&["reset", "s"]);
     assert!(out.status.success());
     let err = split.read("s").unwrap_err();
     assert_eq!(err.raw_os_error(), Some(libc::ENOENT), "ghost: {err}");
@@ -738,7 +738,7 @@ fn e2e_ghost_heals_when_the_host_file_returns() {
     assert_eq!(split.read("s").unwrap(), b"V1");
     // Ghost it: source gone, cycle reset, open -> ENOENT.
     std::fs::remove_file(split.source_path("s")).unwrap();
-    assert!(split.client(&["reset", "--name", "s"]).status.success());
+    assert!(split.client(&["reset", "s"]).status.success());
     let err = split.read("s").unwrap_err();
     assert_eq!(err.raw_os_error(), Some(libc::ENOENT), "ghost: {err}");
     // The file returns (a NEW incarnation, as any real restore would):
@@ -775,7 +775,7 @@ fn e2e_atomic_replace_serves_fresh_bytes_and_a_new_inode() {
     let tmp = split.source_path("s.tmp");
     std::fs::write(&tmp, b"V2-CONTENT").unwrap();
     std::fs::rename(&tmp, split.source_path("s")).unwrap();
-    let out = split.client(&["reset", "--name", "s"]);
+    let out = split.client(&["reset", "s"]);
     assert!(out.status.success());
     match split.read("s") {
         Ok(b) => assert_eq!(b, b"V2-CONTENT", "replaced incarnation serves fresh"),
@@ -819,7 +819,7 @@ fn e2e_reset_allows_reread() {
     let _g = serial();
     let split = Split::new("reset", &[("s", b"R", "*")]);
     assert_eq!(std::fs::read(split.path("s")).unwrap(), b"R");
-    let out = split.client(&["reset", "--name", "s"]);
+    let out = split.client(&["reset", "s"]);
     assert!(out.status.success(), "reset failed: {}", write_out(&out));
     assert_eq!(std::fs::read(split.path("s")).unwrap(), b"R");
 }
@@ -907,7 +907,7 @@ fn e2e_source_mode_passthrough_masks_write_bits() {
     std::fs::write(&f, b"M").unwrap();
     use std::os::unix::fs::PermissionsExt as _;
     std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644)).unwrap();
-    let out = split.client(&["add", "m", "--file", &f.display().to_string(), "--hash", "*"]);
+    let out = split.client(&["add", "m", &f.display().to_string(), "*"]);
     assert!(out.status.success(), "add failed: {}", write_out(&out));
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -955,7 +955,7 @@ fn e2e_dynamic_add_visible() {
     let src = tempfile::tempdir().unwrap();
     let f = src.path().join("new.secret");
     std::fs::write(&f, b"FRESH").unwrap();
-    let out = split.client(&["add", "fresh", "--file", &f.display().to_string(), "--hash", "*"]);
+    let out = split.client(&["add", "fresh", &f.display().to_string(), "*"]);
     assert!(out.status.success(), "add failed: {}", write_out(&out));
     // The content must appear through the mount (hub -> fused).
     let mut seen = false;
@@ -1048,7 +1048,7 @@ fn e2e_different_binary_denied() {
         !out.status.success(),
         "a different binary must be denied even within the budget reset window"
     );
-    let _ = split.client(&["reset", "--name", "s"]);
+    let _ = split.client(&["reset", "s"]);
     let out = Command::new("cat").arg(split.path("s")).output().unwrap();
     assert!(!out.status.success(), "different package must stay denied after reset");
 }
@@ -1108,7 +1108,7 @@ fn e2e_ld_preload_changes_package_hash_and_is_denied() {
     let pkg = package_hash_of_self();
     let split = Split::new("ldpreload", &[("s", b"L", &pkg)]);
     assert_eq!(std::fs::read(split.path("s")).unwrap(), b"L");
-    let _ = split.client(&["reset", "--name", "s"]);
+    let _ = split.client(&["reset", "s"]);
     let art = tempfile::tempdir().unwrap();
     let lib = art.path().join("evil.so");
     std::fs::write(&lib, b"not really an so but it maps").unwrap();
@@ -1190,7 +1190,7 @@ fn e2e_policy_kill9_the_mount_survives_and_a_store_only_respawn_resyncs() {
     // fused's control loop reconnects (~1s poll) and the snapshot
     // replay re-serves; budget was spent pre-kill (MR5 persistence),
     // so reset — the explicit policy path — then read.
-    let out = split.client(&["reset", "--name", "s"]);
+    let out = split.client(&["reset", "s"]);
     assert!(out.status.success(), "reset after respawn: {}", write_out(&out));
     let mut ok = false;
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -1209,7 +1209,7 @@ fn e2e_policy_kill9_the_mount_survives_and_a_store_only_respawn_resyncs() {
     let src = tempfile::tempdir().unwrap();
     let f = src.path().join("post-restart.secret");
     std::fs::write(&f, b"AFTER").unwrap();
-    let out = split.client(&["add", "late", "--file", &f.display().to_string(), "--hash", "*"]);
+    let out = split.client(&["add", "late", &f.display().to_string(), "*"]);
     assert!(out.status.success(), "post-respawn add failed: {}", write_out(&out));
     let mut seen = false;
     let deadline = Instant::now() + Duration::from_secs(5);

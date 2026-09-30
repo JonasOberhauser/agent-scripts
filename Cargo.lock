@@ -389,7 +389,6 @@ dependencies = [
 name = "fuse-client"
 version = "0.33.0"
 dependencies = [
- "clap",
  "crossterm",
  "fuse-protocol",
  "libc",

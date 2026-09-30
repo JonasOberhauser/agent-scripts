@@ -6,86 +6,101 @@ use servyi_servatui::App;
 
 mod pending_layer;
 
-/// The CLI tree, DERIVED from `COMMAND_TABLE` — one source of truth
-/// for the wire parser, completion, and the command line (issue
-/// servyi/servatui#5). Only the client-local commands (`restart`,
-/// `completions`) and the two global options live here.
-fn build_cli() -> clap::Command {
-    let mut cli = clap::Command::new("fuse-client")
-        .about("Send CRUD commands to the fuse-server")
-        .arg(
-            clap::Arg::new("socket")
-                .short('s')
-                .long("socket")
-                .env(fuse_protocol::ENV_CMD_SOCKET)
-                .default_value(fuse_protocol::DEFAULT_CMD_SOCKET)
-                .value_parser(clap::value_parser!(PathBuf)),
-        )
-        .arg(
-            clap::Arg::new("complete")
-                .long("complete")
-                .hide(true)
-                .action(clap::ArgAction::SetTrue)
-                .help("Shell completion mode (also auto-engaged when COMP_LINE is set)"),
-        );
-    for spec in fuse_protocol::COMMAND_TABLE {
-        let mut sub = clap::Command::new(spec.name).about(spec.help);
-        for a in spec.cli_args {
-            let mut arg = if a.flag {
-                clap::Arg::new(a.name).long(a.name)
-            } else {
-                clap::Arg::new(a.name)
-            };
-            arg = arg.required(!a.optional);
-            sub = sub.arg(match a.kind {
-                fuse_protocol::ArgKind::U64 => {
-                    arg.value_parser(clap::value_parser!(u64))
-                }
-                fuse_protocol::ArgKind::Path => {
-                    arg.value_parser(clap::value_parser!(PathBuf))
-                }
-                fuse_protocol::ArgKind::Str => arg,
-            });
-        }
-        cli = cli.subcommand(sub);
-    }
-    cli.subcommand(
-        clap::Command::new("restart").about(
-            "Restart the fuse-server from the state file: stop the old \
-daemon (and its supervised data daemon), clean up socket and mount \
-point, respawn with the same configuration and re-add every secret \
-from the state file's host paths. This is the same flow the client \
-runs on a version mismatch, exposed as a one-word command; it asks \
-no questions.",
-        ),
-    )
-    .subcommand(
-        clap::Command::new("completions")
-            .about("Emit the delegating shell-completion scripts (bash | zsh | fish)")
-            .arg(clap::Arg::new("shell").required(true)),
-    )
+/// What the command line asks for. The table commands take their
+/// ARGS-STRING verbatim — the same positional line the TUI types,
+/// validated by the same parse closures (issue servyi/servatui#5:
+/// one grammar, no second CLI-specific description of it).
+#[derive(Debug, PartialEq)]
+enum Dispatch {
+    Complete,
+    Completions(String),
+    Restart,
+    /// A COMMAND_TABLE word plus its verbatim args-string.
+    Table(String, String),
+    /// No command word: the interactive TUI.
+    Tui,
+    Help,
 }
 
-/// Serialize matched subcommand values into the wire ARGS-STRING, in
-/// the row's declared `cli_args` order (positionals and flags alike:
-/// `add NAME FILE HASH` keeps its order whatever the user's flag
-/// order was). Optional values simply drop out.
-fn args_string(spec: &fuse_protocol::CommandSpec, sub: &clap::ArgMatches) -> String {
-    use fuse_protocol::ArgKind;
-    let mut parts: Vec<String> = Vec::new();
-    for a in spec.cli_args {
-        let value = match a.kind {
-            ArgKind::U64 => sub.get_one::<u64>(a.name).map(|v| v.to_string()),
-            ArgKind::Path => sub
-                .get_one::<std::path::PathBuf>(a.name)
-                .map(|p| p.display().to_string()),
-            ArgKind::Str => sub.get_one::<String>(a.name).cloned(),
+/// Usage text, generated from the table's help strings — nothing
+/// hand-listed to drift.
+fn usage(default_socket: &str) -> String {
+    let mut u = format!(
+        "Usage: fuse-client [-s|--socket PATH] [--complete] [COMMAND [ARGS...]]\n\
+         (default socket: {default_socket}; no COMMAND starts the TUI)\n\
+         Commands:\n"
+    );
+    for spec in fuse_protocol::COMMAND_TABLE {
+        u.push_str(&format!("  {} — {}\n", spec.name, spec.help));
+    }
+    u.push_str("  restart — stop the supervised daemons and respawn from the state file\n");
+    u.push_str("  completions SHELL — emit the shell-completion script (bash | zsh | fish)\n");
+    u
+}
+
+/// Parse `[flags] WORD [ARGS...]`: flags (`-s`/`--socket`/`--socket=X`
+/// and `--complete`) are recognized BEFORE the command word; after it
+/// everything is the verbatim args-string, so argument values may
+/// contain leading dashes via `--`.
+fn parse_argv(argv: &[String], default_socket: PathBuf) -> Result<(PathBuf, Dispatch), String> {
+    let mut socket = default_socket;
+    let mut i = 0;
+    let mut complete = false;
+    let word: String;
+    loop {
+        let Some(a) = argv.get(i) else {
+            return Ok((socket, if complete { Dispatch::Complete } else { Dispatch::Tui }));
         };
-        if let Some(v) = value {
-            parts.push(v);
+        i += 1;
+        match a.as_str() {
+            "-s" | "--socket" => {
+                socket = argv.get(i).cloned().map(PathBuf::from).ok_or_else(|| {
+                    format!("{} requires a PATH\n\n{}", a, usage(socket.to_str().unwrap_or("")))
+                })?;
+                i += 1;
+            }
+            other if other.starts_with("--socket=") => {
+                socket = PathBuf::from(&other["--socket=".len()..]);
+            }
+            "--complete" => complete = true,
+            "-h" | "--help" => return Ok((socket, Dispatch::Help)),
+            "--" => {
+                word = argv.get(i).cloned().ok_or_else(|| "no COMMAND after --".to_string())?;
+                i += 1;
+                break;
+            }
+            other if other.starts_with('-') => {
+                return Err(format!(
+                    "unknown flag {other:?}\n\n{}",
+                    usage(socket.to_str().unwrap_or(""))
+                ));
+            }
+            other => {
+                word = other.to_string();
+                break;
+            }
         }
     }
-    parts.join(" ")
+    if complete {
+        return Ok((socket, Dispatch::Complete));
+    }
+    let args = argv[i..].join(" ");
+    let d = match word.as_str() {
+        "restart" => Dispatch::Restart,
+        "completions" => Dispatch::Completions(
+            argv.get(i).cloned().unwrap_or_default(),
+        ),
+        w if fuse_protocol::COMMAND_TABLE.iter().any(|s| s.name == w) => {
+            Dispatch::Table(word.clone(), args)
+        }
+        w => {
+            return Err(format!(
+                "unknown command {w:?}\n\n{}",
+                usage(socket.to_str().unwrap_or(""))
+            ));
+        }
+    };
+    Ok((socket, d))
 }
 
 fn main() {
@@ -116,33 +131,40 @@ fn main() {
         tracing_subscriber::fmt().with_env_filter(filter).init();
     }
 
-    let matches = build_cli().get_matches();
-    let socket = matches
-        .get_one::<PathBuf>("socket")
-        .cloned()
-        .expect("default_value guarantees a socket");
+    // The socket default: explicit flag > environment > well-known.
+    let default_socket = std::env::var_os(fuse_protocol::ENV_CMD_SOCKET)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(fuse_protocol::DEFAULT_CMD_SOCKET));
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let (socket, dispatch) = match parse_argv(&argv, default_socket) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(2);
+        }
+    };
 
     // Shell completion comes FIRST: it must never hit the version
     // handshake, the log, or anything slow — a Tab press waits on it.
-    if matches.get_flag("complete") || std::env::var_os("COMP_LINE").is_some() {
+    if matches!(dispatch, Dispatch::Help) {
+        print!("{}", usage(fuse_protocol::DEFAULT_CMD_SOCKET));
+        return;
+    }
+    if matches!(dispatch, Dispatch::Complete) || std::env::var_os("COMP_LINE").is_some() {
         complete_mode(&socket);
         return;
     }
-    if let Some((name, sub)) = matches.subcommand() {
-        if name == "completions" {
-            print_completion_script(sub.get_one::<String>("shell").expect("required"));
-            return;
-        }
+    if let Dispatch::Completions(shell) = &dispatch {
+        print_completion_script(shell);
+        return;
     }
 
     let app = App::builder(&socket).protocol_all(client_protocols()).build();
 
-    if let Some((name, _sub)) = matches.subcommand() {
-        if name == "restart" {
-            let log_path = discover_log_path(&app);
-            restart_server(&app, log_path.as_deref());
-            return;
-        }
+    if matches!(dispatch, Dispatch::Restart) {
+        let log_path = discover_log_path(&app);
+        restart_server(&app, log_path.as_deref());
+        return;
     }
 
     if app.server_running() {
@@ -151,26 +173,19 @@ fn main() {
         check_start_server(&app);
     }
 
-    match matches.subcommand() {
-        Some((name, sub)) => {
-            let spec = fuse_protocol::COMMAND_TABLE
-                .iter()
-                .find(|s| s.name == name)
-                .expect("every non-local subcommand is a table row");
-            let args = args_string(spec, sub);
-            match app.run_cli_command(name, &args) {
-                Ok(lines) => {
-                    for line in lines {
-                        println!("{line}");
-                    }
-                }
-                Err(e) => {
-                    eprintln!("Error: {e}");
-                    std::process::exit(1);
+    match dispatch {
+        Dispatch::Table(word, args) => match app.run_cli_command(&word, &args) {
+            Ok(lines) => {
+                for line in lines {
+                    println!("{line}");
                 }
             }
-        }
-        None => {
+            Err(e) => {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        },
+        Dispatch::Tui => {
             let pending: fuse_protocol::PendingIds =
                 std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
             let secrets: fuse_protocol::SecretNames =
@@ -197,8 +212,7 @@ fn main() {
             // frame — so action failures (with their remediation
             // commands) are visible in the TUI, not only in the /tmp
             // log file.
-            let log_sink: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
-                Default::default();
+            let log_sink: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
             let talk = pending_layer::spawn_worker(
                 socket.clone(),
                 pending.clone(),
@@ -228,6 +242,8 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        // handled before the App existed
+        Dispatch::Complete | Dispatch::Completions(_) | Dispatch::Restart | Dispatch::Help => {}
     }
 }
 
@@ -788,6 +804,63 @@ fn ask_reset_anyway() {
     } else {
         eprintln!("Exiting without restarting.");
         std::process::exit(1);
+    }
+}
+
+// ── passthrough argv tests ─────────────────────────────────────
+
+#[test]
+fn parse_argv_recognizes_flags_before_the_command_word() {
+    let d = PathBuf::from("/default.sock");
+    let (s, dispatch) =
+        parse_argv(&["--socket".into(), "/x.sock".into(), "grant".into(), "7".into()], d.clone())
+            .expect("ok");
+    assert_eq!(s, PathBuf::from("/x.sock"));
+    assert!(matches!(dispatch, Dispatch::Table(ref w, ref a)
+        if w == "grant" && a == "7"));
+    // -s short, --socket=X, and --complete
+    let (s, _) = parse_argv(&["-s".into(), "/y.sock".into(), "status".into()], d.clone()).unwrap();
+    assert_eq!(s, PathBuf::from("/y.sock"));
+    let (s, disp) = parse_argv(&["--socket=/z.sock".into(), "status".into()], d.clone()).unwrap();
+    assert_eq!(s, PathBuf::from("/z.sock"));
+    assert!(matches!(disp, Dispatch::Table(ref w, ref a) if w == "status" && a.is_empty()));
+    let (_, disp) = parse_argv(&["--complete".into()], d.clone()).unwrap();
+    assert!(matches!(disp, Dispatch::Complete));
+    // no word: the TUI
+    let (_, disp) = parse_argv(&[], d.clone()).unwrap();
+    assert!(matches!(disp, Dispatch::Tui));
+    // -h
+    let (_, disp) = parse_argv(&["-h".into()], d).unwrap();
+    assert!(matches!(disp, Dispatch::Help));
+}
+
+#[test]
+fn parse_argv_keeps_args_verbatim_after_the_word() {
+    let d = PathBuf::from("/d.sock");
+    // values may contain dashes once the word has started
+    let (_, disp) = parse_argv(
+        &["add".into(), "s.yaml".into(), "/tmp/f".into(), "-weird-hash".into()],
+        d.clone(),
+    )
+    .unwrap();
+    assert!(matches!(disp, Dispatch::Table(ref w, ref a)
+        if w == "add" && a == "s.yaml /tmp/f -weird-hash"));
+    // -- escapes a leading-dash word
+    let (_, disp) = parse_argv(&["--".into(), "status".into()], d).unwrap();
+    assert!(matches!(disp, Dispatch::Table(ref w, _) if w == "status"));
+}
+
+#[test]
+fn parse_argv_rejects_unknown_flags_and_words_with_usage() {
+    let d = PathBuf::from("/d.sock");
+    let e = parse_argv(&["--nonsense".into()], d.clone()).unwrap_err();
+    assert!(e.contains("unknown flag") && e.contains("grant"), "{e}");
+    let e = parse_argv(&["frobnicate".into()], d).unwrap_err();
+    assert!(e.contains("unknown command") && e.contains("status"), "{e}");
+    // the usage lists every table row and both local commands
+    let u = usage("/d.sock");
+    for w in ["grant", "lockdown", "show-map", "restart", "completions"] {
+        assert!(u.contains(w), "usage must list {w}: {u}");
     }
 }
 
