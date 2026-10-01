@@ -972,7 +972,7 @@ dependencies = [
 [[package]]
 name = "servatui-display"
 version = "0.3.1"
-source = "git+https://github.com/servyi/servatui.git?branch=cli-patterns#5c947218072d41aa9cb5cd5f69998903e8831235"
+source = "git+https://github.com/servyi/servatui.git?rev=a971caf#a971caf5022dd016abc18d598f8d5bb174957433"
 dependencies = [
  "crossterm",
  "ratatui",
@@ -983,7 +983,7 @@ dependencies = [
 [[package]]
 name = "servyi-servatui"
 version = "0.8.3"
-source = "git+https://github.com/servyi/servatui.git?branch=cli-patterns#5c947218072d41aa9cb5cd5f69998903e8831235"
+source = "git+https://github.com/servyi/servatui.git?rev=a971caf#a971caf5022dd016abc18d598f8d5bb174957433"
 dependencies = [
  "base64",
  "clap",
