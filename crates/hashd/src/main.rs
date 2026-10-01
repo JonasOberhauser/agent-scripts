@@ -54,7 +54,7 @@ fn default_socket() -> String {
     if std::path::Path::new("/run").is_dir() && can_write_run() {
         fuse_protocol::hashd::DEFAULT_SOCK.to_string()
     } else {
-        format!("/tmp/fuse-hashd-{}.sock", nix_uid())
+        format!("{HASHD_SOCK_PREFIX}{}.sock", nix_uid())
     }
 }
 
@@ -64,6 +64,10 @@ fn can_write_run() -> bool {
         .or_else(|_| std::fs::metadata("/run").map(|m| !m.permissions().readonly()))
         .is_ok_and(|ok| ok)
 }
+
+/// Prefix of every hashd socket path (uid-suffixed); the scanner
+/// below must accept exactly what the builder above creates.
+const HASHD_SOCK_PREFIX: &str = "/tmp/fuse-hashd-";
 
 fn nix_uid() -> u32 {
     std::fs::read_to_string("/proc/self/status")
@@ -220,7 +224,7 @@ mod tests {
         // Deterministic branch check, independent of this test host.
         let s = default_socket();
         assert!(
-            s.starts_with("/run/") || s.starts_with("/tmp/fuse-hashd-"),
+            s.starts_with("/run/") || s.starts_with(HASHD_SOCK_PREFIX),
             "unexpected default socket {s}"
         );
     }

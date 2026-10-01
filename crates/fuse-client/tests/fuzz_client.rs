@@ -252,7 +252,7 @@ fn run_client(socket: &std::path::Path, state_file: &std::path::Path, argv: &[St
         .arg("--socket")
         .arg(socket)
         .args(argv)
-        .env("FUSE_GATEKEEPER_STATE", state_file)
+        .env(fuse_protocol::ENV_STATE_FILE, state_file)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());

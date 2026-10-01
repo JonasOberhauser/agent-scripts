@@ -52,6 +52,16 @@ pub const DEFAULT_MOUNT_POINT: &str = "/tmp/fuse-gatekeeper-mnt";
 pub const DEFAULT_LOG_PATH: &str = "/tmp/fuse-gatekeeper.log";
 /// State file written by the orchestrator, read by fuse-client for restarts.
 pub const STATE_FILE: &str = "/tmp/fuse-gatekeeper-state.json";
+/// Where the policy daemon serves the data daemon (fused).
+pub const DEFAULT_ORACLE_SOCKET: &str = "/tmp/fuse-gatekeeper-oracle.sock";
+/// The flag every daemon/spawner uses to point at the oracle socket
+/// (typed by fuse-server, fused, run-agent, and fuse-client's
+/// respawn argv — one spelling).
+pub const ORACLE_SOCKET_FLAG: &str = "--oracle-socket";
+/// The policy daemon's binary name (clap name, orchestrator default).
+pub const SERVER_BIN: &str = "fuse-server";
+/// The data daemon's binary name (clap name, policy-daemon spawn).
+pub const FUSED_BIN: &str = "fused";
 
 // ── environment variables ───────────────────────────────────────
 // ONE registry: env-var names are interface, and interface strings
@@ -70,6 +80,11 @@ pub const ENV_CMD_SOCKET: &str = "FUSE_GATEKEEPER_SOCKET";
 pub const DEFAULT_CMD_SOCKET: &str = "/tmp/fuse-gatekeeper.sock";
 /// Where `fuse-server` reaches the privileged hashd socket.
 pub const ENV_HASHD_SOCK: &str = "FUSE_HASHD_SOCK";
+/// bash's `complete -C` protocol: the completing line. Shared by the
+/// client binary (reads it) and the e2e tests (sets it).
+pub const COMP_LINE: &str = "COMP_LINE";
+/// bash's `complete -C` protocol: the cursor offset into COMP_LINE.
+pub const COMP_POINT: &str = "COMP_POINT";
 
 /// State file path, overridable via [`ENV_STATE_FILE`] (e.g. for
 /// E2E tests that must not clobber a live state file).
@@ -83,7 +98,7 @@ pub use error::IoError;
 pub use io::{CommandOutput, IoProvider, PathState, SystemIo, Transport};
 pub use protocol::{Command, PENDING_ONLY_HASH, HashEntryStatus, MapEntry, MountEntry, PendingAccessInfo, Response, SecretStatus, ServerStateFile, StateSecretEntry, Salt, anonymize, anonymize_path, collapse_paths, versions_compatible};
 pub use real_io::{MockSystemIo, RealSystemIo};
-pub use servatui_protocols::{CommandSpec, Completer, COMMAND_TABLE,
+pub use servatui_protocols::{cmd, CommandSpec, Completer, COMMAND_TABLE,
     client_protocols, client_protocols_with_snapshots, pending_info, poll_pending_info,
     poll_pending_once, poll_secret_names, print_response, run_command_once, PendingIds,
     SecretNames,

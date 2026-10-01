@@ -30,7 +30,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Wrap;
 use ratatui::widgets::Paragraph;
 use servatui_display::{DisplayLayer, EventResult, LayerCtx, StackIntent};
-use servyi_servatui::WidgetEntry;
+use servyi_servatui::tui::WidgetEntry;
 use unicode_width::UnicodeWidthStr;
 
 /// Widget-name of the panel rows (ownership/hit-testing key).
@@ -81,9 +81,9 @@ impl Button {
     /// The wire protocol this button speaks.
     fn protocol_name(&self) -> &'static str {
         match self {
-            Button::GrantForever { .. } => "grant-forever",
-            _ if self.is_grant() => "grant",
-            _ => "deny",
+            Button::GrantForever { .. } => fuse_protocol::cmd::GRANT_FOREVER,
+            _ if self.is_grant() => fuse_protocol::cmd::GRANT,
+            _ => fuse_protocol::cmd::DENY,
         }
     }
 
@@ -462,7 +462,7 @@ enum GridRow<'a> {
 fn small_shell_hint() -> String {
     let mut names: Vec<&str> = Vec::new();
     for spec in fuse_protocol::COMMAND_TABLE {
-        let relevant = spec.name == "pending"
+        let relevant = spec.name == fuse_protocol::cmd::PENDING
             || matches!(spec.complete, fuse_protocol::Completer::PendingIds);
         if relevant && !names.contains(&spec.name) {
             names.push(spec.name);

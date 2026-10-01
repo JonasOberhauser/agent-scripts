@@ -387,7 +387,7 @@ dependencies = [
 
 [[package]]
 name = "fuse-client"
-version = "0.32.0"
+version = "0.33.0"
 dependencies = [
  "clap",
  "crossterm",
@@ -407,7 +407,7 @@ dependencies = [
 
 [[package]]
 name = "fuse-mount"
-version = "0.32.0"
+version = "0.33.0"
 dependencies = [
  "bimap",
  "clap",
@@ -428,8 +428,9 @@ dependencies = [
 
 [[package]]
 name = "fuse-protocol"
-version = "0.32.0"
+version = "0.33.0"
 dependencies = [
+ "clap",
  "libc",
  "serde",
  "serde_json",
@@ -440,7 +441,7 @@ dependencies = [
 
 [[package]]
 name = "fuse-server"
-version = "0.32.0"
+version = "0.33.0"
 dependencies = [
  "clap",
  "dashmap",
@@ -512,7 +513,7 @@ dependencies = [
 
 [[package]]
 name = "hashd"
-version = "0.32.0"
+version = "0.33.0"
 dependencies = [
  "fuse-protocol",
  "tempfile",
@@ -867,7 +868,7 @@ checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
 
 [[package]]
 name = "run-agent"
-version = "0.32.0"
+version = "0.33.0"
 dependencies = [
  "clap",
  "fuse-protocol",
@@ -971,7 +972,7 @@ dependencies = [
 [[package]]
 name = "servatui-display"
 version = "0.3.1"
-source = "git+https://github.com/servyi/servatui.git?rev=be753e5#be753e55f57ef9f6f9c83e8c9f513a2e2991e73e"
+source = "git+https://github.com/servyi/servatui.git?rev=a971caf#a971caf5022dd016abc18d598f8d5bb174957433"
 dependencies = [
  "crossterm",
  "ratatui",
@@ -982,9 +983,10 @@ dependencies = [
 [[package]]
 name = "servyi-servatui"
 version = "0.8.3"
-source = "git+https://github.com/servyi/servatui.git?rev=be753e5#be753e55f57ef9f6f9c83e8c9f513a2e2991e73e"
+source = "git+https://github.com/servyi/servatui.git?rev=a971caf#a971caf5022dd016abc18d598f8d5bb174957433"
 dependencies = [
  "base64",
+ "clap",
  "crossterm",
  "libc",
  "ratatui",

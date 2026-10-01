@@ -42,6 +42,25 @@ fn run_client(socket: &Path, args: &[&str]) -> (String, String, i32) {
     )
 }
 
+/// Run the real client binary as bash's `complete -C` would: the
+/// completing line and cursor offset arrive in the environment.
+fn run_client_completing(socket: &Path, line: &str) -> (String, i32) {
+    let bin = client_binary();
+    let point = line.len().to_string();
+    let output = Command::new(&bin)
+        .arg("--socket")
+        .arg(socket)
+        .arg("--complete")
+        .env(fuse_protocol::COMP_LINE, line)
+        .env(fuse_protocol::COMP_POINT, point)
+        .output()
+        .unwrap_or_else(|e| panic!("Failed to run fuse-client --complete: {e}"));
+    (
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        output.status.code().unwrap_or(-1),
+    )
+}
+
 /// Serializes tests that touch process-global env (ENV_STATE_FILE):
 /// cargo runs tests in one binary in parallel, and set_var is global.
 static STATE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -205,7 +224,7 @@ fn e2e_client_binary_against_server() {
     std::fs::write(&secret_file, b"TOPSECRET").unwrap();
 
     let (stdout, stderr, code) = run_client(&socket, &[
-        "add-secret", "new.yaml",
+        "add", "new.yaml",
         "--file", secret_file.to_str().unwrap(),
         "--hash", "abc123",
     ]);
@@ -223,19 +242,19 @@ fn e2e_client_binary_against_server() {
     assert!(stdout.contains("abc123"), "should show new hash: {stdout}");
 
     // ── 4. List mounts ──
-    let (stdout, stderr, code) = run_client(&socket, &["list-mounts"]);
+    let (stdout, stderr, code) = run_client(&socket, &["mounts"]);
     assert_eq!(code, 0, "list-mounts failed: {stderr}");
     assert!(stdout.contains("existing.yaml"), "mounts should list existing.yaml: {stdout}");
     assert!(stdout.contains("new.yaml"), "mounts should list new.yaml: {stdout}");
 
     // ── 5. Version check ──
-    let (stdout, stderr, code) = run_client(&socket, &["get-version"]);
+    let (stdout, stderr, code) = run_client(&socket, &["version"]);
     assert_eq!(code, 0, "get-version failed: {stderr}");
     assert!(stdout.contains(VERSION), "version should be {VERSION}: {stdout}");
 
     // ── 6. Rotate hash ──
     let (stdout, stderr, code) = run_client(&socket, &[
-        "rotate-hash", "new.yaml", "--hash", "newhash",
+        "rotate", "new.yaml", "--hash", "newhash",
     ]);
     assert_eq!(code, 0, "rotate-hash failed: {stderr}");
     assert!(stdout.contains("OK"), "rotate should print OK: {stdout}");
@@ -245,7 +264,7 @@ fn e2e_client_binary_against_server() {
     assert!(stdout.contains("newhash"), "status should show rotated hash: {stdout}");
 
     // ── 7. Remove secret ──
-    let (stdout, stderr, code) = run_client(&socket, &["remove-secret", "new.yaml"]);
+    let (stdout, stderr, code) = run_client(&socket, &["remove", "new.yaml"]);
     assert_eq!(code, 0, "remove-secret failed: {stderr}");
     assert!(stdout.contains("OK"), "remove should print OK: {stdout}");
 
@@ -273,11 +292,11 @@ fn e2e_client_binary_against_server() {
     assert!(stdout.contains("No pending"), "should have no pending: {stdout}");
 
     // ── 9. Log path ──
-    let (stdout, _, _) = run_client(&socket, &["get-log-path"]);
+    let (stdout, _, _) = run_client(&socket, &["logpath"]);
     assert!(stdout.contains("Log path"), "should show log path: {stdout}");
 
     // ── 10. Remove non-existent → should fail ──
-    let (stdout, stderr, code) = run_client(&socket, &["remove-secret", "nonexistent"]);
+    let (stdout, stderr, code) = run_client(&socket, &["remove", "nonexistent"]);
     assert_eq!(code, 1, "removing nonexistent should exit 1: {stdout} {stderr}");
     assert!(stderr.contains("not found") || stdout.contains("not found") || stderr.contains("Error"),
         "should report error for missing secret: {stdout} | {stderr}");
@@ -294,7 +313,7 @@ fn grant_forever_retries_hashd_after_remediation() {
     let hashd_sock = dir.path().join("hashd.sock");
 
     // No hashd yet: point the server at the (silent) socket path.
-    std::env::set_var("FUSE_HASHD_SOCK", &hashd_sock);
+    std::env::set_var(fuse_protocol::ENV_HASHD_SOCK, &hashd_sock);
 
     let state = Arc::new({
         let s = ServerState::new();
@@ -354,7 +373,7 @@ fn grant_forever_retries_hashd_after_remediation() {
     assert!(matches!(probe, fuse_server::ReadOutcome::Granted), "got: {probe:?}");
 
     let _ = stub;
-    std::env::remove_var("FUSE_HASHD_SOCK");
+    std::env::remove_var(fuse_protocol::ENV_HASHD_SOCK);
 }
 
 #[test]
@@ -537,4 +556,100 @@ fn restart_respawns_on_the_state_files_oracle_rendezvous() {
     }
     let _ = sacrificial.kill();
     let _ = sacrificial.wait();
+}
+
+// ── Shell completion (servyi/servatui#5): dynamic against live state ──
+//
+// The completions binary path exercises the REAL socket server: first
+// words come from the compile-time command table, argument values
+// from live `status`/`pending` — the dynamic direction the issue
+// thread settled on.
+#[test]
+fn completion_is_dynamic_against_live_server_state() {
+    let dir = test_tempdir();
+    let socket = dir.path().join("complete.sock");
+
+    let state = Arc::new({
+        let s = ServerState::new();
+        s.add("existing.yaml", "/tmp/host/existing.yaml", 5, "hash1");
+        s
+    });
+    // One live pending so PendingIds completion has a real id.
+    state.create_pending("existing.yaml", 4242, Some("pkg_hash_x"), "hash mismatch", None);
+
+    let sock = socket.clone();
+    let st = Arc::clone(&state);
+    let _server = std::thread::spawn(move || {
+        let _ = run_socket_server(&sock, st);
+    });
+    wait_for_server(&socket);
+
+    // ── First word: command names, prefix-filtered, from the table ──
+    let (out, code) = run_client_completing(&socket, "fuse-client sta");
+    assert_eq!(code, 0, "completion must exit 0: {out}");
+    assert_eq!(out.trim_end(), "status", "prefix sta completes to status only: {out}");
+
+    // ── Secret-name argument from the LIVE status reply ──
+    let (out, code) = run_client_completing(&socket, "fuse-client reset exi");
+    assert_eq!(code, 0);
+    assert_eq!(out.trim_end(), "existing.yaml", "reset completes the real secret: {out}");
+
+    // Empty prefix after trailing space lists every candidate.
+    let (out, _) = run_client_completing(&socket, "fuse-client reset ");
+    assert_eq!(out.trim_end(), "existing.yaml", "empty prefix lists all secrets: {out}");
+
+    // ── Pending-id argument from the LIVE pending reply ──
+    let id = state.pending.iter().next().unwrap().id;
+    let (out, code) = run_client_completing(&socket, "fuse-client grant ");
+    assert_eq!(code, 0);
+    assert_eq!(out.trim_end(), id.to_string(), "grant completes the real pending id: {out}");
+
+    // ── Arity guard: the SECOND argument of rotate (the hash) never
+    //    completes into secret names ──
+    let (out, code) = run_client_completing(&socket, "fuse-client rotate existing.yaml ");
+    assert_eq!(code, 0);
+    assert_eq!(out, "", "hash position must not complete: {out}");
+
+    // ── Non-completing command: no argument candidates ──
+    let (out, code) = run_client_completing(&socket, "fuse-client status x");
+    assert_eq!(code, 0);
+    assert_eq!(out, "", "status has no argument completion: {out}");
+
+    // ── Offline degradation: dead socket → command names still work,
+    //    argument candidates vanish, exit stays 0 ──
+    let dead = dir.path().join("dead.sock");
+    let (out, code) = run_client_completing(&dead, "fuse-client re");
+    assert_eq!(code, 0, "offline completion must not fail the shell: {out}");
+    assert!(
+        out.lines().any(|l| l == "reset") && out.lines().any(|l| l == "remove"),
+        "offline first-word completes command names: {out}"
+    );
+    let (out, code) = run_client_completing(&dead, "fuse-client reset x");
+    assert_eq!(code, 0);
+    assert_eq!(out, "", "offline argument completion degrades to empty: {out}");
+
+    // ── bash's REAL invocation: COMP_LINE in the environment, no
+    //    --complete flag on argv (complete -C spawns the bare binary) ──
+    let bin = client_binary();
+    let output = Command::new(&bin)
+        .arg("--socket")
+        .arg(&socket)
+        .env(fuse_protocol::COMP_LINE, "fuse-client grant ")
+        .env(fuse_protocol::COMP_POINT, "fuse-client grant ".len().to_string())
+        .output()
+        .expect("bare COMP_LINE completion");
+    let id = state.pending.iter().next().unwrap().id;
+    let bare = String::from_utf8_lossy(&output.stdout).to_string();
+    assert_eq!(
+        bare.trim_end(),
+        id.to_string(),
+        "COMP_LINE alone must complete the live pending id: {bare}"
+    );
+
+    // ── The installed scripts delegate: `completions` emits them ──
+    let (out, stderr, code) = run_client(&socket, &["completions", "bash"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(out.contains("complete -C fuse-client fuse-client"), "{out}");
+    let (_, stderr, code) = run_client(&socket, &["completions", "tcsh"]);
+    assert_eq!(code, 1, "unsupported shell must exit 1: {stderr}");
 }
