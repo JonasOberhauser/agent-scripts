@@ -19,7 +19,7 @@ struct Cli {
     #[arg(short, long)]
     mount_point: PathBuf,
     /// Policy daemon's oracle socket (adjudication + content updates).
-    #[arg(short, long, default_value = "/tmp/fuse-gatekeeper-oracle.sock")]
+    #[arg(short, long, default_value = fuse_protocol::DEFAULT_ORACLE_SOCKET)]
     oracle_socket: String,
     /// Serve a MOCK kernel instead of mounting: JSON-line ops on this
     /// unix socket become real FUSE wire requests into the same

@@ -393,7 +393,7 @@ impl ProcStack {
             .arg("--oracle-socket").arg(&self.oracle)
             .arg("--pending-timeout").arg("1")
             .arg("--secret").arg(format!("s:{}:*", self.host.display()))
-            .env("FUSE_GATEKEEPER_POLICY", &self.policy_store)
+            .env(fuse_protocol::ENV_POLICY_FILE, &self.policy_store)
             .env("RUST_LOG", "warn")
             .stdout(std::process::Stdio::from(log.try_clone().unwrap()))
             .stderr(log)

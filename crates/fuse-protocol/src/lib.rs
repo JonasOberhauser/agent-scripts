@@ -52,6 +52,8 @@ pub const DEFAULT_MOUNT_POINT: &str = "/tmp/fuse-gatekeeper-mnt";
 pub const DEFAULT_LOG_PATH: &str = "/tmp/fuse-gatekeeper.log";
 /// State file written by the orchestrator, read by fuse-client for restarts.
 pub const STATE_FILE: &str = "/tmp/fuse-gatekeeper-state.json";
+/// Where the policy daemon serves the data daemon (fused).
+pub const DEFAULT_ORACLE_SOCKET: &str = "/tmp/fuse-gatekeeper-oracle.sock";
 
 // ── environment variables ───────────────────────────────────────
 // ONE registry: env-var names are interface, and interface strings

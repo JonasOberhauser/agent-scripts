@@ -37,7 +37,7 @@ struct Cli {
     log_path: PathBuf,
     /// Socket where the data daemon (fused) connects for adjudication
     /// and content updates.
-    #[arg(long, default_value = "/tmp/fuse-gatekeeper-oracle.sock")]
+    #[arg(long, default_value = fuse_protocol::DEFAULT_ORACLE_SOCKET)]
     oracle_socket: PathBuf,
 }
 

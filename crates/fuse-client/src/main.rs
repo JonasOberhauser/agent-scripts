@@ -6,6 +6,15 @@ use servyi_servatui::App;
 
 mod pending_layer;
 
+/// This binary's name — the clap tree, the completion scripts, and
+/// the COMP_LINE fallback all reference it; retyping it invites
+/// drift the day the binary is renamed.
+const BIN_NAME: &str = env!("CARGO_PKG_NAME");
+
+/// Base name of the client action log (beside the state file, or
+/// /tmp when no state file is known).
+const CLIENT_LOG_BASE: &str = "fuse-gatekeeper-client.log";
+
 /// The client-LOCAL commands (never on the wire): declared once,
 /// referenced everywhere.
 mod local {
@@ -20,7 +29,7 @@ mod local {
 fn build_cli(protocols: &[servyi_servatui::Protocol]) -> clap::Command {
     // The client's own extras (top-level options + local subcommands);
     // every protocol becomes a subcommand with its carried pattern.
-    let extras = clap::Command::new("fuse-client")
+    let extras = clap::Command::new(BIN_NAME)
         .about("Send CRUD commands to the fuse-server")
         .arg(
             clap::Arg::new("socket")
@@ -62,11 +71,11 @@ fn main() {
         .ok()
         .map(|p| {
             std::path::Path::new(&p)
-                .with_file_name("fuse-gatekeeper-client.log")
+                .with_file_name(CLIENT_LOG_BASE)
                 .to_string_lossy()
                 .to_string()
         })
-        .unwrap_or_else(|| "/tmp/fuse-gatekeeper-client.log".to_string());
+        .unwrap_or_else(|| format!("/tmp/{CLIENT_LOG_BASE}"));
     // Default to info: an unset RUST_LOG must not silence the panel
     // action log (that is the whole point of the file).
     let filter = tracing_subscriber::EnvFilter::builder()
@@ -322,7 +331,7 @@ fn complete_mode(socket: &std::path::Path) {
                 .file_name()
                 .map(|f| f.to_string_lossy().into_owned())
         })
-        .unwrap_or_else(|| "fuse-client".to_string());
+        .unwrap_or_else(|| BIN_NAME.to_string());
     let mut prior = prior;
     if prior.first().map(|w| w == &prog).unwrap_or(false) {
         let _removed = prior.remove(0);
@@ -361,15 +370,15 @@ fn complete_mode(socket: &std::path::Path) {
 /// None = unsupported shell (caller reports and exits nonzero).
 fn completion_script(shell: &str) -> Option<String> {
     match shell {
-        "bash" => Some("complete -C fuse-client fuse-client\n".to_string()),
-        "zsh" => Some(
-            "autoload -U +X bashcompinit && bashcompinit\ncomplete -C fuse-client fuse-client\n"
-                .to_string(),
-        ),
-        "fish" => Some(
-            "complete -c fuse-client -f -a '(fuse-client --complete (commandline -cop))'\n"
-                .to_string(),
-        ),
+        "bash" => Some(format!("complete -C {b} {b}\n", b = BIN_NAME)),
+        "zsh" => Some(format!(
+            "autoload -U +X bashcompinit && bashcompinit\ncomplete -C {b} {b}\n",
+            b = BIN_NAME
+        )),
+        "fish" => Some(format!(
+            "complete -c {b} -f -a '({b} --complete (commandline -cop))'\n",
+            b = BIN_NAME
+        )),
         _ => None,
     }
 }
@@ -616,7 +625,7 @@ fn start_server_from_state(app: &App, state: &ServerStateFile, log_path: Option<
     eprintln!("Restoring {} secret(s)...", state.secrets.len());
     for entry in &state.secrets {
         let args = format!("{} {} {}", entry.fuse_name, entry.host_path, entry.hash);
-        match app.run_cli_command("add", &args) {
+        match app.run_cli_command(fuse_protocol::cmd::ADD, &args) {
             Ok(_) => eprintln!("  Restored {}", entry.fuse_name),
             Err(e) => eprintln!("  Error restoring {}: {e}", entry.fuse_name),
         }
@@ -740,7 +749,7 @@ fn ask_reset_anyway() {
             server_pid: 0,
             server_binary: String::new(),
             mount_point: String::new(),
-            socket: "/tmp/fuse-gatekeeper.sock".into(),
+            socket: fuse_protocol::DEFAULT_CMD_SOCKET.into(),
             log_level: "info".into(),
             pending_timeout: 10,
             runtime_wrapper: None,

@@ -165,7 +165,7 @@ impl Split {
             ));
         }
         let policy = policy
-            .env("FUSE_GATEKEEPER_POLICY", dirs[1].path().join("policy.json"))
+            .env(fuse_protocol::ENV_POLICY_FILE, dirs[1].path().join("policy.json"))
             .stdout(server_log.try_clone().unwrap()).stderr(server_log)
             .spawn()
             .expect("spawn fuse-server (policy)");
@@ -385,7 +385,7 @@ impl Split {
         cmd.arg("--socket").arg(&self.socket)
             .arg("--oracle-socket").arg(&self.oracle)
             .arg("--pending-timeout").arg("5")
-            .env("FUSE_GATEKEEPER_POLICY", self._dirs[1].path().join("policy.json"))
+            .env(fuse_protocol::ENV_POLICY_FILE, self._dirs[1].path().join("policy.json"))
             .env("RUST_LOG", "fuse_mount=info,fuse_server=info")
             .stdout(std::process::Stdio::from(log.try_clone().unwrap()))
             .stderr(log);
@@ -574,7 +574,7 @@ fn e2e_grants_survive_a_policy_daemon_kill() {
         .arg("--pending-timeout").arg("5")
         .arg("--secret")
         .arg(format!("s:{}:*", split.source_path("s").display()))
-        .env("FUSE_GATEKEEPER_POLICY", split._dirs[1].path().join("policy.json"))
+        .env(fuse_protocol::ENV_POLICY_FILE, split._dirs[1].path().join("policy.json"))
         .stdout(std::process::Stdio::from(server_log2.try_clone().unwrap()))
         .stderr(server_log2);
     let mut child = cmd.spawn().expect("respawn fuse-server");
