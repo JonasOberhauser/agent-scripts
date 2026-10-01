@@ -224,7 +224,9 @@ fn e2e_client_binary_against_server() {
     std::fs::write(&secret_file, b"TOPSECRET").unwrap();
 
     let (stdout, stderr, code) = run_client(&socket, &[
-        "add", "new.yaml", secret_file.to_str().unwrap(), "abc123",
+        "add", "new.yaml",
+        "--file", secret_file.to_str().unwrap(),
+        "--hash", "abc123",
     ]);
     assert_eq!(code, 0, "add-secret failed: {stderr}");
     assert!(
@@ -252,7 +254,7 @@ fn e2e_client_binary_against_server() {
 
     // ── 6. Rotate hash ──
     let (stdout, stderr, code) = run_client(&socket, &[
-        "rotate", "new.yaml", "newhash",
+        "rotate", "new.yaml", "--hash", "newhash",
     ]);
     assert_eq!(code, 0, "rotate-hash failed: {stderr}");
     assert!(stdout.contains("OK"), "rotate should print OK: {stdout}");

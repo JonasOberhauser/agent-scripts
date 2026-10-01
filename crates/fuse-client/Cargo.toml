@@ -6,7 +6,8 @@ license.workspace = true
 
 [dependencies]
 fuse-protocol = { workspace = true }
-servyi-servatui = { workspace = true, features = ["tui"] }
+clap = { workspace = true }
+servyi-servatui = { workspace = true, features = ["tui", "cli"] }
 servatui-display = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -30,7 +30,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Wrap;
 use ratatui::widgets::Paragraph;
 use servatui_display::{DisplayLayer, EventResult, LayerCtx, StackIntent};
-use servyi_servatui::WidgetEntry;
+use servyi_servatui::tui::WidgetEntry;
 use unicode_width::UnicodeWidthStr;
 
 /// Widget-name of the panel rows (ownership/hit-testing key).
