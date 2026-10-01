@@ -14,7 +14,7 @@ use tracing::{error, info};
 
 
 #[derive(Parser)]
-#[command(name = "fused", about = "FUSE gatekeeper DATA daemon: secret bytes + mount; access decided by the policy daemon")]
+#[command(name = fuse_protocol::FUSED_BIN, about = "FUSE gatekeeper DATA daemon: secret bytes + mount; access decided by the policy daemon")]
 struct Cli {
     #[arg(short, long)]
     mount_point: PathBuf,

@@ -54,6 +54,14 @@ pub const DEFAULT_LOG_PATH: &str = "/tmp/fuse-gatekeeper.log";
 pub const STATE_FILE: &str = "/tmp/fuse-gatekeeper-state.json";
 /// Where the policy daemon serves the data daemon (fused).
 pub const DEFAULT_ORACLE_SOCKET: &str = "/tmp/fuse-gatekeeper-oracle.sock";
+/// The flag every daemon/spawner uses to point at the oracle socket
+/// (typed by fuse-server, fused, run-agent, and fuse-client's
+/// respawn argv — one spelling).
+pub const ORACLE_SOCKET_FLAG: &str = "--oracle-socket";
+/// The policy daemon's binary name (clap name, orchestrator default).
+pub const SERVER_BIN: &str = "fuse-server";
+/// The data daemon's binary name (clap name, policy-daemon spawn).
+pub const FUSED_BIN: &str = "fused";
 
 // ── environment variables ───────────────────────────────────────
 // ONE registry: env-var names are interface, and interface strings

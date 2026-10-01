@@ -515,7 +515,7 @@ fn respawn_argv(state: &ServerStateFile) -> Vec<String> {
         // The surviving data daemon retries THIS rendezvous; respawning
         // on the global default would orphan it (an alive mount that
         // never syncs again).
-        argv.push("--oracle-socket".to_string());
+        argv.push(fuse_protocol::ORACLE_SOCKET_FLAG.to_string());
         argv.push(oracle.clone());
     }
     argv.push("--log-level".to_string());
@@ -948,7 +948,7 @@ mod tests {
         let argv = respawn_argv(&base);
         let i = argv
             .iter()
-            .position(|a| a == "--oracle-socket")
+            .position(|a| a == fuse_protocol::ORACLE_SOCKET_FLAG)
             .expect("the rendezvous flag is present");
         assert_eq!(argv[i + 1], "/tmp/.tmpABC/oracle.sock");
         // and the global default stays implicit when unset
