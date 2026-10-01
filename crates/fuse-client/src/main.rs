@@ -6,6 +6,13 @@ use servyi_servatui::App;
 
 mod pending_layer;
 
+/// The client-LOCAL commands (never on the wire): declared once,
+/// referenced everywhere.
+mod local {
+    pub const RESTART: &str = "restart";
+    pub const COMPLETIONS: &str = "completions";
+}
+
 /// The full CLI, COMBINED from the registered protocols (each row
 /// carries its own clap pattern — servatui's `cli` feature) plus the
 /// client's local commands and top-level options. Nothing here
@@ -32,7 +39,7 @@ fn build_cli(protocols: &[servyi_servatui::Protocol]) -> clap::Command {
                 .help("Shell completion mode (also auto-engaged when COMP_LINE is set)"),
         )
         .subcommand(
-            clap::Command::new("restart").about(
+            clap::Command::new(local::RESTART).about(
                 "Restart the fuse-server from the state file: stop the old \
 daemon (and its supervised data daemon), clean up socket and mount \
 point, respawn with the same configuration and re-add every secret \
@@ -40,7 +47,7 @@ from the state file's host paths.",
             ),
         )
         .subcommand(
-            clap::Command::new("completions")
+            clap::Command::new(local::COMPLETIONS)
                 .about("Emit the delegating shell-completion scripts (bash | zsh | fish)")
                 .arg(clap::Arg::new("shell").required(true)),
         );
@@ -92,7 +99,7 @@ fn main() {
         return;
     }
     if let Some((name, sub)) = matches.subcommand() {
-        if name == "completions" {
+        if name == local::COMPLETIONS {
             print_completion_script(sub.get_one::<String>("shell").expect("required"));
             return;
         }
@@ -116,7 +123,7 @@ fn main() {
     let app = App::builder(&socket).protocol_all(protocols).build();
 
     if let Some((name, _)) = matches.subcommand() {
-        if name == "restart" {
+        if name == local::RESTART {
             let log_path = discover_log_path(&app);
             restart_server(&app, log_path.as_deref());
             return;
@@ -383,7 +390,7 @@ fn print_completion_script(shell: &str) {
 /// predates logpath discovery (callers decide their own fallback).
 fn discover_log_path(app: &App) -> Option<String> {
     use fuse_protocol::Response;
-    app.run_cli_command_raw("logpath", "")
+    app.run_cli_command_raw(fuse_protocol::cmd::LOGPATH, "")
         .ok()
         .and_then(|(_, raw)| serde_json::from_slice::<Response>(&raw).ok())
         .and_then(|r| match r {
@@ -395,7 +402,7 @@ fn discover_log_path(app: &App) -> Option<String> {
 fn check_version_or_restart(app: &App) {
     use fuse_protocol::Response;
 
-    let server_version = match app.run_cli_command_raw("version", "") {
+    let server_version = match app.run_cli_command_raw(fuse_protocol::cmd::VERSION, "") {
         Ok((_, raw)) => serde_json::from_slice::<Response>(&raw)
             .ok()
             .and_then(|r| match r {
@@ -628,7 +635,7 @@ fn restart_server(app: &App, log_path: Option<&str>) {
         }
     };
 
-    let status_info = match app.run_cli_command_raw("status", "") {
+    let status_info = match app.run_cli_command_raw(fuse_protocol::cmd::STATUS, "") {
         Ok((_, raw)) => serde_json::from_slice::<Response>(&raw)
             .ok()
             .and_then(|r| match r {

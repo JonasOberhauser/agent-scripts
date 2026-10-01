@@ -188,8 +188,8 @@ impl Completer {
     pub fn query(self) -> Option<(&'static str, Command)> {
         match self {
             Completer::None => None,
-            Completer::SecretNames { .. } => Some(("status", Command::Status)),
-            Completer::PendingIds => Some(("pending", Command::ListPending)),
+            Completer::SecretNames { .. } => Some((cmd::STATUS, Command::Status)),
+            Completer::PendingIds => Some((cmd::PENDING, Command::ListPending)),
         }
     }
 
@@ -346,23 +346,44 @@ fn add_cli() -> Vec<clap::Arg> {
     ]
 }
 
+/// The single source of every command word. The table rows below are
+/// BUILT from these constants, and every other reference in the code
+/// base imports them — no command string is ever retyped.
+pub mod cmd {
+    pub const STATUS: &str = "status";
+    pub const MOUNTS: &str = "mounts";
+    pub const RESET: &str = "reset";
+    pub const RESET_ALL: &str = "reset-all";
+    pub const ADD: &str = "add";
+    pub const REMOVE: &str = "remove";
+    pub const ROTATE: &str = "rotate";
+    pub const PENDING: &str = "pending";
+    pub const GRANT: &str = "grant";
+    pub const GRANT_FOREVER: &str = "grant-forever";
+    pub const DENY: &str = "deny";
+    pub const LOCKDOWN: &str = "lockdown";
+    pub const SHOW_MAP: &str = "show-map";
+    pub const VERSION: &str = "version";
+    pub const LOGPATH: &str = "logpath";
+}
+
 /// The complete wire command set, in protocol order.
 pub const COMMAND_TABLE: &[CommandSpec] = &[
-    CommandSpec { name: "status", help: "Show all secrets and access counts", parse: parse_status, complete: NO_COMPLETE, offline: None, cli_args: no_cli_args },
-    CommandSpec { name: "mounts", help: "List mounted secret files", parse: parse_mounts, complete: NO_COMPLETE, offline: None, cli_args: no_cli_args },
-    CommandSpec { name: "reset", help: "Reset access counter for one or all secrets", parse: parse_reset, complete: Completer::SecretNames { after_space: true }, offline: None, cli_args: reset_cli },
-    CommandSpec { name: "reset-all", help: "Reset all access counters", parse: parse_reset_all, complete: NO_COMPLETE, offline: None, cli_args: no_cli_args },
-    CommandSpec { name: "add", help: "Add a new secret from a file", parse: parse_add, complete: NO_COMPLETE, offline: None, cli_args: add_cli },
-    CommandSpec { name: "remove", help: "Remove a secret", parse: parse_remove, complete: Completer::SecretNames { after_space: true }, offline: None, cli_args: name_cli },
-    CommandSpec { name: "rotate", help: "Change the allowed binary hash", parse: parse_rotate, complete: Completer::SecretNames { after_space: false }, offline: None, cli_args: name_hash_cli },
-    CommandSpec { name: "pending", help: "Show pending access requests", parse: parse_pending, complete: NO_COMPLETE, offline: None, cli_args: no_cli_args },
-    CommandSpec { name: "grant", help: "Grant a pending access request", parse: parse_grant, complete: Completer::PendingIds, offline: None, cli_args: id_cli },
-    CommandSpec { name: "grant-forever", help: "Grant a pending access permanently (whitelists the observed package hash)", parse: parse_grant_forever, complete: Completer::PendingIds, offline: None, cli_args: id_cli },
-    CommandSpec { name: "deny", help: "Deny a pending access request", parse: parse_deny, complete: Completer::PendingIds, offline: None, cli_args: id_cli },
-    CommandSpec { name: "lockdown", help: "Lock in current grants; deny all future unauthorized access immediately (persisted)", parse: parse_lockdown, complete: NO_COMPLETE, offline: None, cli_args: no_cli_args },
-    CommandSpec { name: "show-map", help: "Show the outer -> anonymized container-view name map", parse: parse_show_map, complete: NO_COMPLETE, offline: None, cli_args: no_cli_args },
-    CommandSpec { name: "version", help: "Show server version", parse: parse_version, complete: NO_COMPLETE, offline: Some(offline_version), cli_args: no_cli_args },
-    CommandSpec { name: "logpath", help: "Show server log file path", parse: parse_logpath, complete: NO_COMPLETE, offline: None, cli_args: no_cli_args },
+    CommandSpec { name: cmd::STATUS, help: "Show all secrets and access counts", parse: parse_status, complete: NO_COMPLETE, offline: None, cli_args: no_cli_args },
+    CommandSpec { name: cmd::MOUNTS, help: "List mounted secret files", parse: parse_mounts, complete: NO_COMPLETE, offline: None, cli_args: no_cli_args },
+    CommandSpec { name: cmd::RESET, help: "Reset access counter for one or all secrets", parse: parse_reset, complete: Completer::SecretNames { after_space: true }, offline: None, cli_args: reset_cli },
+    CommandSpec { name: cmd::RESET_ALL, help: "Reset all access counters", parse: parse_reset_all, complete: NO_COMPLETE, offline: None, cli_args: no_cli_args },
+    CommandSpec { name: cmd::ADD, help: "Add a new secret from a file", parse: parse_add, complete: NO_COMPLETE, offline: None, cli_args: add_cli },
+    CommandSpec { name: cmd::REMOVE, help: "Remove a secret", parse: parse_remove, complete: Completer::SecretNames { after_space: true }, offline: None, cli_args: name_cli },
+    CommandSpec { name: cmd::ROTATE, help: "Change the allowed binary hash", parse: parse_rotate, complete: Completer::SecretNames { after_space: false }, offline: None, cli_args: name_hash_cli },
+    CommandSpec { name: cmd::PENDING, help: "Show pending access requests", parse: parse_pending, complete: NO_COMPLETE, offline: None, cli_args: no_cli_args },
+    CommandSpec { name: cmd::GRANT, help: "Grant a pending access request", parse: parse_grant, complete: Completer::PendingIds, offline: None, cli_args: id_cli },
+    CommandSpec { name: cmd::GRANT_FOREVER, help: "Grant a pending access permanently (whitelists the observed package hash)", parse: parse_grant_forever, complete: Completer::PendingIds, offline: None, cli_args: id_cli },
+    CommandSpec { name: cmd::DENY, help: "Deny a pending access request", parse: parse_deny, complete: Completer::PendingIds, offline: None, cli_args: id_cli },
+    CommandSpec { name: cmd::LOCKDOWN, help: "Lock in current grants; deny all future unauthorized access immediately (persisted)", parse: parse_lockdown, complete: NO_COMPLETE, offline: None, cli_args: no_cli_args },
+    CommandSpec { name: cmd::SHOW_MAP, help: "Show the outer -> anonymized container-view name map", parse: parse_show_map, complete: NO_COMPLETE, offline: None, cli_args: no_cli_args },
+    CommandSpec { name: cmd::VERSION, help: "Show server version", parse: parse_version, complete: NO_COMPLETE, offline: Some(offline_version), cli_args: no_cli_args },
+    CommandSpec { name: cmd::LOGPATH, help: "Show server log file path", parse: parse_logpath, complete: NO_COMPLETE, offline: None, cli_args: no_cli_args },
 ];
 
 pub fn client_protocols() -> Vec<Protocol> {
@@ -519,7 +540,7 @@ pub fn run_command_once(
 
 /// One poll cycle returning the FULL pending request list.
 pub fn poll_pending_info(socket: &std::path::Path) -> Result<Vec<PendingAccessInfo>, String> {
-    match run_command_once(socket, "pending", &Command::ListPending)? {
+    match run_command_once(socket, cmd::PENDING, &Command::ListPending)? {
         crate::Response::PendingList { pending } => Ok(pending),
         other => Err(format!("unexpected response to list_pending: {other:?}")),
     }
@@ -528,7 +549,7 @@ pub fn poll_pending_info(socket: &std::path::Path) -> Result<Vec<PendingAccessIn
 /// One poll cycle returning the server's secret NAMES (from `status`),
 /// the live source for reset/remove/rotate completion.
 pub fn poll_secret_names(socket: &std::path::Path) -> Result<Vec<String>, String> {
-    match run_command_once(socket, "status", &Command::Status)? {
+    match run_command_once(socket, cmd::STATUS, &Command::Status)? {
         crate::Response::Status { secrets, .. } => {
             Ok(secrets.into_iter().map(|s| s.name).collect())
         }
