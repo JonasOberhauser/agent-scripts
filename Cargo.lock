@@ -430,6 +430,7 @@ dependencies = [
 name = "fuse-protocol"
 version = "0.33.0"
 dependencies = [
+ "clap",
  "libc",
  "serde",
  "serde_json",
@@ -971,7 +972,7 @@ dependencies = [
 [[package]]
 name = "servatui-display"
 version = "0.3.1"
-source = "git+https://github.com/servyi/servatui.git?branch=cli-patterns#e3a905d4a67afd70381f4bb2ae6c49d8da43046c"
+source = "git+https://github.com/servyi/servatui.git?branch=cli-patterns#fe61d3e9ce161576a9da4885d70b27a6be341041"
 dependencies = [
  "crossterm",
  "ratatui",
@@ -982,7 +983,7 @@ dependencies = [
 [[package]]
 name = "servyi-servatui"
 version = "0.8.3"
-source = "git+https://github.com/servyi/servatui.git?branch=cli-patterns#e3a905d4a67afd70381f4bb2ae6c49d8da43046c"
+source = "git+https://github.com/servyi/servatui.git?branch=cli-patterns#fe61d3e9ce161576a9da4885d70b27a6be341041"
 dependencies = [
  "base64",
  "clap",

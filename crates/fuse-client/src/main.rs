@@ -30,7 +30,7 @@ fn build_cli(protocols: &[servyi_servatui::Protocol]) -> clap::Command {
                 .help("Shell completion mode (also auto-engaged when COMP_LINE is set)"),
         );
     for p in protocols {
-        cli = cli.subcommand(servyi_servatui::cli::subcommand(p.name, p.help, p.cli_args));
+        cli = cli.subcommand(servyi_servatui::cli::subcommand(p));
     }
     cli.subcommand(
         clap::Command::new("restart").about(
@@ -79,12 +79,7 @@ fn main() {
     // the patterns and the runtime read the same rows.
     let protocols = client_protocols();
     let matches = build_cli(&protocols).get_matches();
-    // The pattern lookup the dispatch needs after the App takes the
-    // protocols: (name, cli_args) pairs, one per row.
-    let patterns: Vec<(&'static str, &'static [servyi_servatui::cli::CliArg])> = protocols
-        .iter()
-        .map(|p| (p.name, p.cli_args))
-        .collect();
+
     let socket = matches
         .get_one::<PathBuf>("socket")
         .cloned()
@@ -103,6 +98,21 @@ fn main() {
         }
     }
 
+    // Serialize the args-string BEFORE the App takes the protocols:
+    // (name, args) for the table command, if any.
+    // Local commands (restart/completions) are not table rows: they
+    // have no protocol, so they dispatch to None.
+    let dispatch = matches.subcommand().and_then(|(name, sub)| {
+        protocols
+            .iter()
+            .find(|p| p.name == name)
+            .map(|proto| {
+                (
+                    name.to_string(),
+                    servyi_servatui::cli::args_string(&proto.clap_args, sub),
+                )
+            })
+    });
     let app = App::builder(&socket).protocol_all(protocols).build();
 
     if let Some((name, _)) = matches.subcommand() {
@@ -119,14 +129,9 @@ fn main() {
         check_start_server(&app);
     }
 
-    match matches.subcommand() {
-        Some((name, sub)) => {
-            let (_, cli_args) = patterns
-                .iter()
-                .find(|(n, _)| *n == name)
-                .expect("every non-local subcommand comes from the protocols");
-            let args = servyi_servatui::cli::args_string(cli_args, sub);
-            match app.run_cli_command(name, &args) {
+    match dispatch {
+        Some((name, args)) => {
+            match app.run_cli_command(&name, &args) {
                 Ok(lines) => {
                     for line in lines {
                         println!("{line}");

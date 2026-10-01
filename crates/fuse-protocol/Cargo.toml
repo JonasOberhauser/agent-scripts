@@ -9,7 +9,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 libc = "0.2"
-servyi-servatui = { workspace = true }
+servyi-servatui = { workspace = true, features = ["cli"] }
+clap = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
