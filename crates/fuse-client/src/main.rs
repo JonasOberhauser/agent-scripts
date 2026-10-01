@@ -15,6 +15,7 @@ const BIN_NAME: &str = env!("CARGO_PKG_NAME");
 /// /tmp when no state file is known).
 const CLIENT_LOG_BASE: &str = "fuse-gatekeeper-client.log";
 
+
 /// The client-LOCAL commands (never on the wire): declared once,
 /// referenced everywhere.
 mod local {
@@ -103,7 +104,7 @@ fn main() {
 
     // Shell completion comes FIRST: it must never hit the version
     // handshake, the log, or anything slow — a Tab press waits on it.
-    if matches.get_flag("complete") || std::env::var_os("COMP_LINE").is_some() {
+    if matches.get_flag("complete") || std::env::var_os(fuse_protocol::COMP_LINE).is_some() {
         complete_mode(&socket);
         return;
     }
@@ -302,9 +303,9 @@ fn complete_mode(socket: &std::path::Path) {
     let mut out = std::io::BufWriter::new(stdout.lock());
 
     // bash: COMP_LINE/COMP_POINT. fish: argv after --complete.
-    let (prior, completing) = if let Some(line) = std::env::var_os("COMP_LINE") {
+    let (prior, completing) = if let Some(line) = std::env::var_os(fuse_protocol::COMP_LINE) {
         let line = line.to_string_lossy().into_owned();
-        let point = std::env::var("COMP_POINT")
+        let point = std::env::var(fuse_protocol::COMP_POINT)
             .ok()
             .and_then(|p| p.parse::<usize>().ok())
             .unwrap_or(line.len())

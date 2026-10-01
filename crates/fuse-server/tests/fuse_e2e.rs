@@ -151,7 +151,7 @@ impl Split {
             .arg("--pending-timeout").arg("5")
             .env("RUST_LOG", "fuse_mount=info,fuse_server=info");
         if let Some(sock) = hashd_sock {
-            policy.env("FUSE_HASHD_SOCK", sock);
+            policy.env(fuse_protocol::ENV_HASHD_SOCK, sock);
         }
         for (name, content, hash) in secrets {
             let f = secret_dir.path().join(name);

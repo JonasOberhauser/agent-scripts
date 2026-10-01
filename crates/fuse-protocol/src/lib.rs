@@ -72,6 +72,11 @@ pub const ENV_CMD_SOCKET: &str = "FUSE_GATEKEEPER_SOCKET";
 pub const DEFAULT_CMD_SOCKET: &str = "/tmp/fuse-gatekeeper.sock";
 /// Where `fuse-server` reaches the privileged hashd socket.
 pub const ENV_HASHD_SOCK: &str = "FUSE_HASHD_SOCK";
+/// bash's `complete -C` protocol: the completing line. Shared by the
+/// client binary (reads it) and the e2e tests (sets it).
+pub const COMP_LINE: &str = "COMP_LINE";
+/// bash's `complete -C` protocol: the cursor offset into COMP_LINE.
+pub const COMP_POINT: &str = "COMP_POINT";
 
 /// State file path, overridable via [`ENV_STATE_FILE`] (e.g. for
 /// E2E tests that must not clobber a live state file).

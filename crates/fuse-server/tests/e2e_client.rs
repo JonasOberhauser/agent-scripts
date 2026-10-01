@@ -51,8 +51,8 @@ fn run_client_completing(socket: &Path, line: &str) -> (String, i32) {
         .arg("--socket")
         .arg(socket)
         .arg("--complete")
-        .env("COMP_LINE", line)
-        .env("COMP_POINT", point)
+        .env(fuse_protocol::COMP_LINE, line)
+        .env(fuse_protocol::COMP_POINT, point)
         .output()
         .unwrap_or_else(|e| panic!("Failed to run fuse-client --complete: {e}"));
     (
@@ -313,7 +313,7 @@ fn grant_forever_retries_hashd_after_remediation() {
     let hashd_sock = dir.path().join("hashd.sock");
 
     // No hashd yet: point the server at the (silent) socket path.
-    std::env::set_var("FUSE_HASHD_SOCK", &hashd_sock);
+    std::env::set_var(fuse_protocol::ENV_HASHD_SOCK, &hashd_sock);
 
     let state = Arc::new({
         let s = ServerState::new();
@@ -373,7 +373,7 @@ fn grant_forever_retries_hashd_after_remediation() {
     assert!(matches!(probe, fuse_server::ReadOutcome::Granted), "got: {probe:?}");
 
     let _ = stub;
-    std::env::remove_var("FUSE_HASHD_SOCK");
+    std::env::remove_var(fuse_protocol::ENV_HASHD_SOCK);
 }
 
 #[test]
@@ -634,8 +634,8 @@ fn completion_is_dynamic_against_live_server_state() {
     let output = Command::new(&bin)
         .arg("--socket")
         .arg(&socket)
-        .env("COMP_LINE", "fuse-client grant ")
-        .env("COMP_POINT", "fuse-client grant ".len().to_string())
+        .env(fuse_protocol::COMP_LINE, "fuse-client grant ")
+        .env(fuse_protocol::COMP_POINT, "fuse-client grant ".len().to_string())
         .output()
         .expect("bare COMP_LINE completion");
     let id = state.pending.iter().next().unwrap().id;
