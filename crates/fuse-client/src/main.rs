@@ -11,7 +11,9 @@ mod pending_layer;
 /// client's local commands and top-level options. Nothing here
 /// restates a command's grammar (servyi/servatui#5).
 fn build_cli(protocols: &[servyi_servatui::Protocol]) -> clap::Command {
-    let mut cli = clap::Command::new("fuse-client")
+    // The client's own extras (top-level options + local subcommands);
+    // every protocol becomes a subcommand with its carried pattern.
+    let extras = clap::Command::new("fuse-client")
         .about("Send CRUD commands to the fuse-server")
         .arg(
             clap::Arg::new("socket")
@@ -28,23 +30,21 @@ fn build_cli(protocols: &[servyi_servatui::Protocol]) -> clap::Command {
                 .hide(true)
                 .action(clap::ArgAction::SetTrue)
                 .help("Shell completion mode (also auto-engaged when COMP_LINE is set)"),
-        );
-    for p in protocols {
-        cli = cli.subcommand(servyi_servatui::cli::subcommand(p));
-    }
-    cli.subcommand(
-        clap::Command::new("restart").about(
-            "Restart the fuse-server from the state file: stop the old \
+        )
+        .subcommand(
+            clap::Command::new("restart").about(
+                "Restart the fuse-server from the state file: stop the old \
 daemon (and its supervised data daemon), clean up socket and mount \
 point, respawn with the same configuration and re-add every secret \
 from the state file's host paths.",
-        ),
-    )
-    .subcommand(
-        clap::Command::new("completions")
-            .about("Emit the delegating shell-completion scripts (bash | zsh | fish)")
-            .arg(clap::Arg::new("shell").required(true)),
-    )
+            ),
+        )
+        .subcommand(
+            clap::Command::new("completions")
+                .about("Emit the delegating shell-completion scripts (bash | zsh | fish)")
+                .arg(clap::Arg::new("shell").required(true)),
+        );
+    servyi_servatui::cli::clap_tree(extras, protocols)
 }
 
 fn main() {
