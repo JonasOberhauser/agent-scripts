@@ -16,24 +16,13 @@
 
 use fuse_protocol::oracle::OracleReply;
 use fuse_protocol::Command;
-use fuse_server::oracle_service::{run_oracle_server, OracleHub};
+use fuse_server::oracle_service::OracleHub;
 use fuse_server::{ReadOutcome, ServerState};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-
-/// #69 discipline: a dead per-run hashd socket, so a hashd running on
-/// THIS machine (production /run/fuse-hashd.sock) is never asked to
-/// hash the fuzzed random pids. Assigned on the `mut` local before the
-/// state is shared, exactly as the oracle_service harness does.
-fn dead_hashd_sock() -> String {
-    std::env::temp_dir().join(format!(
-        "fuzz-hashd-dead-{}.sock",
-        std::process::id()
-    )).display().to_string()
-}
 
 // ── deterministic RNG (splitmix64, same as the orchestrator tier) ──
 struct Rng(u64);
@@ -98,15 +87,20 @@ fn daemon_chaos_marathon() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
     assert!(minutes > 0, "set FUZZ_MINUTES (the marathon is opt-in)");
+    // The kit mints the root: the dead #69 seam and the reused host
+    // file live under it (issue #63 — the PID-derived shared-temp
+    // name was identical for every test in one binary).
+    let stack = gatekeeper_testkit::Stack::new().spawn_in_process();
+    let dead_seam = stack.state().hashd_sock.clone();
+    let host = stack.scratch("fuzz-m-host-reused");
     let stop = std::time::Instant::now() + Duration::from_secs(60 * minutes);
     let mut seed = 0u64;
     while Instant::now() < stop {
         let mut rng = Rng(seed | 1);
         let mut state = ServerState::new();
-        state.hashd_sock = dead_hashd_sock();
+        state.hashd_sock = dead_seam.clone();
         // ONE host file reused across seeds (zero disk footprint — a
         // per-seed file filled a disk in an earlier marathon).
-        let host = std::env::temp_dir().join("fuzz-m-host-reused");
         let _ = std::fs::write(&host, b"FUZZ-DATA");
         state.add("s", &host, 9, "sha256-real");
         let hub = OracleHub::new();
@@ -127,14 +121,17 @@ fn daemon_chaos_marathon() {
 
 #[test]
 fn command_socket_chaos_never_panics_and_never_authorizes() {
-    // ONE host file reused across seeds (zero disk footprint — the
-    // first marathon leaked one file per seed until the disk filled).
-    let host = std::env::temp_dir().join("fuzz-cmd-host-reused");
+    // The kit mints the root (issue #63): dead #69 seam + the ONE
+    // host file reused across seeds (zero disk footprint — the first
+    // marathon leaked one file per seed until the disk filled).
+    let stack = gatekeeper_testkit::Stack::new().spawn_in_process();
+    let dead_seam = stack.state().hashd_sock.clone();
+    let host = stack.scratch("fuzz-cmd-host-reused");
     std::fs::write(&host, b"FUZZ-DATA").unwrap();
     for seed in 0..512u64 {
         let mut rng = Rng(seed | 1);
         let mut state = ServerState::new();
-        state.hashd_sock = dead_hashd_sock();
+        state.hashd_sock = dead_seam.clone();
         // NON-wildcard: only "sha256-real" may ever grant.
         state.add("s", &host, 9, "sha256-real");
         let hub = OracleHub::new();
@@ -169,21 +166,30 @@ fn command_socket_chaos_never_panics_and_never_authorizes() {
 // ── gap 3: the oracle socket (the container's random-access surface),
 // against a LIVE daemon over a real socket ──
 
-fn oracle_env(tag: &str, state: Arc<ServerState>) -> std::path::PathBuf {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.keep().join(format!("fuzz-oracle-{tag}.sock"));
-    let st = Arc::clone(&state);
-    let p2 = path.clone();
-    std::thread::spawn(move || {
-        let _ = run_oracle_server(&p2, st, OracleHub::new());
-    });
-    for _ in 0..200 {
-        if path.exists() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    path
+/// The kit-backed oracle environment (issue #63): per-stack root,
+/// real oracle wire. Keep the HANDLE — dropping it tears the stack
+/// (root and socket with it); the old harness keep()d its dir for
+/// exactly as long.
+/// The kit (issue #63) as one call: spawns the oracle around a
+/// state built WITH the root in hand, writes the seed's host file
+/// under it, registers the secret. Keep the HANDLE alive for the
+/// stack's lifetime.
+fn oracle_env_kit(
+    seed: u64,
+    build: impl FnOnce(&std::path::Path) -> ServerState + Send + 'static,
+) -> (
+    std::path::PathBuf,
+    gatekeeper_testkit::StackHandle,
+    Arc<ServerState>,
+    std::path::PathBuf,
+) {
+    let handle = gatekeeper_testkit::Stack::new().state_from(build).spawn_in_process();
+    let host = handle.scratch(&format!("fuzz-oracle-host-{seed}"));
+    std::fs::write(&host, b"FUZZ-DATA").unwrap();
+    handle.state().add("s", &host, 9, "sha256-real"); // non-wildcard
+    let sock = handle.oracle_socket().to_path_buf();
+    let state = handle.state().clone();
+    (sock, handle, state, host)
 }
 
 fn send_line(path: &Path, line: &str) -> Option<String> {
@@ -200,17 +206,15 @@ fn send_line(path: &Path, line: &str) -> Option<String> {
 fn oracle_socket_random_access_stays_alive_and_contained() {
     for seed in 0..40u64 {
         let mut rng = Rng(seed.wrapping_mul(7919) | 1);
-        let mut st = ServerState::new();
-        st.hashd_sock = dead_hashd_sock();
-        let state = Arc::new(st);
-        // Short pendings: a wrong-hash ask BLOCKS as a pending (the
-        // product) — 150ms keeps the containment probe fast while the
-        // pend-out-and-deny flow remains exercised.
-        *state.pending_timeout.lock().unwrap() = Duration::from_millis(150);
-        let host = std::env::temp_dir().join("fuzz-oracle-host-reused");
-        std::fs::write(&host, b"FUZZ-DATA").unwrap();
-        state.add("s", &host, 9, "sha256-real"); // non-wildcard
-        let sock = oracle_env(&seed.to_string(), Arc::clone(&state));
+        // The kit (issue #63): the state is built WITH the root in
+        // hand (host file and dead seam derive under it, private by
+        // construction); 150ms pendings — a wrong-hash ask BLOCKS as
+        // a pending (the product) while the probe stays fast.
+        let (sock, _keep, _state, _host) = oracle_env_kit(seed, |_root| {
+            let st = ServerState::new();
+            *st.pending_timeout.lock().unwrap() = Duration::from_millis(150);
+            st
+        });
 
         // Chaos: 32 random requests on fresh connections — the
         // container doing random accesses (valid-shaped Asks with

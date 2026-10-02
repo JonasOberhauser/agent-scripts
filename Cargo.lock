@@ -415,6 +415,7 @@ dependencies = [
  "fuse-protocol",
  "fuse-server",
  "fuser",
+ "gatekeeper-testkit",
  "libc",
  "nix 0.29.0",
  "serde",
@@ -447,6 +448,7 @@ dependencies = [
  "dashmap",
  "fuse-protocol",
  "fuser",
+ "gatekeeper-testkit",
  "libc",
  "nix 0.29.0",
  "serde",
@@ -471,6 +473,16 @@ dependencies = [
  "pkg-config",
  "smallvec",
  "zerocopy",
+]
+
+[[package]]
+name = "gatekeeper-testkit"
+version = "0.32.0"
+dependencies = [
+ "fuse-protocol",
+ "fuse-server",
+ "libc",
+ "tempfile",
 ]
 
 [[package]]

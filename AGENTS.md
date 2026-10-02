@@ -119,6 +119,17 @@ Do not weaken these properties without updating this section.
 
 ## Testing Philosophy
 
+### The testkit is the only stack minter
+
+Tests never hand-roll the file-backed parts of a gatekeeper stack
+(sockets, mounts, shared-temp scratch): `crates/gatekeeper-testkit`
+builds them — per-stack random roots (collisions cannot happen by
+construction), process-global tag leases (a duplicate live tag in one
+binary panics naming it), the dead hashd seam by default. The
+`stack_testkit_only` lint (`lints/stack-lint`, CI job `stack-lint`)
+flags hand-creation; its finding count is the #63 migration debt, and
+it flips to deny when the migration completes.
+
 ### Mocks must simulate real-world scenarios, not just happy paths
 
 Mocks exist to test logic quickly without external dependencies, but they are

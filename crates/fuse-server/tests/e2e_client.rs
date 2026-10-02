@@ -310,10 +310,16 @@ fn e2e_client_binary_against_server() {
 fn grant_forever_retries_hashd_after_remediation() {
     let dir = test_tempdir();
     let socket = dir.path().join("remediation.sock");
-    let hashd_sock = dir.path().join("hashd.sock");
 
-    // No hashd yet: point the server at the (silent) socket path.
-    std::env::set_var(fuse_protocol::ENV_HASHD_SOCK, &hashd_sock);
+    // The kit owns the hashd bind (issue #63). The pending below is
+    // created SYNTHETICALLY with an unreachable snapshot (what a read
+    // while hashd was down leaves behind) — the only live lookup is
+    // grant-forever's retry, so binding the stub up front preserves
+    // the remediation shape exactly: same pending, same live retry.
+    let stub = gatekeeper_testkit::spawn_hashd_stub(gatekeeper_testkit::HashdReply::Canned(
+        "c".repeat(64),
+    ));
+    std::env::set_var(fuse_protocol::ENV_HASHD_SOCK, stub.path());
 
     let state = Arc::new({
         let s = ServerState::new();
@@ -339,30 +345,6 @@ fn grant_forever_retries_hashd_after_remediation() {
         let _ = run_socket_server(&sock, st);
     });
     wait_for_server(&socket);
-
-    // Operator follows the printed fix: hashd comes up mid-pending.
-    let stub = {
-        use std::io::{BufRead as _, BufReader, Write as _};
-        let listener = std::os::unix::net::UnixListener::bind(&hashd_sock).unwrap();
-        std::thread::spawn(move || {
-            for conn in listener.incoming().flatten() {
-                let Ok(clone) = conn.try_clone() else { continue };
-                let mut reader = BufReader::new(clone);
-                let mut stream = conn;
-                let mut line = String::new();
-                if reader.read_line(&mut line).is_err() {
-                    continue;
-                }
-                let reply = if line.trim() == format!("hash {}", 4242) {
-                    format!("ok {}\n", "c".repeat(64))
-                } else {
-                    "error gone test\n".to_string()
-                };
-                let _ = stream.write_all(reply.as_bytes());
-                let _ = stream.flush();
-            }
-        })
-    };
 
     let (stdout, stderr, code) = run_client(&socket, &["grant-forever", &id.to_string()]);
     assert_eq!(code, 0, "grant-forever after starting hashd failed: {stderr}");

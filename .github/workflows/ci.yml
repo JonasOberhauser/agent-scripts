@@ -15,6 +15,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -85,10 +86,10 @@ jobs:
           sudo apt-get install -y pkg-config libfuse3-dev
       - uses: servyi/lints/.github/actions/lint-policy@main
   stack-lint:
-    # The #63 enforcement skeleton (lints/stack-lint): in test code,
-    # file-backed stack parts (sockets, mounts, shared-temp scratch)
-    # must come from the gatekeeper testkit. WARN today — the finding
-    # count is the migration debt; flips to -D when #63 completes.
+    # The #63 enforcement (lints/stack-lint): in test code, file-backed
+    # stack parts (sockets, mounts, shared-temp scratch) must come from
+    # the gatekeeper testkit. The migration is COMPLETE (step 2a of
+    # #82: findings 7 → 0, zero `#[allow]` markers) — deny, as planned.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -101,11 +102,9 @@ jobs:
       - name: Build the lint driver
         run: cargo +nightly-2026-09-21 build --release
         working-directory: lints/stack-lint
-      - name: Sweep (warn — the count is #63 migration debt)
+      - name: Sweep (deny — the #63 migration is complete)
         run: |
           RUSTC_WRAPPER="$PWD/lints/stack-lint/target/release/stack-lint" \
-          RUSTFLAGS="-W stack_testkit_only" \
+          RUSTFLAGS="-D stack_testkit_only" \
           CARGO_TARGET_DIR="$PWD/target/stack-lint" \
-          cargo +nightly-2026-09-21 check --workspace --all-targets 2>&1 | tee sweep.log
-          FINDINGS=$(grep -c 'hand-creates a file-backed stack part' sweep.log || true)
-          echo "stack_testkit_only findings: $FINDINGS (issue #63 debt)"
+          cargo +nightly-2026-09-21 check --workspace --all-targets

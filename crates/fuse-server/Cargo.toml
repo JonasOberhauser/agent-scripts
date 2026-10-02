@@ -19,6 +19,7 @@ dashmap = "6"
 tempfile = "3"
 
 [dev-dependencies]
+gatekeeper-testkit = { path = "../gatekeeper-testkit" }
 tempfile = "3"
 libc = "0.2"
 
