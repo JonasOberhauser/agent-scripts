@@ -14,7 +14,7 @@
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::Command;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -22,12 +22,6 @@ static SERIAL: Mutex<()> = Mutex::new(());
 
 fn serial() -> MutexGuard<'static, ()> {
     SERIAL.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-fn bin(name: &str) -> PathBuf {
-    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/debug").join(name);
-    assert!(p.exists(), "{name} not built (run `cargo build`): {}", p.display());
-    p
 }
 
 fn fuse_available() -> bool {
@@ -51,383 +45,91 @@ fn hashing_available() -> bool {
     ok
 }
 
-/// The hashd seam for the package-hash tests: the KIT's live stub,
-/// answering `hash {pid}` with the locally-computed package hash —
-/// the stub PLAYS the privileged helper (these tests gate on
-/// `hashing_available`), verifying the production shape where the
-/// policy daemon never hashes by itself but always asks over the
-/// socket. The kit owns the bind (issue #63); only the reply policy
-/// (`Compute`) lives here.
-fn hashd_stub() -> gatekeeper_testkit::HashdStub {
-    gatekeeper_testkit::spawn_hashd_stub(gatekeeper_testkit::HashdReply::Compute)
-}
-
-/// The split stack: policy daemon + data daemon + mount point.
+/// The split stack (step 2 of #82/#63): a THIN WRAPPER over the kit's
+/// [`gatekeeper_testkit::RealMountStack`] — same historical name and
+/// spawn shape for the ~30 tests below; the harness logic (spawn
+/// waits, diagnostics, kill points, respawns) lives in the kit now.
 struct Split {
-    mount: PathBuf,
-    socket: PathBuf,
-    oracle: PathBuf,
-    procs: Vec<Child>,
-    _dirs: Vec<tempfile::TempDir>,
-    /// MR4: the SOURCE files must outlive the split — transparent
-    /// reads open the host file at read time, so dropping the tempdir
-    /// (as the snapshot-era harness did, bytes having been copied at
-    /// add) would delete the secret out from under the mount.
-    _secret_dir: tempfile::TempDir,
-}
-
-impl Drop for Split {
-    fn drop(&mut self) {
-        for p in self.procs.iter_mut() {
-            let _ = p.kill();
-            let _ = p.wait();
-        }
-        for bin_ in ["fusermount3", "fusermount"] {
-            let _ = Command::new(bin_).arg("-uz").arg(&self.mount).status();
-        }
-        let _ = std::fs::remove_file(&self.socket);
-        let _ = std::fs::remove_file(&self.oracle);
-    }
+    inner: gatekeeper_testkit::RealMountStack,
 }
 
 impl Split {
     /// Start both daemons; `secrets` as (name, content, hash).
+    /// (The `tag` argument is vestigial: kit identity is minted, not
+    /// named — review on #82. It survives for log-file naming.)
     fn new(tag: &str, secrets: &[(&str, &[u8], &str)]) -> Split {
-        Split::new_impl(tag, secrets, None)
-    }
-
-    /// Like [`Split::new`], but the policy daemon hashes readers via a
-    /// hashd at `hashd_sock` (see [`hashd_stub`]) — the production
-    /// shape: the server itself NEVER touches /proc/<pid>/map_files.
-    fn new_with_hashd(tag: &str, secrets: &[(&str, &[u8], &str)], hashd_sock: &Path) -> Split {
-        Split::new_impl(tag, secrets, Some(hashd_sock))
-    }
-
-    fn new_impl(_tag: &str, secrets: &[(&str, &[u8], &str)], hashd_sock: Option<&Path>) -> Split {
-        let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
-        let mount = dirs[0].path().join("mnt");
-        std::fs::create_dir_all(&mount).unwrap();
-        let socket = dirs[1].path().join("cmd.sock");
-        let oracle = dirs[2].path().join("oracle.sock");
-        // Daemon output goes to files, not /dev/null: a failing mount
-        // or a broken control loop must be DIAGNOSABLE from the test
-        // failure, not guessed at (#39 — "content sync broken" hid
-        // `fusermount3: mount failed: Operation not permitted`).
-        let server_log = std::fs::File::create(dirs[1].path().join("server.log")).unwrap();
-        let fused_log = std::fs::File::create(dirs[2].path().join("fused.log")).unwrap();
-
-        // The policy daemon loads secrets from files (--secret N:F:H).
-        let secret_dir = tempfile::tempdir().unwrap();
-        let mut policy = Command::new(bin("fuse-server"));
-        policy
-            .arg("--socket").arg(&socket)
-            .arg("--oracle-socket").arg(&oracle)
-            .arg("--pending-timeout").arg("5")
-            .env("RUST_LOG", "fuse_mount=info,fuse_server=info");
-        if let Some(sock) = hashd_sock {
-            policy.env(fuse_protocol::ENV_HASHD_SOCK, sock);
-        }
+        let mut stack = gatekeeper_testkit::Stack::new()
+            .pending_timeout(Duration::from_secs(5));
         for (name, content, hash) in secrets {
-            let f = secret_dir.path().join(name);
-            // Path-shaped names (issue #34) carry directories — the
-            // source tree must exist before the write.
-            std::fs::create_dir_all(f.parent().unwrap()).unwrap();
-            std::fs::write(&f, content).unwrap();
-            policy.arg("--secret").arg(format!(
-                "{name}:{}:{hash}",
-                f.display()
-            ));
+            stack = stack.secret(name, content, hash);
         }
-        let policy = policy
-            .env(fuse_protocol::ENV_POLICY_FILE, dirs[1].path().join("policy.json"))
-            .stdout(server_log.try_clone().unwrap()).stderr(server_log)
-            .spawn()
-            .expect("spawn fuse-server (policy)");
-
-        wait_connect(&oracle, "oracle socket");
-        wait_connect(&socket, "command socket");
-
-        let data = Command::new(bin("fused"))
-            .arg("--mount-point").arg(&mount)
-            .arg("--oracle-socket").arg(&oracle)
-            .env("RUST_LOG", "info")
-            .stdout(fused_log.try_clone().unwrap()).stderr(fused_log)
-            .spawn()
-            .expect("spawn fused (data daemon)");
-
-        wait_mount(&mount, &dirs);
-        // Wait until the content snapshot has landed in the data
-        // daemon. The container view is anonymized (issue #47): the
-        // salt lands in the policy store at the server's first
-        // registration persist — poll for it, then wait on the INNER
-        // name the mount actually serves.
-        for _ in 0..200 {
-            if dirs[1].path().join("policy.json").exists() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        for (name, _, _) in secrets {
-            let target = mount.join(inner_name_of(dirs[1].path(), name));
-            let deadline = Instant::now() + Duration::from_secs(10);
-            while Instant::now() < deadline {
-                if target.exists() {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            assert!(
-                target.exists(),
-                "secret '{name}' never appeared in the mount (content sync broken)"
-            );
-        }
-
-        Split { mount, socket, oracle, procs: vec![policy, data], _dirs: dirs, _secret_dir: secret_dir }
+        let _ = tag;
+        Split { inner: stack.spawn_real_mount() }
     }
 
-    /// Resolve a secret's mount path by its OUTER (clear) name: the
-    /// container view serves the anonymized form (issue #47), derived
-    /// from the salt in this split's own policy store.
+    /// Like [`Split::new`], but the policy daemon hashes readers via
+    /// the kit's LIVE hashd stub (`HashdReply::Compute` — the
+    /// production shape: the server itself NEVER touches
+    /// /proc/<pid>/map_files).
+    fn new_with_hashd(tag: &str, secrets: &[(&str, &[u8], &str)]) -> Split {
+        let _ = tag;
+        let mut stack = gatekeeper_testkit::Stack::new()
+            .pending_timeout(Duration::from_secs(5))
+            .live_hashd_stub(gatekeeper_testkit::HashdReply::Compute);
+        for (name, content, hash) in secrets {
+            stack = stack.secret(name, content, hash);
+        }
+        Split { inner: stack.spawn_real_mount() }
+    }
+
+    fn mount(&self) -> &Path {
+        self.inner.mount()
+    }
+
     fn path(&self, name: &str) -> PathBuf {
-        self.mount.join(self.inner(name))
+        self.inner.path(name)
     }
 
     fn inner(&self, name: &str) -> String {
-        inner_name_of(self._dirs[1].path(), name)
+        self.inner.inner(name)
     }
 
-    /// The host-side source file behind a served name (MR4 tests:
-    /// transparent reads observe it live).
     fn source_path(&self, name: &str) -> PathBuf {
-        self._secret_dir.path().join(name)
+        self.inner.source_path(name)
     }
 
-    /// std::fs::read with daemon logs attached to any failure —
-    /// mount-layer bugs must be diagnosable from the CI output, not
-    /// guessed at (#41 lesson).
     fn read(&self, rel: &str) -> std::io::Result<Vec<u8>> {
-        std::fs::read(self.path(rel))
+        self.inner.read(rel)
     }
 
     fn dump_logs(&self, what: &str) -> String {
-        let mut s = format!("--- {what} ---\n");
-        for name in ["server.log", "server2.log", "fused.log"] {
-            let p = self._dirs.iter().find_map(|d| {
-                let p = d.path().join(name);
-                p.exists().then_some(p)
-            });
-            if let Some(p) = p {
-                if let Ok(t) = std::fs::read_to_string(&p) {
-                    let lines: Vec<&str> = t.lines().collect();
-                    let start = lines.len().saturating_sub(25);
-                    s.push_str(&format!("== {name} ==\n{}\n", lines[start..].join("\n")));
-                }
-            }
-        }
-        s
+        self.inner.dump_logs(what)
     }
 
     fn client(&self, args: &[&str]) -> std::process::Output {
-        Command::new(bin("fuse-client"))
-            .arg("--socket").arg(&self.socket)
-            .args(args)
-            .env("RUST_LOG", "fuse_mount=info,fuse_server=info")
-            .output()
-            .expect("run fuse-client")
+        self.inner.client(args)
     }
-}
 
-fn wait_connect(path: &Path, what: &str) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < deadline {
-        if std::os::unix::net::UnixStream::connect(path).is_ok() {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(50));
+    // ── the kill points (#68): kit methods, historical names ──────
+
+    fn kill_policy(&mut self) {
+        self.inner.kill_policy();
     }
-    panic!("{what} never came up at {}", path.display());
-}
 
-fn wait_mount(mount: &Path, dirs: &[tempfile::TempDir]) {
-    // The mountpoint DIRECTORY always exists (we made it) — checking
-    // read_dir() would pass trivially with no mount at all and later
-    // surface as a misleading "content sync broken" (#39). Verify the
-    // kernel actually has a FUSE mount on the path.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < deadline {
-        if mounted_fuse(mount) {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(50));
+    fn kill_data(&mut self) {
+        self.inner.kill_data();
     }
-    let fused_log = log_tail(dirs.get(2).map(|d| d.path().join("fused.log")).as_deref());
-    // The cross-crate stale-binary trap, named: cargo test -p fuse-server
-    // does NOT rebuild fuse-mount's fused binary — the harness runs
-    // whatever artifact sits in target/debug. A loader error in
-    // fused.log means that artifact was built against a different
-    // libfuse than the host provides (observed live, twice: a binary
-    // demanding libfuse3.so.4/.so.3 while the system ships another
-    // soname — "it used to work" was a fresher artifact).
-    let loader_hint = if fused_log.contains("error while loading shared libraries") {
-        "\nHINT: fused.log shows a shared-library loader error — the          target/debug/fused artifact is STALE (cargo test does not rebuild \
-         other crates' binaries). Run `cargo build -p fuse-mount` and re-run."
-    } else {
-        ""
-    };
-    panic!(
-        "FUSE mount never came up at {} — /dev/fuse present: {}, fusermount3: {}\
-         \n--- env ---\n{}--- server.log ---\n{}--- fused.log ---\n{}{loader_hint}",
-        mount.display(),
-        Path::new("/dev/fuse").exists(),
-        fusermount3_state(),
-        probe_env(),
-        log_tail(dirs.get(1).map(|d| d.path().join("server.log")).as_deref()),
-        fused_log,
-    );
-}
 
-/// fusermount3 presence + permission bits: mounting as a non-root user
-/// needs the setuid bit (or the direct-mount fallback needs root +
-/// CAP_SYS_ADMIN). A stripped setuid bit is a classic silent killer.
-fn fusermount3_state() -> String {
-    use std::os::unix::fs::MetadataExt;
-    match std::fs::metadata("/usr/bin/fusermount3") {
-        Ok(m) => {
-            let mode = m.mode();
-            format!(
-                "present, mode {:o}, uid {} (setuid: {})",
-                mode,
-                m.uid(),
-                mode & 0o4000 != 0
-            )
-        }
-        Err(_) => String::from("absent"),
-    }
-}
-
-fn probe_env() -> String {
-    let id = Command::new("id").output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_else(|e| format!("id failed: {e}"));
-    let caps = Command::new("sh")
-        .args(["-c", "grep '^Cap' /proc/self/status"])
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default();
-    format!("{id}\n{caps}\n")
-}
-
-
-// Resolve a secret's container-view (anonymized) name from a split's
-// policy store — the salt lands there at the server's first
-// registration persist.
-fn inner_name_of(store: &Path, name: &str) -> String {
-    let txt = std::fs::read_to_string(store.join("policy.json"))
-        .expect("policy store written at first registration");
-    let v: serde_json::Value = serde_json::from_str(&txt).unwrap();
-    let hex = v["salt"].as_str().unwrap_or_default();
-    let bytes: Vec<u8> = (0..hex.len() / 2)
-        .filter_map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok())
-        .collect();
-    let salt = fuse_protocol::Salt::from_bytes(bytes)
-        .expect("salt persisted before the mount serves");
-    fuse_protocol::anonymize_path(&salt, name)
-}
-
-/// SIGKILL a daemon child and reap it. The kill points exercised by
-/// the split-invariant tests (#50): kill -9 leaves no cleanup hooks —
-/// stale sockets and dead mounts are exactly what the survivors see.
-fn kill9(c: &mut Child) {
-    let pid = c.id() as i32;
-    let sig = libc::SIGKILL;
-    // SAFETY: a plain signal to one child pid we own.
-    unsafe { libc::kill(pid, sig) };
-    let _ = c.wait();
-}
-
-impl Split {
-    /// Respawn the POLICY daemon on the same sockets and policy store,
-    /// WITHOUT --secret: the pure MR5 load path must re-register every
-    /// secret from the store (this is what distinguishes it from the
-    /// grants-survive test, which re-passes --secret).
     fn respawn_policy(&mut self, tag: &str) {
-        let log = std::fs::OpenOptions::new()
-            .create(true).append(true)
-            .open(self._dirs[1].path().join(format!("server-respawn-{tag}.log")))
-            .unwrap();
-        let mut cmd = std::process::Command::new(bin("fuse-server"));
-        cmd.arg("--socket").arg(&self.socket)
-            .arg("--oracle-socket").arg(&self.oracle)
-            .arg("--pending-timeout").arg("5")
-            .env(fuse_protocol::ENV_POLICY_FILE, self._dirs[1].path().join("policy.json"))
-            .env("RUST_LOG", "fuse_mount=info,fuse_server=info")
-            .stdout(std::process::Stdio::from(log.try_clone().unwrap()))
-            .stderr(log);
-        self.procs[0] = cmd.spawn().expect("respawn fuse-server");
-        // The stale socket file still exists — wait for a LIVE accept.
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while Instant::now() < deadline {
-            if std::os::unix::net::UnixStream::connect(&self.socket).is_ok() {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        panic!("respawned policy daemon never accepted: {}", self.dump_logs(tag));
+        self.inner.respawn_policy_store_only(tag);
     }
 
-    /// Spawn a FRESH data daemon on the same mountpoint + oracle —
-    /// the recovery for a killed fused. Clears the dead mount first
-    /// (lazy unmount), exactly as the orchestrator's teardown does.
+    fn respawn_policy_with_secrets(&mut self, tag: &str) {
+        self.inner.respawn_policy_with_secrets(tag);
+    }
+
     fn respawn_data(&mut self, tag: &str) {
-        for b in ["fusermount3", "fusermount"] {
-            let _ = Command::new(b).arg("-uz").arg(&self.mount).status();
-        }
-        let log = std::fs::OpenOptions::new()
-            .create(true).append(true)
-            .open(self._dirs[2].path().join(format!("fused-respawn-{tag}.log")))
-            .unwrap();
-        let mut cmd = Command::new(bin("fused"));
-        cmd.arg("--mount-point").arg(&self.mount)
-            .arg("--oracle-socket").arg(&self.oracle)
-            .env("RUST_LOG", "info")
-            .stdout(std::process::Stdio::from(log.try_clone().unwrap()))
-            .stderr(log);
-        self.procs[1] = cmd.spawn().expect("respawn fused");
-        wait_mount(&self.mount, &self._dirs);
-    }
-}
-
-
-/// Whether the kernel has a FUSE mount ON this exact path: statfs(2)
-/// reports FUSE_SUPER_MAGIC for the filesystem covering the path — a
-/// kernel-standardized ABI answer with no mounts-table format to
-/// parse (field order/escaping bugs cannot happen here). An unmounted
-/// mountpoint reports its parent filesystem instead (e.g. tmpfs).
-fn mounted_fuse(path: &Path) -> bool {
-    let c = match std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
-    // SAFETY: libc::statfs is a struct of plain integers/arrays with no
-    // invalid zero bit patterns; zero-init is a valid value.
-    let mut st = unsafe { std::mem::zeroed::<libc::statfs>() };
-    let path_ptr = c.as_ptr();
-    // SAFETY: the path is a valid NUL-terminated CString owned by `c`
-    // and `st` is a valid, aligned out-pointer for the duration of the call.
-    let stat_ok = unsafe { libc::statfs(path_ptr, &mut st) };
-    stat_ok == 0 && st.f_type == libc::FUSE_SUPER_MAGIC
-}
-
-fn log_tail(path: Option<&Path>) -> String {
-    match path.and_then(|p| std::fs::read_to_string(p).ok()) {
-        Some(s) => {
-            let lines: Vec<&str> = s.lines().collect();
-            let start = lines.len().saturating_sub(25);
-            let mut out = lines[start..].join("\n");
-            out.push('\n');
-            out
-        }
-        None => String::from("(no log)\n"),
+        self.inner.respawn_data(tag);
     }
 }
 
@@ -455,7 +157,7 @@ fn e2e_root_is_directory() {
     if !fuse_available() { return; }
     let _g = serial();
     let split = Split::new("root", &[("s", b"X", "*")]);
-    assert!(std::fs::metadata(&split.mount).unwrap().is_dir());
+    assert!(std::fs::metadata(split.mount()).unwrap().is_dir());
 }
 
 #[test]
@@ -477,13 +179,13 @@ fn e2e_path_shaped_names_serve_flat() {
     if !fuse_available() { return; }
     let _g = serial();
     let split = Split::new("paths", &[("a/b/c.txt", b"NESTED", "*")]);
-    assert!(split.mount.is_dir(), "the mount root is a directory");
-    let labels: Vec<std::ffi::OsString> = std::fs::read_dir(&split.mount)
+    assert!(split.mount().is_dir(), "the mount root is a directory");
+    let labels: Vec<std::ffi::OsString> = std::fs::read_dir(split.mount())
         .unwrap()
         .map(|e| e.unwrap().file_name())
         .collect();
     assert_eq!(labels.len(), 1, "one flat entry, not a tree: {labels:?}");
-    let entry = split.mount.join(&labels[0]);
+    let entry = split.mount().join(&labels[0]);
     assert!(entry.is_file(), "the flat entry is the secret file");
     assert_eq!(std::fs::read(&entry).unwrap(), b"NESTED");
 }
@@ -534,34 +236,11 @@ fn e2e_grants_survive_a_policy_daemon_kill() {
     assert_eq!(split.read("s").unwrap(), b"KEEP");
 
     // kill -9 the policy daemon; the mount stays (split design).
-    split.procs[0].kill().unwrap();
-    split.procs[0].wait().unwrap();
-
-    // Respawn on the same sockets + the SAME policy store path the
-    // harness armed via FUSE_GATEKEEPER_POLICY.
-    let server_log2 = std::fs::OpenOptions::new()
-        .create(true).append(true)
-        .open(split._dirs[1].path().join("server2.log")).unwrap();
-    let mut cmd = std::process::Command::new(bin("fuse-server"));
-    cmd.arg("--socket").arg(&split.socket)
-        .arg("--oracle-socket").arg(&split.oracle)
-        .arg("--pending-timeout").arg("5")
-        .arg("--secret")
-        .arg(format!("s:{}:*", split.source_path("s").display()))
-        .env(fuse_protocol::ENV_POLICY_FILE, split._dirs[1].path().join("policy.json"))
-        .stdout(std::process::Stdio::from(server_log2.try_clone().unwrap()))
-        .stderr(server_log2);
-    let mut child = cmd.spawn().expect("respawn fuse-server");
-    // `exists()` is satisfied by the STALE socket file of the killed
-    // server — wait for a live accept instead (the harness's
-    // wait_connect semantics).
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while std::time::Instant::now() < deadline {
-        if std::os::unix::net::UnixStream::connect(&split.socket).is_ok() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    // Respawn on the same sockets + the SAME policy store, WITH the
+    // secret re-registered — the re-add path, as opposed to the
+    // store-only load the respawn_policy kill point exercises.
+    split.kill_policy();
+    split.respawn_policy_with_secrets("mr5");
 
     // Budget spent BEFORE the kill must still be spent AFTER it.
     let err = split.read("s").unwrap_err();
@@ -574,8 +253,6 @@ fn e2e_grants_survive_a_policy_daemon_kill() {
         Ok(b) => assert_eq!(b, b"KEEP"),
         Err(e) => panic!("post-reset read failed: {e}\n{}", split.dump_logs("mr5 failure")),
     }
-    child.kill().unwrap();
-    let _ = child.wait();
 }
 
 #[test]
@@ -594,7 +271,7 @@ fn e2e_fused_kill9_policy_untouched_a_fresh_data_daemon_remounts() {
     // Budget now spent — and must REMAIN spent across the data
     // daemon's death+remount (policy never died).
 
-    kill9(&mut split.procs[1]);
+    split.kill_data();
 
     // Policy untouched: the cmd socket answers status immediately.
     let out = split.client(&["status"]);
@@ -605,7 +282,7 @@ fn e2e_fused_kill9_policy_untouched_a_fresh_data_daemon_remounts() {
     let mut listed = false;
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
-        if let Ok(rd) = std::fs::read_dir(&split.mount) {
+        if let Ok(rd) = std::fs::read_dir(split.mount()) {
             if rd.filter_map(|e| e.ok())
                 .any(|e| e.file_name().to_string_lossy() == split.inner("s"))
             {
@@ -636,7 +313,7 @@ fn e2e_policy_kill9_before_any_read_a_store_only_respawn_serves() {
     if !fuse_available() { return; }
     let _g = serial();
     let mut split = Split::new("earlykill", &[("s", b"EARLY", "*")]);
-    kill9(&mut split.procs[0]);
+    split.kill_policy();
     split.respawn_policy("earlykill");
     let mut ok = false;
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -827,7 +504,7 @@ fn e2e_readdir_lists_secrets() {
     if !fuse_available() { return; }
     let _g = serial();
     let split = Split::new("readdir", &[("a", b"A", "*"), ("b", b"B", "*")]);
-    let names: Vec<String> = std::fs::read_dir(&split.mount)
+    let names: Vec<String> = std::fs::read_dir(split.mount())
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
@@ -905,7 +582,7 @@ fn e2e_statfs_works() {
     let split = Split::new("statfs", &[("s", b"0123456789", "*")]);
     // statfs through std: use `nix`-free approach — command success on
     // the mount directory suffices as a smoke check.
-    assert!(std::fs::read_dir(&split.mount).is_ok());
+    assert!(std::fs::read_dir(split.mount()).is_ok());
 }
 
 #[test]
@@ -989,13 +666,12 @@ fn e2e_hash_mismatch_denied() {
     if !hashing_available() { return; }
     let _g = serial();
     let pkg = package_hash_of_self();
-    let stub = hashd_stub();
-    let split = Split::new_with_hashd("hash", &[("s", b"H", "definitely_not_our_package")], stub.path());
+    let split = Split::new_with_hashd("hash", &[("s", b"H", "definitely_not_our_package")]);
     let err = std::fs::read(split.path("s")).unwrap_err();
     assert_eq!(err.raw_os_error(), Some(libc::EACCES), "wrong hash must pend out to deny");
     // …and with the right hash it serves immediately.
     drop(split);
-    let split2 = Split::new_with_hashd("hash-ok", &[("s", b"H", &pkg)], stub.path());
+    let split2 = Split::new_with_hashd("hash-ok", &[("s", b"H", &pkg)]);
     assert_eq!(std::fs::read(split2.path("s")).unwrap(), b"H");
     }
 
@@ -1013,8 +689,7 @@ fn e2e_different_binary_denied() {
     let _g = serial();
     // Our package hash whitelisted; a DIFFERENT binary must be denied.
     let pkg = package_hash_of_self();
-    let stub = hashd_stub();
-    let split = Split::new_with_hashd("diff", &[("s", b"D", &pkg)], stub.path());
+    let split = Split::new_with_hashd("diff", &[("s", b"D", &pkg)]);
     assert_eq!(std::fs::read(split.path("s")).unwrap(), b"D");
     // A distinct process (cat) has a different package hash: EACCES.
     let out = Command::new("cat").arg(split.path("s")).output().unwrap();
@@ -1033,8 +708,7 @@ fn e2e_grant_forever_full_flow() {
     if !hashing_available() { return; }
     let _g = serial();
     let _pkg = package_hash_of_self();
-    let stub = hashd_stub();
-    let split = Split::new_with_hashd("gf", &[("s", b"FOREVER", "not_our_hash")], stub.path());
+    let split = Split::new_with_hashd("gf", &[("s", b"FOREVER", "not_our_hash")]);
     // Budget unspent but hash wrong: the read pends.
     let p = split.path("s");
     let reader = std::thread::spawn(move || std::fs::read(p));
@@ -1135,10 +809,10 @@ fn e2e_policy_kill9_the_mount_survives_and_a_store_only_respawn_resyncs() {
     std::io::Read::read_exact(&mut pinned, &mut buf).unwrap();
     assert_eq!(&buf, b"R1");
 
-    kill9(&mut split.procs[0]);
+    split.kill_policy();
 
     // Dead window: the mount survives...
-    let names = std::fs::read_dir(&split.mount).unwrap()
+    let names = std::fs::read_dir(split.mount()).unwrap()
         .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
         .collect::<Vec<_>>();
     assert!(

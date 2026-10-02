@@ -7,7 +7,8 @@ edition = "2021"
 fuse-protocol = { path = "../fuse-protocol" }
 fuse-server = { path = "../fuse-server" }
 tempfile = "3"
+serde_json = "1"
+libc = "0.2"
 
 [dev-dependencies]
-libc = "0.2"
 
