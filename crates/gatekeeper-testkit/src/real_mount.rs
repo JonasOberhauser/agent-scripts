@@ -363,8 +363,9 @@ impl Drop for RealMountStack {
 /// stale sockets and dead mounts are exactly what the survivors see.
 fn kill9(c: &mut Child) {
     let pid = c.id() as i32;
+    let sig = libc::SIGKILL;
     // SAFETY: a plain SIGKILL to one child pid we own.
-    let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+    let _ = unsafe { libc::kill(pid, sig) };
     let _ = c.wait();
 }
 
