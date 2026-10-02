@@ -124,11 +124,16 @@ Do not weaken these properties without updating this section.
 Tests never hand-roll the file-backed parts of a gatekeeper stack
 (sockets, mounts, shared-temp scratch): `crates/gatekeeper-testkit`
 builds them — per-stack random roots (collisions cannot happen by
-construction), process-global tag leases (a duplicate live tag in one
-binary panics naming it), the dead hashd seam by default. The
+construction), the dead hashd seam by default, live hashd stubs
+(`HashdReply::{Canned, Compute}`), raw `StubSocket` rendezvous, and
+the real-binary tier (`Driver::RealMount` / `spawn_real_mount()`:
+`fuse-server` + `fused` children on a kernel FUSE mount, with the
+kill points — `kill_policy`/`kill_data`, store-only and
+secrets-re-registration respawns, `respawn_data` — as handle methods;
+`fuse_e2e`'s `Split` is a thin wrapper of it). The
 `stack_testkit_only` lint (`lints/stack-lint`, CI job `stack-lint`)
-flags hand-creation; its finding count is the #63 migration debt, and
-it flips to deny when the migration completes.
+DENIES hand-creation — the #63 migration is complete (findings 7 → 0,
+zero allow markers).
 
 ### Mocks must simulate real-world scenarios, not just happy paths
 

@@ -392,6 +392,7 @@ dependencies = [
  "clap",
  "crossterm",
  "fuse-protocol",
+ "gatekeeper-testkit",
  "libc",
  "ratatui",
  "serde",
@@ -482,6 +483,7 @@ dependencies = [
  "fuse-protocol",
  "fuse-server",
  "libc",
+ "serde_json",
  "tempfile",
 ]
 

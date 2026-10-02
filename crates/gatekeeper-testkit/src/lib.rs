@@ -36,12 +36,16 @@
 //! repetition safe. Within one binary, [`Stack::new`] takes a
 //! process-global tag lease — a duplicate panics naming the tag.
 //!
-//! ## What is deliberately NOT here (step 2, with the binary drivers)
+//! ## The binary driver (step 2 — `Driver::RealMount`)
 //!
-//! Kill points (`.kill_policy()`/`.respawn_policy()`/`.kill_data()/
-//! .respawn_data()`) and `Driver::RealMount` belong to the real-
-//! binary drivers (`Split` becomes a thin wrapper); the in-process
-//! policy has no process to kill.
+//! [`Stack::spawn_real_mount`] brings up the REAL daemons —
+//! `fuse-server` + `fused` as child processes on a kernel FUSE mount,
+//! all under the stack's root — with #68's kill points as handle
+//! methods (`kill_policy`/`kill_data`, store-only and
+//! secrets-re-registration policy respawns, `respawn_data`). The
+//! spawn waits carry the diagnostics the old hand-rolled harness
+//! accumulated; `fuse_e2e`'s `Split` is a thin wrapper of
+//! [`RealMountStack`].
 //!
 //! ## Stubs (step 2a — the hashd seam and raw rendezvous)
 //!
@@ -64,6 +68,9 @@ use std::time::Duration;
 use fuse_protocol::io::SystemIo as _;
 use fuse_server::oracle_service::{run_oracle_server, OracleHub};
 use fuse_server::ServerState;
+
+mod real_mount;
+pub use real_mount::{bin, real_mount_available, Driver, RealMountStack};
 
 /// Default pending window for kit stacks: short (tests want fast
 /// pend-outs), long enough for grant flows.
@@ -90,20 +97,24 @@ pub struct Stack {
     id: u64,
     /// Minted at `new()` — the FIRST thing that exists, so stubs and
     /// custom states can derive from it before anything spawns.
-    root: tempfile::TempDir,
-    pending_timeout: Duration,
+    pub(crate) root: tempfile::TempDir,
+    pub(crate) pending_timeout: Duration,
     /// Arm MR5 write-through persistence to a store under the stack's
     /// root (off by default — hermetic stacks; #59).
     store: bool,
     /// A LIVE kit-spawned hashd stub pinned to the state's seam
     /// (overrides the dead default; #69 discipline: the kit binds).
-    live_hashd: Option<HashdReply>,
+    pub(crate) live_hashd: Option<HashdReply>,
     /// Harnesses that build their OWN `ServerState`: built WITH the
     /// stack's root in hand, so every file-backed choice (the hashd
     /// seam, the store) derives under the private root instead of a
     /// shared convention path (review on #82).
     custom_state: Option<StateBuild>,
-    secrets: Vec<SecretSpec>,
+    pub(crate) secrets: Vec<SecretSpec>,
+    /// Which driver `spawn()` brings up (the #63 axis). `None`
+    /// (default) is the in-process policy; `RealMount` is the real
+    /// binaries + kernel mount.
+    driver: Driver,
 }
 
 /// What a kit hashd stub answers on the wire (`hash {pid}` → reply).
@@ -149,7 +160,44 @@ impl Stack {
             live_hashd: None,
             custom_state: None,
             secrets: Vec::new(),
+            driver: Driver::None,
         }
+    }
+
+    /// Pick the driver `spawn()` brings up: [`Driver::None`] (the
+    /// in-process policy tier) or [`Driver::RealMount`] (the real
+    /// `fuse-server` + `fused` binaries and a kernel FUSE mount —
+    /// kill points and all, see [`RealMountStack`]).
+    #[must_use]
+    pub fn driver(mut self, d: Driver) -> Self {
+        self.driver = d;
+        self
+    }
+
+    /// Spawn per the configured [`Driver`]: the in-process policy
+    /// stack or the real-mount binary tier.
+    pub fn spawn(self) -> StackHandleOrRealMount {
+        match self.driver {
+            Driver::None => StackHandleOrRealMount::InProcess(self.spawn_in_process()),
+            Driver::RealMount => StackHandleOrRealMount::RealMount(self.spawn_real_mount()),
+        }
+    }
+
+    /// Spawn the REAL-binary tier: `fuse-server` + `fused` children
+    /// and a kernel FUSE mount under the stack's root, with #68's
+    /// kill points as handle methods. Requires `/dev/fuse` and
+    /// `fusermount3` (see [`real_mount_available`]).
+    ///
+    /// The policy store is ALWAYS armed on this tier (the inner
+    /// names' salt lands in it, and the respawn kill points load
+    /// through it); `state_from` is meaningless here (a binary owns
+    /// its state) and is ignored.
+    ///
+    /// # Panics
+    /// Panics if the daemons never come up (with their logs
+    /// attached), or the binaries cannot be spawned.
+    pub fn spawn_real_mount(self) -> RealMountStack {
+        RealMountStack::spawn(self)
     }
 
     /// The pending window for asks that pend (default: 2s).
@@ -298,8 +346,8 @@ impl Stack {
 pub struct HashdStub {
     /// `None` when the socket lives under a stack root the
     /// `StackHandle` already owns.
-    _root: Option<tempfile::TempDir>,
-    path: PathBuf,
+    pub(crate) _root: Option<tempfile::TempDir>,
+    pub(crate) path: PathBuf,
 }
 
 impl HashdStub {
@@ -369,7 +417,7 @@ impl StubSocket {
     }
 }
 
-fn bind_hashd_wire(path: &Path, reply: HashdReply) {
+pub(crate) fn bind_hashd_wire(path: &Path, reply: HashdReply) {
     let listener = UnixListener::bind(path).expect("testkit: bind hashd stub");
     // The wire thread runs until process exit (a deleted-path listener
     // accepts nothing new); the handle is deliberately discarded.
@@ -408,6 +456,14 @@ fn ask_hashd(path: &Path, pid: u32) -> String {
     let mut line = String::new();
     let _n = BufReader::new(s).read_line(&mut line).expect("read");
     line
+}
+
+/// What [`Stack::spawn`] returns per the configured [`Driver`].
+pub enum StackHandleOrRealMount {
+    /// The in-process policy tier.
+    InProcess(StackHandle),
+    /// The real-binary mount tier.
+    RealMount(RealMountStack),
 }
 
 /// A live stack: every surface a test tier needs. Dropping it tears
