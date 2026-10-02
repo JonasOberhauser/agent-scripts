@@ -13,88 +13,30 @@
 
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 
-use std::path::Path;
-use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use fuse_mount::mock_driver::MockDriver;
-use fuse_server::oracle_service::OracleHub;
-use fuse_server::ServerState;
 
-struct Fused {
-    child: Child,
-    control: std::path::PathBuf,
-}
-
-impl Drop for Fused {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        let _ = std::fs::remove_file(&self.control);
-    }
-}
-
-fn spawn_fused(dir: &Path, oracle: &Path) -> Fused {
-    let control = dir.join("mock-fuse.sock");
-    let log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(dir.join("fused.log"))
-        .unwrap();
-    #[allow(clippy::zombie_processes)]
-    let child = Command::new(env!("CARGO_BIN_EXE_fused"))
-        .arg("--mount-point")
-        .arg(dir.join("mnt"))
-        .arg("--oracle-socket")
-        .arg(oracle)
-        .arg("--mock-fuse")
-        .arg(&control)
-        .env("RUST_LOG", "info")
-        .stdout(Stdio::from(log.try_clone().unwrap()))
-        .stderr(log)
-        .spawn()
-        .expect("spawn fused");
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < deadline {
-        if control.exists() {
-            return Fused { child, control };
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    unreachable!("fused never bound the mock control socket within 10s");
-}
-
-/// The in-process policy daemon: real wire protocol, dead hashd seam
-/// (#69), fast pendings, one secret with the wildcard hash.
-fn oracle_env(
-    _dir: &Path,
-) -> (std::path::PathBuf, Arc<ServerState>, OracleHub, gatekeeper_testkit::StackHandle) {
-    // The kit (issue #63): per-stack root, dead hashd seam (#69),
-    // 150ms pendings, the host secret under the root. Keep the
-    // HANDLE — dropping it tears the policy stack down.
-    let stack = gatekeeper_testkit::Stack::new()
+/// The mock-fuse split stack, kit-minted (step 2 of #82/#63): the
+/// in-process policy daemon (real wire protocol, dead #69 seam,
+/// 150ms pendings, the host secret under the root) AND the real
+/// fused child on `--mock-fuse`, its control socket under the same
+/// root — one handle, RAII teardown.
+fn stack() -> gatekeeper_testkit::MockFuseStack {
+    gatekeeper_testkit::Stack::new()
         .pending_timeout(Duration::from_millis(150))
         .secret("s", b"MOCK-FUSE-CONTENT", "*")
-        .spawn_in_process();
-    (
-        stack.oracle_socket().to_path_buf(),
-        stack.state().clone(),
-        stack.hub().clone(),
-        stack,
-    )
+        .spawn_mock_fuse()
 }
 
 #[test]
 fn fused_serves_a_full_read_path_over_the_mock_kernel() {
-    let dir = tempfile::tempdir().unwrap();
-    let (oracle, _state, hub, _keep) = oracle_env(dir.path());
-    let fused = spawn_fused(dir.path(), &oracle);
+    let fused = stack();
 
     // The control loop needs a moment to connect and receive Serve;
     // poll the listing until the inner name appears.
-    hub.serve("s", "ab12cd34ef56", 0o400);
-    let mut d = MockDriver::connect(&fused.control).expect("connect driver");
+    fused.hub().serve("s", "ab12cd34ef56", 0o400);
+    let mut d = MockDriver::connect(fused.control_socket()).expect("connect driver");
     let _init = d.init().expect("init handshake");
 
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -185,14 +127,12 @@ fn quiescent_fd_count(pid: u32) -> usize {
 
 #[test]
 fn a_driver_abandoning_an_open_fh_leaks_nothing() {
-    let dir = tempfile::tempdir().unwrap();
-    let (oracle, _state, hub, _keep) = oracle_env(dir.path());
-    let fused = spawn_fused(dir.path(), &oracle);
-    hub.serve("s", "ab12cd34ef56", 0o400);
+    let fused = stack();
+    fused.hub().serve("s", "ab12cd34ef56", 0o400);
 
     let deadline = Instant::now() + Duration::from_secs(10);
     let ino = loop {
-        let mut d = MockDriver::connect(&fused.control).expect("connect");
+        let mut d = MockDriver::connect(fused.control_socket()).expect("connect");
         let _ = d.init().expect("init");
         if let Ok(entry) = d.lookup("ab12cd34ef56") {
             break entry.nodeid;
@@ -203,27 +143,27 @@ fn a_driver_abandoning_an_open_fh_leaks_nothing() {
 
     // Steady state WITH one connected driver (the connection itself
     // holds fds; only the DELTA across the open is meaningful).
-    let mut d = MockDriver::connect(&fused.control).expect("connect");
+    let mut d = MockDriver::connect(fused.control_socket()).expect("connect");
     let _ = d.init().expect("init");
     let _ = d.statfs().expect("statfs");
-    let baseline = quiescent_fd_count(fused.child.id());
+    let baseline = quiescent_fd_count(fused.pid());
 
     // Open (the host fd is now fused's to hold until RELEASE)…
     let _open = d.open(ino).expect("open");
-    let during = quiescent_fd_count(fused.child.id());
+    let during = quiescent_fd_count(fused.pid());
     assert_eq!(during, baseline + 1, "the passed host fd must be open");
 
     // …and hang up WITHOUT releasing — process death, the hostile
     // path. The mock must synthesize the RELEASEs the real kernel
     // sends when a process exits with files open.
     drop(d);
-    let mut next = MockDriver::connect(&fused.control).expect("reconnect");
+    let mut next = MockDriver::connect(fused.control_socket()).expect("reconnect");
     let _ = next.init().expect("init");
     // The cleanup runs at the PREVIOUS bridge's exit; the reconnect
     // can overtake it via the accept queue, so poll to the steady state.
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        if quiescent_fd_count(fused.child.id()) == baseline {
+        if quiescent_fd_count(fused.pid()) == baseline {
             break;
         }
         assert!(
@@ -242,14 +182,12 @@ fn a_driver_abandoning_an_open_fh_leaks_nothing() {
 /// (and the store) survive; the new driver re-inits and reads again.
 #[test]
 fn the_session_survives_driver_reconnects() {
-    let dir = tempfile::tempdir().unwrap();
-    let (oracle, state, hub, _keep) = oracle_env(dir.path());
-    let fused = spawn_fused(dir.path(), &oracle);
-    hub.serve("s", "ab12cd34ef56", 0o400);
+    let fused = stack();
+    fused.hub().serve("s", "ab12cd34ef56", 0o400);
 
     let deadline = Instant::now() + Duration::from_secs(10);
     let ino = loop {
-        let mut d = MockDriver::connect(&fused.control).expect("connect");
+        let mut d = MockDriver::connect(fused.control_socket()).expect("connect");
         let _ = d.init().expect("init");
         if let Ok(entry) = d.lookup("ab12cd34ef56") {
             break entry.nodeid;
@@ -260,9 +198,9 @@ fn the_session_survives_driver_reconnects() {
 
     // Budget reset through the POLICY daemon (the CLI's `reset`
     // path), then a fresh driver on the SAME session.
-    let _reset = state.reset(Some("s"));
+    let _reset = fused.state().reset(Some("s"));
 
-    let mut d2 = MockDriver::connect(&fused.control).expect("reconnect");
+    let mut d2 = MockDriver::connect(fused.control_socket()).expect("reconnect");
     let _ = d2.init().expect("init");
     let opened = d2.open(ino).expect("reopen after reconnect");
     let _ = opened;

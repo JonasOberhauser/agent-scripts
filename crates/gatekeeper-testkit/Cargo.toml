@@ -11,4 +11,6 @@ serde_json = "1"
 libc = "0.2"
 
 [dev-dependencies]
+fuse-mount = { path = "../fuse-mount" }
+fuser = "0.15"
 

@@ -480,8 +480,10 @@ dependencies = [
 name = "gatekeeper-testkit"
 version = "0.32.0"
 dependencies = [
+ "fuse-mount",
  "fuse-protocol",
  "fuse-server",
+ "fuser",
  "libc",
  "serde_json",
  "tempfile",
