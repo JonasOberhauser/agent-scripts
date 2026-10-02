@@ -12,7 +12,7 @@
 
 #![allow(clippy::unwrap_used, clippy::panic, unused_results)]
 
-use std::io::{BufRead as _, BufReader, Write as _};
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -51,41 +51,15 @@ fn hashing_available() -> bool {
     ok
 }
 
-/// A stand-in for the real hashd: answers `hash {pid}` with the
-/// locally-computed package hash. Legitimate here — the stub PLAYS the
-/// privileged helper (and these tests gate on `hashing_available`),
-/// letting them verify the production shape where the policy daemon
-/// never hashes by itself but always asks over the socket.
-fn hashd_stub() -> PathBuf {
-    let dir = tempfile::tempdir().unwrap().keep();
-    let sock = dir.join("hashd.sock");
-    let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
-    std::thread::spawn(move || {
-        use fuse_protocol::io::SystemIo as _;
-        for conn in listener.incoming().flatten() {
-            let Ok(clone) = conn.try_clone() else { continue };
-            let mut reader = BufReader::new(clone);
-            let mut stream = conn;
-            let mut line = String::new();
-            if reader.read_line(&mut line).is_err() {
-                continue;
-            }
-            let reply = match line
-                .trim()
-                .strip_prefix("hash ")
-                .and_then(|p| p.parse::<u32>().ok())
-            {
-                Some(pid) => match fuse_protocol::RealSystemIo::new().sha256_process_package(pid) {
-                    Ok(h) => format!("ok {h}\n"),
-                    Err(e) => format!("error gone {e}\n"),
-                },
-                None => "error malformed request\n".to_string(),
-            };
-            let _ = stream.write_all(reply.as_bytes());
-            let _ = stream.flush();
-        }
-    });
-    sock
+/// The hashd seam for the package-hash tests: the KIT's live stub,
+/// answering `hash {pid}` with the locally-computed package hash —
+/// the stub PLAYS the privileged helper (these tests gate on
+/// `hashing_available`), verifying the production shape where the
+/// policy daemon never hashes by itself but always asks over the
+/// socket. The kit owns the bind (issue #63); only the reply policy
+/// (`Compute`) lives here.
+fn hashd_stub() -> gatekeeper_testkit::HashdStub {
+    gatekeeper_testkit::spawn_hashd_stub(gatekeeper_testkit::HashdReply::Compute)
 }
 
 /// The split stack: policy daemon + data daemon + mount point.
@@ -1016,12 +990,12 @@ fn e2e_hash_mismatch_denied() {
     let _g = serial();
     let pkg = package_hash_of_self();
     let stub = hashd_stub();
-    let split = Split::new_with_hashd("hash", &[("s", b"H", "definitely_not_our_package")], &stub);
+    let split = Split::new_with_hashd("hash", &[("s", b"H", "definitely_not_our_package")], stub.path());
     let err = std::fs::read(split.path("s")).unwrap_err();
     assert_eq!(err.raw_os_error(), Some(libc::EACCES), "wrong hash must pend out to deny");
     // …and with the right hash it serves immediately.
     drop(split);
-    let split2 = Split::new_with_hashd("hash-ok", &[("s", b"H", &pkg)], &stub);
+    let split2 = Split::new_with_hashd("hash-ok", &[("s", b"H", &pkg)], stub.path());
     assert_eq!(std::fs::read(split2.path("s")).unwrap(), b"H");
     }
 
@@ -1040,7 +1014,7 @@ fn e2e_different_binary_denied() {
     // Our package hash whitelisted; a DIFFERENT binary must be denied.
     let pkg = package_hash_of_self();
     let stub = hashd_stub();
-    let split = Split::new_with_hashd("diff", &[("s", b"D", &pkg)], &stub);
+    let split = Split::new_with_hashd("diff", &[("s", b"D", &pkg)], stub.path());
     assert_eq!(std::fs::read(split.path("s")).unwrap(), b"D");
     // A distinct process (cat) has a different package hash: EACCES.
     let out = Command::new("cat").arg(split.path("s")).output().unwrap();
@@ -1060,7 +1034,7 @@ fn e2e_grant_forever_full_flow() {
     let _g = serial();
     let _pkg = package_hash_of_self();
     let stub = hashd_stub();
-    let split = Split::new_with_hashd("gf", &[("s", b"FOREVER", "not_our_hash")], &stub);
+    let split = Split::new_with_hashd("gf", &[("s", b"FOREVER", "not_our_hash")], stub.path());
     // Budget unspent but hash wrong: the read pends.
     let p = split.path("s");
     let reader = std::thread::spawn(move || std::fs::read(p));

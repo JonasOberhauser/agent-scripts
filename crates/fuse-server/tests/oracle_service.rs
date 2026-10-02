@@ -399,39 +399,15 @@ fn lockdown_asks_are_refused_immediately_without_pending() {
 /// the synthetic pid).
 #[test]
 fn stub_hashd_answer_carries_the_pid_hash_not_an_error() {
+    // The kit binds the stub under the stack's root and pins the seam:
+    // no hand-rolled listener, no leaked keep()'d dir (issue #63).
     let canned = "a".repeat(64);
-    // Bind the stub on a per-test path and pin the state to it.
-    let dir = tempfile::tempdir().unwrap().keep();
-    let sock = dir.join("hashd.stub.sock");
-    let stub_sock = sock.clone();
-    let canned2 = canned.clone();
-    std::thread::spawn(move || {
-        let listener = std::os::unix::net::UnixListener::bind(&stub_sock).unwrap();
-        for conn in listener.incoming() {
-            let Ok(mut conn) = conn else { break };
-            use std::io::{BufRead, BufReader, Write};
-            let mut reader = BufReader::new(conn.try_clone().unwrap());
-            let mut line = String::new();
-            if reader.read_line(&mut line).is_err() {
-                break;
-            }
-            // One question, one answer — the hashd wire contract.
-            let _ = writeln!(conn, "ok {canned2}");
-            let _ = conn.flush();
-        }
-    });
     let stack = gatekeeper_testkit::Stack::new()
-        .hashd_stub(&sock)
+        .live_hashd_stub(gatekeeper_testkit::HashdReply::Canned(canned.clone()))
         .spawn_in_process();
     let path = stack.oracle_socket().to_path_buf();
     let state = stack.state().clone();
     state.add("s", "/tmp/host/s", 1, "some_hash");
-    // Wait for the stub listener before asking.
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while !sock.exists() {
-        assert!(std::time::Instant::now() < deadline, "stub hashd never bound");
-        std::thread::sleep(Duration::from_millis(10));
-    }
 
     // The ask presents no hash; adjudication hashes via the seam. The
     // canned hash is NOT the secret's permitted hash, so it pends —

@@ -24,17 +24,6 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// #69 discipline: a dead per-run hashd socket, so a hashd running on
-/// THIS machine (production /run/fuse-hashd.sock) is never asked to
-/// hash the fuzzed random pids. Assigned on the `mut` local before the
-/// state is shared, exactly as the oracle_service harness does.
-fn dead_hashd_sock() -> String {
-    std::env::temp_dir().join(format!(
-        "fuzz-hashd-dead-{}.sock",
-        std::process::id()
-    )).display().to_string()
-}
-
 // ── deterministic RNG (splitmix64, same as the orchestrator tier) ──
 struct Rng(u64);
 impl Rng {
@@ -98,15 +87,20 @@ fn daemon_chaos_marathon() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
     assert!(minutes > 0, "set FUZZ_MINUTES (the marathon is opt-in)");
+    // The kit mints the root: the dead #69 seam and the reused host
+    // file live under it (issue #63 — the PID-derived shared-temp
+    // name was identical for every test in one binary).
+    let stack = gatekeeper_testkit::Stack::new().spawn_in_process();
+    let dead_seam = stack.state().hashd_sock.clone();
+    let host = stack.scratch("fuzz-m-host-reused");
     let stop = std::time::Instant::now() + Duration::from_secs(60 * minutes);
     let mut seed = 0u64;
     while Instant::now() < stop {
         let mut rng = Rng(seed | 1);
         let mut state = ServerState::new();
-        state.hashd_sock = dead_hashd_sock();
+        state.hashd_sock = dead_seam.clone();
         // ONE host file reused across seeds (zero disk footprint — a
         // per-seed file filled a disk in an earlier marathon).
-        let host = std::env::temp_dir().join("fuzz-m-host-reused");
         let _ = std::fs::write(&host, b"FUZZ-DATA");
         state.add("s", &host, 9, "sha256-real");
         let hub = OracleHub::new();
@@ -127,14 +121,17 @@ fn daemon_chaos_marathon() {
 
 #[test]
 fn command_socket_chaos_never_panics_and_never_authorizes() {
-    // ONE host file reused across seeds (zero disk footprint — the
-    // first marathon leaked one file per seed until the disk filled).
-    let host = std::env::temp_dir().join("fuzz-cmd-host-reused");
+    // The kit mints the root (issue #63): dead #69 seam + the ONE
+    // host file reused across seeds (zero disk footprint — the first
+    // marathon leaked one file per seed until the disk filled).
+    let stack = gatekeeper_testkit::Stack::new().spawn_in_process();
+    let dead_seam = stack.state().hashd_sock.clone();
+    let host = stack.scratch("fuzz-cmd-host-reused");
     std::fs::write(&host, b"FUZZ-DATA").unwrap();
     for seed in 0..512u64 {
         let mut rng = Rng(seed | 1);
         let mut state = ServerState::new();
-        state.hashd_sock = dead_hashd_sock();
+        state.hashd_sock = dead_seam.clone();
         // NON-wildcard: only "sha256-real" may ever grant.
         state.add("s", &host, 9, "sha256-real");
         let hub = OracleHub::new();
