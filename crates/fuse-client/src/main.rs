@@ -1,44 +1,67 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::panic, unused_results))]
 use std::path::PathBuf;
 
-use clap::Parser;
 use fuse_protocol::{client_protocols, ServerStateFile, VERSION as CLIENT_VERSION};
 use servyi_servatui::App;
 
 mod pending_layer;
 
-#[derive(Parser)]
-#[command(name = "fuse-client", about = "Send CRUD commands to the fuse-server")]
-struct Cli {
-    #[arg(short, long, env = fuse_protocol::ENV_CMD_SOCKET, default_value = fuse_protocol::DEFAULT_CMD_SOCKET)]
-    socket: PathBuf,
-    #[command(subcommand)]
-    command: Option<Commands>,
+/// This binary's name — the clap tree, the completion scripts, and
+/// the COMP_LINE fallback all reference it; retyping it invites
+/// drift the day the binary is renamed.
+const BIN_NAME: &str = env!("CARGO_PKG_NAME");
+
+/// Base name of the client action log (beside the state file, or
+/// /tmp when no state file is known).
+const CLIENT_LOG_BASE: &str = "fuse-gatekeeper-client.log";
+
+
+/// The client-LOCAL commands (never on the wire): declared once,
+/// referenced everywhere.
+mod local {
+    pub const RESTART: &str = "restart";
+    pub const COMPLETIONS: &str = "completions";
 }
 
-#[derive(clap::Subcommand)]
-enum Commands {
-    Reset { #[arg(short, long)] name: Option<String> },
-    ResetAll,
-    Status,
-    AddSecret { name: String, #[arg(short, long)] file: PathBuf, #[arg(long)] hash: String },
-    RemoveSecret { name: String },
-    RotateHash { name: String, #[arg(long)] hash: String },
-    ListMounts,
-    Pending,
-    Grant { id: u64 },
-    /// Grant a pending access permanently (whitelists the package hash).
-    GrantForever { id: u64 },
-    Deny { id: u64 },
-    GetVersion,
-    GetLogPath,
-    /// Restart the fuse-server from the state file: stop the old
-    /// daemon (and its supervised data daemon), clean up socket and
-    /// mount point, respawn with the same configuration and re-add
-    /// every secret from the state file's host paths.  This is the
-    /// same flow the client runs on a version mismatch, exposed as a
-    /// one-word command; it asks no questions.
-    Restart,
+/// The full CLI, COMBINED from the registered protocols (each row
+/// carries its own clap pattern — servatui's `cli` feature) plus the
+/// client's local commands and top-level options. Nothing here
+/// restates a command's grammar (servyi/servatui#5).
+fn build_cli(protocols: &[servyi_servatui::Protocol]) -> clap::Command {
+    // The client's own extras (top-level options + local subcommands);
+    // every protocol becomes a subcommand with its carried pattern.
+    let extras = clap::Command::new(BIN_NAME)
+        .about("Send CRUD commands to the fuse-server")
+        .arg(
+            clap::Arg::new("socket")
+                .short('s')
+                .long("socket")
+                .env(fuse_protocol::ENV_CMD_SOCKET)
+                .default_value(fuse_protocol::DEFAULT_CMD_SOCKET)
+                .value_parser(clap::value_parser!(PathBuf))
+                .global(true),
+        )
+        .arg(
+            clap::Arg::new("complete")
+                .long("complete")
+                .hide(true)
+                .action(clap::ArgAction::SetTrue)
+                .help("Shell completion mode (also auto-engaged when COMP_LINE is set)"),
+        )
+        .subcommand(
+            clap::Command::new(local::RESTART).about(
+                "Restart the fuse-server from the state file: stop the old \
+daemon (and its supervised data daemon), clean up socket and mount \
+point, respawn with the same configuration and re-add every secret \
+from the state file's host paths.",
+            ),
+        )
+        .subcommand(
+            clap::Command::new(local::COMPLETIONS)
+                .about("Emit the delegating shell-completion scripts (bash | zsh | fish)")
+                .arg(clap::Arg::new("shell").required(true)),
+        );
+    servyi_servatui::cli::clap_tree(extras, protocols)
 }
 
 fn main() {
@@ -49,11 +72,11 @@ fn main() {
         .ok()
         .map(|p| {
             std::path::Path::new(&p)
-                .with_file_name("fuse-gatekeeper-client.log")
+                .with_file_name(CLIENT_LOG_BASE)
                 .to_string_lossy()
                 .to_string()
         })
-        .unwrap_or_else(|| "/tmp/fuse-gatekeeper-client.log".to_string());
+        .unwrap_or_else(|| format!("/tmp/{CLIENT_LOG_BASE}"));
     // Default to info: an unset RUST_LOG must not silence the panel
     // action log (that is the whole point of the file).
     let filter = tracing_subscriber::EnvFilter::builder()
@@ -69,16 +92,52 @@ fn main() {
         tracing_subscriber::fmt().with_env_filter(filter).init();
     }
 
-    let cli = Cli::parse();
+    // One protocol set feeds BOTH the combined CLI tree and the App —
+    // the patterns and the runtime read the same rows.
+    let protocols = client_protocols();
+    let matches = build_cli(&protocols).get_matches();
 
-    let app = App::builder(&cli.socket)
-        .protocol_all(client_protocols())
-        .build();
+    let socket = matches
+        .get_one::<PathBuf>("socket")
+        .cloned()
+        .expect("default_value guarantees a socket");
 
-    if let Some(Commands::Restart) = &cli.command {
-        let log_path = discover_log_path(&app);
-        restart_server(&app, log_path.as_deref());
+    // Shell completion comes FIRST: it must never hit the version
+    // handshake, the log, or anything slow — a Tab press waits on it.
+    if matches.get_flag("complete") || std::env::var_os(fuse_protocol::COMP_LINE).is_some() {
+        complete_mode(&socket);
         return;
+    }
+    if let Some((name, sub)) = matches.subcommand() {
+        if name == local::COMPLETIONS {
+            print_completion_script(sub.get_one::<String>("shell").expect("required"));
+            return;
+        }
+    }
+
+    // Serialize the args-string BEFORE the App takes the protocols:
+    // (name, args) for the table command, if any.
+    // Local commands (restart/completions) are not table rows: they
+    // have no protocol, so they dispatch to None.
+    let dispatch = matches.subcommand().and_then(|(name, sub)| {
+        protocols
+            .iter()
+            .find(|p| p.name == name)
+            .map(|proto| {
+                (
+                    name.to_string(),
+                    servyi_servatui::cli::args_string(&proto.clap_args, sub),
+                )
+            })
+    });
+    let app = App::builder(&socket).protocol_all(protocols).build();
+
+    if let Some((name, _)) = matches.subcommand() {
+        if name == local::RESTART {
+            let log_path = discover_log_path(&app);
+            restart_server(&app, log_path.as_deref());
+            return;
+        }
     }
 
     if app.server_running() {
@@ -87,10 +146,9 @@ fn main() {
         check_start_server(&app);
     }
 
-    match &cli.command {
-        Some(cmd) => {
-            let (proto_name, args) = build_clap_command(cmd);
-            match app.run_cli_command(&proto_name, &args) {
+    match dispatch {
+        Some((name, args)) => {
+            match app.run_cli_command(&name, &args) {
                 Ok(lines) => {
                     for line in lines {
                         println!("{line}");
@@ -129,10 +187,9 @@ fn main() {
             // frame — so action failures (with their remediation
             // commands) are visible in the TUI, not only in the /tmp
             // log file.
-            let log_sink: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
-                Default::default();
+            let log_sink: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
             let talk = pending_layer::spawn_worker(
-                cli.socket.clone(),
+                socket.clone(),
                 pending.clone(),
                 secrets,
                 collapsed_names.clone(),
@@ -155,7 +212,7 @@ fn main() {
             }));
             let _layer_id = display.add_layer(Box::new(panel));
             display.set_log_sink(log_sink);
-            if let Err(e) = display.run(&cli.socket, &protocols) {
+            if let Err(e) = display.run(&socket, &protocols) {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
             }
@@ -163,24 +220,177 @@ fn main() {
     }
 }
 
-fn build_clap_command(cmd: &Commands) -> (String, String) {
-    match cmd {
-        Commands::Reset { name } => ("reset".into(), name.clone().unwrap_or_default()),
-        Commands::ResetAll => ("reset-all".into(), "".into()),
-        Commands::Status => ("status".into(), "".into()),
-        Commands::AddSecret { name, file, hash } => {
-            ("add".into(), format!("{name} {} {hash}", file.display()))
+// ── Shell completion (servyi/servatui#5) ───────────────────────
+
+/// Slice a completing line into (confirmed prior words, the word
+/// being completed). Pure — the unit tests pin the edge cases.
+fn split_completing(line_before_cursor: &str) -> (Vec<String>, String) {
+    let mut words: Vec<String> = line_before_cursor
+        .split_whitespace()
+        .map(|w| w.to_string())
+        .collect();
+    // A trailing (or doubled) space means a NEW empty word is being
+    // completed: "reset " → (["reset"], "").
+    let starting_new = line_before_cursor.ends_with(char::is_whitespace)
+        || line_before_cursor.is_empty();
+    let completing = if starting_new {
+        String::new()
+    } else {
+        words.pop().unwrap_or_default()
+    };
+    (words, completing)
+}
+
+/// One minimal servatui step round over the cmd socket, with a hard
+/// timeout: completion must never hang the shell. Mirrors
+/// `run_cli_command_raw`'s wire sequence exactly: the bare command
+/// NAME frame (a JSON string), the parsed-args frame, then the
+/// response line; the finalize sentinel closes the exchange.
+/// Connect failure (dead server) returns None — callers degrade to
+/// command names.
+fn one_shot_query(
+    socket: &std::path::Path,
+    name: &str,
+    command: &fuse_protocol::Command,
+) -> Option<String> {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
+    let mut c = UnixStream::connect(socket).ok()?;
+    let _ = c.set_read_timeout(Some(std::time::Duration::from_millis(200)));
+    let _ = c.set_write_timeout(Some(std::time::Duration::from_millis(200)));
+    let name_frame = serde_json::to_string(name).ok()?;
+    let args_frame = serde_json::to_string(command).ok()?;
+    c.write_all(format!("{name_frame}\n").as_bytes()).ok()?;
+    c.write_all(format!("{args_frame}\n").as_bytes()).ok()?;
+    let mut line = String::new();
+    {
+        let mut reader = BufReader::new(c.try_clone().ok()?);
+        if reader.read_line(&mut line).is_err() {
+            return None;
         }
-        Commands::RemoveSecret { name } => ("remove".into(), name.clone()),
-        Commands::RotateHash { name, hash } => ("rotate".into(), format!("{name} {hash}")),
-        Commands::ListMounts => ("mounts".into(), "".into()),
-        Commands::Pending => ("pending".into(), "".into()),
-        Commands::Grant { id } => ("grant".into(), id.to_string()),
-        Commands::GrantForever { id } => ("grant-forever".into(), id.to_string()),
-        Commands::Deny { id } => ("deny".into(), id.to_string()),
-        Commands::GetVersion => ("version".into(), "".into()),
-        Commands::GetLogPath => ("logpath".into(), "".into()),
-        Commands::Restart => unreachable!("restart runs its own local flow"),
+    }
+    // finalize sentinel — the daemon's step protocol expects it.
+    let _ = c.write_all(b"null\n");
+    let _ = c.flush();
+    Some(line)
+}
+
+/// The candidate VALUES for a command's first argument, from the live
+/// server — the single kind→query mapping (shared shape with the TUI
+/// completers): PendingIds → `pending`, SecretNames → `status`.
+fn live_candidates(socket: &std::path::Path, word: &str) -> Vec<String> {
+    use fuse_protocol::{COMMAND_TABLE, Response};
+    let Some(spec) = COMMAND_TABLE.iter().find(|s| s.name == word) else {
+        return Vec::new();
+    };
+    // The SINGLE kind→query mapping lives on Completer
+    // (`query`/`values_from`), shared with the TUI's poller wiring.
+    let Some((query_word, cmd)) = spec.complete.query() else {
+        return Vec::new();
+    };
+    one_shot_query(socket, query_word, &cmd)
+        .and_then(|reply| serde_json::from_str::<Response>(reply.trim()).ok())
+        .map(|resp| spec.complete.values_from(&resp))
+        .unwrap_or_default()
+}
+
+/// Completion entry: print one candidate per line (bare words — both
+/// bash's `complete -C` and fish's `-a` expect position candidates).
+fn complete_mode(socket: &std::path::Path) {
+    use fuse_protocol::COMMAND_TABLE;
+    use std::io::Write;
+    let stdout = std::io::stdout();
+    let mut out = std::io::BufWriter::new(stdout.lock());
+
+    // bash: COMP_LINE/COMP_POINT. fish: argv after --complete.
+    let (prior, completing) = if let Some(line) = std::env::var_os(fuse_protocol::COMP_LINE) {
+        let line = line.to_string_lossy().into_owned();
+        let point = std::env::var(fuse_protocol::COMP_POINT)
+            .ok()
+            .and_then(|p| p.parse::<usize>().ok())
+            .unwrap_or(line.len())
+            .min(line.len());
+        split_completing(&line[..point])
+    } else {
+        // fish: everything AFTER --complete is the command line being
+        // completed (a custom --socket sits before the flag).
+        let argv: Vec<String> = std::env::args()
+            .skip_while(|a| a != "--complete")
+            .skip(1)
+            .collect();
+        split_completing(&argv.join(" "))
+    };
+
+    // bash's COMP_LINE (and fish's `commandline -cp`) include the
+    // program's own word first — drop it so "fuse-client sta"
+    // completes the COMMAND, not an argument of a command named
+    // "fuse-client".
+    let prog = std::env::args()
+        .next()
+        .and_then(|a| {
+            std::path::Path::new(&a)
+                .file_name()
+                .map(|f| f.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| BIN_NAME.to_string());
+    let mut prior = prior;
+    if prior.first().map(|w| w == &prog).unwrap_or(false) {
+        let _removed = prior.remove(0);
+    }
+
+    let candidates: Vec<String> = if prior.is_empty() {
+        // First word: command names (compile-time table — the command
+        // surface is not served over the wire, per the issue thread).
+        COMMAND_TABLE
+            .iter()
+            .map(|s| s.name.to_string())
+            .filter(|n| n.starts_with(&completing))
+            .collect()
+    } else {
+        // Argument position: only the FIRST argument completes (the
+        // SecretNames `rotate` hash guard falls out — arity check).
+        let is_first_arg = prior.len() == 1;
+        if !is_first_arg {
+            Vec::new()
+        } else {
+            live_candidates(socket, &prior[0])
+                .into_iter()
+                .filter(|c| c.starts_with(&completing))
+                .collect()
+        }
+    };
+    for c in candidates {
+        let _ = writeln!(out, "{c}");
+    }
+    let _ = out.flush();
+}
+
+/// The delegating shell scripts — dumb and static; the binary is the
+/// smart dynamic half. Hand-written (three ~4-line scripts) rather
+/// than a clap_complete dependency for the same protocol.
+/// None = unsupported shell (caller reports and exits nonzero).
+fn completion_script(shell: &str) -> Option<String> {
+    match shell {
+        "bash" => Some(format!("complete -C {b} {b}\n", b = BIN_NAME)),
+        "zsh" => Some(format!(
+            "autoload -U +X bashcompinit && bashcompinit\ncomplete -C {b} {b}\n",
+            b = BIN_NAME
+        )),
+        "fish" => Some(format!(
+            "complete -c {b} -f -a '({b} --complete (commandline -cop))'\n",
+            b = BIN_NAME
+        )),
+        _ => None,
+    }
+}
+
+fn print_completion_script(shell: &str) {
+    match completion_script(shell) {
+        Some(script) => print!("{script}"),
+        None => {
+            eprintln!("unsupported shell {shell:?} (bash | zsh | fish)");
+            std::process::exit(1);
+        }
     }
 }
 
@@ -190,7 +400,7 @@ fn build_clap_command(cmd: &Commands) -> (String, String) {
 /// predates logpath discovery (callers decide their own fallback).
 fn discover_log_path(app: &App) -> Option<String> {
     use fuse_protocol::Response;
-    app.run_cli_command_raw("logpath", "")
+    app.run_cli_command_raw(fuse_protocol::cmd::LOGPATH, "")
         .ok()
         .and_then(|(_, raw)| serde_json::from_slice::<Response>(&raw).ok())
         .and_then(|r| match r {
@@ -202,7 +412,7 @@ fn discover_log_path(app: &App) -> Option<String> {
 fn check_version_or_restart(app: &App) {
     use fuse_protocol::Response;
 
-    let server_version = match app.run_cli_command_raw("version", "") {
+    let server_version = match app.run_cli_command_raw(fuse_protocol::cmd::VERSION, "") {
         Ok((_, raw)) => serde_json::from_slice::<Response>(&raw)
             .ok()
             .and_then(|r| match r {
@@ -305,7 +515,7 @@ fn respawn_argv(state: &ServerStateFile) -> Vec<String> {
         // The surviving data daemon retries THIS rendezvous; respawning
         // on the global default would orphan it (an alive mount that
         // never syncs again).
-        argv.push("--oracle-socket".to_string());
+        argv.push(fuse_protocol::ORACLE_SOCKET_FLAG.to_string());
         argv.push(oracle.clone());
     }
     argv.push("--log-level".to_string());
@@ -416,7 +626,7 @@ fn start_server_from_state(app: &App, state: &ServerStateFile, log_path: Option<
     eprintln!("Restoring {} secret(s)...", state.secrets.len());
     for entry in &state.secrets {
         let args = format!("{} {} {}", entry.fuse_name, entry.host_path, entry.hash);
-        match app.run_cli_command("add", &args) {
+        match app.run_cli_command(fuse_protocol::cmd::ADD, &args) {
             Ok(_) => eprintln!("  Restored {}", entry.fuse_name),
             Err(e) => eprintln!("  Error restoring {}: {e}", entry.fuse_name),
         }
@@ -435,7 +645,7 @@ fn restart_server(app: &App, log_path: Option<&str>) {
         }
     };
 
-    let status_info = match app.run_cli_command_raw("status", "") {
+    let status_info = match app.run_cli_command_raw(fuse_protocol::cmd::STATUS, "") {
         Ok((_, raw)) => serde_json::from_slice::<Response>(&raw)
             .ok()
             .and_then(|r| match r {
@@ -540,7 +750,7 @@ fn ask_reset_anyway() {
             server_pid: 0,
             server_binary: String::new(),
             mount_point: String::new(),
-            socket: "/tmp/fuse-gatekeeper.sock".into(),
+            socket: fuse_protocol::DEFAULT_CMD_SOCKET.into(),
             log_level: "info".into(),
             pending_timeout: 10,
             runtime_wrapper: None,
@@ -570,6 +780,148 @@ fn ask_reset_anyway() {
     }
 }
 
+// ── combined-CLI tests ─────────────────────────────────────────
+
+#[test]
+fn the_cli_tree_is_combined_from_the_protocols_and_locals() {
+    let protocols = client_protocols();
+    let cli = build_cli(&protocols);
+    cli.clone().debug_assert();
+    let names: Vec<&str> = cli.get_subcommands().map(|c| c.get_name()).collect();
+    // every protocol command is a subcommand — including lockdown and
+    // show-map, which the hand-written enum had silently omitted
+    for p in &protocols {
+        assert!(names.contains(&p.name), "{} missing from the CLI", p.name);
+    }
+    assert!(names.contains(&"restart") && names.contains(&"completions"));
+    // and the pattern is live: add carries its typed flags
+    let add = cli.find_subcommand("add").expect("add");
+    let arg_names: Vec<&str> = add.get_arguments().map(|a| a.get_id().as_str()).collect();
+    assert!(arg_names.contains(&"file") && arg_names.contains(&"hash"));
+    // typed u64 pattern on grant
+    let grant = cli.find_subcommand("grant").expect("grant");
+    let err = grant
+        .clone()
+        .try_get_matches_from(["grant", "not-a-number"]);
+    assert!(err.is_err(), "u64 pattern must reject garbage");
+}
+
+// ── completion unit tests ──────────────────────────────────────// ── completion unit tests ──────────────────────────────────────
+
+/// Minimal servatui step-protocol listener. Binds SYNCHRONOUSLY (the
+/// client's connect can never race an unbound socket), then serves
+/// one exchange — read request line, reply `resp`, consume the null
+/// sentinel — on a detached thread.
+#[cfg(test)]
+fn spawn_step_listener(socket: &std::path::Path, resp: &str) {
+    use std::io::{BufRead, BufReader, Write};
+    let _ = std::fs::remove_file(socket);
+    let l = std::os::unix::net::UnixListener::bind(socket).expect("bind fake");
+    let resp = resp.to_string();
+    std::thread::spawn(move || {
+        if let Ok((s, _)) = l.accept() {
+            // The real wire: name frame, then args frame, then reply,
+            // then the finalize sentinel.
+            let mut name = String::new();
+            let mut args = String::new();
+            let mut reader = BufReader::new(&s);
+            reader.read_line(&mut name).expect("read name");
+            reader.read_line(&mut args).expect("read args");
+            let _ = (&s).write_all(format!("{resp}\n").as_bytes());
+            let mut sentinel = String::new();
+            let _ = BufReader::new(&s).read_line(&mut sentinel);
+            assert_eq!(name.trim(), "\"status\"", "first frame is the name");
+        }
+    });
+}
+
+#[test]
+fn split_completing_slices_word_and_prefix() {
+    // mid-word
+    let (prior, w) = split_completing("fuse-client reset exi");
+    assert_eq!(prior, vec!["fuse-client", "reset"]);
+    assert_eq!(w, "exi");
+    // trailing space opens a NEW empty word
+    let (prior, w) = split_completing("fuse-client reset ");
+    assert_eq!(prior, vec!["fuse-client", "reset"]);
+    assert_eq!(w, "");
+    // cursor before the line end (bash COMP_POINT): at offset 13 one
+    // char into `reset` the completing word is "r"; at 17 (end of
+    // `reset`) it is the whole word.
+    let (prior, w) = split_completing("fuse-client reset existing.yaml");
+    let (p2, w2) = split_completing(&"fuse-client reset existing.yaml"[..13]);
+    let (p3, w3) = split_completing(&"fuse-client reset existing.yaml"[..17]);
+    assert_eq!(w, "existing.yaml");
+    assert_eq!(w2, "r");
+    assert_eq!(w3, "reset");
+    assert_eq!(prior.len(), 2);
+    assert_eq!(p2.len(), 1);
+    assert_eq!(p3.len(), 1);
+    // empty line
+    let (prior, w) = split_completing("");
+    assert!(prior.is_empty());
+    assert_eq!(w, "");
+    // first word mid-typing
+    let (prior, w) = split_completing("sta");
+    assert!(prior.is_empty());
+    assert_eq!(w, "sta");
+}
+
+#[test]
+fn live_candidates_reads_secret_names_from_status_reply() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let sock = dir.path().join("u1.sock");
+    let reply = r#"{"type":"status","secrets":[{"name":"a.yaml","access_count":0,"allowed_hashes":[],"inner":"h1","size":3,"unlimited":false}],"lockdown":false}"#;
+    spawn_step_listener(&sock, reply);
+    let got = live_candidates(&sock, "reset");
+    assert_eq!(got, vec!["a.yaml".to_string()]);
+}
+
+#[test]
+fn live_candidates_reads_pending_ids_from_pending_reply() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let sock = dir.path().join("u2.sock");
+    let reply = r#"{"type":"pending_list","pending":[{"id":7,"secret_name":"a.yaml","pid":42,"pid_hash":null,"reason":"one-read","expires_at":999}]}"#;
+    spawn_step_listener(&sock, reply);
+    let got = live_candidates(&sock, "grant");
+    assert_eq!(got, vec!["7".to_string()]);
+}
+
+#[test]
+fn live_candidates_degrades_to_empty_on_dead_socket_and_bad_replies() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let dead = dir.path().join("nope.sock");
+    assert!(live_candidates(&dead, "reset").is_empty());
+    assert!(live_candidates(&dead, "grant").is_empty());
+    // non-completing commands never query at all
+    assert!(live_candidates(&dead, "status").is_empty());
+    // unknown command word
+    assert!(live_candidates(&dead, "nonsense").is_empty());
+    let sock = dir.path().join("u3.sock");
+    spawn_step_listener(&sock, "not json at all");
+    // unparseable reply degrades to empty, never panics
+    assert!(live_candidates(&sock, "reset").is_empty());
+    // wrong response variant for the query degrades to empty
+    let sock2 = dir.path().join("u4.sock");
+    spawn_step_listener(&sock2, r#"{"type":"ok"}"#);
+    assert!(live_candidates(&sock2, "reset").is_empty());
+}
+
+#[test]
+fn completion_scripts_delegate_to_the_binary() {
+    // Scripts must delegate via `complete -C` / fish `-a` — nothing
+    // static about commands may live in the script.
+    let bash = completion_script("bash").expect("bash");
+    let zsh = completion_script("zsh").expect("zsh");
+    let fish = completion_script("fish").expect("fish");
+    assert!(bash.contains("complete -C fuse-client fuse-client"), "{bash}");
+    assert!(zsh.contains("bashcompinit") && zsh.contains("complete -C"), "{zsh}");
+    assert!(fish.contains("--complete"), "{fish}");
+    assert!(completion_script("tcsh").is_none());
+    assert!(completion_script("").is_none());
+}
+
+#[cfg(test)]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -596,7 +948,7 @@ mod tests {
         let argv = respawn_argv(&base);
         let i = argv
             .iter()
-            .position(|a| a == "--oracle-socket")
+            .position(|a| a == fuse_protocol::ORACLE_SOCKET_FLAG)
             .expect("the rendezvous flag is present");
         assert_eq!(argv[i + 1], "/tmp/.tmpABC/oracle.sock");
         // and the global default stays implicit when unset

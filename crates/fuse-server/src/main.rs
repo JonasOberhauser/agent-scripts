@@ -17,7 +17,7 @@ use tracing::{error, info, warn};
 use fuse_server::{OracleHub, ServerState};
 
 #[derive(Parser)]
-#[command(name = "fuse-server", about = "FUSE gatekeeper POLICY daemon (decisions + command socket; data lives in fused)")]
+#[command(name = fuse_protocol::SERVER_BIN, about = "FUSE gatekeeper POLICY daemon (decisions + command socket; data lives in fused)")]
 struct Cli {
     /// Accepted for backward compatibility with older orchestrators;
     /// mounting is the data daemon's job now.
@@ -37,7 +37,7 @@ struct Cli {
     log_path: PathBuf,
     /// Socket where the data daemon (fused) connects for adjudication
     /// and content updates.
-    #[arg(long, default_value = "/tmp/fuse-gatekeeper-oracle.sock")]
+    #[arg(long, default_value = fuse_protocol::DEFAULT_ORACLE_SOCKET)]
     oracle_socket: PathBuf,
 }
 
@@ -99,13 +99,13 @@ fn main() {
     // to this binary and keep it as a child; on our exit it dies too.
     if let Some(mp) = &cli.mount_point {
         let exe = std::env::current_exe().expect("current exe");
-        let fused = exe.parent().map(|d| d.join("fused")).filter(|p| p.exists());
+        let fused = exe.parent().map(|d| d.join(fuse_protocol::FUSED_BIN)).filter(|p| p.exists());
         match fused {
             Some(fused) => {
                 info!("  mount-point:     {} (spawning supervised data daemon)", mp.display());
                 let child = std::process::Command::new(&fused)
                     .arg("--mount-point").arg(mp)
-                    .arg("--oracle-socket").arg(&cli.oracle_socket)
+                    .arg(fuse_protocol::ORACLE_SOCKET_FLAG).arg(&cli.oracle_socket)
                     .spawn();
                 match child {
                     Ok(c) => {

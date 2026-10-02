@@ -386,7 +386,7 @@ where
                 .as_ref()
                 .map(|p| p.to_string_lossy().into_owned());
             if let Some(oracle) = oracle_arg.as_deref() {
-                fuse_args.push("--oracle-socket");
+                fuse_args.push(fuse_protocol::ORACLE_SOCKET_FLAG);
                 fuse_args.push(oracle);
             }
             fuse_args.push("--log-level");

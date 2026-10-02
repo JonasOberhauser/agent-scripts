@@ -179,9 +179,42 @@ pub enum Completer {
     },
 }
 
+impl Completer {
+    /// The one-shot query (wire word + command) whose response
+    /// carries this completer's values — the SINGLE kind→query
+    /// mapping (servyi/servatui#5): `--complete` asks it directly;
+    /// the TUI's pollers feed the same queries' results into the
+    /// snapshot completers.
+    pub fn query(self) -> Option<(&'static str, Command)> {
+        match self {
+            Completer::None => None,
+            Completer::SecretNames { .. } => Some((cmd::STATUS, Command::Status)),
+            Completer::PendingIds => Some((cmd::PENDING, Command::ListPending)),
+        }
+    }
+
+    /// The candidate values this completer draws from a response to
+    /// [`Completer::query`]. Mismatched variants yield none.
+    pub fn values_from(self, resp: &Response) -> Vec<String> {
+        match (self, resp) {
+            (
+                Completer::SecretNames { .. },
+                Response::Status { secrets, .. },
+            ) => secrets.iter().map(|s| s.name.clone()).collect(),
+            (Completer::PendingIds, crate::Response::PendingList { pending }) => {
+                pending.iter().map(|p| p.id.to_string()).collect()
+            }
+            _ => Vec::new(),
+        }
+    }
+}
+
 /// Offline (server-not-running) fallback renderer for CLI use.
 pub type OfflineFn = fn(&str, &mut dyn Console) -> Result<(), String>;
 
+/// Re-exported CLI-pattern vocabulary (servatui): rows declare their
+/// CLI arguments with it and clients combine them into a full CLI
+/// tree (see servatui's `cli` feature).
 /// ONE definition per wire command.  The client registry derives
 /// parse/completion from here, the server registry derives its name
 /// dispatch from here, and `handle_command`'s exhaustive match makes
@@ -193,6 +226,11 @@ pub struct CommandSpec {
     pub parse: fn(&str) -> Result<Command, String>,
     pub complete: Completer,
     pub offline: Option<OfflineFn>,
+    /// The command's clap pattern (servatui `cli` feature): plain
+    /// `clap::Arg`s in wire args-string order, carried onto the
+    /// Protocol for clients that build their CLI from the registered
+    /// protocols.
+    pub cli_args: fn() -> Vec<clap::Arg>,
 }
 
 const NO_COMPLETE: Completer = Completer::None;
@@ -266,23 +304,86 @@ fn offline_version(_args: &str, out: &mut dyn Console) -> Result<(), String> {
     Ok(())
 }
 
+
+// ── clap patterns (const-table-safe: fn items coerce in const) ──
+
+fn no_cli_args() -> Vec<clap::Arg> {
+    Vec::new()
+}
+
+/// `grant`/`grant-forever`/`deny`: the pending id.
+fn id_cli() -> Vec<clap::Arg> {
+    vec![clap::Arg::new("id").required(true).value_parser(clap::value_parser!(u64))]
+}
+
+/// `remove`: the secret name.
+fn name_cli() -> Vec<clap::Arg> {
+    vec![clap::Arg::new("name").required(true)]
+}
+
+/// `reset [--name NAME]`.
+fn reset_cli() -> Vec<clap::Arg> {
+    vec![clap::Arg::new("name").long("name").required(false)]
+}
+
+/// `rotate NAME --hash HASH`.
+fn name_hash_cli() -> Vec<clap::Arg> {
+    vec![
+        clap::Arg::new("name").required(true),
+        clap::Arg::new("hash").long("hash").required(true),
+    ]
+}
+
+/// `add NAME --file PATH --hash HASH`.
+fn add_cli() -> Vec<clap::Arg> {
+    vec![
+        clap::Arg::new("name").required(true),
+        clap::Arg::new("file")
+            .long("file")
+            .required(true)
+            .value_parser(clap::value_parser!(std::path::PathBuf)),
+        clap::Arg::new("hash").long("hash").required(true),
+    ]
+}
+
+/// The single source of every command word. The table rows below are
+/// BUILT from these constants, and every other reference in the code
+/// base imports them — no command string is ever retyped.
+pub mod cmd {
+    pub const STATUS: &str = "status";
+    pub const MOUNTS: &str = "mounts";
+    pub const RESET: &str = "reset";
+    pub const RESET_ALL: &str = "reset-all";
+    pub const ADD: &str = "add";
+    pub const REMOVE: &str = "remove";
+    pub const ROTATE: &str = "rotate";
+    pub const PENDING: &str = "pending";
+    pub const GRANT: &str = "grant";
+    pub const GRANT_FOREVER: &str = "grant-forever";
+    pub const DENY: &str = "deny";
+    pub const LOCKDOWN: &str = "lockdown";
+    pub const SHOW_MAP: &str = "show-map";
+    pub const VERSION: &str = "version";
+    pub const LOGPATH: &str = "logpath";
+}
+
 /// The complete wire command set, in protocol order.
 pub const COMMAND_TABLE: &[CommandSpec] = &[
-    CommandSpec { name: "status", help: "Show all secrets and access counts", parse: parse_status, complete: NO_COMPLETE, offline: None },
-    CommandSpec { name: "mounts", help: "List mounted secret files", parse: parse_mounts, complete: NO_COMPLETE, offline: None },
-    CommandSpec { name: "reset", help: "Reset access counter for one or all secrets", parse: parse_reset, complete: Completer::SecretNames { after_space: true }, offline: None },
-    CommandSpec { name: "reset-all", help: "Reset all access counters", parse: parse_reset_all, complete: NO_COMPLETE, offline: None },
-    CommandSpec { name: "add", help: "Add a new secret from a file", parse: parse_add, complete: NO_COMPLETE, offline: None },
-    CommandSpec { name: "remove", help: "Remove a secret", parse: parse_remove, complete: Completer::SecretNames { after_space: true }, offline: None },
-    CommandSpec { name: "rotate", help: "Change the allowed binary hash", parse: parse_rotate, complete: Completer::SecretNames { after_space: false }, offline: None },
-    CommandSpec { name: "pending", help: "Show pending access requests", parse: parse_pending, complete: NO_COMPLETE, offline: None },
-    CommandSpec { name: "grant", help: "Grant a pending access request", parse: parse_grant, complete: Completer::PendingIds, offline: None },
-    CommandSpec { name: "grant-forever", help: "Grant a pending access permanently (whitelists the observed package hash)", parse: parse_grant_forever, complete: Completer::PendingIds, offline: None },
-    CommandSpec { name: "deny", help: "Deny a pending access request", parse: parse_deny, complete: Completer::PendingIds, offline: None },
-    CommandSpec { name: "lockdown", help: "Lock in current grants; deny all future unauthorized access immediately (persisted)", parse: parse_lockdown, complete: NO_COMPLETE, offline: None },
-    CommandSpec { name: "show-map", help: "Show the outer -> anonymized container-view name map", parse: parse_show_map, complete: NO_COMPLETE, offline: None },
-    CommandSpec { name: "version", help: "Show server version", parse: parse_version, complete: NO_COMPLETE, offline: Some(offline_version) },
-    CommandSpec { name: "logpath", help: "Show server log file path", parse: parse_logpath, complete: NO_COMPLETE, offline: None },
+    CommandSpec { name: cmd::STATUS, help: "Show all secrets and access counts", parse: parse_status, complete: NO_COMPLETE, offline: None, cli_args: no_cli_args },
+    CommandSpec { name: cmd::MOUNTS, help: "List mounted secret files", parse: parse_mounts, complete: NO_COMPLETE, offline: None, cli_args: no_cli_args },
+    CommandSpec { name: cmd::RESET, help: "Reset access counter for one or all secrets", parse: parse_reset, complete: Completer::SecretNames { after_space: true }, offline: None, cli_args: reset_cli },
+    CommandSpec { name: cmd::RESET_ALL, help: "Reset all access counters", parse: parse_reset_all, complete: NO_COMPLETE, offline: None, cli_args: no_cli_args },
+    CommandSpec { name: cmd::ADD, help: "Add a new secret from a file", parse: parse_add, complete: NO_COMPLETE, offline: None, cli_args: add_cli },
+    CommandSpec { name: cmd::REMOVE, help: "Remove a secret", parse: parse_remove, complete: Completer::SecretNames { after_space: true }, offline: None, cli_args: name_cli },
+    CommandSpec { name: cmd::ROTATE, help: "Change the allowed binary hash", parse: parse_rotate, complete: Completer::SecretNames { after_space: false }, offline: None, cli_args: name_hash_cli },
+    CommandSpec { name: cmd::PENDING, help: "Show pending access requests", parse: parse_pending, complete: NO_COMPLETE, offline: None, cli_args: no_cli_args },
+    CommandSpec { name: cmd::GRANT, help: "Grant a pending access request", parse: parse_grant, complete: Completer::PendingIds, offline: None, cli_args: id_cli },
+    CommandSpec { name: cmd::GRANT_FOREVER, help: "Grant a pending access permanently (whitelists the observed package hash)", parse: parse_grant_forever, complete: Completer::PendingIds, offline: None, cli_args: id_cli },
+    CommandSpec { name: cmd::DENY, help: "Deny a pending access request", parse: parse_deny, complete: Completer::PendingIds, offline: None, cli_args: id_cli },
+    CommandSpec { name: cmd::LOCKDOWN, help: "Lock in current grants; deny all future unauthorized access immediately (persisted)", parse: parse_lockdown, complete: NO_COMPLETE, offline: None, cli_args: no_cli_args },
+    CommandSpec { name: cmd::SHOW_MAP, help: "Show the outer -> anonymized container-view name map", parse: parse_show_map, complete: NO_COMPLETE, offline: None, cli_args: no_cli_args },
+    CommandSpec { name: cmd::VERSION, help: "Show server version", parse: parse_version, complete: NO_COMPLETE, offline: Some(offline_version), cli_args: no_cli_args },
+    CommandSpec { name: cmd::LOGPATH, help: "Show server log file path", parse: parse_logpath, complete: NO_COMPLETE, offline: None, cli_args: no_cli_args },
 ];
 
 pub fn client_protocols() -> Vec<Protocol> {
@@ -300,7 +401,8 @@ pub fn client_protocols_with_snapshots(pending: PendingIds, secrets: SecretNames
     COMMAND_TABLE
         .iter()
         .map(|spec| {
-            let proto = cmd_protocol(spec.name, spec.help, spec.parse);
+            let proto = cmd_protocol(spec.name, spec.help, spec.parse)
+                .clap_args((spec.cli_args)());
             let proto = match spec.complete {
                 Completer::None => proto,
                 Completer::PendingIds => proto.complete(pending_completer(pending.clone())),
@@ -438,7 +540,7 @@ pub fn run_command_once(
 
 /// One poll cycle returning the FULL pending request list.
 pub fn poll_pending_info(socket: &std::path::Path) -> Result<Vec<PendingAccessInfo>, String> {
-    match run_command_once(socket, "pending", &Command::ListPending)? {
+    match run_command_once(socket, cmd::PENDING, &Command::ListPending)? {
         crate::Response::PendingList { pending } => Ok(pending),
         other => Err(format!("unexpected response to list_pending: {other:?}")),
     }
@@ -447,7 +549,7 @@ pub fn poll_pending_info(socket: &std::path::Path) -> Result<Vec<PendingAccessIn
 /// One poll cycle returning the server's secret NAMES (from `status`),
 /// the live source for reset/remove/rotate completion.
 pub fn poll_secret_names(socket: &std::path::Path) -> Result<Vec<String>, String> {
-    match run_command_once(socket, "status", &Command::Status)? {
+    match run_command_once(socket, cmd::STATUS, &Command::Status)? {
         crate::Response::Status { secrets, .. } => {
             Ok(secrets.into_iter().map(|s| s.name).collect())
         }
@@ -461,6 +563,70 @@ pub fn poll_secret_names(socket: &std::path::Path) -> Result<Vec<String>, String
 /// messages from the transport layer.
 pub fn poll_pending_once(socket: &std::path::Path) -> Result<Vec<u64>, String> {
     Ok(poll_pending_info(socket)?.into_iter().map(|p| p.id).collect())
+}
+
+#[cfg(test)]
+mod completer_mapping_tests {
+    use super::*;
+    use crate::protocol::Response;
+
+    #[test]
+    fn the_kind_to_query_mapping_is_one_table() {
+        assert_eq!(Completer::None.query(), None);
+        // every query word is a registered table row
+        for c in [
+            Completer::PendingIds,
+            Completer::SecretNames { after_space: true },
+            Completer::SecretNames { after_space: false },
+        ] {
+            let (word, _cmd) = c.query().expect("completing kinds query");
+            assert!(
+                COMMAND_TABLE.iter().any(|s| s.name == word),
+                "query word {word:?} must be a table row"
+            );
+        }
+        assert_eq!(Completer::PendingIds.query().map(|(w, _)| w), Some("pending"));
+        assert_eq!(Completer::SecretNames { after_space: true }.query().map(|(w, _)| w), Some("status"));
+    }
+
+    #[test]
+    fn values_come_from_the_matching_response() {
+        let status = Response::Status {
+            secrets: vec![crate::protocol::SecretStatus {
+                name: "a.yaml".into(),
+                access_count: 0,
+                allowed_hashes: vec![],
+                inner: "h1".into(),
+                size: 3,
+                unlimited: false,
+            }],
+            lockdown: false,
+        };
+        assert_eq!(
+            Completer::SecretNames { after_space: true }.values_from(&status),
+            vec!["a.yaml".to_string()]
+        );
+        // wrong kind vs wrong response: no values, never a panic
+        assert!(Completer::PendingIds.values_from(&status).is_empty());
+        let pending = Response::PendingList {
+            pending: vec![PendingAccessInfo {
+                id: 7,
+                secret_name: "a.yaml".into(),
+                process_name: None,
+                pid: 42,
+                pid_hash: None,
+                pid_hash_error: None,
+                reason: "one-read".into(),
+                expired: false,
+                expires_at: 99,
+            }],
+        };
+        assert_eq!(
+            Completer::PendingIds.values_from(&pending),
+            vec!["7".to_string()]
+        );
+        assert!(Completer::SecretNames { after_space: false }.values_from(&pending).is_empty());
+    }
 }
 
 #[cfg(test)]

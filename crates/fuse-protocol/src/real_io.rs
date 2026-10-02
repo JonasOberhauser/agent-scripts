@@ -5,7 +5,7 @@ use crate::io::{CommandOutput, PathState, SystemIo};
 use crate::IoError;
 
 
-/// One parsed /proc/<pid>/maps line: `Ok(Some((range, path)))` for a
+/// One parsed `/proc/<pid>/`maps line: `Ok(Some((range, path)))` for a
 /// file-backed mapping, `Ok(None)` for a pathless segment, `Err` when
 /// the line does not match the documented 5-mandatory-field format
 /// ("start-end perms offset dev inode [path..]").
@@ -14,7 +14,7 @@ use crate::IoError;
 /// name them by — but every mandatory field is validated to exist, and
 /// the pathname is taken as the whole remainder of the line so paths
 /// containing spaces survive intact.
-/// Disambiguate why a /proc/<pid> inspection step failed, from the errno:
+/// Disambiguate why a `/proc/<pid>` inspection step failed, from the errno:
 /// each cause has a different remediation, and the pending panel shows
 /// this text to the human deciding the grant.
 fn inspect_hint(e: &std::io::Error) -> &'static str {
@@ -38,7 +38,7 @@ fn map_files_hint(e: &std::io::Error) -> &'static str {
     match e.kind() {
         NotFound => "Mapped file unreachable in this mount namespace — a guest \
                      path that does not exist where the server runs.",
-        PermissionDenied => "Following /proc/<pid>/map_files requires \
+        PermissionDenied => "Following `/proc/<pid>/`map_files requires \
                              CAP_SYS_ADMIN or CAP_CHECKPOINT_RESTORE in the \
                              INITIAL user namespace (kernel fs/proc/base.c, \
                              proc_map_files_get_link) — not ptrace of the \
@@ -293,7 +293,7 @@ impl SystemIo for RealSystemIo {
                 "read /proc/{pid}/exe: {e}. {}", inspect_hint(&e)
             )))?;
         // Collect (mapping-range, path) pairs.  The range addresses the
-        // exact mapped inode via /proc/<pid>/map_files/, which works
+        // exact mapped inode via `/proc/<pid>/`map_files/, which works
         // even when the on-disk path was replaced or unlinked
         // (deleted-but-mapped libraries are common after updates).
         let mut entries: Vec<(String, PathBuf)> = vec![(String::new(), exe)];

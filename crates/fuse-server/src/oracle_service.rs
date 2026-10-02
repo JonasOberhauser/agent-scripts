@@ -426,10 +426,30 @@ pub static ORACLE_HUB: std::sync::LazyLock<OracleHub> = std::sync::LazyLock::new
 
 /// Run the oracle listener. Blocks.
 pub fn run_oracle_server(socket_path: &std::path::Path, state: Arc<ServerState>, hub: OracleHub) -> Result<(), String> {
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    run_oracle_server_with_stop(socket_path, state, hub, &stop)
+}
+
+/// Like [`run_oracle_server`], with a stop seam for long-running test
+/// harnesses (the e2e fuzz marathon): set the flag and connect once
+/// (the poison pill wakes the blocking accept) — the loop exits and
+/// the thread reclaims. Without it, every stack-up leaked one immortal
+/// accept thread, and ~2k fuzz worlds hit the process/thread limit
+/// (the fused under test then died spawning its own threads).
+pub fn run_oracle_server_with_stop(
+    socket_path: &std::path::Path,
+    state: Arc<ServerState>,
+    hub: OracleHub,
+    stop: &std::sync::atomic::AtomicBool,
+) -> Result<(), String> {
     let _ = std::fs::remove_file(socket_path);
     let listener = UnixListener::bind(socket_path).map_err(|e| e.to_string())?;
     info!("Oracle server listening at {}", socket_path.display());
     for conn in listener.incoming().flatten() {
+        if stop.load(std::sync::atomic::Ordering::Acquire) {
+            info!("oracle: stop requested — shutting down the listener");
+            break;
+        }
         let state = Arc::clone(&state);
         let hub = hub.clone();
         let _conn_thread = std::thread::spawn(move || handle_conn(&state, &hub, conn));

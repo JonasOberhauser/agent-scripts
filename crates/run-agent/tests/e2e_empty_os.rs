@@ -197,8 +197,8 @@ impl EmptyOs {
             .env("XDG_RUNTIME_DIR", &self.xdg_runtime)
             .env("CONTAINERS_CONF", &self.containers_conf)
             .env("CONTAINERS_STORAGE_CONF", self.root.join("storage.conf"))
-            .env("FUSE_GATEKEEPER_STATE", self.root.join("state.json"))
-            .env("FUSE_GATEKEEPER_POLICY", &self.policy_store)
+            .env(fuse_protocol::ENV_STATE_FILE, self.root.join("state.json"))
+            .env(fuse_protocol::ENV_POLICY_FILE, &self.policy_store)
             .env("RUST_LOG", "error")
     }
 

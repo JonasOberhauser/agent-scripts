@@ -151,7 +151,7 @@ impl Split {
             .arg("--pending-timeout").arg("5")
             .env("RUST_LOG", "fuse_mount=info,fuse_server=info");
         if let Some(sock) = hashd_sock {
-            policy.env("FUSE_HASHD_SOCK", sock);
+            policy.env(fuse_protocol::ENV_HASHD_SOCK, sock);
         }
         for (name, content, hash) in secrets {
             let f = secret_dir.path().join(name);
@@ -165,7 +165,7 @@ impl Split {
             ));
         }
         let policy = policy
-            .env("FUSE_GATEKEEPER_POLICY", dirs[1].path().join("policy.json"))
+            .env(fuse_protocol::ENV_POLICY_FILE, dirs[1].path().join("policy.json"))
             .stdout(server_log.try_clone().unwrap()).stderr(server_log)
             .spawn()
             .expect("spawn fuse-server (policy)");
@@ -385,7 +385,7 @@ impl Split {
         cmd.arg("--socket").arg(&self.socket)
             .arg("--oracle-socket").arg(&self.oracle)
             .arg("--pending-timeout").arg("5")
-            .env("FUSE_GATEKEEPER_POLICY", self._dirs[1].path().join("policy.json"))
+            .env(fuse_protocol::ENV_POLICY_FILE, self._dirs[1].path().join("policy.json"))
             .env("RUST_LOG", "fuse_mount=info,fuse_server=info")
             .stdout(std::process::Stdio::from(log.try_clone().unwrap()))
             .stderr(log);
@@ -532,7 +532,7 @@ fn e2e_re_add_unchanged_content_preserves_state_end_to_end() {
     let src = tempfile::tempdir().unwrap();
     let f = src.path().join("s");
     std::fs::write(&f, b"KEEP").unwrap();
-    let out = split.client(&["add-secret", "--file", f.to_str().unwrap(), "--hash", "*", "s"]);
+    let out = split.client(&["add", "--file", f.to_str().unwrap(), "--hash", "*", "s"]);
     assert!(out.status.success(), "re-add failed: {}", write_out(&out));
 
     // Read state persisted: still consumed, not a fresh cycle.
@@ -574,7 +574,7 @@ fn e2e_grants_survive_a_policy_daemon_kill() {
         .arg("--pending-timeout").arg("5")
         .arg("--secret")
         .arg(format!("s:{}:*", split.source_path("s").display()))
-        .env("FUSE_GATEKEEPER_POLICY", split._dirs[1].path().join("policy.json"))
+        .env(fuse_protocol::ENV_POLICY_FILE, split._dirs[1].path().join("policy.json"))
         .stdout(std::process::Stdio::from(server_log2.try_clone().unwrap()))
         .stderr(server_log2);
     let mut child = cmd.spawn().expect("respawn fuse-server");
@@ -907,7 +907,7 @@ fn e2e_source_mode_passthrough_masks_write_bits() {
     std::fs::write(&f, b"M").unwrap();
     use std::os::unix::fs::PermissionsExt as _;
     std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644)).unwrap();
-    let out = split.client(&["add-secret", "m", "--file", &f.display().to_string(), "--hash", "*"]);
+    let out = split.client(&["add", "m", "--file", &f.display().to_string(), "--hash", "*"]);
     assert!(out.status.success(), "add failed: {}", write_out(&out));
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -955,7 +955,7 @@ fn e2e_dynamic_add_visible() {
     let src = tempfile::tempdir().unwrap();
     let f = src.path().join("new.secret");
     std::fs::write(&f, b"FRESH").unwrap();
-    let out = split.client(&["add-secret", "fresh", "--file", &f.display().to_string(), "--hash", "*"]);
+    let out = split.client(&["add", "fresh", "--file", &f.display().to_string(), "--hash", "*"]);
     assert!(out.status.success(), "add failed: {}", write_out(&out));
     // The content must appear through the mount (hub -> fused).
     let mut seen = false;
@@ -970,7 +970,7 @@ fn e2e_dynamic_add_visible() {
     }
     assert!(seen, "dynamically added secret never became readable");
 
-    let out = split.client(&["remove-secret", "fresh"]);
+    let out = split.client(&["remove", "fresh"]);
     assert!(out.status.success(), "remove failed: {}", write_out(&out));
     let mut gone = false;
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -1209,7 +1209,7 @@ fn e2e_policy_kill9_the_mount_survives_and_a_store_only_respawn_resyncs() {
     let src = tempfile::tempdir().unwrap();
     let f = src.path().join("post-restart.secret");
     std::fs::write(&f, b"AFTER").unwrap();
-    let out = split.client(&["add-secret", "late", "--file", &f.display().to_string(), "--hash", "*"]);
+    let out = split.client(&["add", "late", "--file", &f.display().to_string(), "--hash", "*"]);
     assert!(out.status.success(), "post-respawn add failed: {}", write_out(&out));
     let mut seen = false;
     let deadline = Instant::now() + Duration::from_secs(5);

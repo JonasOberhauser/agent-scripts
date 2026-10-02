@@ -43,7 +43,7 @@ pub struct MountEntry {
 pub struct PendingAccessInfo {
     pub id: u64,
     pub secret_name: String,
-    /// Name of the requesting process (from /proc/<pid>/comm), if known.
+    /// Name of the requesting process (from `/proc/<pid>`/comm), if known.
     #[serde(default)]
     pub process_name: Option<String>,
     pub pid: u32,

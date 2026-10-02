@@ -25,6 +25,7 @@ clap = { workspace = true }
 
 [dev-dependencies]
 gatekeeper-testkit = { path = "../gatekeeper-testkit" }
+servyi-servatui = { workspace = true }
 tempfile = "3"
 fuse-server = { path = "../fuse-server" }
 
