@@ -29,6 +29,10 @@ pub enum Driver {
     /// In-process policy only (the step-1 shape).
     #[default]
     None,
+    /// The real `fused` binary against the in-process policy, the
+    /// FUSE channel's kernel end mocked — runs everywhere (no
+    /// `/dev/fuse`). See [`crate::MockFuseStack`].
+    MockFuse,
     /// The real `fuse-server` + `fused` binaries and a kernel FUSE
     /// mount. Requires `/dev/fuse` and a working `fusermount3`.
     RealMount,
@@ -150,7 +154,7 @@ impl RealMountStack {
             assert!(
                 target.exists(),
                 "testkit: secret '{name}' never appeared in the mount (content sync broken) — {}",
-                Self::dump_logs_for(root.path(), "spawn")
+                dump_logs_under(root.path(), "spawn")
             );
         }
 
@@ -217,25 +221,7 @@ impl RealMountStack {
     /// Tail every daemon log under the root — mount-layer bugs must
     /// be diagnosable from the CI output, not guessed at (#41).
     pub fn dump_logs(&self, what: &str) -> String {
-        Self::dump_logs_for(self.root.path(), what)
-    }
-
-    fn dump_logs_for(root: &Path, what: &str) -> String {
-        let mut s = format!("--- {what} ---\n");
-        let mut logs: Vec<PathBuf> = std::fs::read_dir(root)
-            .map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.path()).collect())
-            .unwrap_or_default();
-        logs.sort();
-        for p in logs {
-            if p.extension().is_some_and(|e| e == "log") {
-                if let Ok(t) = std::fs::read_to_string(&p) {
-                    let lines: Vec<&str> = t.lines().collect();
-                    let start = lines.len().saturating_sub(25);
-                    s.push_str(&format!("== {} ==\n{}\n", p.display(), lines[start..].join("\n")));
-                }
-            }
-        }
-        s
+        dump_logs_under(self.root.path(), what)
     }
 
     fn respawn_log(&self, tag: &str, name: &str) -> std::fs::File {
@@ -344,6 +330,26 @@ impl RealMountStack {
     }
 }
 
+/// Tail every `*.log` under a stack root — the shared #41 diagnostic
+/// (in-process and binary tiers alike).
+pub(crate) fn dump_logs_under(root: &Path, what: &str) -> String {
+    let mut s = format!("--- {what} ---\n");
+    let mut logs: Vec<PathBuf> = std::fs::read_dir(root)
+        .map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.path()).collect())
+        .unwrap_or_default();
+    logs.sort();
+    for p in logs {
+        if p.extension().is_some_and(|e| e == "log") {
+            if let Ok(t) = std::fs::read_to_string(&p) {
+                let lines: Vec<&str> = t.lines().collect();
+                let start = lines.len().saturating_sub(25);
+                s.push_str(&format!("== {} ==\n{}\n", p.display(), lines[start..].join("\n")));
+            }
+        }
+    }
+    s
+}
+
 impl Drop for RealMountStack {
     fn drop(&mut self) {
         for p in self.procs.iter_mut() {
@@ -384,7 +390,7 @@ fn wait_connect(path: &Path, what: &str, root: &Path) {
         up,
         "testkit: {what} never came up at {} — {}",
         path.display(),
-        RealMountStack::dump_logs_for(root, what)
+        dump_logs_under(root, what)
     );
 }
 
@@ -421,7 +427,7 @@ fn wait_mount(mount: &Path, root: &Path) {
         Path::new("/dev/fuse").exists(),
         fusermount3_state(),
         probe_env(),
-        RealMountStack::dump_logs_for(root, "mount timeout"),
+        dump_logs_under(root, "mount timeout"),
     );
 }
 
