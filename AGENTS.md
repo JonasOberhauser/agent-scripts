@@ -125,8 +125,11 @@ Tests never hand-roll the file-backed parts of a gatekeeper stack
 (sockets, mounts, shared-temp scratch): `crates/gatekeeper-testkit`
 builds them — per-stack random roots (collisions cannot happen by
 construction), the dead hashd seam by default, live hashd stubs
-(`HashdReply::{Canned, Compute}`), raw `StubSocket` rendezvous, and
-the real-binary tier (`Driver::RealMount` / `spawn_real_mount()`:
+(`HashdReply::{Canned, Compute}`), raw `StubSocket` rendezvous, the
+mock-fuse split (`Driver::MockFuse` / `spawn_mock_fuse()`: the real
+`fused` on `--mock-fuse` against the in-process policy — the
+everywhere-tier), and the real-binary tier (`Driver::RealMount` /
+`spawn_real_mount()`:
 `fuse-server` + `fused` children on a kernel FUSE mount, with the
 kill points — `kill_policy`/`kill_data`, store-only and
 secrets-re-registration respawns, `respawn_data` — as handle methods;

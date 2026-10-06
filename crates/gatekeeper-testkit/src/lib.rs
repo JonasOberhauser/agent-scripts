@@ -69,8 +69,11 @@ use fuse_protocol::io::SystemIo as _;
 use fuse_server::oracle_service::{run_oracle_server, OracleHub};
 use fuse_server::ServerState;
 
+mod mock_fuse;
+pub use mock_fuse::{mock_fuse_available, MockFuseStack};
 mod real_mount;
 pub use real_mount::{bin, real_mount_available, Driver, RealMountStack};
+use real_mount::dump_logs_under;
 
 /// Default pending window for kit stacks: short (tests want fast
 /// pend-outs), long enough for grant flows.
@@ -175,12 +178,25 @@ impl Stack {
     }
 
     /// Spawn per the configured [`Driver`]: the in-process policy
-    /// stack or the real-mount binary tier.
-    pub fn spawn(self) -> StackHandleOrRealMount {
+    /// stack, the mock-fuse split, or the real-mount binary tier.
+    pub fn spawn(self) -> SpawnedStack {
         match self.driver {
-            Driver::None => StackHandleOrRealMount::InProcess(self.spawn_in_process()),
-            Driver::RealMount => StackHandleOrRealMount::RealMount(self.spawn_real_mount()),
+            Driver::None => SpawnedStack::InProcess(self.spawn_in_process()),
+            Driver::MockFuse => SpawnedStack::MockFuse(self.spawn_mock_fuse()),
+            Driver::RealMount => SpawnedStack::RealMount(self.spawn_real_mount()),
         }
+    }
+
+    /// Spawn the MOCK-FUSE split: the in-process policy daemon plus
+    /// the real `fused` binary on `--mock-fuse`, its mock control
+    /// socket under the stack's root (see [`MockFuseStack`]) — the
+    /// everywhere-tier, no `/dev/fuse` needed.
+    ///
+    /// # Panics
+    /// Panics if the fused binary cannot be spawned or never binds
+    /// its control socket within 10s.
+    pub fn spawn_mock_fuse(self) -> MockFuseStack {
+        MockFuseStack::spawn(self)
     }
 
     /// Spawn the REAL-binary tier: `fuse-server` + `fused` children
@@ -459,9 +475,11 @@ fn ask_hashd(path: &Path, pid: u32) -> String {
 }
 
 /// What [`Stack::spawn`] returns per the configured [`Driver`].
-pub enum StackHandleOrRealMount {
+pub enum SpawnedStack {
     /// The in-process policy tier.
     InProcess(StackHandle),
+    /// The mock-fuse split tier (real fused, mocked kernel end).
+    MockFuse(MockFuseStack),
     /// The real-binary mount tier.
     RealMount(RealMountStack),
 }
@@ -510,6 +528,11 @@ impl StackHandle {
     /// `stack_testkit_only` flags them).
     pub fn scratch(&self, name: &str) -> PathBuf {
         self._root.path().join(name)
+    }
+
+    /// Tail every daemon log under the stack's root.
+    pub fn dump_logs(&self, what: &str) -> String {
+        dump_logs_under(self._root.path(), what)
     }
 }
 
