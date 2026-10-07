@@ -47,12 +47,48 @@ impl std::fmt::Display for HashdError {
     }
 }
 
-/// One question, one answer. Short timeout: callers sit on the read
-/// path of a (blocked) secret read and must degrade quickly.
+/// How long a hash ANSWER may take. Hashing scales with the target's
+/// file-backed bytes — hundreds of MB for ordinary host processes
+/// (a 233 MB locale-archive alone is common) — so a sub-second budget
+/// classified every healthy-but-working hashd as busy (the field
+/// report: "always busy, even right after restarting"). Callers sit
+/// on a blocked secret read with a pending window of seconds; 8s
+/// fits that flow while still bounding a wedged daemon.
+const HASH_ANSWER_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// One question, one answer, within [`HASH_ANSWER_TIMEOUT`] — with
+/// the #38 promise honored: Busy is transient, so a busy window is
+/// retried (bounded, short backoff) before the error surfaces.
 pub fn ask(socket: &str, pid: u32) -> Result<String, HashdError> {
+    ask_with_answer_timeout(socket, pid, HASH_ANSWER_TIMEOUT)
+}
+
+/// Test seam for [`ask`]: the answer budget is the one timing a test
+/// cannot wait out at production scale.
+pub fn ask_with_answer_timeout(
+    socket: &str,
+    pid: u32,
+    answer_timeout: Duration,
+) -> Result<String, HashdError> {
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        match ask_once(socket, pid, answer_timeout) {
+            Ok(h) => return Ok(h),
+            Err(HashdError::Busy(why)) if attempts < 3 => {
+                // the promised "retry in a moment will succeed"
+                std::thread::sleep(Duration::from_millis(250));
+                let _ = why;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+fn ask_once(socket: &str, pid: u32, answer_timeout: Duration) -> Result<String, HashdError> {
     let mut stream = connect_with_retry(socket)?;
     stream
-        .set_read_timeout(Some(Duration::from_millis(500)))
+        .set_read_timeout(Some(answer_timeout))
         .map_err(|e| HashdError::Unreachable(e.to_string()))?;
     stream
         .write_all(format!("hash {pid}\n").as_bytes())
@@ -65,9 +101,9 @@ pub fn ask(socket: &str, pid: u32) -> Result<String, HashdError> {
     );
     let mut line = String::new();
     let _n = reader.read_line(&mut line).map_err(|e| {
-        // The read timeout (500ms) surfaces as WouldBlock/errno 11:
-        // hashd accepted us but is busy hashing something big and
-        // answered nothing — NOT unreachable (#38).
+        // The read timeout surfaces as WouldBlock/errno 11: hashd
+        // accepted us but is busy hashing something big and answered
+        // nothing — NOT unreachable (#38).
         if e.kind() == std::io::ErrorKind::WouldBlock
             || e.raw_os_error() == Some(libc::EAGAIN)
         {
@@ -89,7 +125,7 @@ pub fn ask(socket: &str, pid: u32) -> Result<String, HashdError> {
 fn connect_with_retry(socket: &str) -> Result<UnixStream, HashdError> {
     let deadline = std::time::Instant::now() + Duration::from_millis(400);
     loop {
-        match UnixStream::connect(socket) {
+        match connect_bounded(socket, deadline) {
             Ok(s) => return Ok(s),
             Err(e) => {
                 let busy = e.raw_os_error() == Some(libc::EAGAIN); // EWOULDBLOCK is the same errno
@@ -104,6 +140,110 @@ fn connect_with_retry(socket: &str) -> Result<UnixStream, HashdError> {
             }
         }
     }
+}
+
+/// connect(2) against a wedged listener with a FULL backlog BLOCKS
+/// indefinitely on AF_UNIX — a retry loop would multiply the hang
+/// into forever. Nonblocking connect + poll, bounded by `deadline`;
+/// timeout surfaces as EAGAIN (busy: the #38 backlog semantics).
+fn connect_bounded(socket: &str, deadline: std::time::Instant) -> Result<UnixStream, std::io::Error> {
+    use std::os::unix::io::FromRawFd;
+    // SAFETY: socket(2) has no preconditions.
+    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // Nonblocking for the connect itself: a BLOCKING connect against a
+    // full AF_UNIX backlog hangs INSIDE the syscall — no poll loop can
+    // rescue it. Cleared again once connected.
+    // SAFETY: F_GETFL on a live fd we own.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags >= 0 {
+        // SAFETY: F_SETFL with the flags we just read, plus O_NONBLOCK.
+        let _fl = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+    }
+    // SAFETY: an all-zero sockaddr_un is a valid zeroed C struct; the
+    // path is filled below before any use.
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    let bytes = socket.as_bytes();
+    if bytes.len() >= addr.sun_path.len() {
+        // SAFETY: fd is a live descriptor we own and never use again.
+        let _cl = unsafe { libc::close(fd) };
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "socket path too long",
+        ));
+    }
+    for (dst, b) in addr.sun_path.iter_mut().zip(bytes) {
+        *dst = *b as libc::c_char;
+    }
+    // SAFETY: addr is a fully-initialized sockaddr_un for this fd.
+    let rc = unsafe {
+        libc::connect(
+            fd,
+            &addr as *const libc::sockaddr_un as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::EINPROGRESS) {
+            // SAFETY: fd is a live descriptor we own and never use again.
+            let _cl = unsafe { libc::close(fd) };
+            return Err(err);
+        }
+        loop {
+            if std::time::Instant::now() >= deadline {
+                // SAFETY: fd is a live descriptor we own and never use again.
+                let _cl = unsafe { libc::close(fd) };
+                return Err(std::io::Error::from_raw_os_error(libc::EAGAIN));
+            }
+            let mut pfd = libc::pollfd { fd, events: libc::POLLOUT, revents: 0 };
+            // SAFETY: pfd is a valid single-element pollfd for a live fd.
+            let prc = unsafe { libc::poll(&mut pfd, 1, 25) };
+            if prc < 0 {
+                let e = std::io::Error::last_os_error();
+                // SAFETY: fd is a live descriptor we own and never use again.
+                let _cl = unsafe { libc::close(fd) };
+                return Err(e);
+            }
+            if prc == 0 {
+                continue; // 25ms slice, re-check the deadline
+            }
+            let mut so_err: libc::c_int = 0;
+            let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+            // SAFETY: so_err/len are correctly sized for SO_ERROR.
+            let rc2 = unsafe {
+                libc::getsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_ERROR,
+                    &mut so_err as *mut libc::c_int as *mut libc::c_void,
+                    &mut len,
+                )
+            };
+            if rc2 != 0 || so_err != 0 {
+                let e = if rc2 != 0 {
+                    std::io::Error::last_os_error()
+                } else {
+                    std::io::Error::from_raw_os_error(so_err)
+                };
+                // SAFETY: fd is a live descriptor we own and never use again.
+                let _cl = unsafe { libc::close(fd) };
+                return Err(e);
+            }
+            break; // connected
+        }
+    }
+    // Back to blocking reads/writes for the exchange itself.
+    if flags >= 0 {
+        // SAFETY: F_SETFL restoring the original blocking mode.
+        let _fl = unsafe { libc::fcntl(fd, libc::F_SETFL, flags) };
+    }
+    // The stream owns the fd from here.
+    // SAFETY: fd is a live, connected socket we transfer ownership of.
+    Ok(unsafe { UnixStream::from_raw_fd(fd) })
 }
 
 /// Parse one reply line into a result.
@@ -320,7 +460,7 @@ mod tests {
         // Connected, never accepted, never answered — hashd "busy".
         let _holder = UnixStream::connect(&sock).unwrap();
         let t0 = std::time::Instant::now();
-        let e = ask(&sock.display().to_string(), 1).unwrap_err();
+        let e = ask_with_answer_timeout(&sock.display().to_string(), 1, Duration::from_millis(50)).unwrap_err();
         assert!(
             matches!(e, HashdError::Busy(_)),
             "an unanswered (busy) ask must classify Busy, got: {e:?}"
@@ -336,6 +476,37 @@ mod tests {
             "busy must not tell the user to restart hashd: {text}"
         );
         assert!(text.contains("retry"), "busy must name retry: {text}");
+    }
+
+    /// The field report: "hashd always busy, even right after
+    /// restarting" — a healthy hashd whose hash simply exceeds the
+    /// answer budget. The promised retry must convert a busy FIRST
+    /// ask into a successful SECOND one.
+    #[test]
+    fn a_busy_first_ask_retries_to_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("busy-then-ok.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let serves = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = std::sync::Arc::clone(&serves);
+        std::thread::spawn(move || {
+            use std::io::{BufRead, BufReader, Write};
+            for (n, mut conn) in listener.incoming().flatten().enumerate() {
+                let mut line = String::new();
+                BufReader::new(&conn).read_line(&mut line).expect("req");
+                if n == 0 {
+                    seen.store(1, std::sync::atomic::Ordering::SeqCst);
+                    // hold without answering: the small injected budget
+                    // classifies this ask Busy; the client disconnects
+                    std::thread::sleep(Duration::from_millis(400));
+                    continue;
+                }
+                let _ = conn.write_all(format!("{{\"ok\":\"{}\"}}\n", "a".repeat(64)).as_bytes());
+            }
+        });
+        let got = ask_with_answer_timeout(&sock.display().to_string(), 7, Duration::from_millis(80))
+            .expect("retry recovers");
+        assert_eq!(got, "a".repeat(64));
     }
 
     #[test]
