@@ -67,11 +67,11 @@ cargo test
 sha256sum $(which goose)
 # e.g. 9f86d081884c7d65...
 
-# 2. Run (secret is passed as HOST:CONTAINER)
+# 2. Run (secret is passed as JSON: {"host":..,"container":..})
 ./target/release/run-agent \
     9f86d081884c7d65... \
     goose \
-    --secret ~/prod-config.yaml:/root/.config/goose/production.yaml
+    --secret '{"host":"~/prod-config.yaml","container":"/root/.config/goose/production.yaml"}' 
 ```
 
 `run-agent` will:
@@ -110,10 +110,10 @@ mkdir -p fuse_mnt
 ./target/release/fuse-server \
     --mount-point fuse_mnt \
     --socket /tmp/fuse-gatekeeper.sock \
-    --secret secrets.yaml:/path/to/secrets.yaml:9f86d081884c7d65...
+    --secret '{"name":"secrets.yaml","file":"/path/to/secrets.yaml","hash":"9f86d081884c7d65..."}'
 ```
 
-Format: `--secret <NAME>:<FILE_PATH>:<SHA256_OF_ALLOWED_BINARY>`
+Format: `--secret <JSON>` with `name`, `file`, `hash` fields
 
 **2. (In another terminal) Inspect / manage via the client:**
 
