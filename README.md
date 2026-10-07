@@ -201,7 +201,7 @@ Arguments:
   [CONTAINER_ARGS]...  Command to run in the container; none = interactive bash
 
 Options:
-      --secret <HOST:CONTAINER>     Secret to serve through FUSE (repeatable).
+      --secret <JSON {"host","container"}>  Secret to serve through FUSE (repeatable).
                                     Directories are mapped recursively.
       --fuse-server <PATH>          Path to fuse-server binary [default: fuse-server,
                                     resolved next to run-agent first]
