@@ -1,0 +1,12 @@
+[2m2026-10-07T09:04:40.170097Z[0m [32m INFO[0m [2mfuse_server[0m[2m:[0m fuse-server (policy daemon) v0.33.0 starting
+[2m2026-10-07T09:04:40.170129Z[0m [32m INFO[0m [2mfuse_server[0m[2m:[0m   socket:          /home/nanoos/projects/agent-scripts/workspace/fgk54-20261007-110440/run/cmd.sock
+[2m2026-10-07T09:04:40.170137Z[0m [32m INFO[0m [2mfuse_server[0m[2m:[0m   oracle-socket:   /home/nanoos/projects/agent-scripts/workspace/fgk54-20261007-110440/run/oracle.sock
+[2m2026-10-07T09:04:40.170143Z[0m [32m INFO[0m [2mfuse_server[0m[2m:[0m   pending-timeout: 5s
+[2m2026-10-07T09:04:40.170377Z[0m [32m INFO[0m [2mfuse_server::policy_store[0m[2m:[0m policy store /home/nanoos/projects/agent-scripts/workspace/fgk54-20261007-110440/policy.json: no file — fresh start
+[2m2026-10-07T09:04:40.171869Z[0m [32m INFO[0m [2mfuse_server[0m[2m:[0m   policy store:    0 restored, 0 ghosts
+[2m2026-10-07T09:04:40.171896Z[0m [32m INFO[0m [2mfuse_server[0m[2m:[0m Registering secret 's' (4096 bytes, host inode 47736088)
+[2m2026-10-07T09:04:40.172901Z[0m [32m INFO[0m [2mfuse_server::oracle_service[0m[2m:[0m Oracle server listening at /home/nanoos/projects/agent-scripts/workspace/fgk54-20261007-110440/run/oracle.sock
+[2m2026-10-07T09:04:40.172913Z[0m [32m INFO[0m [2mfuse_server::socket[0m[2m:[0m Socket server listening at /home/nanoos/projects/agent-scripts/workspace/fgk54-20261007-110440/run/cmd.sock
+[2m2026-10-07T09:04:40.890788Z[0m [33m WARN[0m [2mfuse_server::oracle_service[0m[2m:[0m hashd (/run/fuse-hashd.sock) could not hash pid 1046709: hashd busy — Resource temporarily unavailable (os error 11)
+[2m2026-10-07T09:04:40.890891Z[0m [32m INFO[0m [2mfuse_server::oracle_service[0m[2m:[0m Access pending for 's' by pid 1046709: hash mismatch: got <unknown>, expected aa (id=1). Waiting up to 5s for grant...
+[2m2026-10-07T09:04:45.903701Z[0m [33m WARN[0m [2mfuse_server::oracle_service[0m[2m:[0m Pending access 1 timed out

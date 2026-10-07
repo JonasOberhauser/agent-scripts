@@ -1,0 +1,9 @@
+[2m2026-10-07T08:58:16.446646Z[0m [32m INFO[0m [2mfuse_server[0m[2m:[0m fuse-server (policy daemon) v0.33.0 starting
+[2m2026-10-07T08:58:16.446673Z[0m [32m INFO[0m [2mfuse_server[0m[2m:[0m   socket:          /home/nanoos/projects/agent-scripts/workspace/fgk54-20261007-105816/run/cmd.sock
+[2m2026-10-07T08:58:16.446683Z[0m [32m INFO[0m [2mfuse_server[0m[2m:[0m   oracle-socket:   /home/nanoos/projects/agent-scripts/workspace/fgk54-20261007-105816/run/oracle.sock
+[2m2026-10-07T08:58:16.446690Z[0m [32m INFO[0m [2mfuse_server[0m[2m:[0m   pending-timeout: 5s
+[2m2026-10-07T08:58:16.446867Z[0m [32m INFO[0m [2mfuse_server::policy_store[0m[2m:[0m policy store /home/nanoos/projects/agent-scripts/workspace/fgk54-20261007-105816/policy.json: no file — fresh start
+[2m2026-10-07T08:58:16.447789Z[0m [32m INFO[0m [2mfuse_server[0m[2m:[0m   policy store:    0 restored, 0 ghosts
+[2m2026-10-07T08:58:16.447813Z[0m [32m INFO[0m [2mfuse_server[0m[2m:[0m Registering secret 's' (4096 bytes, host inode 47733723)
+[2m2026-10-07T08:58:16.448875Z[0m [32m INFO[0m [2mfuse_server::socket[0m[2m:[0m Socket server listening at /home/nanoos/projects/agent-scripts/workspace/fgk54-20261007-105816/run/cmd.sock
+[2m2026-10-07T08:58:16.448921Z[0m [32m INFO[0m [2mfuse_server::oracle_service[0m[2m:[0m Oracle server listening at /home/nanoos/projects/agent-scripts/workspace/fgk54-20261007-105816/run/oracle.sock

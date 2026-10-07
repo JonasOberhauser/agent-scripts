@@ -1,5 +1,5 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::panic, unused_results))]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use fuse_protocol::{client_protocols, ServerStateFile, VERSION as CLIENT_VERSION};
 use servyi_servatui::App;
@@ -231,7 +231,10 @@ fn split_completing(line_before_cursor: &str) -> (Vec<String>, String) {
         .collect();
     // A trailing (or doubled) space means a NEW empty word is being
     // completed: "reset " → (["reset"], "").
-    let starting_new = line_before_cursor.ends_with(char::is_whitespace)
+    let starting_new = line_before_cursor
+        .chars()
+        .next_back()
+        .is_some_and(char::is_whitespace)
         || line_before_cursor.is_empty();
     let completing = if starting_new {
         String::new()
@@ -481,9 +484,13 @@ fn pid_cmdline_names_server(cmdline: &[u8], server_binary: &str) -> bool {
     // cmdline args are NUL-separated; the executable is argv[0].
     let argv0 = cmdline.split(|&b| b == 0).next().unwrap_or(&[]);
     let argv0 = String::from_utf8_lossy(argv0);
+    // Basename equality: handles every spelling (./x, /a/b/x, a/b/x)
+    // that names the same binary — the old ends_with("/x") missed
+    // spellings like "./fuse-server".
     argv0 == server_binary
-        || argv0.ends_with(&format!("/{server_binary}"))
-        || server_binary.ends_with(&format!("/{argv0}"))
+        || Path::new(argv0.as_ref()).file_name().is_some_and(|a| {
+            Path::new(server_binary).file_name().is_some_and(|b| a == b)
+        })
 }
 
 fn server_kill_spec(state: &ServerStateFile) -> ServerKillSpec {

@@ -107,24 +107,38 @@ fn connect_with_retry(socket: &str) -> Result<UnixStream, HashdError> {
 }
 
 /// Parse one reply line into a result.
+/// The helper's reply, as JSON — one standard grammar parsed by one
+/// standard parser (serde); the old hand-rolled `ok `/`error ...`
+/// prefix grammar is gone.
+#[derive(serde::Deserialize)]
+struct Reply {
+    ok: Option<String>,
+    #[serde(default)]
+    error: Option<ReplyError>,
+}
+
+#[derive(serde::Deserialize)]
+struct ReplyError {
+    /// `unprivileged` | `gone` | anything else for a generic failure.
+    kind: String,
+    message: String,
+}
+
 pub fn parse_reply(line: &str) -> Result<String, HashdError> {
-    if let Some(hash) = line.strip_prefix("ok ") {
-        let hash = hash.trim();
+    let r: Reply = serde_json::from_str(line.trim())
+        .map_err(|e| HashdError::Other(format!("malformed reply: {e} (line {line:?})")))?;
+    if let Some(hash) = r.ok {
         if hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit()) {
-            return Ok(hash.to_string());
+            return Ok(hash);
         }
         return Err(HashdError::Other(format!("malformed hash in reply: {line:?}")));
     }
-    if let Some(why) = line.strip_prefix("error unprivileged ") {
-        return Err(HashdError::Unprivileged(why.to_string()));
+    match r.error {
+        Some(e) if e.kind == "unprivileged" => Err(HashdError::Unprivileged(e.message)),
+        Some(e) if e.kind == "gone" => Err(HashdError::Gone(e.message)),
+        Some(e) => Err(HashdError::Other(e.message)),
+        None => Err(HashdError::Other(format!("malformed reply: {line:?}"))),
     }
-    if let Some(why) = line.strip_prefix("error gone ") {
-        return Err(HashdError::Gone(why.to_string()));
-    }
-    if let Some(why) = line.strip_prefix("error ") {
-        return Err(HashdError::Other(why.to_string()));
-    }
-    Err(HashdError::Other(format!("malformed reply: {line:?}")))
 }
 
 /// Where the hashd binary belongs when a service runs it: a system
@@ -210,20 +224,25 @@ pub fn is_unprivileged_error(msg: &str) -> bool {
 }
 
 
+// Tests may hand-parse output/protocol lines: sanctioned by policy
+// (test + allow), NOT available to production code. unknown_lints:
+// the custom_parser lint exists only under the servyi driver.
 #[cfg(test)]
+#[allow(unknown_lints)]
+#[allow(custom_parser)]
 mod tests {
     use super::*;
 
     #[test]
     fn parses_ok_hash() {
         let h = "a".repeat(64);
-        assert_eq!(parse_reply(&format!("ok {h}")).unwrap(), h);
+        assert_eq!(parse_reply(&format!(r#"{{"ok":"{h}"}}"#)).unwrap(), h);
     }
 
     #[test]
     fn rejects_malformed_hash() {
         assert!(matches!(
-            parse_reply("ok nothex"),
+            parse_reply(r#"{"ok":"nothex"}"#),
             Err(HashdError::Other(_))
         ));
     }
@@ -231,15 +250,15 @@ mod tests {
     #[test]
     fn classifies_error_kinds() {
         assert!(matches!(
-            parse_reply("error unprivileged EPERM following map_files"),
+            parse_reply(r#"{"error":{"kind":"unprivileged","message":"EPERM following map_files"}}"#),
             Err(HashdError::Unprivileged(msg)) if msg.contains("EPERM")
         ));
         assert!(matches!(
-            parse_reply("error gone no such process"),
+            parse_reply(r#"{"error":{"kind":"gone","message":"no such process"}}"#),
             Err(HashdError::Gone(_))
         ));
         assert!(matches!(
-            parse_reply("error something else"),
+            parse_reply(r#"{"error":{"kind":"io","message":"something else"}}"#),
             Err(HashdError::Other(_))
         ));
         assert!(matches!(
@@ -336,7 +355,7 @@ mod tests {
             // closes it when the listener drops.
             let listener =
                 unsafe { std::os::unix::net::UnixListener::from_raw_fd(fd) };
-            let reply = format!("ok {}\n", "a".repeat(64));
+            let reply = format!("{{\"ok\":\"{}\"}}\n", "a".repeat(64));
             for conn in listener.incoming().flatten() {
                 let mut conn = conn;
                 let mut line = String::new();
@@ -460,7 +479,7 @@ mod tests {
             let mut line = String::new();
             let _n = reader.read_line(&mut line).unwrap();
             let reply = if line.trim() == "hash 7" {
-                format!("ok {}\n", "b".repeat(64))
+                format!("{{\"ok\":\"{}\"}}\n", "b".repeat(64))
             } else {
                 "error unprivileged EPERM\n".to_string()
             };

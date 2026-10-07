@@ -2,6 +2,12 @@
 //!
 //! No /dev/fuse needed — the socket server runs independently from the FUSE mount.
 
+// Tests may hand-parse output/protocol lines: sanctioned by policy
+// (test + allow), NOT available to production code. unknown_lints:
+// the custom_parser lint exists only under the servyi driver.
+#![allow(unknown_lints)]
+#![allow(custom_parser)]
+
 #![allow(clippy::unwrap_used, clippy::panic, unused_results)]
 
 use std::path::{Path, PathBuf};
@@ -354,9 +360,9 @@ fn grant_forever_retries_hashd_after_remediation() {
                     continue;
                 }
                 let reply = if line.trim() == format!("hash {}", 4242) {
-                    format!("ok {}\n", "c".repeat(64))
+                    format!("{{\"ok\":\"{}\"}}\n", "c".repeat(64))
                 } else {
-                    "error gone test\n".to_string()
+                    "{{\"error\":{{\"kind\":\"gone\",\"message\":\"test\"}}}}\n".to_string()
                 };
                 let _ = stream.write_all(reply.as_bytes());
                 let _ = stream.flush();

@@ -228,14 +228,19 @@ fn main() {
     }
 }
 
+/// JSON — one standard syntax parsed by one standard parser (serde);
+/// no colon-escaping rules for names, paths, or hashes:
+/// `--secret '{"name":"api","file":"/h/api.yaml","hash":"*"}'`.
 fn parse_secret(spec: &str) -> Result<(String, std::path::PathBuf, String), String> {
-    let parts: Vec<&str> = spec.splitn(3, ':').collect();
-    if parts.len() != 3 {
-        return Err("expected NAME:FILE:HASH".into());
+    #[derive(serde::Deserialize)]
+    struct Spec {
+        name: String,
+        file: std::path::PathBuf,
+        hash: String,
     }
-    let name = parts[0].to_string();
-    let host = std::fs::canonicalize(parts[1])
-        .map_err(|e| format!("cannot resolve {}: {e}", parts[1]))?;
-    let hash = parts[2].to_string();
-    Ok((name, host, hash))
+    let s: Spec = serde_json::from_str(spec)
+        .map_err(|e| format!("--secret expects JSON {{\"name\",\"file\",\"hash\"}}: {e}"))?;
+    let host = std::fs::canonicalize(&s.file)
+        .map_err(|e| format!("cannot resolve {}: {e}", s.file.display()))?;
+    Ok((s.name, host, s.hash))
 }

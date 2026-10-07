@@ -10,6 +10,12 @@
 //!
 //! Run under a mount-capable context (e.g. the userns wrapper).
 
+// Tests may hand-parse output/protocol lines: sanctioned by policy
+// (test + allow), NOT available to production code. unknown_lints:
+// the custom_parser lint exists only under the servyi driver.
+#![allow(unknown_lints)]
+#![allow(custom_parser)]
+
 #![allow(clippy::unwrap_used, clippy::panic, unused_results)]
 
 use std::io::{BufRead as _, BufReader, Write as _};
@@ -70,16 +76,20 @@ fn hashd_stub() -> PathBuf {
             if reader.read_line(&mut line).is_err() {
                 continue;
             }
-            let reply = match line
-                .trim()
-                .strip_prefix("hash ")
-                .and_then(|p| p.parse::<u32>().ok())
-            {
-                Some(pid) => match fuse_protocol::RealSystemIo::new().sha256_process_package(pid) {
-                    Ok(h) => format!("ok {h}\n"),
-                    Err(e) => format!("error gone {e}\n"),
-                },
-                None => "error malformed request\n".to_string(),
+            // request grammar: WORD pid — plain split
+            let mut words = line.trim().split(' ');
+            let reply = match (words.next(), words.next().and_then(|p| p.parse::<u32>().ok())) {
+                (Some("hash"), Some(pid)) => {
+                    match fuse_protocol::RealSystemIo::new().sha256_process_package(pid) {
+                        Ok(h) => format!("{{\"ok\":\"{h}\"}}\n"),
+                        Err(e) => format!(
+                            "{{\"error\":{{\"kind\":\"gone\",\"message\":{}}}}}\n",
+                            serde_json::to_string(&e.to_string()).unwrap()
+                        ),
+                    }
+                }
+                _ => "{{\"error\":{{\"kind\":\"generic\",\"message\":\"malformed request\"}}}}\n"
+                    .to_string(),
             };
             let _ = stream.write_all(reply.as_bytes());
             let _ = stream.flush();
@@ -159,10 +169,8 @@ impl Split {
             // source tree must exist before the write.
             std::fs::create_dir_all(f.parent().unwrap()).unwrap();
             std::fs::write(&f, content).unwrap();
-            policy.arg("--secret").arg(format!(
-                "{name}:{}:{hash}",
-                f.display()
-            ));
+            let spec = serde_json::json!({ "name": name, "file": f, "hash": hash });
+            policy.arg("--secret").arg(spec.to_string());
         }
         let policy = policy
             .env(fuse_protocol::ENV_POLICY_FILE, dirs[1].path().join("policy.json"))
@@ -573,7 +581,11 @@ fn e2e_grants_survive_a_policy_daemon_kill() {
         .arg("--oracle-socket").arg(&split.oracle)
         .arg("--pending-timeout").arg("5")
         .arg("--secret")
-        .arg(format!("s:{}:*", split.source_path("s").display()))
+        .arg(serde_json::json!({
+            "name": "s",
+            "file": split.source_path("s"),
+            "hash": "*",
+        }).to_string())
         .env(fuse_protocol::ENV_POLICY_FILE, split._dirs[1].path().join("policy.json"))
         .stdout(std::process::Stdio::from(server_log2.try_clone().unwrap()))
         .stderr(server_log2);

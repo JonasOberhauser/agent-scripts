@@ -19,6 +19,12 @@
 //!     reads it and pkills by ITS socket path — unique per tempdir)
 //!     stays sandboxed.
 
+// Tests may hand-parse output/protocol lines: sanctioned by policy
+// (test + allow), NOT available to production code. unknown_lints:
+// the custom_parser lint exists only under the servyi driver.
+#![allow(unknown_lints)]
+#![allow(custom_parser)]
+
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 use std::io::{BufRead, BufReader, Write};

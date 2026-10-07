@@ -21,7 +21,12 @@ pub fn run_socket_server(
     handle.run(state)
 }
 
+// Tests may hand-parse output/protocol lines: sanctioned by policy
+// (test + allow), NOT available to production code. unknown_lints:
+// the custom_parser lint exists only under the servyi driver.
 #[cfg(test)]
+#[allow(unknown_lints)]
+#[allow(custom_parser)]
 mod tests {
     use super::*;
     use fuse_protocol::client_protocols;
