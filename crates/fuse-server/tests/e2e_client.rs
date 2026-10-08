@@ -67,6 +67,23 @@ fn run_client_completing(socket: &Path, line: &str) -> (String, i32) {
     )
 }
 
+/// run_client with extra environment (the respawned server inherits
+/// the CLIENT's environment — the tests below pin what that means).
+fn run_client_env(socket: &Path, args: &[&str], envs: &[(&str, &std::ffi::OsString)]) -> (String, String, i32) {
+    let bin = client_binary();
+    let mut cmd = Command::new(&bin);
+    cmd.arg("--socket").arg(socket).args(args);
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    let output = cmd.output().unwrap_or_else(|e| panic!("Failed to run fuse-client: {e}"));
+    (
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        String::from_utf8_lossy(&output.stderr).to_string(),
+        output.status.code().unwrap_or(-1),
+    )
+}
+
 /// Serializes tests that touch process-global env (ENV_STATE_FILE):
 /// cargo runs tests in one binary in parallel, and set_var is global.
 static STATE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -641,3 +658,178 @@ fn completion_is_dynamic_against_live_server_state() {
     let (_, stderr, code) = run_client(&socket, &["completions", "tcsh"]);
     assert_eq!(code, 1, "unsupported shell must exit 1: {stderr}");
 }
+// ── issue #93: restart restores the STACK, not just the process ──
+
+/// Set one env var for the remainder of the scope, restore after
+/// (poison-proof, like with_state_file_in's Restore).
+struct EnvReset(&'static str, Option<std::ffi::OsString>);
+impl EnvReset {
+    fn new(key: &'static str, value: Option<&std::ffi::OsStr>) -> Self {
+        let old = std::env::var_os(key);
+        match value {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+        EnvReset(key, old)
+    }
+}
+impl Drop for EnvReset {
+    fn drop(&mut self) {
+        match self.1.take() {
+            Some(v) => std::env::set_var(self.0, v),
+            None => std::env::remove_var(self.0),
+        }
+    }
+}
+
+/// F1 (#93): the respawn must arm the SAME policy store the stack ran
+/// with. The stack's store is chosen by the ORCHESTRATOR's
+/// environment (FUSE_GATEKEEPER_POLICY); the respawn inherits the
+/// CLIENT's environment instead, so a restart of a custom-store stack
+/// arms the user's default store — mounting a DIFFERENT secret set
+/// (observed live: a scratch restart mounted the operator's real
+/// production secrets). Today this fails: the re-add lands in the
+/// default store, not the stack's.
+#[test]
+fn restart_respawns_on_the_stacks_own_policy_store() {
+    let dir = test_tempdir();
+    let cmd_sock = dir.path().join("cmd.sock");
+    let oracle_sock = dir.path().join("oracle.sock");
+    let stack_store = dir.path().join("policy-a.json");
+    let xdg = dir.path().join("xdg"); // isolates the DEFAULT store
+    std::fs::create_dir_all(dir.path().join("xdg")).unwrap();
+    std::fs::create_dir_all(dir.path().join("mnt")).unwrap();
+
+    let secret1 = dir.path().join("one.bin");
+    let secret2 = dir.path().join("two.bin");
+    std::fs::write(&secret1, b"ONE").unwrap();
+    std::fs::write(&secret2, b"TWO").unwrap();
+
+    // The stack's server: runs with the stack's OWN policy store (as
+    // run-agent always arranges). Policy-only — no mount needed.
+    let mut server = Command::new(env!("CARGO_BIN_EXE_fuse-server"))
+        .arg("--socket").arg(&cmd_sock)
+        .arg("--oracle-socket").arg(&oracle_sock)
+        .arg("--log-path").arg(dir.path().join("server.log"))
+        .arg("--secret").arg("s1").arg(&secret1).arg("aa")
+        .env("FUSE_GATEKEEPER_POLICY", &stack_store)
+        .env("RUST_LOG", "info")
+        .spawn().expect("spawn stack server");
+    wait_for_socket(&cmd_sock, "stack server");
+    assert!(stack_store.exists(), "boot registration persists (store written)");
+    assert!(!xdg.join("gatekeeper").exists(), "default store untouched while the stack runs");
+
+    let state = serde_json::json!({
+        "version": VERSION,
+        "server_pid": server.id(),
+        "server_binary": env!("CARGO_BIN_EXE_fuse-server"),
+        "mount_point": dir.path().join("mnt").to_string_lossy(),
+        "socket": cmd_sock.to_string_lossy(),
+        "log_level": "info",
+        "pending_timeout": 10,
+        "runtime_wrapper": null,
+        "oracle_socket": oracle_sock.to_string_lossy(),
+        "secrets": [
+            { "fuse_name": "s1", "host_path": secret1.to_string_lossy(), "hash": "aa" },
+            { "fuse_name": "s2", "host_path": secret2.to_string_lossy(), "hash": "bb" },
+        ],
+    });
+    std::fs::write(dir.path().join("state.json"), state.to_string()).unwrap();
+
+    let xdg_os: std::ffi::OsString = xdg.to_string_lossy().into_owned().into();
+    let state_os: std::ffi::OsString = dir.path().join("state.json").to_string_lossy().into_owned().into();
+    let _guard = STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _reset_state = EnvReset::new(fuse_protocol::ENV_STATE_FILE, Some(&state_os));
+    let _reset_xdg = EnvReset::new("XDG_STATE_HOME", Some(&xdg_os));
+    let (stdout, stderr, code) = run_client_env(
+        &cmd_sock,
+        &["restart"],
+        &[("XDG_STATE_HOME", &xdg_os)],
+    );
+    assert_eq!(code, 0, "restart failed: {stderr}\n{stdout}");
+
+    // The re-add (s2) must land in THE STACK'S store…
+    let store: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&stack_store).unwrap()).unwrap();
+    let names: Vec<&str> = store["secrets"]
+        .as_array().unwrap()
+        .iter().map(|s| s["name"].as_str().unwrap()).collect();
+    assert!(
+        names.contains(&"s2"),
+        "the respawn armed the STACK's store (re-add s2 visible); got {names:?} \
+         (if s2 is missing, the respawn armed the DEFAULT store — env loss, #93 F1)"
+    );
+    // …and the default store must not have been created by the respawn.
+    assert!(
+        !xdg.join("gatekeeper").exists(),
+        "the respawn armed the DEFAULT store (XDG isolated): env loss, #93 F1"
+    );
+
+    // cleanup: exactly the pid the client reported spawning
+    if let Some(pid) = stdout
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("Spawned pid ").and_then(|p| p.parse::<i32>().ok()))
+    {
+        let _ = Command::new("kill").arg(pid.to_string()).output();
+    }
+    let _ = server.kill();
+    let _ = server.wait();
+}
+
+/// F4 (#93): the respawn APPENDS to the server log. Today it
+/// truncates — the restart destroys the very log lines that would
+/// explain a failed restart (observed live: restart #2's failure was
+/// overwritten by nothing).
+#[test]
+fn restart_appends_to_the_server_log_instead_of_truncating() {
+    let dir = test_tempdir();
+    let cmd_sock = dir.path().join("cmd.sock");
+    let oracle_sock = dir.path().join("oracle.sock");
+    let log = dir.path().join("server.log");
+    std::fs::create_dir_all(dir.path().join("mnt")).unwrap();
+    // history from BEFORE the restart — forensics that must survive it
+    std::fs::write(&log, "PRE-RESTART LOG LINE THAT MUST SURVIVE\n").unwrap();
+
+    let mut server = Command::new(env!("CARGO_BIN_EXE_fuse-server"))
+        .arg("--socket").arg(&cmd_sock)
+        .arg("--oracle-socket").arg(&oracle_sock)
+        .arg("--log-path").arg(&log)
+        .spawn().expect("spawn server");
+    wait_for_socket(&cmd_sock, "server");
+
+    let state = serde_json::json!({
+        "version": VERSION,
+        "server_pid": server.id(),
+        "server_binary": env!("CARGO_BIN_EXE_fuse-server"),
+        "mount_point": dir.path().join("mnt").to_string_lossy(),
+        "socket": cmd_sock.to_string_lossy(),
+        "log_level": "info",
+        "pending_timeout": 10,
+        "runtime_wrapper": null,
+        "oracle_socket": oracle_sock.to_string_lossy(),
+        "secrets": [],
+    });
+    std::fs::write(dir.path().join("state.json"), state.to_string()).unwrap();
+
+    let state_os: std::ffi::OsString = dir.path().join("state.json").to_string_lossy().into_owned().into();
+    let _guard = STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _reset_state = EnvReset::new(fuse_protocol::ENV_STATE_FILE, Some(&state_os));
+    let (stdout, stderr, code) = run_client(&cmd_sock, &["restart"]);
+    assert_eq!(code, 0, "restart failed: {stderr}\n{stdout}");
+
+    let after = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        after.contains("PRE-RESTART LOG LINE THAT MUST SURVIVE"),
+        "the respawn truncated the log — restart forensics destroyed, #93 F4; after: {after:?}"
+    );
+
+    if let Some(pid) = stdout
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("Spawned pid ").and_then(|p| p.parse::<i32>().ok()))
+    {
+        let _ = Command::new("kill").arg(pid.to_string()).output();
+    }
+    let _ = server.kill();
+    let _ = server.wait();
+}
+
