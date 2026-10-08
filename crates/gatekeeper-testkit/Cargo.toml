@@ -1,0 +1,16 @@
+[package]
+name = "gatekeeper-testkit"
+version = "0.32.0"
+edition = "2021"
+
+[dependencies]
+fuse-protocol = { path = "../fuse-protocol" }
+fuse-server = { path = "../fuse-server" }
+tempfile = "3"
+serde_json = "1"
+libc = "0.2"
+
+[dev-dependencies]
+fuse-mount = { path = "../fuse-mount" }
+fuser = "0.15"
+

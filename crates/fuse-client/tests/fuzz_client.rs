@@ -283,11 +283,14 @@ fn run_client(socket: &std::path::Path, state_file: &std::path::Path, argv: &[St
 }
 
 fn drive_seed(seed: u64, vintage: bool) {
-    let dir = tempfile::tempdir().unwrap();
-    let sock = dir.path().join("client.sock");
-    let state_file = dir.path().join("state.json");
+    // The kit mints the rendezvous (issue #63): the hostile daemon's
+    // socket and the state file live under a private root — the test
+    // owns only the hostile BEHAVIOR, which is the subject here.
+    let stub = gatekeeper_testkit::StubSocket::bind("client");
+    let sock = stub.path().to_path_buf();
+    let state_file = stub.scratch("state.json");
     std::fs::write(&state_file, "{}").unwrap();
-    let listener = UnixListener::bind(&sock).unwrap();
+    let listener = stub.listener().try_clone().unwrap();
     {
         let (l, s) = (listener, seed);
         // Explicit discard: the thread self-reclaims on its idle

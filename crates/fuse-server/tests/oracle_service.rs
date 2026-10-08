@@ -20,40 +20,6 @@ use fuse_protocol::oracle::{OracleCommand, OracleReply, OracleRequest};
 use fuse_server::oracle_service::{run_oracle_server, OracleHub};
 use fuse_server::{ReadOutcome, ServerState};
 
-fn oracle_env() -> (std::path::PathBuf, Arc<ServerState>, std::thread::JoinHandle<()>) {
-    // keep()d for the test's lifetime (unique per test; tmp litter only)
-    let dir = tempfile::tempdir().unwrap().keep();
-    // #59 discipline, applied to the hashd seam (#69): pin it to a
-    // dead per-test path so a hashd running on the HOST (production
-    // /run/fuse-hashd.sock) can neither answer nor error. Tests that
-    // want a hashd bind their own stub and pin its path instead.
-    oracle_env_with_hashd(&dir.join("hashd.dead.sock").display().to_string())
-}
-
-fn oracle_env_with_hashd(
-    hashd_sock: &str,
-) -> (std::path::PathBuf, Arc<ServerState>, std::thread::JoinHandle<()>) {
-    let dir = tempfile::tempdir().unwrap().keep();
-    let path = dir.join("oracle.sock");
-    // Same arming discipline as main()'s policy_path: assign the
-    // immutable socket on the mut local BEFORE the Arc is shared.
-    let mut st = ServerState::new();
-    st.hashd_sock = hashd_sock.to_string();
-    let state = Arc::new(st);
-    *state.pending_timeout.lock().unwrap() = Duration::from_secs(2);
-    let s2 = Arc::clone(&state);
-    let hub = OracleHub::new();
-    let (moved, wait_path) = (path.clone(), path.clone());
-    let t = std::thread::spawn(move || run_oracle_server(&moved, s2, hub).unwrap());
-    // wait for listener
-    for _ in 0..200 {
-        if wait_path.exists() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    (path, state, t)
-}
 
 fn ask(path: &std::path::Path, name: &str, pid: u32, offset: u64, size: u32) -> OracleReply {
     let mut conn = std::os::unix::net::UnixStream::connect(path).unwrap();
@@ -301,7 +267,9 @@ fn open_passes_an_fd_and_stats_flow() {
 
 #[test]
 fn star_hash_ask_is_allowed_and_serves_offsets() {
-    let (path, state, _t) = oracle_env();
+    let stack = gatekeeper_testkit::Stack::new().spawn_in_process();
+    let path = stack.oracle_socket().to_path_buf();
+    let state = stack.state().clone();
     state.add("s", "/tmp/host/s", 10, "*");
     assert_eq!(ask(&path, "s", 10, 2, 3), OracleReply::Allow);
     assert_eq!(state.status()[0].access_count, 1, "allow records the read");
@@ -309,7 +277,8 @@ fn star_hash_ask_is_allowed_and_serves_offsets() {
 
 #[test]
 fn unknown_secret_denies_enoent() {
-    let (path, _state, _t) = oracle_env();
+    let stack = gatekeeper_testkit::Stack::new().spawn_in_process();
+    let path = stack.oracle_socket().to_path_buf();
     match ask(&path, "nope", 1, 0, 4) {
         OracleReply::Deny { errno, .. } => assert_eq!(errno, libc::ENOENT),
         other => panic!("expected ENOENT deny, got {other:?}"),
@@ -318,7 +287,9 @@ fn unknown_secret_denies_enoent() {
 
 #[test]
 fn second_pid_pends_then_grant_allows() {
-    let (path, state, _t) = oracle_env();
+    let stack = gatekeeper_testkit::Stack::new().spawn_in_process();
+    let path = stack.oracle_socket().to_path_buf();
+    let state = stack.state().clone();
     state.add("s", "/tmp/host/s", 12, "*");
     assert_eq!(ask(&path, "s", 10, 0, 6), OracleReply::Allow);
     // The same pid streaming FORWARD: allowed (multi-chunk read).
@@ -342,7 +313,9 @@ fn second_pid_pends_then_grant_allows() {
 
 #[test]
 fn pending_expiry_denies_with_eacces() {
-    let (path, state, _t) = oracle_env();
+    let stack = gatekeeper_testkit::Stack::new().spawn_in_process();
+    let path = stack.oracle_socket().to_path_buf();
+    let state = stack.state().clone();
     *state.pending_timeout.lock().unwrap() = Duration::from_millis(300);
     state.add("s", "/tmp/host/s", 1, "*");
     assert_eq!(ask(&path, "s", 10, 0, 1), OracleReply::Allow);
@@ -360,7 +333,9 @@ fn pending_expiry_denies_with_eacces() {
 /// and kept the reader stuck until the full pending timeout.
 #[test]
 fn deny_unblocks_the_reader_immediately_with_eperm() {
-    let (path, state, _t) = oracle_env();
+    let stack = gatekeeper_testkit::Stack::new().spawn_in_process();
+    let path = stack.oracle_socket().to_path_buf();
+    let state = stack.state().clone();
     state.add("s", "/tmp/host/s", 1, "some_hash");
     // Long enough that a non-short-circuiting loop fails the time bound.
     *state.pending_timeout.lock().unwrap() = Duration::from_secs(15);
@@ -396,7 +371,9 @@ fn lockdown_asks_are_refused_immediately_without_pending() {
     // Issue #66: with the lockdown armed, an unauthorized ask is
     // answered on the spot — EACCES, no pending entry, and no
     // pend-out delay to measure.
-    let (path, state, _t) = oracle_env();
+    let stack = gatekeeper_testkit::Stack::new().spawn_in_process();
+    let path = stack.oracle_socket().to_path_buf();
+    let state = stack.state().clone();
     state.add("s", "/tmp/host/s", 1, "some_hash");
     state.arm_lockdown();
 
@@ -428,35 +405,15 @@ fn lockdown_asks_are_refused_immediately_without_pending() {
 /// the synthetic pid).
 #[test]
 fn stub_hashd_answer_carries_the_pid_hash_not_an_error() {
+    // The kit binds the stub under the stack's root and pins the seam:
+    // no hand-rolled listener, no leaked keep()'d dir (issue #63).
     let canned = "a".repeat(64);
-    // Bind the stub on a per-test path and pin the state to it.
-    let dir = tempfile::tempdir().unwrap().keep();
-    let sock = dir.join("hashd.stub.sock");
-    let stub_sock = sock.clone();
-    let canned2 = canned.clone();
-    std::thread::spawn(move || {
-        let listener = std::os::unix::net::UnixListener::bind(&stub_sock).unwrap();
-        for conn in listener.incoming() {
-            let Ok(mut conn) = conn else { break };
-            use std::io::{BufRead, BufReader, Write};
-            let mut reader = BufReader::new(conn.try_clone().unwrap());
-            let mut line = String::new();
-            if reader.read_line(&mut line).is_err() {
-                break;
-            }
-            // One question, one answer — the hashd wire contract.
-            let _ = writeln!(conn, "ok {canned2}");
-            let _ = conn.flush();
-        }
-    });
-    let (path, state, _t) = oracle_env_with_hashd(&sock.display().to_string());
+    let stack = gatekeeper_testkit::Stack::new()
+        .live_hashd_stub(gatekeeper_testkit::HashdReply::Canned(canned.clone()))
+        .spawn_in_process();
+    let path = stack.oracle_socket().to_path_buf();
+    let state = stack.state().clone();
     state.add("s", "/tmp/host/s", 1, "some_hash");
-    // Wait for the stub listener before asking.
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while !sock.exists() {
-        assert!(std::time::Instant::now() < deadline, "stub hashd never bound");
-        std::thread::sleep(Duration::from_millis(10));
-    }
 
     // The ask presents no hash; adjudication hashes via the seam. The
     // canned hash is NOT the secret's permitted hash, so it pends —
@@ -480,7 +437,9 @@ fn stub_hashd_answer_carries_the_pid_hash_not_an_error() {
 
 #[test]
 fn wrong_hash_pends_and_carries_the_hash_error() {
-    let (path, state, _t) = oracle_env();
+    let stack = gatekeeper_testkit::Stack::new().spawn_in_process();
+    let path = stack.oracle_socket().to_path_buf();
+    let state = stack.state().clone();
     state.add("s", "/tmp/host/s", 1, "some_hash");
     // The ask blocks while the pending waits: run it on a thread so the
     // pending entry can be inspected before it expires.

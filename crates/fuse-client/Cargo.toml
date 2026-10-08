@@ -22,4 +22,5 @@ tui-input = "0.10"
 
 [dev-dependencies]
 tempfile = "3"
+gatekeeper-testkit = { path = "../gatekeeper-testkit" }
 
