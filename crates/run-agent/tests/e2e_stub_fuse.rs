@@ -390,11 +390,7 @@ fn secret_wiring_follows_the_server_reported_inner_name() {
         60,
         &[
             "--secret",
-            &serde_json::json!({
-                "host": host_secret,
-                "container": "/root/secrets.yaml",
-            })
-            .to_string(),
+            &format!("{}:/root/secrets.yaml", host_secret.display()),
         ],
         None,
     );

@@ -127,23 +127,23 @@ impl SecretMapping {
     ///
     /// `~` is **not** expanded by us — the caller's shell expands it for
     /// host paths, and the container's `sh -c` expands it for container
-    /// paths (where `~` = `/root`). JSON — one standard syntax, parsed
-    /// by one standard parser (serde), no colon-escaping rules to
-    /// document: `--secret '{"host":"/h/k","container":"~/k"}'`.
+    /// paths (where `~` = `/root`). HOST:CONTAINER — the shell-friendly
+    /// colon form (tilde expands after `:` in bash), parsed with plain
+    /// `split` (the sanctioned idiom): host is the FIRST field, the
+    /// container is everything after it (colons in the container path
+    /// survive).
     pub fn parse(s: &str) -> Result<Self, String> {
-        #[derive(serde::Deserialize)]
-        struct Spec {
-            host: PathBuf,
-            container: PathBuf,
-        }
-        let spec: Spec = serde_json::from_str(s)
-            .map_err(|e| format!("--secret expects JSON {{\"host\",\"container\"}}: {e}"))?;
-        if spec.host.as_os_str().is_empty() || spec.container.as_os_str().is_empty() {
-            return Err("--secret host and container must be non-empty".to_string());
+        let fields: Vec<&str> = s.split(':').collect();
+        let host = fields.first().copied().unwrap_or_default();
+        let container = fields[1..].join(":");
+        if host.is_empty() || container.is_empty() {
+            return Err(format!(
+                "--secret expects HOST:CONTAINER (both non-empty), got '{s}'"
+            ));
         }
         Ok(Self {
-            host: spec.host,
-            container: spec.container,
+            host: PathBuf::from(host),
+            container: PathBuf::from(container),
         })
     }
 }
@@ -385,45 +385,44 @@ mod tests {
 
     #[test]
     fn secret_mapping_parse() {
-        let m = SecretMapping::parse(
-            r#"{"host":"/home/jonas/key.json","container":"/root/.config/opencode/auth.json"}"#,
-        )
-        .unwrap();
+        let m = SecretMapping::parse("/home/jonas/key.json:/root/.config/opencode/auth.json")
+            .unwrap();
         assert_eq!(m.host, PathBuf::from("/home/jonas/key.json"));
         assert_eq!(m.container, PathBuf::from("/root/.config/opencode/auth.json"));
     }
 
     #[test]
-    fn secret_mapping_parse_rejects_malformed_json() {
-        // the old colon grammar is now a parse error, not silently
-        // reinterpreted
-        assert!(SecretMapping::parse("/host/key:/root/key").is_err());
-        assert!(SecretMapping::parse("no json at all").is_err());
+    fn secret_mapping_parse_keeps_colons_in_container_path() {
+        // container is everything after the FIRST colon
+        let m = SecretMapping::parse("/host/key:/root/a:b/c").unwrap();
+        assert_eq!(m.host, PathBuf::from("/host/key"));
+        assert_eq!(m.container, PathBuf::from("/root/a:b/c"));
+    }
+
+    #[test]
+    fn secret_mapping_parse_rejects_missing_colon() {
+        assert!(SecretMapping::parse("no_colon").is_err());
     }
 
     #[test]
     fn secret_mapping_parse_rejects_empty_host() {
-        assert!(SecretMapping::parse(r#"{"host":"","container":"/c/p"}"#).is_err());
+        assert!(SecretMapping::parse(":/container/path").is_err());
     }
 
     #[test]
     fn secret_mapping_parse_rejects_empty_container() {
-        assert!(SecretMapping::parse(r#"{"host":"/host","container":""}"#).is_err());
+        assert!(SecretMapping::parse("/host:").is_err());
     }
 
     #[test]
     fn secret_mapping_parse_allows_tilde_container() {
-        let m = SecretMapping::parse(r#"{"host":"/host/key","container":"~/.config/app/key.json"}"#)
-            .unwrap();
+        let m = SecretMapping::parse("/host/key:~/.config/app/key.json").unwrap();
         assert_eq!(m.container, PathBuf::from("~/.config/app/key.json"));
     }
 
     #[test]
     fn secret_mapping_parse_directory_paths() {
-        let m = SecretMapping::parse(
-            r#"{"host":"/host/secrets/","container":"/root/.config/app/secrets/"}"#,
-        )
-        .unwrap();
+        let m = SecretMapping::parse("/host/secrets/:/root/.config/app/secrets/").unwrap();
         assert_eq!(m.host, PathBuf::from("/host/secrets/"));
         assert_eq!(m.container, PathBuf::from("/root/.config/app/secrets/"));
     }

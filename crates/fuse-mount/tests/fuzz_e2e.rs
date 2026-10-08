@@ -399,7 +399,7 @@ impl ProcStack {
             .arg("--oracle-socket").arg(&self.oracle)
             .arg("--pending-timeout").arg("1")
             .arg("--secret")
-            .arg(serde_json::json!({ "name": "s", "file": self.host, "hash": "*" }).to_string())
+            .arg(format!("s:{}:*", self.host.display()))
             .env(fuse_protocol::ENV_POLICY_FILE, &self.policy_store)
             .env("RUST_LOG", "warn")
             .stdout(std::process::Stdio::from(log.try_clone().unwrap()))

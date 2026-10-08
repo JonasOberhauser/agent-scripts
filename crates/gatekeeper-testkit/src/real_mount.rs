@@ -112,9 +112,9 @@ impl RealMountStack {
                 std::fs::create_dir_all(parent).expect("testkit: secret parent dir");
             }
             std::fs::write(&f, &spec.content).expect("testkit: write host file");
-            let _ = policy.arg("--secret").arg(
-                serde_json::json!({ "name": spec.name, "file": f, "hash": spec.hash }).to_string(),
-            );
+            let _ = policy
+                .arg("--secret")
+                .arg(format!("{}:{}:{}", spec.name, f.display(), spec.hash));
             secrets.push((spec.name.clone(), f, spec.hash.clone()));
         }
         let policy = policy
@@ -287,9 +287,7 @@ impl RealMountStack {
             let _ = cmd.env(fuse_protocol::ENV_HASHD_SOCK, stub.path());
         }
         for (name, path, hash) in &self.secrets {
-            let _ = cmd.arg("--secret").arg(
-                serde_json::json!({ "name": name, "file": path, "hash": hash }).to_string(),
-            );
+            let _ = cmd.arg("--secret").arg(format!("{name}:{}:{hash}", path.display()));
         }
         self.procs[0] = cmd.spawn().expect("testkit: respawn fuse-server (secrets)");
         self.wait_live_accept("respawned policy daemon (secrets)");

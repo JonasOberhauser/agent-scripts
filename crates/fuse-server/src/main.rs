@@ -228,19 +228,21 @@ fn main() {
     }
 }
 
-/// JSON — one standard syntax parsed by one standard parser (serde);
-/// no colon-escaping rules for names, paths, or hashes:
-/// `--secret '{"name":"api","file":"/h/api.yaml","hash":"*"}'`.
+/// NAME:FILE:HASH — the shell-friendly colon form (tilde expands
+/// after `:` in bash), parsed with plain `split` (the sanctioned
+/// idiom): NAME is the first field, HASH is the LAST, FILE is the
+/// joined middle — colons in the file path survive (the old
+/// splitn(3) silently dumped them into the hash field).
 fn parse_secret(spec: &str) -> Result<(String, std::path::PathBuf, String), String> {
-    #[derive(serde::Deserialize)]
-    struct Spec {
-        name: String,
-        file: std::path::PathBuf,
-        hash: String,
+    let fields: Vec<&str> = spec.split(':').collect();
+    if fields.len() < 3 {
+        return Err("expected NAME:FILE:HASH".into());
     }
-    let s: Spec = serde_json::from_str(spec)
-        .map_err(|e| format!("--secret expects JSON {{\"name\",\"file\",\"hash\"}}: {e}"))?;
-    let host = std::fs::canonicalize(&s.file)
-        .map_err(|e| format!("cannot resolve {}: {e}", s.file.display()))?;
-    Ok((s.name, host, s.hash))
+    let name = fields[0].to_string();
+    let file = fields[1..fields.len() - 1].join(":");
+    let hash = fields[fields.len() - 1].to_string();
+    let file_path = std::path::PathBuf::from(&file);
+    let host = std::fs::canonicalize(&file_path)
+        .map_err(|e| format!("cannot resolve {file}: {e}"))?;
+    Ok((name, host, hash))
 }
