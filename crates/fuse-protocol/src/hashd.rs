@@ -148,19 +148,23 @@ fn connect_with_retry(socket: &str) -> Result<UnixStream, HashdError> {
 /// timeout surfaces as EAGAIN (busy: the #38 backlog semantics).
 fn connect_bounded(socket: &str, deadline: std::time::Instant) -> Result<UnixStream, std::io::Error> {
     use std::os::unix::io::FromRawFd;
-    // SAFETY: socket(2) has no preconditions.
-    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+    let (af_unix, sock_stream, zero) = (libc::AF_UNIX, libc::SOCK_STREAM, 0);
+    // SAFETY: socket(2) with plain constants has no preconditions.
+    let fd = unsafe { libc::socket(af_unix, sock_stream, zero) };
     if fd < 0 {
         return Err(std::io::Error::last_os_error());
     }
     // Nonblocking for the connect itself: a BLOCKING connect against a
     // full AF_UNIX backlog hangs INSIDE the syscall — no poll loop can
     // rescue it. Cleared again once connected.
+    let getfl = libc::F_GETFL;
     // SAFETY: F_GETFL on a live fd we own.
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    let flags = unsafe { libc::fcntl(fd, getfl) };
     if flags >= 0 {
-        // SAFETY: F_SETFL with the flags we just read, plus O_NONBLOCK.
-        let _fl = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+        let nonblock = flags | libc::O_NONBLOCK;
+        let setfl = libc::F_SETFL;
+        // SAFETY: F_SETFL with the computed nonblocking flags.
+        let _nb = unsafe { libc::fcntl(fd, setfl, nonblock) };
     }
     // SAFETY: an all-zero sockaddr_un is a valid zeroed C struct; the
     // path is filled below before any use.
@@ -178,14 +182,11 @@ fn connect_bounded(socket: &str, deadline: std::time::Instant) -> Result<UnixStr
     for (dst, b) in addr.sun_path.iter_mut().zip(bytes) {
         *dst = *b as libc::c_char;
     }
-    // SAFETY: addr is a fully-initialized sockaddr_un for this fd.
-    let rc = unsafe {
-        libc::connect(
-            fd,
-            &addr as *const libc::sockaddr_un as *const libc::sockaddr,
-            std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
-        )
-    };
+    let addr_ptr = &addr as *const libc::sockaddr_un as *const libc::sockaddr;
+    let addr_len = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+    // SAFETY: addr is a fully-initialized sockaddr_un; the pointer and
+    // length describe exactly it.
+    let rc = unsafe { libc::connect(fd, addr_ptr, addr_len) };
     if rc != 0 {
         let err = std::io::Error::last_os_error();
         if err.raw_os_error() != Some(libc::EINPROGRESS) {
@@ -200,8 +201,11 @@ fn connect_bounded(socket: &str, deadline: std::time::Instant) -> Result<UnixStr
                 return Err(std::io::Error::from_raw_os_error(libc::EAGAIN));
             }
             let mut pfd = libc::pollfd { fd, events: libc::POLLOUT, revents: 0 };
-            // SAFETY: pfd is a valid single-element pollfd for a live fd.
-            let prc = unsafe { libc::poll(&mut pfd, 1, 25) };
+            let n_fds = 1;
+            let slice_ms = 25;
+            let poll_ptr = &mut pfd as *mut libc::pollfd;
+            // SAFETY: poll_ptr/n_fds describe exactly pfd above.
+            let prc = unsafe { libc::poll(poll_ptr, n_fds, slice_ms) };
             if prc < 0 {
                 let e = std::io::Error::last_os_error();
                 // SAFETY: fd is a live descriptor we own and never use again.
@@ -213,16 +217,10 @@ fn connect_bounded(socket: &str, deadline: std::time::Instant) -> Result<UnixStr
             }
             let mut so_err: libc::c_int = 0;
             let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-            // SAFETY: so_err/len are correctly sized for SO_ERROR.
-            let rc2 = unsafe {
-                libc::getsockopt(
-                    fd,
-                    libc::SOL_SOCKET,
-                    libc::SO_ERROR,
-                    &mut so_err as *mut libc::c_int as *mut libc::c_void,
-                    &mut len,
-                )
-            };
+            let opt_val = &mut so_err as *mut libc::c_int as *mut libc::c_void;
+            let (sol, soerr, fd_arg, len_ptr) = (libc::SOL_SOCKET, libc::SO_ERROR, fd, &mut len);
+            // SAFETY: opt_val/len_ptr are correctly sized for SO_ERROR.
+            let rc2 = unsafe { libc::getsockopt(fd_arg, sol, soerr, opt_val, len_ptr) };
             if rc2 != 0 || so_err != 0 {
                 let e = if rc2 != 0 {
                     std::io::Error::last_os_error()
@@ -238,8 +236,9 @@ fn connect_bounded(socket: &str, deadline: std::time::Instant) -> Result<UnixStr
     }
     // Back to blocking reads/writes for the exchange itself.
     if flags >= 0 {
+        let setfl2 = libc::F_SETFL;
         // SAFETY: F_SETFL restoring the original blocking mode.
-        let _fl = unsafe { libc::fcntl(fd, libc::F_SETFL, flags) };
+        let _fl = unsafe { libc::fcntl(fd, setfl2, flags) };
     }
     // The stream owns the fd from here.
     // SAFETY: fd is a live, connected socket we transfer ownership of.
