@@ -1,18 +1,16 @@
-//! The ONE prefix-matching site in the workspace (see the approval
-//! request on servyi/lints#9).
-//!
-//! Every completion surface — the TUI completers, `--complete`'s
-//! command-name and live-candidate filters — narrows a candidate list
-//! by a typed prefix. `str::starts_with` is the std function for
-//! exactly this job; no crate does it better at completion-scale
-//! candidate counts (`fst`/`radix_trie` are prefix SEARCH at
-//! thousands of keys — over-engineering here by construction).
-//!
-//! Consolidated into this module so the whole workspace's prefix
-//! matching lives behind ONE sanctioned seam. The
-//! `/// WARNING: CUSTOM PARSER — APPROVED BY: <url>` header lands on
-//! this file together with the maintainer's approval comment (the
-//! linter verifies the link, its author, and the sentence).
+/// WARNING: CUSTOM PARSER — APPROVED BY: <https://github.com/JonasOberhauser/agent-scripts/pull/92#issuecomment-6059228895>
+///
+/// (Approved use: "filtering among a list of options by a specified
+/// prefix string, resulting in all the options that start with the
+/// specified prefix".)
+///
+/// This is the ONE prefix-matching site in the workspace: every
+/// completion surface — the TUI completers, `--complete`'s
+/// command-name and live-candidate filters — narrows its candidates
+/// through this function. `str::starts_with` is the std tool for the
+/// job; no crate does it better at completion-scale candidate counts
+/// (`fst`/`radix_trie` are prefix SEARCH at thousands of keys —
+/// over-engineering here by construction).
 
 /// The candidates that start with `prefix`, in order, unchanged —
 /// pure filtering; formatting stays with the callers.
