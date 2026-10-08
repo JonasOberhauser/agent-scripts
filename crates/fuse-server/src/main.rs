@@ -238,6 +238,14 @@ fn parse_secret(spec: &str) -> Result<(String, std::path::PathBuf, String), Stri
     if fields.len() < 3 {
         return Err("expected NAME:FILE:HASH".into());
     }
+    // ':' cannot occur in NAME (it is the field delimiter) — fail
+    // closed rather than silently re-splitting. It cannot occur in a
+    // real HASH either (hex digest or `*`), which is why taking the
+    // LAST field as the hash and joining the middle as FILE is safe:
+    // colons in FILE paths work; colons anywhere else are a typo.
+    if fields[0].contains(':') || fields[fields.len() - 1].is_empty() {
+        return Err("NAME must not contain ':' and HASH must be non-empty".into());
+    }
     let name = fields[0].to_string();
     let file = fields[1..fields.len() - 1].join(":");
     let hash = fields[fields.len() - 1].to_string();
@@ -245,4 +253,35 @@ fn parse_secret(spec: &str) -> Result<(String, std::path::PathBuf, String), Stri
     let host = std::fs::canonicalize(&file_path)
         .map_err(|e| format!("cannot resolve {file}: {e}"))?;
     Ok((name, host, hash))
+}
+
+#[cfg(test)]
+mod secret_spec_tests {
+    use super::parse_secret;
+
+    #[test]
+    fn colons_in_the_file_path_work() {
+        // name first, hash LAST, file = joined middle: unambiguous
+        // because name is validated ':'-free and real hashes are
+        // hex/'*' (never ':').
+        let dir = tempfile::tempdir().unwrap();
+        let weird = dir.path().join("a:b:c.yaml");
+        std::fs::write(&weird, b"DATA").unwrap();
+        let (name, file, hash) =
+            parse_secret(&format!("api:{}:*", weird.display())).unwrap();
+        assert_eq!(name, "api");
+        assert_eq!(file, std::fs::canonicalize(&weird).unwrap());
+        assert_eq!(hash, "*");
+    }
+
+    #[test]
+    fn rejects_empty_hash() {
+        assert!(parse_secret("n:f:").is_err(), "empty hash rejected");
+    }
+
+    #[test]
+    fn rejects_too_few_fields() {
+        assert!(parse_secret("only:name").is_err());
+        assert!(parse_secret("nofields").is_err());
+    }
 }

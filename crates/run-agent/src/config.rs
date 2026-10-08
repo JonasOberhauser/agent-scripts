@@ -141,6 +141,19 @@ impl SecretMapping {
                 "--secret expects HOST:CONTAINER (both non-empty), got '{s}'"
             ));
         }
+        // Unlike NAME:FILE:HASH (whose name/hash fields are colon-free
+        // by construction, making the middle join unambiguous), BOTH
+        // fields here are paths — a second ':' cannot be attributed to
+        // either side, and a mis-split would mount the WRONG file.
+        // Exactly one colon: anything else fails closed with the
+        // symlink workaround.
+        if fields.len() != 2 {
+            return Err(format!(
+                "--secret HOST:CONTAINER takes exactly ONE ':' (the field \
+                 delimiter); paths containing ':' cannot be expressed — \
+                 symlink them to colon-free names first. got '{s}'"
+            ));
+        }
         Ok(Self {
             host: PathBuf::from(host),
             container: PathBuf::from(container),
@@ -392,11 +405,15 @@ mod tests {
     }
 
     #[test]
-    fn secret_mapping_parse_keeps_colons_in_container_path() {
-        // container is everything after the FIRST colon
-        let m = SecretMapping::parse("/host/key:/root/a:b/c").unwrap();
-        assert_eq!(m.host, PathBuf::from("/host/key"));
-        assert_eq!(m.container, PathBuf::from("/root/a:b/c"));
+    fn secret_mapping_rejects_a_second_colon_ambiguously() {
+        // BOTH fields are paths, so `a:b:c` cannot be attributed to
+        // either side — and a mis-split would mount the WRONG file.
+        // Exactly one ':' is accepted; more fail closed with the
+        // symlink workaround.
+        for bad in ["/host/a:b:/c", "/host/key:/root/a:b/c"] {
+            let e = SecretMapping::parse(bad).unwrap_err();
+            assert!(e.contains("exactly ONE"), "{bad}: {e}");
+        }
     }
 
     #[test]
