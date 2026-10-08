@@ -70,6 +70,15 @@ use fuse_server::oracle_service::{run_oracle_server, OracleHub};
 use fuse_server::ServerState;
 
 mod mock_fuse;
+pub mod supervised;
+use supervised::SupervisedStack;
+
+/// Crate-internal connect-wait shared by the binary tiers (the
+/// diagnostics live in real_mount's copy; this one keeps the
+/// message minimal for the supervision tier).
+pub(crate) fn wait_connect_pub(path: &std::path::Path, what: &str, root: &std::path::Path) {
+    crate::real_mount::wait_connect_pub(path, what, root);
+}
 pub use mock_fuse::{mock_fuse_available, MockFuseStack};
 mod real_mount;
 pub use real_mount::{bin, real_mount_available, Driver, RealMountStack};
@@ -118,6 +127,11 @@ pub struct Stack {
     /// (default) is the in-process policy; `RealMount` is the real
     /// binaries + kernel mount.
     driver: Driver,
+    /// Substitute data daemon for the binary tiers (#94 seam):
+    /// passed to fuse-server as `--fused-binary`. Defaults to the
+    /// kit's `fake-fused` on the [`Driver::Supervised`] tier; also
+    /// honored by [`Driver::RealMount`].
+    pub(crate) fused_binary: Option<PathBuf>,
 }
 
 /// What a kit hashd stub answers on the wire (`hash {pid}` → reply).
@@ -164,6 +178,7 @@ impl Stack {
             custom_state: None,
             secrets: Vec::new(),
             driver: Driver::None,
+            fused_binary: None,
         }
     }
 
@@ -177,6 +192,25 @@ impl Stack {
         self
     }
 
+    /// Substitute the data daemon for the binary tiers (#94): passed
+    /// to `fuse-server` as `--fused-binary`. The
+    /// [`Driver::Supervised`] tier defaults to the kit's `fake-fused`.
+    #[must_use]
+    pub fn fused_binary(mut self, path: impl Into<PathBuf>) -> Self {
+        self.fused_binary = Some(path.into());
+        self
+    }
+
+    /// Spawn the SUPERVISION tier (#94): the real policy daemon
+    /// supervising a substituted data daemon — no kernel FUSE, runs
+    /// in every container. See [`SupervisedStack`].
+    ///
+    /// # Panics
+    /// Panics if the policy daemon never answers.
+    pub fn spawn_supervised(self) -> SupervisedStack {
+        SupervisedStack::spawn(self)
+    }
+
     /// Spawn per the configured [`Driver`]: the in-process policy
     /// stack, the mock-fuse split, or the real-mount binary tier.
     pub fn spawn(self) -> SpawnedStack {
@@ -184,6 +218,7 @@ impl Stack {
             Driver::None => SpawnedStack::InProcess(self.spawn_in_process()),
             Driver::MockFuse => SpawnedStack::MockFuse(self.spawn_mock_fuse()),
             Driver::RealMount => SpawnedStack::RealMount(self.spawn_real_mount()),
+            Driver::Supervised => SpawnedStack::Supervised(self.spawn_supervised()),
         }
     }
 
@@ -497,6 +532,9 @@ pub enum SpawnedStack {
     MockFuse(MockFuseStack),
     /// The real-binary mount tier.
     RealMount(RealMountStack),
+    /// The supervision tier (#94): real policy daemon + substituted
+    /// data daemon, no kernel FUSE.
+    Supervised(SupervisedStack),
 }
 
 /// A live stack: every surface a test tier needs. Dropping it tears
@@ -548,6 +586,41 @@ impl StackHandle {
     /// Tail every daemon log under the stack's root.
     pub fn dump_logs(&self, what: &str) -> String {
         dump_logs_under(self._root.path(), what)
+    }
+}
+
+// Tests may hand-parse output/protocol lines: sanctioned by policy
+// (test + allow), NOT available to production code.
+#[cfg(test)]
+#[allow(unknown_lints)]
+#[allow(custom_parser)]
+#[allow(clippy::panic)]
+mod supervised_tests {
+    use crate::{Driver, Stack};
+
+    /// The supervision tier comes up everywhere (no /dev/fuse): the
+    /// policy daemon answers and the SUBSTITUTED daemon is alive
+    /// carrying the stack's mount point (#94 seam).
+    #[test]
+    fn supervision_tier_spawns_the_substituted_daemon() {
+        let stack = Stack::new().driver(Driver::Supervised).spawn();
+        let mut sup = match stack {
+            crate::SpawnedStack::Supervised(s) => s,
+            _ => panic!("driver mismatch"),
+        };
+        assert!(
+            std::os::unix::net::UnixStream::connect(sup.socket()).is_ok(),
+            "policy daemon answers on the cmd socket"
+        );
+        let daemons = sup.daemon_pids();
+        assert!(
+            !daemons.is_empty(),
+            "the substituted data daemon is alive under supervision"
+        );
+        sup.kill_policy();
+        // give the (currently nonexistent) reaping a moment — #93 F2
+        // will tighten this into the reaping assertion.
+        std::thread::sleep(std::time::Duration::from_millis(300));
     }
 }
 
