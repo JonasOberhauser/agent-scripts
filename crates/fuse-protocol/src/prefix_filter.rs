@@ -11,7 +11,7 @@
 /// job; no crate does it better at completion-scale candidate counts
 /// (`fst`/`radix_trie` are prefix SEARCH at thousands of keys —
 /// over-engineering here by construction).
-
+///
 /// The candidates that start with `prefix`, in order, unchanged —
 /// pure filtering; formatting stays with the callers.
 pub fn prefixed<'a, I, S>(candidates: I, prefix: &'a str) -> impl Iterator<Item = S> + 'a
