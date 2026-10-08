@@ -344,11 +344,11 @@ fn complete_mode(socket: &std::path::Path) {
     let candidates: Vec<String> = if prior.is_empty() {
         // First word: command names (compile-time table — the command
         // surface is not served over the wire, per the issue thread).
-        COMMAND_TABLE
-            .iter()
-            .map(|s| s.name.to_string())
-            .filter(|n| n.starts_with(&completing))
-            .collect()
+        fuse_protocol::prefix_filter::prefixed(
+            COMMAND_TABLE.iter().map(|s| s.name.to_string()),
+            &completing,
+        )
+        .collect()
     } else {
         // Argument position: only the FIRST argument completes (the
         // SecretNames `rotate` hash guard falls out — arity check).
@@ -356,9 +356,7 @@ fn complete_mode(socket: &std::path::Path) {
         if !is_first_arg {
             Vec::new()
         } else {
-            live_candidates(socket, &prior[0])
-                .into_iter()
-                .filter(|c| c.starts_with(&completing))
+            fuse_protocol::prefix_filter::prefixed(live_candidates(socket, &prior[0]), &completing)
                 .collect()
         }
     };
