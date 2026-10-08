@@ -641,3 +641,46 @@ fn completion_is_dynamic_against_live_server_state() {
     let (_, stderr, code) = run_client(&socket, &["completions", "tcsh"]);
     assert_eq!(code, 1, "unsupported shell must exit 1: {stderr}");
 }
+
+/// #94 seam: `--fused-binary` substitutes the supervised data daemon.
+/// The fake ignores argv and RUNS — observable as a live process
+/// carrying our --mount-point argument — no kernel FUSE needed, so
+/// this runs in every container tier.
+#[test]
+fn fused_binary_seam_substitutes_the_supervised_daemon() {
+    let dir = test_tempdir();
+    let cmd_sock = dir.path().join("cmd.sock");
+    let oracle_sock = dir.path().join("oracle.sock");
+    let mnt = dir.path().join("mnt");
+    std::fs::create_dir_all(&mnt).unwrap();
+    let fake = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/debug/fake-fused");
+    assert!(fake.exists(), "fake-fused not built (cargo build --workspace): {}", fake.display());
+
+    let mut server = Command::new(env!("CARGO_BIN_EXE_fuse-server"))
+        .arg("--socket").arg(&cmd_sock)
+        .arg("--oracle-socket").arg(&oracle_sock)
+        .arg("--mount-point").arg(&mnt)
+        .arg("--fused-binary").arg(&fake)
+        .env("RUST_LOG", "warn")
+        .spawn().expect("spawn server");
+    wait_for_socket(&cmd_sock, "server");
+
+    // the fake is alive and carries OUR mount point in its argv
+    let probe = Command::new("pgrep")
+        .arg("-f")
+        .arg(format!("{}.*{}", fake.display(), mnt.display()))
+        .output().expect("pgrep");
+    let found = String::from_utf8_lossy(&probe.stdout);
+    assert!(
+        probe.status.success() && !found.trim().is_empty(),
+        "the seam must spawn the SUBSTITUTED binary (pgrep found nothing)"
+    );
+
+    // cleanup: the fake dies with SIGTERM (default disposition)
+    for pid in found.split_whitespace() {
+        let _ = Command::new("kill").arg(pid).output();
+    }
+    let _ = server.kill();
+    let _ = server.wait();
+}
