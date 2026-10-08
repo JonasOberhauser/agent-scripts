@@ -442,12 +442,12 @@ pub(crate) fn complete_first_secret(
     if tokens.next().is_some() {
         return Vec::new(); // a second argument has started
     }
-    if !complete_after_space && confirmed.ends_with(char::is_whitespace) {
+    if !complete_after_space
+        && confirmed.chars().next_back().is_some_and(char::is_whitespace)
+    {
         return Vec::new(); // e.g. `rotate NAME `: the hash is being typed
     }
-    candidates
-        .iter()
-        .filter(|n| n.starts_with(arg))
+    crate::prefix_filter::prefixed(candidates.iter(), arg)
         .map(|n| format!("{cmd} {n}"))
         .collect()
 }
@@ -504,9 +504,7 @@ pub(crate) fn pending_completions(ids: &[u64], confirmed: &str) -> Vec<String> {
     if tokens.next().is_some() {
         return Vec::new(); // grant/deny take exactly one argument
     }
-    ids.iter()
-        .map(|id| id.to_string())
-        .filter(|id| id.starts_with(arg))
+    crate::prefix_filter::prefixed(ids.iter().map(|id| id.to_string()), arg)
         .map(|id| format!("{cmd} {id}"))
         .collect()
 }
@@ -629,7 +627,12 @@ mod completer_mapping_tests {
     }
 }
 
+// Tests may hand-parse output/protocol lines: sanctioned by policy
+// (test + allow), NOT available to production code. unknown_lints:
+// the custom_parser lint exists only under the servyi driver.
 #[cfg(test)]
+#[allow(unknown_lints)]
+#[allow(custom_parser)]
 mod tests {
     use super::*;
 

@@ -26,13 +26,15 @@ struct Cli {
     #[arg(long)]
     hash: Option<String>,
 
-    /// Secret to serve through FUSE: HOST:CONTAINER.
+    /// Secret to serve through FUSE: HOST and CONTAINER as two words.
     /// HOST is the real file/dir on the host; CONTAINER is an absolute path
     /// inside the container where the secret should appear (e.g.
     /// `/root/.config/opencode/auth.json`).
     /// Directories are mapped recursively (like `cp -r`).
-    /// Can be specified multiple times.
-    #[arg(long, value_name = "HOST:CONTAINER")]
+    /// Can be specified multiple times. Two separate words — no
+    /// delimiter grammar, nothing to escape: colons and tildes are
+    /// ordinary path characters (the shell expands ~ in both).
+    #[arg(long, num_args = 2, value_names = ["HOST", "CONTAINER"])]
     secret: Vec<String>,
 
     /// Path to the fuse-server binary.
@@ -112,10 +114,12 @@ fn main() -> ExitCode {
 
     let cli = Cli::parse();
 
+    // num_args = 2: values arrive as flat [host, container, ...]
+    // pairs; chunk them (indexing, not parsing).
     let secrets: Vec<SecretMapping> = cli
         .secret
-        .iter()
-        .map(|s| SecretMapping::parse(s))
+        .chunks(2)
+        .map(|pair| SecretMapping::from_pair(&pair[0], &pair[1]))
         .collect::<Result<_, _>>()
         .unwrap_or_else(|e| {
             error!("{e}");

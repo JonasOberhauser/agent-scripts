@@ -373,7 +373,7 @@ fn title_line(shown: usize, total: usize, error: Option<&str>, width: u16) -> Li
     if let Some(e) = error {
         // Use whatever width the panel actually has, not a fixed cap.
         let room = (width as usize).saturating_sub(prefix.width() + 4);
-        t.push_str(&format!("! {} ", truncate_pad(e, room).trim_end()));
+        t.push_str(&format!("! {} ", truncate_fit(e, room)));
     }
     Line::raw(t)
 }
@@ -391,12 +391,22 @@ fn requester(req: &PendingAccessInfo) -> String {
 /// are as wide as the terminal renders them, not as many bytes or chars
 /// they contain.
 fn truncate_pad(s: &str, max: usize) -> String {
+    let mut out = truncate_fit(s, max);
+    let total = unicode_width::UnicodeWidthStr::width(out.as_str());
+    if total < max {
+        out.push_str(&" ".repeat(max - total));
+    }
+    out
+}
+
+/// Truncate to `max` display columns, unpadded — the caller that
+/// used to `trim_end()` a padded result wants exactly this.
+fn truncate_fit(s: &str, max: usize) -> String {
     let total = s.width();
     if total <= max {
-        let mut out = s.to_string();
-        out.push_str(&" ".repeat(max - total));
-        out
-    } else {
+        return s.to_string();
+    }
+    {
         let keep = max.saturating_sub(1);
         let mut out = String::new();
         let mut width = 0;
@@ -508,18 +518,24 @@ fn fit_requester_and_secret(req: &PendingAccessInfo, collapsed: Option<&str>, ma
         return truncate_pad(&owner, max);
     }
     // Keep the last secret_budget-1 columns of the secret, prefix …
+    // Grapheme-cluster walk (unicode-segmentation): emoji and
+    // combining sequences stay intact instead of splitting at char
+    // boundaries.
     let keep = secret_budget - 1;
-    let mut start = secret.len();
+    let mut kept = String::new();
     let mut width = 0;
-    for (i, ch) in secret.char_indices().rev() {
-        let ch_w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
-        if width + ch_w > keep {
+    for g in unicode_segmentation::UnicodeSegmentation::graphemes(secret, true).rev() {
+        let g_w: usize = g
+            .chars()
+            .map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(0))
+            .sum();
+        if width + g_w > keep {
             break;
         }
-        start = i;
-        width += ch_w;
+        kept.insert_str(0, g);
+        width += g_w;
     }
-    format!("{owner} → …{}", &secret[start..])
+    format!("{owner} → …{kept}")
 }
 
 /// Hover (#25): the button under the mouse renders with the same
@@ -1319,7 +1335,12 @@ fn contains(area: &Rect, col: u16, row: u16) -> bool {
     col >= area.x && col < area.x + area.width && row >= area.y && row < area.y + area.height
 }
 
+// Tests may hand-parse output/protocol lines: sanctioned by policy
+// (test + allow), NOT available to production code. unknown_lints:
+// the custom_parser lint exists only under the servyi driver.
 #[cfg(test)]
+#[allow(unknown_lints)]
+#[allow(custom_parser)]
 mod tests {
     use super::*;
     use crossterm::event::KeyModifiers;

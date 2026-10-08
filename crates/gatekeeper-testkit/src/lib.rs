@@ -451,13 +451,28 @@ fn serve_hashd_wire(listener: UnixListener, reply: HashdReply) {
         if reader.read_line(&mut line).is_err() {
             continue;
         }
-        let out = match (&reply, line.trim().strip_prefix("hash ").and_then(|p| p.parse::<u32>().ok())) {
-            (HashdReply::Canned(hash), Some(_)) => format!("ok {hash}\n"),
-            (HashdReply::Compute, Some(pid)) => match fuse_protocol::RealSystemIo::new().sha256_process_package(pid) {
-                Ok(h) => format!("ok {h}\n"),
-                Err(e) => format!("error gone {e}\n"),
-            },
-            (_, None) => "error malformed request\n".to_string(),
+        // request grammar: WORD pid — plain split; replies are the
+        // helper's JSON wire (serde-shaped strings, one line)
+        let mut words = line.trim().split(' ');
+        let out = match (
+            &reply,
+            words.next(),
+            words.next().and_then(|p| p.parse::<u32>().ok()),
+        ) {
+            (HashdReply::Canned(hash), Some("hash"), Some(_)) => {
+                format!("{{\"ok\":\"{hash}\"}}\n")
+            }
+            (HashdReply::Compute, Some("hash"), Some(pid)) => {
+                match fuse_protocol::RealSystemIo::new().sha256_process_package(pid) {
+                    Ok(h) => format!("{{\"ok\":\"{h}\"}}\n"),
+                    Err(e) => format!(
+                        "{{\"error\":{{\"kind\":\"gone\",\"message\":{}}}}}\n",
+                        serde_json::to_string(&e.to_string()).unwrap_or_default()
+                    ),
+                }
+            }
+            (_, _, _) => "{\"error\":{\"kind\":\"generic\",\"message\":\"malformed request\"}}\n"
+                .to_string(),
         };
         let _ = stream.write_all(out.as_bytes());
         let _ = stream.flush();
@@ -536,7 +551,12 @@ impl StackHandle {
     }
 }
 
+// Tests may hand-parse output/protocol lines: sanctioned by policy
+// (test + allow), NOT available to production code. unknown_lints:
+// the custom_parser lint exists only under the servyi driver.
 #[cfg(test)]
+#[allow(unknown_lints)]
+#[allow(custom_parser)]
 mod tests {
     use super::*;
     use fuse_protocol::oracle::OracleReply;
@@ -612,18 +632,27 @@ mod tests {
         assert_eq!(seam, &stub_path.display().to_string(),
             "the seam points at the kit-bound stub");
         assert!(stub_path.ends_with("hashd.sock"));
-        assert_eq!(ask_hashd(&stub_path, 7), format!("ok {}\n", "b".repeat(64)));
+        assert_eq!(
+            ask_hashd(&stub_path, 7),
+            format!("{{\"ok\":\"{}\"}}\n", "b".repeat(64))
+        );
     }
 
     #[test]
     fn standalone_hashd_stub_answers_canned_and_malformed() {
         let stub = spawn_hashd_stub(HashdReply::Canned("c".repeat(64)));
-        assert_eq!(ask_hashd(stub.path(), 42), format!("ok {}\n", "c".repeat(64)));
+        assert_eq!(
+            ask_hashd(stub.path(), 42),
+            format!("{{\"ok\":\"{}\"}}\n", "c".repeat(64))
+        );
         let mut s = UnixStream::connect(stub.path()).expect("connect");
         std::io::Write::write_all(&mut s, b"garbage\n").expect("write");
         let mut line = String::new();
         let _n = BufReader::new(s).read_line(&mut line).expect("read");
-        assert_eq!(line, "error malformed request\n");
+        assert_eq!(
+            line,
+            "{\"error\":{\"kind\":\"generic\",\"message\":\"malformed request\"}}\n"
+        );
     }
 
     #[test]

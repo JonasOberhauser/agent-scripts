@@ -74,30 +74,16 @@ fn read_mapped_inode(pid: u32, range: &str, path: &Path) -> Result<Vec<u8>, IoEr
     })
 }
 
-fn parse_maps_line(line: &str) -> Result<Option<(String, PathBuf)>, String> {
-    const BAD: fn(&str) -> String = |l| format!("malformed maps line: {l:?}");
-    let mut fields = line.splitn(6, ' ');
-    let range = fields.next().ok_or_else(|| BAD(line))?;
-    let (start, end) = range.split_once('-').ok_or_else(|| BAD(line))?;
-    if start.is_empty() || end.is_empty() {
-        return Err(BAD(line));
-    }
-    // perms, offset, device, inode — all mandatory.
-    let perms = fields.next().ok_or_else(|| BAD(line))?;
-    if perms.len() != 4 {
-        return Err(BAD(line));
-    }
-    let _offset = fields.next().ok_or_else(|| BAD(line))?; // offset
-    let _dev = fields.next().ok_or_else(|| BAD(line))?; // dev:major:minor
-    let inode = fields.next().ok_or_else(|| BAD(line))?;
-    if inode.is_empty() || !inode.chars().all(|c| c.is_ascii_digit()) {
-        return Err(BAD(line));
-    }
-    // Path is optional ([heap], [stack], [vvar]… have none); when
-    // present it is the remainder — spaces included.
-    match fields.next().map(str::trim) {
-        Some(p) if p.starts_with('/') => Ok(Some((range.to_string(), PathBuf::from(p)))),
-        Some(_) | None => Ok(None),
+/// procfs errors in OUR error voice, preserving the io texts the
+/// hashd classification matches on ("Permission denied", "No such
+/// file").
+fn proc_err(e: procfs::ProcError) -> IoError {
+    use procfs::ProcError;
+    match e {
+        ProcError::Io(inner, _) => IoError(inner.to_string()),
+        ProcError::PermissionDenied(_) => IoError("Permission denied".into()),
+        ProcError::NotFound(which) => IoError(format!("No such file: {which:?}")),
+        other => IoError(format!("procfs: {other}")),
     }
 }
 
@@ -297,23 +283,17 @@ impl SystemIo for RealSystemIo {
         // even when the on-disk path was replaced or unlinked
         // (deleted-but-mapped libraries are common after updates).
         let mut entries: Vec<(String, PathBuf)> = vec![(String::new(), exe)];
-        let maps = std::fs::read_to_string(format!("/proc/{pid}/maps"))
-            .map_err(|e| IoError(format!(
-                "read /proc/{pid}/maps: {e}. {}", inspect_hint(&e)
-            )))?;
-        for line in maps.lines() {
-            match parse_maps_line(line) {
-                // Pathless segments ([heap], [stack], [vvar], …) are
-                // legitimate — they carry no file content.
-                Ok(None) => {}
-                Ok(Some((range, path))) => {
-                    if !entries.iter().any(|(_, p)| p == &path) {
-                        entries.push((range, path));
-                    }
+        // The kernel's maps format is parsed by the off-the-shelf
+        // procfs crate (paths with spaces included); the map_files
+        // RANGE for each file-backed mapping is rebuilt from the
+        // addresses it reports.
+        let proc = procfs::process::Process::new(pid as i32).map_err(proc_err)?;
+        for m in proc.maps().map_err(proc_err)? {
+            if let procfs::process::MMapPath::Path(path) = &m.pathname {
+                if !entries.iter().any(|(_, p)| p == path) {
+                    let range = format!("{:x}-{:x}", m.address.0, m.address.1);
+                    entries.push((range, path.clone()));
                 }
-                // A malformed maps line is never silently skipped: the
-                // format is load-bearing for the trust decision.
-                Err(e) => return Err(IoError(format!("/proc/{pid}/maps: {e}"))),
             }
         }
         entries.sort_by(|a, b| a.1.cmp(&b.1));
@@ -818,28 +798,32 @@ impl SystemIo for MockSystemIo {
     }
 
     fn is_dir(&self, path: &Path) -> bool {
-        let path_str = path.to_string_lossy();
-        if self.dirs.contains(&path_str.to_string()) {
+        let path_str = path.to_string_lossy().to_string();
+        if self.dirs.contains(&path_str) || self.created_dirs.borrow().contains(&path_str) {
             return true;
         }
-        let prefix = format!("{}/", path_str.trim_end_matches('/'));
-        self.files.keys().any(|k| k.starts_with(&prefix))
+        // Path-prefix semantics (component-based) instead of string
+        // prefix matching: no trailing-slash normalization dance.
+        // CHILDREN only — a file occupying the exact name is not
+        // inside a directory of that name (the old "path/" prefix
+        // implied the same exclusion).
+        self.files
+            .keys()
+            .any(|k| Path::new(k).starts_with(path) && Path::new(k) != path)
     }
 
     fn list_dir(&self, path: &Path) -> Result<Vec<PathBuf>, IoError> {
-        let path_str = path.to_string_lossy();
-        let prefix = format!("{}/", path_str.trim_end_matches('/'));
         let mut entries = Vec::new();
         let mut seen = std::collections::HashSet::new();
         for key in self.files.keys() {
-            if let Some(rest) = key.strip_prefix(&prefix) {
-                let component = match rest.find('/') {
-                    Some(i) => &rest[..i],
-                    None => rest,
-                };
-                let full = format!("{}{}", prefix, component);
+            // CHILDREN only: the path itself (empty rest) would make a
+            // directory its own entry and any walker loop forever.
+            if let Some(rest) = Path::new(key).strip_prefix(path).ok().filter(|r| !r.as_os_str().is_empty()) {
+                // the first component below `path` — plain split idiom
+                let component = rest.to_string_lossy().split('/').next().unwrap_or("").to_string();
+                let full = path.join(&component);
                 if seen.insert(full.clone()) {
-                    entries.push(PathBuf::from(full));
+                    entries.push(full);
                 }
             }
         }
@@ -870,8 +854,32 @@ impl SystemIo for MockSystemIo {
 }
 
 #[cfg(test)]
+mod path_membership_tests {
+    use super::MockSystemIo;
+    use crate::io::SystemIo;
+    use std::path::Path;
+
+    /// Children-only membership: the exact regression where a
+    /// component-based strip_prefix (empty rest) made a directory its
+    /// own child and any walker loop forever (stack overflow in
+    /// cp_directory_into_existing_dir).
+    #[test]
+    fn path_membership_is_children_only() {
+        let m = MockSystemIo::new().with_file("/d/x", b"DATA");
+        assert!(m.is_dir(Path::new("/d")));
+        assert!(!m.is_dir(Path::new("/d/x")));
+        // a FILE occupying the exact name is not "inside" a directory
+        // of that name
+        let m = MockSystemIo::new().with_file("/f", b"DATA");
+        assert!(!m.is_dir(Path::new("/f")));
+        let listed = m.list_dir(Path::new("/f")).expect("empty listing");
+        assert!(listed.is_empty(), "a file lists nothing: {listed:?}");
+    }
+}
+
+#[cfg(test)]
 mod tests {
-    use super::{inspect_hint, map_files_hint, parse_maps_line};
+    use super::{inspect_hint, map_files_hint};
 
     /// A dead pid fails closed AND names the procfs source it tried —
     /// no on-disk path is ever consulted (TOCTOU: paths race with swaps).
@@ -906,52 +914,20 @@ mod tests {
         assert!(map_files_hint(&other).contains("could not be read"));
     }
 
+    /// The dead-maps read: procfs itself fails closed on a vanished
+    /// pid (we never fall back to on-disk paths — TOCTOU).
     #[test]
-    fn parses_file_backed_mapping_with_spaced_path() {
-        let (range, path) = parse_maps_line(
-            "7f2a:1-7f2a:2 r--p 00000000 fd:01 123456 /opt/my libs/lib x.so",
-        )
-        .expect("valid line")
-        .expect("file-backed");
-        assert_eq!(range, "7f2a:1-7f2a:2");
-        assert_eq!(path, std::path::PathBuf::from("/opt/my libs/lib x.so"));
-    }
-
-    #[test]
-    fn parses_deleted_mapped_file() {
-        let line = "7f0000000000-7f0000001000 r--p 00000000 fd:01 99 /usr/lib/x.so (deleted)";
-        let (_, path) = parse_maps_line(line).unwrap().unwrap();
-        assert_eq!(path, std::path::PathBuf::from("/usr/lib/x.so (deleted)"));
-    }
-
-    #[test]
-    fn pathless_segments_are_none_not_errors() {
-        for line in [
-            "7ffd-7ffe rw-p 00000000 00:00 0 [heap]",
-            "7ffd-7ffe rw-p 00000000 00:00 0 [stack]",
-            "7ffd-7ffe r--p 00000000 00:00 0 [vvar]",
-            "7ffd-7ffe rw-p 00000000 00:00 0",
-        ] {
-            assert!(parse_maps_line(line).unwrap().is_none(), "{line}");
-        }
-    }
-
-    #[test]
-    fn malformed_lines_fail_closed() {
-        for line in [
-            "",
-            "noperms fd:01 1 /x",
-            "7f00-7f01",
-            "7f00-7f01 r--p",
-            "7f00-7f01 r--p 0000",
-            "7f00-7f01 r--p 0000 fd:01",
-            "7f00-7f01 badlen! 0000 fd:01 1 /x",
-            "-7f01 r--p 0000 fd:01 1 /x",
-            "7f00- r--p 0000 fd:01 1 /x",
-            "7f00-7f01 r--p 0000 fd:01 notanumber /x",
-        ] {
-            assert!(parse_maps_line(line).is_err(), "must fail closed: {line:?}");
-        }
+    fn dead_pid_maps_read_fails_closed_via_procfs() {
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("sleep 0.1")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let _status = child.wait().unwrap();
+        // fresh pid without /proc entry: Process::new must fail
+        let err = procfs::process::Process::new(pid as i32).expect_err("dead pid must fail");
+        assert!(!matches!(err, procfs::ProcError::Incomplete(_)), "real read, not skipped");
     }
 
     use super::*;

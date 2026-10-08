@@ -21,6 +21,12 @@
 //!  4. NO HANG — every driver op is bounded; a wedged daemon shows up
 //!     as a timeout failure naming the seed and op.
 
+// Tests may hand-parse output/protocol lines: sanctioned by policy
+// (test + allow), NOT available to production code. unknown_lints:
+// the custom_parser lint exists only under the servyi driver.
+#![allow(unknown_lints)]
+#![allow(custom_parser)]
+
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 use std::sync::Arc;
@@ -392,7 +398,10 @@ impl ProcStack {
             .arg("--socket").arg(&self.cmd_sock)
             .arg("--oracle-socket").arg(&self.oracle)
             .arg("--pending-timeout").arg("1")
-            .arg("--secret").arg(format!("s:{}:*", self.host.display()))
+            .arg("--secret")
+            .arg("s")
+            .arg(&self.host)
+            .arg("*")
             .env(fuse_protocol::ENV_POLICY_FILE, &self.policy_store)
             .env("RUST_LOG", "warn")
             .stdout(std::process::Stdio::from(log.try_clone().unwrap()))

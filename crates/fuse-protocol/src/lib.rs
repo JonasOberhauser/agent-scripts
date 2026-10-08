@@ -3,6 +3,7 @@ pub mod error;
 pub mod hashd;
 pub mod io;
 pub mod oracle;
+pub mod prefix_filter;
 pub use oracle::{HostIdentity, KDev, Kino};
 pub mod protocol;
 pub mod real_io;

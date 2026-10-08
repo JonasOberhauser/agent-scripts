@@ -67,11 +67,11 @@ cargo test
 sha256sum $(which goose)
 # e.g. 9f86d081884c7d65...
 
-# 2. Run (secret is passed as HOST:CONTAINER)
+# 2. Run (secret is passed as two words; ~ expands via the shell)
 ./target/release/run-agent \
     9f86d081884c7d65... \
     goose \
-    --secret ~/prod-config.yaml:/root/.config/goose/production.yaml
+    --secret ~/prod-config.yaml /root/.config/goose/production.yaml
 ```
 
 `run-agent` will:
@@ -110,10 +110,10 @@ mkdir -p fuse_mnt
 ./target/release/fuse-server \
     --mount-point fuse_mnt \
     --socket /tmp/fuse-gatekeeper.sock \
-    --secret secrets.yaml:/path/to/secrets.yaml:9f86d081884c7d65...
+    --secret secrets.yaml /path/to/secrets.yaml 9f86d081884c7d65...
 ```
 
-Format: `--secret <NAME>:<FILE_PATH>:<SHA256_OF_ALLOWED_BINARY>`
+Format: `--secret <NAME> <FILE_PATH> <SHA256_OF_ALLOWED_BINARY>` — three words (clap `num_args`), no delimiter to escape
 
 **2. (In another terminal) Inspect / manage via the client:**
 
@@ -201,7 +201,7 @@ Arguments:
   [CONTAINER_ARGS]...  Command to run in the container; none = interactive bash
 
 Options:
-      --secret <HOST:CONTAINER>     Secret to serve through FUSE (repeatable).
+      --secret <HOST> <CONTAINER>    Secret to serve through FUSE (repeatable).
                                     Directories are mapped recursively.
       --fuse-server <PATH>          Path to fuse-server binary [default: fuse-server,
                                     resolved next to run-agent first]

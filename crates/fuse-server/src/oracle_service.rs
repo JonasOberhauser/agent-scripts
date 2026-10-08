@@ -97,6 +97,7 @@ pub(crate) fn compute_pid_hash(
     // the ambient env->default resolution; in-process harnesses pin
     // it pre-share (#69).
     let socket = state.hashd_sock.as_str();
+    // ask() honors the #38 busy-retry promise internally.
     match fuse_protocol::hashd::ask(socket, pid) {
         Ok(h) => (Some(h), None),
         Err(hashd_err) => {
@@ -105,7 +106,7 @@ pub(crate) fn compute_pid_hash(
                 socket,
                 sibling_hashd_binary().as_deref(),
             );
-            warn!("hashd ({socket}) could not hash pid {pid}: {hashd_err}");
+            warn!("hashd ({socket}) could not hash pid {pid}: {hash_error}");
             (None, Some(hash_error))
         }
     }
@@ -472,3 +473,4 @@ pub fn ask(socket_path: &std::path::Path, name: &str, pid: u32, offset: u64, siz
 /// Unused import guard for PendingAccessInfo (kept for API parity in tests).
 #[allow(dead_code)]
 fn _pending_type_witness(_: Option<PendingAccessInfo>) {}
+

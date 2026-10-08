@@ -70,14 +70,10 @@ fn can_write_run() -> bool {
 const HASHD_SOCK_PREFIX: &str = "/tmp/fuse-hashd-";
 
 fn nix_uid() -> u32 {
-    std::fs::read_to_string("/proc/self/status")
-        .ok()
-        .and_then(|s| {
-            s.lines()
-                .find(|l| l.starts_with("Uid:"))
-                .and_then(|l| l.split_whitespace().nth(1).map(|x| x.to_string()))
-        })
-        .and_then(|x| x.parse().ok())
+    // /proc/self/status parsed by the off-the-shelf procfs crate.
+    procfs::process::Process::myself()
+        .and_then(|p| p.status())
+        .map(|st| st.euid)
         .unwrap_or(0)
 }
 
@@ -119,35 +115,41 @@ fn handle(conn: std::os::unix::net::UnixStream) {
     let trimmed = line.trim();
     let reply = if trimmed == "status" {
         let state = if privileges_ok() { "privileged" } else { "unprivileged" };
-        format!("status {state} follows /proc/<pid>/map_files\n")
+        format!("{{\"status\":\"{state}\"}}\n")
     } else {
-        match trimmed.split_once(' ') {
-            Some(("hash", pid)) => match pid.parse::<u32>() {
-                Ok(pid) => match RealSystemIo::new().sha256_process_package(pid) {
-                    Ok(hash) => format!("ok {hash}\n"),
-                    Err(e) => {
-                        let msg = e.to_string();
-                        let kind = if msg.contains("Operation not permitted")
-                            || msg.contains("Permission denied")
-                        {
-                            if privileges_ok() {
-                                "error"
-                            } else {
-                                // The helper itself lacks the init-ns capability:
-                                // the actionable case for client-side remediation.
-                                "error unprivileged"
-                            }
-                        } else if msg.contains("No such file") {
-                            "error gone"
+        // request grammar: WORD pid — plain split, the exempt idiom
+        let mut words = trimmed.split(' ');
+        match (words.next(), words.next().and_then(|p| p.parse::<u32>().ok())) {
+            (Some("hash"), Some(pid)) => match RealSystemIo::new().sha256_process_package(pid) {
+                Ok(hash) => format!("{{\"ok\":\"{hash}\"}}\n"),
+                Err(e) => {
+                    let msg = e.to_string();
+                    let kind = if msg.contains("Operation not permitted")
+                        || msg.contains("Permission denied")
+                    {
+                        if privileges_ok() {
+                            "generic"
                         } else {
-                            "error"
-                        };
-                        format!("{kind} {msg}\n")
-                    }
-                },
-                Err(_) => "error pid must be a number\n".to_string(),
+                            // The helper itself lacks the init-ns capability:
+                            // the actionable case for client-side remediation.
+                            "unprivileged"
+                        }
+                    } else if msg.contains("No such file") {
+                        "gone"
+                    } else {
+                        "generic"
+                    };
+                    format!(
+                        "{{\"error\":{{\"kind\":\"{kind}\",\"message\":{}}}}}\n",
+                        serde_json::to_string(&msg).unwrap_or_else(|_| "\"?\"".to_string())
+                    )
+                }
             },
-            _ => "error unknown request (use: hash <pid> | status)\n".to_string(),
+            (Some("hash"), None) => {
+                "{\"error\":{\"kind\":\"generic\",\"message\":\"pid must be a number\"}}\n".to_string()
+            }
+            _ => "{\"error\":{\"kind\":\"generic\",\"message\":\"unknown request (use: hash <pid> | status)\"}}\n"
+                .to_string(),
         }
     };
     let _ = stream.write_all(reply.as_bytes());
@@ -215,7 +217,12 @@ fn serve_conns(
     }
 }
 
+// Tests may hand-parse output/protocol lines: sanctioned by policy
+// (test + allow), NOT available to production code. unknown_lints:
+// the custom_parser lint exists only under the servyi driver.
 #[cfg(test)]
+#[allow(unknown_lints)]
+#[allow(custom_parser)]
 mod tests {
     use super::*;
 
@@ -245,7 +252,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("hashd.sock");
         let listener = UnixListener::bind(&sock).unwrap();
-        let reply = format!("ok {}\n", "a".repeat(64));
+        let reply = format!("{{\"ok\":\"{}\"}}\n", "a".repeat(64));
         // The daemon side: the accept loop owns its own thread,
         // exactly as in main().
         std::thread::spawn(move || {

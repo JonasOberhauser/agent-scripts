@@ -127,17 +127,13 @@ impl SecretMapping {
     ///
     /// `~` is **not** expanded by us — the caller's shell expands it for
     /// host paths, and the container's `sh -c` expands it for container
-    /// paths (where `~` = `/root`).
-    pub fn parse(s: &str) -> Result<Self, String> {
-        let (host, container) = s
-            .split_once(':')
-            .ok_or_else(|| format!("--secret expects HOST:CONTAINER, got '{s}'"))?;
-        let host = host.trim();
-        let container = container.trim();
+    /// paths (where `~` = `/root`). Built from the two WORDS clap
+    /// delivers (`--secret HOST CONTAINER`, num_args = 2): no
+    /// delimiter grammar, nothing to escape, no parsing — colons are
+    /// ordinary path characters and the shell expands ~ in both.
+    pub fn from_pair(host: &str, container: &str) -> Result<Self, String> {
         if host.is_empty() || container.is_empty() {
-            return Err(format!(
-                "--secret host and container must be non-empty: '{s}'"
-            ));
+            return Err("--secret host and container must be non-empty".to_string());
         }
         Ok(Self {
             host: PathBuf::from(host),
@@ -371,42 +367,50 @@ pub fn build_exec_args(config: &AgentConfig, setup_script: &str) -> Vec<String> 
     args
 }
 
+// Tests may hand-parse output/protocol lines: sanctioned by policy
+// (test + allow), NOT available to production code. unknown_lints:
+// the custom_parser lint exists only under the servyi driver.
 #[cfg(test)]
+#[allow(unknown_lints)]
+#[allow(custom_parser)]
 mod tests {
     use super::*;
     use fuse_protocol::MockSystemIo;
 
     #[test]
-    fn secret_mapping_parse() {
-        let m = SecretMapping::parse("/home/jonas/key.json:/root/.config/opencode/auth.json").unwrap();
+    fn secret_mapping_from_pair() {
+        let m = SecretMapping::from_pair(
+            "/home/jonas/key.json",
+            "/root/.config/opencode/auth.json",
+        )
+        .unwrap();
         assert_eq!(m.host, PathBuf::from("/home/jonas/key.json"));
         assert_eq!(m.container, PathBuf::from("/root/.config/opencode/auth.json"));
     }
 
     #[test]
-    fn secret_mapping_parse_rejects_missing_colon() {
-        assert!(SecretMapping::parse("no_colon").is_err());
+    fn secret_mapping_accepts_colons_in_either_path() {
+        // two words, no delimiter: colons are ordinary characters
+        let m = SecretMapping::from_pair("/host/a:b", "/root/c:d/e").unwrap();
+        assert_eq!(m.host, PathBuf::from("/host/a:b"));
+        assert_eq!(m.container, PathBuf::from("/root/c:d/e"));
     }
 
     #[test]
-    fn secret_mapping_parse_rejects_empty_host() {
-        assert!(SecretMapping::parse(":/container/path").is_err());
+    fn secret_mapping_rejects_empty_either_side() {
+        assert!(SecretMapping::from_pair("", "/c").is_err());
+        assert!(SecretMapping::from_pair("/h", "").is_err());
     }
 
     #[test]
-    fn secret_mapping_parse_rejects_empty_container() {
-        assert!(SecretMapping::parse("/host:").is_err());
-    }
-
-    #[test]
-    fn secret_mapping_parse_allows_tilde_container() {
-        let m = SecretMapping::parse("/host/key:~/.config/app/key.json").unwrap();
+    fn secret_mapping_allows_tilde_container() {
+        let m = SecretMapping::from_pair("/host/key", "~/.config/app/key.json").unwrap();
         assert_eq!(m.container, PathBuf::from("~/.config/app/key.json"));
     }
 
     #[test]
-    fn secret_mapping_parse_directory_paths() {
-        let m = SecretMapping::parse("/host/secrets/:/root/.config/app/secrets/").unwrap();
+    fn secret_mapping_directory_paths() {
+        let m = SecretMapping::from_pair("/host/secrets/", "/root/.config/app/secrets/").unwrap();
         assert_eq!(m.host, PathBuf::from("/host/secrets/"));
         assert_eq!(m.container, PathBuf::from("/root/.config/app/secrets/"));
     }

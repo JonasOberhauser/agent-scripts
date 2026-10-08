@@ -47,12 +47,48 @@ impl std::fmt::Display for HashdError {
     }
 }
 
-/// One question, one answer. Short timeout: callers sit on the read
-/// path of a (blocked) secret read and must degrade quickly.
+/// How long a hash ANSWER may take. Hashing scales with the target's
+/// file-backed bytes — hundreds of MB for ordinary host processes
+/// (a 233 MB locale-archive alone is common) — so a sub-second budget
+/// classified every healthy-but-working hashd as busy (the field
+/// report: "always busy, even right after restarting"). Callers sit
+/// on a blocked secret read with a pending window of seconds; 8s
+/// fits that flow while still bounding a wedged daemon.
+const HASH_ANSWER_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// One question, one answer, within [`HASH_ANSWER_TIMEOUT`] — with
+/// the #38 promise honored: Busy is transient, so a busy window is
+/// retried (bounded, short backoff) before the error surfaces.
 pub fn ask(socket: &str, pid: u32) -> Result<String, HashdError> {
+    ask_with_answer_timeout(socket, pid, HASH_ANSWER_TIMEOUT)
+}
+
+/// Test seam for [`ask`]: the answer budget is the one timing a test
+/// cannot wait out at production scale.
+pub fn ask_with_answer_timeout(
+    socket: &str,
+    pid: u32,
+    answer_timeout: Duration,
+) -> Result<String, HashdError> {
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        match ask_once(socket, pid, answer_timeout) {
+            Ok(h) => return Ok(h),
+            Err(HashdError::Busy(why)) if attempts < 3 => {
+                // the promised "retry in a moment will succeed"
+                std::thread::sleep(Duration::from_millis(250));
+                let _ = why;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+fn ask_once(socket: &str, pid: u32, answer_timeout: Duration) -> Result<String, HashdError> {
     let mut stream = connect_with_retry(socket)?;
     stream
-        .set_read_timeout(Some(Duration::from_millis(500)))
+        .set_read_timeout(Some(answer_timeout))
         .map_err(|e| HashdError::Unreachable(e.to_string()))?;
     stream
         .write_all(format!("hash {pid}\n").as_bytes())
@@ -65,9 +101,9 @@ pub fn ask(socket: &str, pid: u32) -> Result<String, HashdError> {
     );
     let mut line = String::new();
     let _n = reader.read_line(&mut line).map_err(|e| {
-        // The read timeout (500ms) surfaces as WouldBlock/errno 11:
-        // hashd accepted us but is busy hashing something big and
-        // answered nothing — NOT unreachable (#38).
+        // The read timeout surfaces as WouldBlock/errno 11: hashd
+        // accepted us but is busy hashing something big and answered
+        // nothing — NOT unreachable (#38).
         if e.kind() == std::io::ErrorKind::WouldBlock
             || e.raw_os_error() == Some(libc::EAGAIN)
         {
@@ -89,7 +125,7 @@ pub fn ask(socket: &str, pid: u32) -> Result<String, HashdError> {
 fn connect_with_retry(socket: &str) -> Result<UnixStream, HashdError> {
     let deadline = std::time::Instant::now() + Duration::from_millis(400);
     loop {
-        match UnixStream::connect(socket) {
+        match connect_bounded(socket, deadline) {
             Ok(s) => return Ok(s),
             Err(e) => {
                 let busy = e.raw_os_error() == Some(libc::EAGAIN); // EWOULDBLOCK is the same errno
@@ -106,25 +142,142 @@ fn connect_with_retry(socket: &str) -> Result<UnixStream, HashdError> {
     }
 }
 
+/// connect(2) against a wedged listener with a FULL backlog BLOCKS
+/// indefinitely on AF_UNIX — a retry loop would multiply the hang
+/// into forever. Nonblocking connect + poll, bounded by `deadline`;
+/// timeout surfaces as EAGAIN (busy: the #38 backlog semantics).
+fn connect_bounded(socket: &str, deadline: std::time::Instant) -> Result<UnixStream, std::io::Error> {
+    use std::os::unix::io::FromRawFd;
+    let (af_unix, sock_stream, zero) = (libc::AF_UNIX, libc::SOCK_STREAM, 0);
+    // SAFETY: socket(2) with plain constants has no preconditions.
+    let fd = unsafe { libc::socket(af_unix, sock_stream, zero) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // Nonblocking for the connect itself: a BLOCKING connect against a
+    // full AF_UNIX backlog hangs INSIDE the syscall — no poll loop can
+    // rescue it. Cleared again once connected.
+    let getfl = libc::F_GETFL;
+    // SAFETY: F_GETFL on a live fd we own.
+    let flags = unsafe { libc::fcntl(fd, getfl) };
+    if flags >= 0 {
+        let nonblock = flags | libc::O_NONBLOCK;
+        let setfl = libc::F_SETFL;
+        // SAFETY: F_SETFL with the computed nonblocking flags.
+        let _nb = unsafe { libc::fcntl(fd, setfl, nonblock) };
+    }
+    // SAFETY: an all-zero sockaddr_un is a valid zeroed C struct; the
+    // path is filled below before any use.
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    let bytes = socket.as_bytes();
+    if bytes.len() >= addr.sun_path.len() {
+        // SAFETY: fd is a live descriptor we own and never use again.
+        let _cl = unsafe { libc::close(fd) };
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "socket path too long",
+        ));
+    }
+    for (dst, b) in addr.sun_path.iter_mut().zip(bytes) {
+        *dst = *b as libc::c_char;
+    }
+    let addr_ptr = &addr as *const libc::sockaddr_un as *const libc::sockaddr;
+    let addr_len = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+    // SAFETY: addr is a fully-initialized sockaddr_un; the pointer and
+    // length describe exactly it.
+    let rc = unsafe { libc::connect(fd, addr_ptr, addr_len) };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::EINPROGRESS) {
+            // SAFETY: fd is a live descriptor we own and never use again.
+            let _cl = unsafe { libc::close(fd) };
+            return Err(err);
+        }
+        loop {
+            if std::time::Instant::now() >= deadline {
+                // SAFETY: fd is a live descriptor we own and never use again.
+                let _cl = unsafe { libc::close(fd) };
+                return Err(std::io::Error::from_raw_os_error(libc::EAGAIN));
+            }
+            let mut pfd = libc::pollfd { fd, events: libc::POLLOUT, revents: 0 };
+            let n_fds = 1;
+            let slice_ms = 25;
+            let poll_ptr = &mut pfd as *mut libc::pollfd;
+            // SAFETY: poll_ptr/n_fds describe exactly pfd above.
+            let prc = unsafe { libc::poll(poll_ptr, n_fds, slice_ms) };
+            if prc < 0 {
+                let e = std::io::Error::last_os_error();
+                // SAFETY: fd is a live descriptor we own and never use again.
+                let _cl = unsafe { libc::close(fd) };
+                return Err(e);
+            }
+            if prc == 0 {
+                continue; // 25ms slice, re-check the deadline
+            }
+            let mut so_err: libc::c_int = 0;
+            let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+            let opt_val = &mut so_err as *mut libc::c_int as *mut libc::c_void;
+            let (sol, soerr, fd_arg, len_ptr) = (libc::SOL_SOCKET, libc::SO_ERROR, fd, &mut len);
+            // SAFETY: opt_val/len_ptr are correctly sized for SO_ERROR.
+            let rc2 = unsafe { libc::getsockopt(fd_arg, sol, soerr, opt_val, len_ptr) };
+            if rc2 != 0 || so_err != 0 {
+                let e = if rc2 != 0 {
+                    std::io::Error::last_os_error()
+                } else {
+                    std::io::Error::from_raw_os_error(so_err)
+                };
+                // SAFETY: fd is a live descriptor we own and never use again.
+                let _cl = unsafe { libc::close(fd) };
+                return Err(e);
+            }
+            break; // connected
+        }
+    }
+    // Back to blocking reads/writes for the exchange itself.
+    if flags >= 0 {
+        let setfl2 = libc::F_SETFL;
+        // SAFETY: F_SETFL restoring the original blocking mode.
+        let _fl = unsafe { libc::fcntl(fd, setfl2, flags) };
+    }
+    // The stream owns the fd from here.
+    // SAFETY: fd is a live, connected socket we transfer ownership of.
+    Ok(unsafe { UnixStream::from_raw_fd(fd) })
+}
+
 /// Parse one reply line into a result.
+/// The helper's reply, as JSON — one standard grammar parsed by one
+/// standard parser (serde); the old hand-rolled `ok `/`error ...`
+/// prefix grammar is gone.
+#[derive(serde::Deserialize)]
+struct Reply {
+    ok: Option<String>,
+    #[serde(default)]
+    error: Option<ReplyError>,
+}
+
+#[derive(serde::Deserialize)]
+struct ReplyError {
+    /// `unprivileged` | `gone` | anything else for a generic failure.
+    kind: String,
+    message: String,
+}
+
 pub fn parse_reply(line: &str) -> Result<String, HashdError> {
-    if let Some(hash) = line.strip_prefix("ok ") {
-        let hash = hash.trim();
+    let r: Reply = serde_json::from_str(line.trim())
+        .map_err(|e| HashdError::Other(format!("malformed reply: {e} (line {line:?})")))?;
+    if let Some(hash) = r.ok {
         if hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit()) {
-            return Ok(hash.to_string());
+            return Ok(hash);
         }
         return Err(HashdError::Other(format!("malformed hash in reply: {line:?}")));
     }
-    if let Some(why) = line.strip_prefix("error unprivileged ") {
-        return Err(HashdError::Unprivileged(why.to_string()));
+    match r.error {
+        Some(e) if e.kind == "unprivileged" => Err(HashdError::Unprivileged(e.message)),
+        Some(e) if e.kind == "gone" => Err(HashdError::Gone(e.message)),
+        Some(e) => Err(HashdError::Other(e.message)),
+        None => Err(HashdError::Other(format!("malformed reply: {line:?}"))),
     }
-    if let Some(why) = line.strip_prefix("error gone ") {
-        return Err(HashdError::Gone(why.to_string()));
-    }
-    if let Some(why) = line.strip_prefix("error ") {
-        return Err(HashdError::Other(why.to_string()));
-    }
-    Err(HashdError::Other(format!("malformed reply: {line:?}")))
 }
 
 /// Where the hashd binary belongs when a service runs it: a system
@@ -210,20 +363,25 @@ pub fn is_unprivileged_error(msg: &str) -> bool {
 }
 
 
+// Tests may hand-parse output/protocol lines: sanctioned by policy
+// (test + allow), NOT available to production code. unknown_lints:
+// the custom_parser lint exists only under the servyi driver.
 #[cfg(test)]
+#[allow(unknown_lints)]
+#[allow(custom_parser)]
 mod tests {
     use super::*;
 
     #[test]
     fn parses_ok_hash() {
         let h = "a".repeat(64);
-        assert_eq!(parse_reply(&format!("ok {h}")).unwrap(), h);
+        assert_eq!(parse_reply(&format!(r#"{{"ok":"{h}"}}"#)).unwrap(), h);
     }
 
     #[test]
     fn rejects_malformed_hash() {
         assert!(matches!(
-            parse_reply("ok nothex"),
+            parse_reply(r#"{"ok":"nothex"}"#),
             Err(HashdError::Other(_))
         ));
     }
@@ -231,15 +389,15 @@ mod tests {
     #[test]
     fn classifies_error_kinds() {
         assert!(matches!(
-            parse_reply("error unprivileged EPERM following map_files"),
+            parse_reply(r#"{"error":{"kind":"unprivileged","message":"EPERM following map_files"}}"#),
             Err(HashdError::Unprivileged(msg)) if msg.contains("EPERM")
         ));
         assert!(matches!(
-            parse_reply("error gone no such process"),
+            parse_reply(r#"{"error":{"kind":"gone","message":"no such process"}}"#),
             Err(HashdError::Gone(_))
         ));
         assert!(matches!(
-            parse_reply("error something else"),
+            parse_reply(r#"{"error":{"kind":"io","message":"something else"}}"#),
             Err(HashdError::Other(_))
         ));
         assert!(matches!(
@@ -301,7 +459,7 @@ mod tests {
         // Connected, never accepted, never answered — hashd "busy".
         let _holder = UnixStream::connect(&sock).unwrap();
         let t0 = std::time::Instant::now();
-        let e = ask(&sock.display().to_string(), 1).unwrap_err();
+        let e = ask_with_answer_timeout(&sock.display().to_string(), 1, Duration::from_millis(50)).unwrap_err();
         assert!(
             matches!(e, HashdError::Busy(_)),
             "an unanswered (busy) ask must classify Busy, got: {e:?}"
@@ -317,6 +475,37 @@ mod tests {
             "busy must not tell the user to restart hashd: {text}"
         );
         assert!(text.contains("retry"), "busy must name retry: {text}");
+    }
+
+    /// The field report: "hashd always busy, even right after
+    /// restarting" — a healthy hashd whose hash simply exceeds the
+    /// answer budget. The promised retry must convert a busy FIRST
+    /// ask into a successful SECOND one.
+    #[test]
+    fn a_busy_first_ask_retries_to_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("busy-then-ok.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let serves = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = std::sync::Arc::clone(&serves);
+        std::thread::spawn(move || {
+            use std::io::{BufRead, BufReader, Write};
+            for (n, mut conn) in listener.incoming().flatten().enumerate() {
+                let mut line = String::new();
+                BufReader::new(&conn).read_line(&mut line).expect("req");
+                if n == 0 {
+                    seen.store(1, std::sync::atomic::Ordering::SeqCst);
+                    // hold without answering: the small injected budget
+                    // classifies this ask Busy; the client disconnects
+                    std::thread::sleep(Duration::from_millis(400));
+                    continue;
+                }
+                let _ = conn.write_all(format!("{{\"ok\":\"{}\"}}\n", "a".repeat(64)).as_bytes());
+            }
+        });
+        let got = ask_with_answer_timeout(&sock.display().to_string(), 7, Duration::from_millis(80))
+            .expect("retry recovers");
+        assert_eq!(got, "a".repeat(64));
     }
 
     #[test]
@@ -336,7 +525,7 @@ mod tests {
             // closes it when the listener drops.
             let listener =
                 unsafe { std::os::unix::net::UnixListener::from_raw_fd(fd) };
-            let reply = format!("ok {}\n", "a".repeat(64));
+            let reply = format!("{{\"ok\":\"{}\"}}\n", "a".repeat(64));
             for conn in listener.incoming().flatten() {
                 let mut conn = conn;
                 let mut line = String::new();
@@ -460,7 +649,7 @@ mod tests {
             let mut line = String::new();
             let _n = reader.read_line(&mut line).unwrap();
             let reply = if line.trim() == "hash 7" {
-                format!("ok {}\n", "b".repeat(64))
+                format!("{{\"ok\":\"{}\"}}\n", "b".repeat(64))
             } else {
                 "error unprivileged EPERM\n".to_string()
             };

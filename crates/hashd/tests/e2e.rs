@@ -10,6 +10,12 @@
 //! root hashd was connectable by root only — every unprivileged
 //! fuse-server got EACCES. It needs root to drop privileges, so it is
 //! #[ignore]-gated like the other environment-dependent suites.
+
+// Tests may hand-parse output/protocol lines: sanctioned by policy
+// (test + allow), NOT available to production code. unknown_lints:
+// the custom_parser lint exists only under the servyi driver.
+#![allow(unknown_lints)]
+#![allow(custom_parser)]
 #![allow(clippy::unwrap_used, clippy::panic, unused_results)]
 
 
@@ -81,8 +87,10 @@ fn speaks_the_protocol_over_a_real_socket() {
     let hashd = spawn_hashd(dir.path());
 
     let reply = ask(&hashd.socket, "status");
+    let st: serde_json::Value =
+        serde_json::from_str(reply.trim()).expect("status reply is JSON: {reply:?}");
     assert!(
-        reply.starts_with("status "),
+        st.get("status").is_some_and(|v| v == "privileged" || v == "unprivileged"),
         "any well-formed status reply counts, got: {reply:?}"
     );
 
@@ -93,24 +101,31 @@ fn speaks_the_protocol_over_a_real_socket() {
         &hashd.socket,
         &format!("hash {}", std::process::id()),
     );
-    if let Some(rest) = reply.strip_prefix("ok ") {
-        assert_eq!(rest.trim().len(), 64, "digest must be sha256 hex: {reply:?}");
+    let v: serde_json::Value =
+        serde_json::from_str(reply.trim()).expect("hash reply is JSON: {reply:?}");
+    if let Some(h) = v.get("ok").and_then(|x| x.as_str()) {
+        assert_eq!(h.len(), 64, "digest must be sha256 hex: {reply:?}");
         assert!(
-            rest.trim().chars().all(|c| c.is_ascii_hexdigit()),
+            h.chars().all(|c| c.is_ascii_hexdigit()),
             "digest must be hex: {reply:?}"
         );
     } else {
+        let kind = v
+            .get("error")
+            .and_then(|e| e.get("kind"))
+            .and_then(|k| k.as_str())
+            .unwrap_or("");
         assert!(
-            reply.starts_with("error unprivileged ")
-                || reply.starts_with("error gone ")
-                || reply.starts_with("error "),
+            ["unprivileged", "gone", "generic"].contains(&kind),
             "hash failures must be classified, got: {reply:?}"
         );
     }
 
     let reply = ask(&hashd.socket, "nonsense");
+    let v: serde_json::Value =
+        serde_json::from_str(reply.trim()).expect("unknown-request reply is JSON: {reply:?}");
     assert!(
-        reply.starts_with("error "),
+        v.get("error").is_some(),
         "unknown requests must be answered, not dropped: {reply:?}"
     );
 }
