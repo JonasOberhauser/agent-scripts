@@ -390,7 +390,8 @@ fn secret_wiring_follows_the_server_reported_inner_name() {
         60,
         &[
             "--secret",
-            &format!("{}:/root/secrets.yaml", host_secret.display()),
+            &host_secret.display().to_string(),
+            "/root/secrets.yaml",
         ],
         None,
     );

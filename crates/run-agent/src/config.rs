@@ -127,32 +127,13 @@ impl SecretMapping {
     ///
     /// `~` is **not** expanded by us — the caller's shell expands it for
     /// host paths, and the container's `sh -c` expands it for container
-    /// paths (where `~` = `/root`). HOST:CONTAINER — the shell-friendly
-    /// colon form (tilde expands after `:` in bash), parsed with plain
-    /// `split` (the sanctioned idiom): host is the FIRST field, the
-    /// container is everything after it (colons in the container path
-    /// survive).
-    pub fn parse(s: &str) -> Result<Self, String> {
-        let fields: Vec<&str> = s.split(':').collect();
-        let host = fields.first().copied().unwrap_or_default();
-        let container = fields[1..].join(":");
+    /// paths (where `~` = `/root`). Built from the two WORDS clap
+    /// delivers (`--secret HOST CONTAINER`, num_args = 2): no
+    /// delimiter grammar, nothing to escape, no parsing — colons are
+    /// ordinary path characters and the shell expands ~ in both.
+    pub fn from_pair(host: &str, container: &str) -> Result<Self, String> {
         if host.is_empty() || container.is_empty() {
-            return Err(format!(
-                "--secret expects HOST:CONTAINER (both non-empty), got '{s}'"
-            ));
-        }
-        // Unlike NAME:FILE:HASH (whose name/hash fields are colon-free
-        // by construction, making the middle join unambiguous), BOTH
-        // fields here are paths — a second ':' cannot be attributed to
-        // either side, and a mis-split would mount the WRONG file.
-        // Exactly one colon: anything else fails closed with the
-        // symlink workaround.
-        if fields.len() != 2 {
-            return Err(format!(
-                "--secret HOST:CONTAINER takes exactly ONE ':' (the field \
-                 delimiter); paths containing ':' cannot be expressed — \
-                 symlink them to colon-free names first. got '{s}'"
-            ));
+            return Err("--secret host and container must be non-empty".to_string());
         }
         Ok(Self {
             host: PathBuf::from(host),
@@ -397,49 +378,39 @@ mod tests {
     use fuse_protocol::MockSystemIo;
 
     #[test]
-    fn secret_mapping_parse() {
-        let m = SecretMapping::parse("/home/jonas/key.json:/root/.config/opencode/auth.json")
-            .unwrap();
+    fn secret_mapping_from_pair() {
+        let m = SecretMapping::from_pair(
+            "/home/jonas/key.json",
+            "/root/.config/opencode/auth.json",
+        )
+        .unwrap();
         assert_eq!(m.host, PathBuf::from("/home/jonas/key.json"));
         assert_eq!(m.container, PathBuf::from("/root/.config/opencode/auth.json"));
     }
 
     #[test]
-    fn secret_mapping_rejects_a_second_colon_ambiguously() {
-        // BOTH fields are paths, so `a:b:c` cannot be attributed to
-        // either side — and a mis-split would mount the WRONG file.
-        // Exactly one ':' is accepted; more fail closed with the
-        // symlink workaround.
-        for bad in ["/host/a:b:/c", "/host/key:/root/a:b/c"] {
-            let e = SecretMapping::parse(bad).unwrap_err();
-            assert!(e.contains("exactly ONE"), "{bad}: {e}");
-        }
+    fn secret_mapping_accepts_colons_in_either_path() {
+        // two words, no delimiter: colons are ordinary characters
+        let m = SecretMapping::from_pair("/host/a:b", "/root/c:d/e").unwrap();
+        assert_eq!(m.host, PathBuf::from("/host/a:b"));
+        assert_eq!(m.container, PathBuf::from("/root/c:d/e"));
     }
 
     #[test]
-    fn secret_mapping_parse_rejects_missing_colon() {
-        assert!(SecretMapping::parse("no_colon").is_err());
+    fn secret_mapping_rejects_empty_either_side() {
+        assert!(SecretMapping::from_pair("", "/c").is_err());
+        assert!(SecretMapping::from_pair("/h", "").is_err());
     }
 
     #[test]
-    fn secret_mapping_parse_rejects_empty_host() {
-        assert!(SecretMapping::parse(":/container/path").is_err());
-    }
-
-    #[test]
-    fn secret_mapping_parse_rejects_empty_container() {
-        assert!(SecretMapping::parse("/host:").is_err());
-    }
-
-    #[test]
-    fn secret_mapping_parse_allows_tilde_container() {
-        let m = SecretMapping::parse("/host/key:~/.config/app/key.json").unwrap();
+    fn secret_mapping_allows_tilde_container() {
+        let m = SecretMapping::from_pair("/host/key", "~/.config/app/key.json").unwrap();
         assert_eq!(m.container, PathBuf::from("~/.config/app/key.json"));
     }
 
     #[test]
-    fn secret_mapping_parse_directory_paths() {
-        let m = SecretMapping::parse("/host/secrets/:/root/.config/app/secrets/").unwrap();
+    fn secret_mapping_directory_paths() {
+        let m = SecretMapping::from_pair("/host/secrets/", "/root/.config/app/secrets/").unwrap();
         assert_eq!(m.host, PathBuf::from("/host/secrets/"));
         assert_eq!(m.container, PathBuf::from("/root/.config/app/secrets/"));
     }

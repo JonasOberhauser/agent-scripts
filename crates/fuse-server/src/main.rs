@@ -25,7 +25,10 @@ struct Cli {
     mount_point: Option<PathBuf>,
     #[arg(short, long, default_value = fuse_protocol::DEFAULT_CMD_SOCKET)]
     socket: PathBuf,
-    #[arg(long, value_name = "NAME:FILE:HASH")]
+    /// Boot-time secret: NAME, FILE, HASH as three words — no
+    /// delimiter grammar, nothing to escape (colons are ordinary
+    /// path characters). Repeatable.
+    #[arg(long, num_args = 3, value_names = ["NAME", "FILE", "HASH"])]
     secret: Vec<String>,
     #[arg(long)]
     allow_other: bool,
@@ -180,8 +183,9 @@ fn main() {
     }
 
     let hub = OracleHub::clone(&fuse_server::ORACLE_HUB);
-    for spec in &cli.secret {
-        match parse_secret(spec) {
+    // num_args = 3: flat [name, file, hash, ...] triples; chunk them.
+    for spec in cli.secret.chunks(3) {
+        match parse_secret(&spec[0], &spec[1], &spec[2]) {
             Ok((name, host, hash)) => {
                 // MR4: register by stat — identity + size, never bytes.
                 let md = match std::fs::metadata(&host) {
@@ -202,7 +206,7 @@ fn main() {
                 hub.serve(&name, &inner, 0o400);
             }
             Err(e) => {
-                error!("Bad --secret '{spec}': {e}");
+                error!("Bad --secret {:?}: {e}", spec);
                 std::process::exit(1);
             }
         }
@@ -228,31 +232,21 @@ fn main() {
     }
 }
 
-/// NAME:FILE:HASH — the shell-friendly colon form (tilde expands
-/// after `:` in bash), parsed with plain `split` (the sanctioned
-/// idiom): NAME is the first field, HASH is the LAST, FILE is the
-/// joined middle — colons in the file path survive (the old
-/// splitn(3) silently dumped them into the hash field).
-fn parse_secret(spec: &str) -> Result<(String, std::path::PathBuf, String), String> {
-    let fields: Vec<&str> = spec.split(':').collect();
-    if fields.len() < 3 {
-        return Err("expected NAME:FILE:HASH".into());
+/// Three WORDS (clap's num_args = 3 delivers them as a triple) — no
+/// delimiter grammar, nothing to escape, no string parsing: colons
+/// and tildes are ordinary path characters.
+fn parse_secret(
+    name: &str,
+    file: &str,
+    hash: &str,
+) -> Result<(String, std::path::PathBuf, String), String> {
+    if name.is_empty() || hash.is_empty() {
+        return Err("NAME and HASH must be non-empty".into());
     }
-    // ':' cannot occur in NAME (it is the field delimiter) — fail
-    // closed rather than silently re-splitting. It cannot occur in a
-    // real HASH either (hex digest or `*`), which is why taking the
-    // LAST field as the hash and joining the middle as FILE is safe:
-    // colons in FILE paths work; colons anywhere else are a typo.
-    if fields[0].contains(':') || fields[fields.len() - 1].is_empty() {
-        return Err("NAME must not contain ':' and HASH must be non-empty".into());
-    }
-    let name = fields[0].to_string();
-    let file = fields[1..fields.len() - 1].join(":");
-    let hash = fields[fields.len() - 1].to_string();
-    let file_path = std::path::PathBuf::from(&file);
+    let file_path = std::path::PathBuf::from(file);
     let host = std::fs::canonicalize(&file_path)
         .map_err(|e| format!("cannot resolve {file}: {e}"))?;
-    Ok((name, host, hash))
+    Ok((name.to_string(), host, hash.to_string()))
 }
 
 #[cfg(test)]
@@ -260,28 +254,25 @@ mod secret_spec_tests {
     use super::parse_secret;
 
     #[test]
-    fn colons_in_the_file_path_work() {
-        // name first, hash LAST, file = joined middle: unambiguous
-        // because name is validated ':'-free and real hashes are
-        // hex/'*' (never ':').
+    fn colons_in_the_file_path_are_ordinary_characters() {
+        // three words, no delimiter: nothing to escape anywhere
         let dir = tempfile::tempdir().unwrap();
         let weird = dir.path().join("a:b:c.yaml");
         std::fs::write(&weird, b"DATA").unwrap();
         let (name, file, hash) =
-            parse_secret(&format!("api:{}:*", weird.display())).unwrap();
+            parse_secret("api", &weird.display().to_string(), "*").unwrap();
         assert_eq!(name, "api");
         assert_eq!(file, std::fs::canonicalize(&weird).unwrap());
         assert_eq!(hash, "*");
     }
 
     #[test]
-    fn rejects_empty_hash() {
-        assert!(parse_secret("n:f:").is_err(), "empty hash rejected");
-    }
-
-    #[test]
-    fn rejects_too_few_fields() {
-        assert!(parse_secret("only:name").is_err());
-        assert!(parse_secret("nofields").is_err());
+    fn rejects_empty_name_or_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("s.yaml");
+        std::fs::write(&f, b"DATA").unwrap();
+        let fs = f.display().to_string();
+        assert!(parse_secret("", &fs, "*").is_err());
+        assert!(parse_secret("n", &fs, "").is_err());
     }
 }
