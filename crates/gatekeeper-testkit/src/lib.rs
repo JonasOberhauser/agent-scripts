@@ -622,6 +622,71 @@ mod supervised_tests {
         // will tighten this into the reaping assertion.
         std::thread::sleep(std::time::Duration::from_millis(300));
     }
+
+    /// The kill -9 counterpart: NO handler can run, so the supervised
+    /// daemon IS orphaned — pinned as expected, because recovery from
+    /// this shape belongs to the restart path (client-side waiting),
+    /// not to the server. The kit's Drop still reclaims it.
+    #[test]
+    fn kill9_orphans_by_construction_and_drop_reclaims() {
+        let mut sup = match Stack::new().driver(Driver::Supervised).spawn() {
+            crate::SpawnedStack::Supervised(s) => s,
+            _ => panic!("driver mismatch"),
+        };
+        assert!(!sup.daemon_pids().is_empty(), "precondition");
+        sup.kill_policy_9();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        // orphaned (alive): the documented kill -9 shape
+        assert!(
+            !sup.daemon_pids().is_empty(),
+            "kill -9 must orphan (no handler runs) — if this fails, something reaps behind our back"
+        );
+        // Drop reclaims (the kit's own hygiene)
+    }
+
+    /// #93 F2: a SIGTERM'd policy server must NOT orphan its
+    /// supervised data daemon. On the host this is the observed
+    /// failure — the leaked fused holds the old mount, the NEXT
+    /// restart's daemon cannot take the mount point, and the stack
+    /// dies with "did not start within 10s". On this tier the fake
+    /// daemon plays the orphan-victim: it exits only when signaled.
+    #[test]
+    fn sigtermed_policy_reaps_its_supervised_daemon() {
+        let mut sup = match Stack::new().driver(Driver::Supervised).spawn() {
+            crate::SpawnedStack::Supervised(s) => s,
+            _ => panic!("driver mismatch"),
+        };
+        assert!(
+            !sup.daemon_pids().is_empty(),
+            "precondition: the supervised daemon is alive"
+        );
+        sup.kill_policy();
+        // bounded wait: the daemon must be gone with the server
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if sup.daemon_pids().is_empty() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the SIGTERM'd server ORPHANED its supervised daemon (#93 F2): {}",
+                sup.daemon_pids()
+                    .iter()
+                    .map(|p| format!(
+                        "{p} state={}",
+                        std::fs::read_to_string(format!("/proc/{p}/stat"))
+                            .unwrap_or_default()
+                            .rsplit(')')
+                            .next()
+                            .and_then(|r| r.split_whitespace().next().map(|f| f.to_string()))
+                            .unwrap_or_default()
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
 }
 
 // Tests may hand-parse output/protocol lines: sanctioned by policy

@@ -5,6 +5,7 @@
 //! (#93 F2).
 
 use std::path::PathBuf;
+
 use std::process::{Child, Command};
 
 use crate::{Stack, bin};
@@ -18,6 +19,16 @@ pub struct SupervisedStack {
     mount: PathBuf,
     socket: PathBuf,
     _root: tempfile::TempDir,
+}
+
+/// kill(2) by pid — std offers no non-Child variant and the kit needs
+/// the exact signal.
+fn kill_pid(pid: u32, sig: i32) -> bool {
+    let pid_t = pid as libc::pid_t;
+    // SAFETY: a plain signal to one known pid; the comparison lives
+    // outside the block (one op per unsafe block).
+    let rc = unsafe { libc::kill(pid_t, sig) };
+    rc == 0
 }
 
 impl SupervisedStack {
@@ -91,12 +102,40 @@ impl SupervisedStack {
         String::from_utf8_lossy(&out.stdout)
             .split_whitespace()
             .filter_map(|p| p.parse().ok())
+            // ZOMBIES ARE DEAD: kill(0) succeeds and pgrep lists them,
+            // but an unreaped entry is not a live daemon (this filter
+            // is what makes reap assertions honest).
+            .filter(|&pid| {
+                std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                    .ok()
+                    // state is the field after the (comm) — read the
+                    // char after the last ')'
+                    .and_then(|s| {
+                        s.rsplit(')').next()
+                            .and_then(|rest| rest.split_whitespace().next().map(|f| f.to_string()))
+                    })
+                    .is_some_and(|state| state != "Z" && state != "X")
+            })
             .collect()
     }
 
-    /// SIGTERM the policy daemon — the #93 F2 move: what happens to
-    /// the supervised child is the assertion's business.
+    /// SIGTERM the policy daemon — the signal `fuse-client restart`
+    /// actually sends (#93 F2): the shutdown handler (and with it the
+    /// supervised-daemon reaping) runs. What happens to the daemon is
+    /// the assertion's business.
     pub fn kill_policy(&mut self) {
+        // NOT Child::kill() — that is SIGKILL, which no handler can
+        // catch; the restart path uses TERM and the test must model
+        // the real signal.
+        let _ = kill_pid(self.policy.id(), libc::SIGTERM);
+        let _ = self.policy.wait();
+    }
+
+    /// SIGKILL the policy daemon — the uncatchable variant (kill -9):
+    /// NO handler runs, so the supervised daemon is orphaned by
+    /// construction; recovery from THIS shape is the restart path's
+    /// business, not the server's.
+    pub fn kill_policy_9(&mut self) {
         let _ = self.policy.kill();
         let _ = self.policy.wait();
     }
