@@ -84,6 +84,15 @@ pub struct ServerStateFile {
     /// files) means the server's global default.
     #[serde(default)]
     pub oracle_socket: Option<String>,
+    /// The environment the ORCHESTRATOR ran the server with — the
+    /// stack-defining variables (policy store, hashd socket, …). The
+    /// restart path applies these to the respawn (#93 F1): the client's
+    /// own environment is NOT the stack's, and a respawn without them
+    /// arms whatever store happens to be default in the operator's
+    /// shell — the observed cross-stack mounting. Additive: absent in
+    /// old state files (empty = inherit, the old behavior).
+    #[serde(default)]
+    pub env: std::collections::HashMap<String, String>,
     pub secrets: Vec<StateSecretEntry>,
 }
 
