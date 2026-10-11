@@ -579,8 +579,10 @@ fn start_server_from_state(app: &App, state: &ServerStateFile, log_path: Option<
     eprintln!("Starting server (v{})...", CLIENT_VERSION);
     let effective_log = log_path.unwrap_or(fuse_protocol::DEFAULT_LOG_PATH);
     let log_path_buf = std::path::PathBuf::from(effective_log);
+    // APPEND (#93 F4): truncating destroyed the pre-restart log lines —
+    // exactly the forensics a failed restart needs.
     let log_file = std::fs::OpenOptions::new()
-        .create(true).truncate(true).write(true)
+        .create(true).append(true)
         .open(&log_path_buf)
         .unwrap_or_else(|e| { eprintln!("open log file: {e}"); std::process::exit(1); });
     let log_file2 = log_file.try_clone().unwrap_or_else(|e| { eprintln!("dup log fd: {e}"); std::process::exit(1); });
@@ -588,6 +590,12 @@ fn start_server_from_state(app: &App, state: &ServerStateFile, log_path: Option<
 
     use std::os::unix::process::CommandExt;
     let mut cmd = std::process::Command::new(&spawn_prog);
+    // The STACK'S environment, not the client's (#93 F1): whatever the
+    // orchestrator pinned (policy store, hashd socket) the respawn
+    // carries — absent entries inherit as before.
+    for (k, v) in &state.env {
+        let _env = cmd.env(k, v);
+    }
     let _cmd = cmd
         .args(&spawn_args)
         .stdin(std::process::Stdio::null())
@@ -751,6 +759,7 @@ fn ask_reset_anyway() {
         // string, every stack on the machine).
         let state = read_state_file();
         let st = ServerStateFile {
+            env: std::collections::HashMap::new(),
             version: String::new(),
             server_pid: 0,
             server_binary: String::new(),
@@ -939,6 +948,7 @@ mod tests {
         // daemon retries that socket forever, and a respawn on the
         // global default leaves an alive mount that never syncs again.
         let base = ServerStateFile {
+            env: std::collections::HashMap::new(),
             version: "0.30.0".into(),
             server_pid: 7,
             server_binary: "/x/fuse-server".into(),

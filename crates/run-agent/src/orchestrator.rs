@@ -1144,6 +1144,14 @@ fn verify_container_fuse<S: SystemIo>(
     ))
 }
 
+/// The environment variables that DEFINE this stack for the policy
+/// daemon (written to the state file; applied by the restart respawn,
+/// #93 F1). None today: spawn_independent carries no env and the
+/// server inherits run-agent's own — extend here when pinning starts.
+fn stack_env(_config: &AgentConfig) -> std::collections::HashMap<String, String> {
+    std::collections::HashMap::new()
+}
+
 /// Write a state file so `fuse-client` can restart the server with the same
 /// secrets when a version mismatch is detected.
 fn write_state_file<S: SystemIo>(
@@ -1165,6 +1173,11 @@ fn write_state_file<S: SystemIo>(
             .oracle_socket
             .as_deref()
             .map(|p| p.to_string_lossy().into_owned()),
+        // #93 F1: the stack-defining env the server runs under. Today
+        // the orchestrator pins nothing through spawn_independent (env
+        // reaches the server by inheritance); the restart path carries
+        // whatever lands here, so a pinned stack restarts as itself.
+        env: stack_env(config),
         secrets: loaded
             .iter()
             .map(|s| fuse_protocol::StateSecretEntry {

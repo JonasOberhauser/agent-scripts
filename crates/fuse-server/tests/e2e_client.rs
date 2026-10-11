@@ -729,6 +729,9 @@ fn restart_respawns_on_the_stacks_own_policy_store() {
         "pending_timeout": 10,
         "runtime_wrapper": null,
         "oracle_socket": oracle_sock.to_string_lossy(),
+        // what a faithful orchestrator pins for THIS stack (#93 F1):
+        // the restart must apply it to the respawn
+        "env": { "FUSE_GATEKEEPER_POLICY": stack_store.to_string_lossy() },
         "secrets": [
             { "fuse_name": "s1", "host_path": secret1.to_string_lossy(), "hash": "aa" },
             { "fuse_name": "s2", "host_path": secret2.to_string_lossy(), "hash": "bb" },
