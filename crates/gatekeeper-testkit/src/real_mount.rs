@@ -36,6 +36,11 @@ pub enum Driver {
     /// The real `fuse-server` + `fused` binaries and a kernel FUSE
     /// mount. Requires `/dev/fuse` and a working `fusermount3`.
     RealMount,
+    /// The SUPERVISION tier (#94): the real `fuse-server` supervising
+    /// a SUBSTITUTED data daemon (default the kit's `fake-fused`) via
+    /// `--fused-binary` — no kernel FUSE, no libfuse, runs everywhere;
+    /// built for supervise/reap/respawn lifecycle tests (#93 F2).
+    Supervised,
 }
 
 /// The split stack: policy daemon + data daemon + mount point, all
@@ -381,6 +386,10 @@ fn kill9(c: &mut Child) {
     // SAFETY: a plain SIGKILL to one child pid we own.
     let _ = unsafe { libc::kill(pid, sig) };
     let _ = c.wait();
+}
+
+pub(crate) fn wait_connect_pub(path: &Path, what: &str, root: &Path) {
+    wait_connect(path, what, root)
 }
 
 fn wait_connect(path: &Path, what: &str, root: &Path) {

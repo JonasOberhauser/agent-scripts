@@ -32,6 +32,11 @@ struct Cli {
     secret: Vec<String>,
     #[arg(long)]
     allow_other: bool,
+    /// Substitute the supervised data-daemon binary (issue #94): the
+    /// supervision seam — tests drive the lifecycle with a fake fused
+    /// that needs no kernel FUSE mount. Same argv otherwise.
+    #[arg(long)]
+    fused_binary: Option<std::path::PathBuf>,
     #[arg(long, default_value = "info")]
     log_level: String,
     #[arg(long, default_value_t = 300)]
@@ -102,7 +107,10 @@ fn main() {
     // to this binary and keep it as a child; on our exit it dies too.
     if let Some(mp) = &cli.mount_point {
         let exe = std::env::current_exe().expect("current exe");
-        let fused = exe.parent().map(|d| d.join(fuse_protocol::FUSED_BIN)).filter(|p| p.exists());
+        let sibling = exe.parent().map(|d| d.join(fuse_protocol::FUSED_BIN)).filter(|p| p.exists());
+        // The seam (#94): an explicit --fused-binary wins over the
+        // exe-sibling default; without either, the loud #37 failure.
+        let fused = cli.fused_binary.clone().or(sibling);
         match fused {
             Some(fused) => {
                 info!("  mount-point:     {} (spawning supervised data daemon)", mp.display());
