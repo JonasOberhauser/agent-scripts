@@ -5,9 +5,7 @@ use std::time::{Duration, Instant};
 use fuse_protocol::SystemIo;
 use tracing::{info, warn};
 
-use crate::config::{
-    build_create_args, build_exec_args, AgentConfig, NESTED_SECCOMP_PROFILE,
-};
+use crate::config::{build_create_args, build_exec_args, AgentConfig, NESTED_SECCOMP_PROFILE};
 
 /// The agentbox Dockerfile, embedded into the binary at compile time
 /// (`include_str!`).  It is the single source for rebuilding the image:
@@ -22,8 +20,7 @@ const EMBEDDED_DOCKERFILE: &str = include_str!("../../../Dockerfile");
 fn dockerfile_content() -> Result<String, String> {
     #[cfg(debug_assertions)]
     if let Some(p) = std::env::var_os("RUN_AGENT_TEST_DOCKERFILE") {
-        return std::fs::read_to_string(p)
-            .map_err(|e| format!("RUN_AGENT_TEST_DOCKERFILE: {e}"));
+        return std::fs::read_to_string(p).map_err(|e| format!("RUN_AGENT_TEST_DOCKERFILE: {e}"));
     }
     Ok(EMBEDDED_DOCKERFILE.to_string())
 }
@@ -81,7 +78,11 @@ fn run_wrapped<S: SystemIo>(io: &S, wrapper: Option<&str>, prog: &str, args: &[&
 /// unmount, trying the available unmount helpers in turn. Returns true
 /// when one of them reports success.
 fn lazy_unmount<S: SystemIo>(io: &S, mount_point: &str, wrapper: Option<&str>) -> bool {
-    for (cmd, flag) in [("fusermount", "-uz"), ("fusermount3", "-uz"), ("umount", "-l")] {
+    for (cmd, flag) in [
+        ("fusermount", "-uz"),
+        ("fusermount3", "-uz"),
+        ("umount", "-l"),
+    ] {
         if run_wrapped(io, wrapper, cmd, &[flag, mount_point]) {
             info!("Lazy unmount succeeded via {cmd} {flag}");
             return true;
@@ -132,12 +133,8 @@ where
 /// respawning server + data daemon), a missing host-side source file
 /// does not — no rebuild can bring the user's file back.
 fn preflight_should_rebuild(results: &[crate::preflight::CheckResult]) -> bool {
-    let mount_broken = results
-        .iter()
-        .any(|r| !r.ok && r.check == "fuse-mount");
-    let host_broken = results
-        .iter()
-        .any(|r| !r.ok && r.check == "source-file");
+    let mount_broken = results.iter().any(|r| !r.ok && r.check == "fuse-mount");
+    let host_broken = results.iter().any(|r| !r.ok && r.check == "source-file");
     mount_broken && !host_broken
 }
 
@@ -173,7 +170,10 @@ fn ensure_mount_point<S: SystemIo>(
                     mount_point.display()
                 )
             })?;
-            info!("Removed a file blocking the mount point {}", mount_point.display());
+            info!(
+                "Removed a file blocking the mount point {}",
+                mount_point.display()
+            );
             return create(io, mount_point);
         }
         PathState::Unreachable(_) => {}
@@ -184,7 +184,10 @@ fn ensure_mount_point<S: SystemIo>(
     io.sleep_ms(200);
     match io.path_state(mount_point) {
         PathState::Dir | PathState::Missing => {
-            info!("Recovered mount point {} from a stale FUSE mount", mount_point.display());
+            info!(
+                "Recovered mount point {} from a stale FUSE mount",
+                mount_point.display()
+            );
             create(io, mount_point)
         }
         state @ (PathState::File | PathState::Unreachable(_)) => {
@@ -212,7 +215,6 @@ fn ensure_mount_point<S: SystemIo>(
         }
     }
 }
-
 
 /// Full orchestration loop — the Rust replacement for `run-agent.sh`.
 ///
@@ -287,23 +289,23 @@ where
         // and the (mocked) socket may still claim to answer.
         let reuse_existing = !force_respawn && io.try_unix_connect(socket);
         if reuse_existing {
-        // A successful connect() is not proof of life: a crashed or wedged
-        // server leaves the socket behind and the kernel still accepts on
-        // the backlog — later adds then die with 'Broken pipe'.  Do a real
-        // read-only round-trip before trusting the server.
-        match send("status", "") {
-            Ok(_) => {
-                info!("Reusing existing fuse-server at {}", socket.display());
-                server_healthy = true;
-            }
-            Err(e) => {
-                warn!(
+            // A successful connect() is not proof of life: a crashed or wedged
+            // server leaves the socket behind and the kernel still accepts on
+            // the backlog — later adds then die with 'Broken pipe'.  Do a real
+            // read-only round-trip before trusting the server.
+            match send("status", "") {
+                Ok(_) => {
+                    info!("Reusing existing fuse-server at {}", socket.display());
+                    server_healthy = true;
+                }
+                Err(e) => {
+                    warn!(
                     "fuse-server at {} accepted a connection but failed the health check ({e}) \
                      — it is stale or wedged; respawning a fresh server",
                     socket.display()
                 );
+                }
             }
-        }
         }
 
         if !server_healthy {
@@ -317,10 +319,9 @@ where
             // server).
             if io.file_exists(socket) {
                 info!("Removing stale socket at {}", socket.display());
-                io.remove_path(socket).map_err(|e| format!(
-                    "Cannot remove stale socket {}: {e}.",
-                    socket.display(),
-                ))?;
+                io.remove_path(socket).map_err(|e| {
+                    format!("Cannot remove stale socket {}: {e}.", socket.display(),)
+                })?;
             }
 
             // Ensure the mount point is fresh and owned by the current user.
@@ -341,14 +342,16 @@ where
                 io.sleep_ms(200);
                 let _ = io.remove_path(&config.mount_point);
 
-                io.create_dir_all(&config.mount_point).map_err(|e| format!(
-                    "create mount point {}: {e}.\n\
+                io.create_dir_all(&config.mount_point).map_err(|e| {
+                    format!(
+                        "create mount point {}: {e}.\n\
                      If the problem persists, run manually:\n  \
                      fusermount -uz {} && rm -rf {}",
-                    config.mount_point.display(),
-                    config.mount_point.display(),
-                    config.mount_point.display(),
-                ))?;
+                        config.mount_point.display(),
+                        config.mount_point.display(),
+                        config.mount_point.display(),
+                    )
+                })?;
 
                 // Make the mount point 'shared' so that mount changes (FUSE
                 // unmount/remount on server restart) propagate to container
@@ -370,17 +373,16 @@ where
                 }
             }
 
-            let mount = config
-                .mount_point
-                .to_str()
-                .ok_or_else(|| format!("mount point is not valid UTF-8: {}", config.mount_point.display()))?;
+            let mount = config.mount_point.to_str().ok_or_else(|| {
+                format!(
+                    "mount point is not valid UTF-8: {}",
+                    config.mount_point.display()
+                )
+            })?;
             let sock = socket
                 .to_str()
                 .ok_or_else(|| format!("socket path is not valid UTF-8: {}", socket.display()))?;
-            let mut fuse_args: Vec<&str> = vec![
-                "--mount-point", mount,
-                "--socket", sock,
-            ];
+            let mut fuse_args: Vec<&str> = vec!["--mount-point", mount, "--socket", sock];
             let oracle_arg: Option<String> = config
                 .oracle_socket
                 .as_ref()
@@ -394,13 +396,16 @@ where
             fuse_args.push(&log_level_str);
             let args = fuse_args;
 
-            let server_bin = config
-                .fuse_server_path
-                .to_str()
-                .ok_or_else(|| format!("fuse-server path is not valid UTF-8: {}", config.fuse_server_path.display()))?;
+            let server_bin = config.fuse_server_path.to_str().ok_or_else(|| {
+                format!(
+                    "fuse-server path is not valid UTF-8: {}",
+                    config.fuse_server_path.display()
+                )
+            })?;
 
             let log_path = config.agent_path.join("fuse-server.log");
-            let log_str = log_path.to_str()
+            let log_str = log_path
+                .to_str()
                 .ok_or_else(|| format!("log path is not valid UTF-8: {}", log_path.display()))?;
 
             // Build the full argv.  The fuse-server must run in the same
@@ -419,7 +424,11 @@ where
             let spawn_args: Vec<&str> = cmd_parts[1..].iter().map(|s| s.as_str()).collect();
 
             let pid = io
-                .spawn_independent(&spawn_prog, &spawn_args, Some(std::path::Path::new(log_str)))
+                .spawn_independent(
+                    &spawn_prog,
+                    &spawn_args,
+                    Some(std::path::Path::new(log_str)),
+                )
                 .map_err(|e| format!("spawn fuse-server: {e}"))?;
             spawned_server_pid = pid;
             info!(
@@ -490,8 +499,12 @@ where
 
         for mapping in &config.secrets {
             load_secret_recursive(
-                io, send, &mapping.host, &mapping.container,
-                config, &mut loaded,
+                io,
+                send,
+                &mapping.host,
+                &mapping.container,
+                config,
+                &mut loaded,
             )?;
         }
 
@@ -617,7 +630,7 @@ where
                 }
             }
         }
-         None => {
+        None => {
             // ── 6.4 Fail fast on a missing image (issue #1) ─────────
             // A missing image must never reach headless `podman run`.
             ensure_image_available(io, wrapper, container_bin, config)?;
@@ -632,7 +645,9 @@ where
                 Ok(o) => {
                     return Err(format!(
                         "Failed to create container: exit {}\nstdout: {}\nstderr: {}",
-                        o.status.unwrap_or(-1), o.stdout, o.stderr
+                        o.status.unwrap_or(-1),
+                        o.stdout,
+                        o.stderr
                     ));
                 }
                 Err(e) => {
@@ -744,7 +759,11 @@ fn secret_name(host: &Path) -> String {
                         }
                     })
                     .collect();
-                comps.push(if safe.is_empty() { "_".to_string() } else { safe });
+                comps.push(if safe.is_empty() {
+                    "_".to_string()
+                } else {
+                    safe
+                });
             }
         }
     }
@@ -775,10 +794,7 @@ where
             let name = entry
                 .file_name()
                 .ok_or_else(|| format!("invalid path: {}", entry.display()))?;
-            load_secret_recursive(
-                io, send, &entry, &container.join(name),
-                config, loaded,
-            )?;
+            load_secret_recursive(io, send, &entry, &container.join(name), config, loaded)?;
         }
         return Ok(());
     }
@@ -793,14 +809,13 @@ where
     // Normalization is realpath — OS-resolved, symlinks included —
     // so the SAME file always lands on the same name regardless of
     // how the mapping spelled its path.
-    let canonical = io.canonicalize(host).map_err(|e| {
-        format!("cannot resolve secret path {}: {e}", host.display())
-    })?;
+    let canonical = io
+        .canonicalize(host)
+        .map_err(|e| format!("cannot resolve secret path {}: {e}", host.display()))?;
     let fuse_name = secret_name(&canonical);
 
     let args = format!("{} {} {}", fuse_name, host.display(), config.binary_hash);
-    let reply = send("add", &args)
-        .map_err(|e| format!("failed to add secret {fuse_name}: {e}"))?;
+    let reply = send("add", &args).map_err(|e| format!("failed to add secret {fuse_name}: {e}"))?;
 
     // The server answers Added { inner } with the anonymized
     // container-view name (issue #47) — that is what the mount serves
@@ -816,7 +831,9 @@ where
             fuse_name.clone()
         }
         Ok(other) => {
-            return Err(format!("add secret {fuse_name}: unexpected reply {other:?}"));
+            return Err(format!(
+                "add secret {fuse_name}: unexpected reply {other:?}"
+            ));
         }
         Err(e) => {
             warn!("add reply unparsable ({e}) — using the outer form: {reply:?}");
@@ -1014,12 +1031,18 @@ fn ensure_image_available<S: SystemIo>(
     }
 }
 
-fn check_container_running<S: SystemIo>(    io: &S,
+fn check_container_running<S: SystemIo>(
+    io: &S,
     wrapper: Option<&str>,
     runtime: &str,
     name: &str,
 ) -> Option<bool> {
-    match run_with_wrapper(io, wrapper, runtime, &["inspect", "-f", "{{.State.Running}}", name]) {
+    match run_with_wrapper(
+        io,
+        wrapper,
+        runtime,
+        &["inspect", "-f", "{{.State.Running}}", name],
+    ) {
         Ok(o) if o.success() => Some(o.stdout.trim() == "true"),
         _ => None,
     }
@@ -1053,7 +1076,12 @@ fn gentle_stop<S: SystemIo>(
         &["exec", container_name, "sh", "-c", sweep],
     );
     io.sleep_ms(1500);
-    let _ = run_with_wrapper(io, wrapper, container_bin, &["stop", "-t", "2", container_name]);
+    let _ = run_with_wrapper(
+        io,
+        wrapper,
+        container_bin,
+        &["stop", "-t", "2", container_name],
+    );
 }
 
 /// Verify every secret is reachable INSIDE the container at `/fuse/<name>`.
@@ -1086,7 +1114,16 @@ fn verify_container_fuse<S: SystemIo>(
                     io,
                     wrapper,
                     container_bin,
-                    &["exec", container_name, "timeout", &secs, "stat", "-c", "%s", &path],
+                    &[
+                        "exec",
+                        container_name,
+                        "timeout",
+                        &secs,
+                        "stat",
+                        "-c",
+                        "%s",
+                        &path,
+                    ],
                 )
                 .map(|o| !o.success())
                 .unwrap_or(true)
@@ -1161,6 +1198,8 @@ fn write_state_file<S: SystemIo>(
     server_pid: u32,
 ) {
     let state = fuse_protocol::ServerStateFile {
+        handoff_socket: None,
+        supervised_pid: None,
         version: fuse_protocol::VERSION.to_string(),
         server_pid,
         server_binary: config.fuse_server_path.to_string_lossy().to_string(),
@@ -1266,10 +1305,7 @@ mod tests {
     #[test]
     fn resolve_dest_trailing_slash_directory() {
         // cp foo/x.txt bar/ → bar/x.txt
-        let d = resolve_dest(
-            Path::new("/host/key.json"),
-            Path::new("/root/.config/app/"),
-        );
+        let d = resolve_dest(Path::new("/host/key.json"), Path::new("/root/.config/app/"));
         assert_eq!(d, PathBuf::from("/root/.config/app/key.json"));
     }
 
@@ -1354,14 +1390,18 @@ mod tests {
         // and oddly-spelled mappings of the same file converge on one
         // name (issue #34: "normalized host paths").
         let mut mock = base_mock().with_file("/home/user/secrets.yaml", b"DATA");
-        mock.files.insert("/link/to/secrets.yaml".into(), b"DATA".to_vec());
+        mock.files
+            .insert("/link/to/secrets.yaml".into(), b"DATA".to_vec());
         let cfg = test_config();
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let sink = std::sync::Arc::clone(&seen);
         let f = move |name: &str, args: &str| -> Result<String, String> {
             if name == "add" {
                 sink.lock().unwrap().push(
-                    args.split_whitespace().next().unwrap_or_default().to_string(),
+                    args.split_whitespace()
+                        .next()
+                        .unwrap_or_default()
+                        .to_string(),
                 );
             }
             Ok(String::new())
@@ -1403,23 +1443,28 @@ mod tests {
         let cfg = test_config();
         let loaded_cell = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let sink = std::sync::Arc::clone(&loaded_cell);
-        let result = run_agent(&mut mock, &cfg, &|name, args| {
-            if name == "add" {
-                let outer = args.split_whitespace().next().unwrap_or_default();
-                let reply = format!(
-                    "{{\"type\":\"added\",\"inner\":\"i-{outer}\"}}"
-                );
-                sink.lock().unwrap().push(reply.clone());
-                return Ok(reply);
-            }
-            Ok(String::new())
-        }, false);
+        let result = run_agent(
+            &mut mock,
+            &cfg,
+            &|name, args| {
+                if name == "add" {
+                    let outer = args.split_whitespace().next().unwrap_or_default();
+                    let reply = format!("{{\"type\":\"added\",\"inner\":\"i-{outer}\"}}");
+                    sink.lock().unwrap().push(reply.clone());
+                    return Ok(reply);
+                }
+                Ok(String::new())
+            },
+            false,
+        );
         assert!(result.is_ok(), "got: {:?}", result.err());
         let replies = loaded_cell.lock().unwrap();
         assert!(!replies.is_empty());
         // the setup script symlinked the INNER form
         let calls = mock.command_calls.borrow();
-        let setup = calls.iter().find(|(_, a)| a.iter().any(|x| x.starts_with("mkdir -p")));
+        let setup = calls
+            .iter()
+            .find(|(_, a)| a.iter().any(|x| x.starts_with("mkdir -p")));
         if let Some((_, a)) = setup {
             assert!(
                 a.iter().any(|x| x.contains("/fuse/i-secrets.yaml")),
@@ -1442,10 +1487,7 @@ mod tests {
         let cfg = test_config();
         let result = run_agent(&mut mock, &cfg, &|_, _| Ok(String::new()), false);
         let err = result.expect_err("missing image must fail run_agent");
-        assert!(
-            err.contains("agentbox"),
-            "error must name the image: {err}"
-        );
+        assert!(err.contains("agentbox"), "error must name the image: {err}");
         assert!(
             err.contains("podman build"),
             "error must contain the build command: {err}"
@@ -1502,8 +1544,10 @@ mod tests {
         );
         let calls = mock.command_calls.borrow();
         assert!(
-            !calls.iter().any(|(bin, args)| bin == "podman"
-                && args.first().map(String::as_str) == Some("build")),
+            !calls
+                .iter()
+                .any(|(bin, args)| bin == "podman"
+                    && args.first().map(String::as_str) == Some("build")),
             "podman build must NOT use the captured path: {calls:?}"
         );
     }
@@ -1518,7 +1562,11 @@ mod tests {
         assert!(result.is_ok(), "got: {:?}", result.err());
         let created = mock.created_dirs.borrow();
         let fuse = cfg.host_fuse().to_string_lossy().to_string();
-        for dir in ["/work/agent1/config", "/work/agent1/workspace", fuse.as_str()] {
+        for dir in [
+            "/work/agent1/config",
+            "/work/agent1/workspace",
+            fuse.as_str(),
+        ] {
             assert!(
                 created.iter().any(|c| c == dir),
                 "folder {dir} must be generated (created: {created:?})"
@@ -1528,8 +1576,7 @@ mod tests {
 
     #[test]
     fn spawns_server_when_none_exists() {
-        let mut mock = base_mock()
-            .with_file("/home/user/secrets.yaml", b"DATA");
+        let mut mock = base_mock().with_file("/home/user/secrets.yaml", b"DATA");
 
         let cfg = test_config();
         let result = run_agent(&mut mock, &cfg, &|_, _| Ok(String::new()), false);
@@ -1542,8 +1589,7 @@ mod tests {
 
     #[test]
     fn reuses_existing_server() {
-        let mut mock = base_mock()
-            .with_file("/home/user/secrets.yaml", b"DATA");
+        let mut mock = base_mock().with_file("/home/user/secrets.yaml", b"DATA");
         mock.unix_connected = true;
 
         let cfg = test_config();
@@ -1562,16 +1608,22 @@ mod tests {
         cfg.binary_hash = fuse_protocol::PENDING_ONLY_HASH.into();
         let sent: std::cell::RefCell<Vec<String>> = Default::default();
         let captured = &sent;
-        let _ = run_agent(&mut mock, &cfg, &|name, args| {
-            if name == "add" {
-                captured.borrow_mut().push(args.to_string());
-            }
-            Ok(String::new())
-        }, false)
+        let _ = run_agent(
+            &mut mock,
+            &cfg,
+            &|name, args| {
+                if name == "add" {
+                    captured.borrow_mut().push(args.to_string());
+                }
+                Ok(String::new())
+            },
+            false,
+        )
         .unwrap();
         let adds = sent.borrow();
         assert!(
-            adds.iter().any(|a| a.contains(fuse_protocol::PENDING_ONLY_HASH)),
+            adds.iter()
+                .any(|a| a.contains(fuse_protocol::PENDING_ONLY_HASH)),
             "sentinel must be sent to the server: {adds:?}"
         );
     }
@@ -1597,8 +1649,7 @@ mod tests {
             container: PathBuf::from("/root/.config/goose/auth.json"),
         }];
 
-        let mut mock = base_mock()
-            .with_file("/home/user/key.json", b"KEY");
+        let mut mock = base_mock().with_file("/home/user/key.json", b"KEY");
 
         let result = run_agent(&mut mock, &cfg, &|_, _| Ok(String::new()), false);
         assert!(result.is_ok(), "got: {:?}", result.err());
@@ -1614,8 +1665,7 @@ mod tests {
             container: PathBuf::from("/root/.config/goose/"),
         }];
 
-        let mut mock = base_mock()
-            .with_file("/home/user/key.json", b"KEY");
+        let mut mock = base_mock().with_file("/home/user/key.json", b"KEY");
 
         let result = run_agent(&mut mock, &cfg, &|_, _| Ok(String::new()), false);
         assert!(result.is_ok(), "got: {:?}", result.err());
@@ -1782,7 +1832,10 @@ mod tests {
         let cfg = test_config();
         let result = run_agent(&mut mock, &cfg, &|_, _| Ok(String::new()), false);
         let err = result.expect_err("an unclearable dead mount must abort the run");
-        assert!(err.contains("fusermount -uz"), "must spell out the manual fix: {err}");
+        assert!(
+            err.contains("fusermount -uz"),
+            "must spell out the manual fix: {err}"
+        );
         assert!(
             mock.spawned.is_empty(),
             "no fuse-server may be spawned before the mount point is usable"
@@ -1832,7 +1885,10 @@ mod tests {
         cfg.oracle_socket = None;
         write_state_file(&cfg, &loaded, &mut mock, 4242);
         let text = String::from_utf8(
-            mock.files.get(fuse_protocol::state_file().to_str().unwrap()).unwrap().clone(),
+            mock.files
+                .get(fuse_protocol::state_file().to_str().unwrap())
+                .unwrap()
+                .clone(),
         )
         .unwrap();
         let f: fuse_protocol::ServerStateFile = serde_json::from_str(&text).unwrap();
@@ -1880,23 +1936,31 @@ mod tests {
             .with_command_result_when_n("timeout", "/tmp/fgk-mnt/", Some(1), 5);
 
         let cfg = test_config();
-        let result = run_agent(&mut mock, &cfg, &|name, _| {
-            if name == "add" {
-                adds.set(adds.get() + 1);
-            }
-            Ok(String::new())
-        }, false);
+        let result = run_agent(
+            &mut mock,
+            &cfg,
+            &|name, _| {
+                if name == "add" {
+                    adds.set(adds.get() + 1);
+                }
+                Ok(String::new())
+            },
+            false,
+        );
         assert!(result.is_ok(), "got: {:?}", result.err());
         assert_eq!(adds.get(), 2, "secrets must be re-added after the rebuild");
         assert_eq!(mock.spawned.len(), 2, "the server must be respawned once");
         let calls = mock.command_calls.borrow();
         assert!(
-            calls.iter().any(|(p, a)| p == "pkill"
-                && a.contains(&"--socket /tmp/fgk.sock".to_string())),
+            calls
+                .iter()
+                .any(|(p, a)| p == "pkill" && a.contains(&"--socket /tmp/fgk.sock".to_string())),
             "recycle must kill the old server BY ITS SOCKET: {calls:?}"
         );
         assert!(
-            !calls.iter().any(|(p, a)| p == "pkill" && a.contains(&"fused".to_string())),
+            !calls
+                .iter()
+                .any(|(p, a)| p == "pkill" && a.contains(&"fused".to_string())),
             "the data daemon must NEVER be killed by run-agent (the mount \
              surviving policy restarts is the split-design invariant): {calls:?}"
         );
@@ -1921,7 +1985,9 @@ mod tests {
         assert!(result.is_ok(), "got: {:?}", result.err());
         let calls = mock.command_calls.borrow();
         assert!(
-            !calls.iter().any(|(p, a)| p == "pkill" && a.contains(&"fused".to_string())),
+            !calls
+                .iter()
+                .any(|(p, a)| p == "pkill" && a.contains(&"fused".to_string())),
             "run-agent must NEVER pkill the data daemon (the mount surviving \
              policy restarts is the split-design invariant): {calls:?}"
         );
@@ -1975,40 +2041,52 @@ mod tests {
         // the current binaries.
         let payloads = std::cell::RefCell::new(vec![
             "{\"type\":\"version\",\"version\":\"0.26.0\"}".to_string(),
-            format!("{{\"type\":\"version\",\"version\":\"{}\"}}", fuse_protocol::VERSION),
+            format!(
+                "{{\"type\":\"version\",\"version\":\"{}\"}}",
+                fuse_protocol::VERSION
+            ),
         ]);
         let mut mock = base_mock().with_file("/home/user/secrets.yaml", b"DATA");
         mock.unix_connected = true;
 
         let cfg = test_config();
-        let result = run_agent(&mut mock, &cfg, &|name, _| {
-            if name == "version" {
-                let mut p = payloads.borrow_mut();
-                if p.is_empty() {
-                    return Ok(format!(
-                        "{{\"type\":\"version\",\"version\":\"{}\"}}",
-                        fuse_protocol::VERSION
-                    ));
+        let result = run_agent(
+            &mut mock,
+            &cfg,
+            &|name, _| {
+                if name == "version" {
+                    let mut p = payloads.borrow_mut();
+                    if p.is_empty() {
+                        return Ok(format!(
+                            "{{\"type\":\"version\",\"version\":\"{}\"}}",
+                            fuse_protocol::VERSION
+                        ));
+                    }
+                    return Ok(p.remove(0));
                 }
-                return Ok(p.remove(0));
-            }
-            Ok(String::new())
-        }, false);
+                Ok(String::new())
+            },
+            false,
+        );
         assert!(result.is_ok(), "got: {:?}", result.err());
-        assert_eq!(mock.spawned.len(), 1, "the stale server must be respawned once");
+        assert_eq!(
+            mock.spawned.len(),
+            1,
+            "the stale server must be respawned once"
+        );
         let calls = mock.command_calls.borrow();
         // #62: the teardown is socket-scoped, never a name sweep —
         // assert the precise pattern.
         assert!(
-            calls
-                .iter()
-                .any(|(p, a)| p == "pkill"
-                    && a.contains(&"-f".to_string())
-                    && a.contains(&"--socket /tmp/fgk.sock".to_string())),
+            calls.iter().any(|(p, a)| p == "pkill"
+                && a.contains(&"-f".to_string())
+                && a.contains(&"--socket /tmp/fgk.sock".to_string())),
             "the incompatible server must be torn down BY ITS SOCKET: {calls:?}"
         );
         assert!(
-            !calls.iter().any(|(p, a)| p == "pkill" && a.contains(&"fuse-server".to_string())),
+            !calls
+                .iter()
+                .any(|(p, a)| p == "pkill" && a.contains(&"fuse-server".to_string())),
             "no bare fuse-server sweep may remain: {calls:?}"
         );
     }
@@ -2021,15 +2099,23 @@ mod tests {
         mock.unix_connected = true;
 
         let cfg = test_config();
-        let result = run_agent(&mut mock, &cfg, &|name, _| {
-            if name == "version" {
-                return Ok("{\"type\":\"version\",\"version\":\"0.26.0\"}".to_string());
-            }
-            Ok(String::new())
-        }, false);
+        let result = run_agent(
+            &mut mock,
+            &cfg,
+            &|name, _| {
+                if name == "version" {
+                    return Ok("{\"type\":\"version\",\"version\":\"0.26.0\"}".to_string());
+                }
+                Ok(String::new())
+            },
+            false,
+        );
         let err = result.expect_err("persistently incompatible server must abort");
         assert!(err.contains("mixed-vintage"), "got: {err}");
-        assert!(err.contains("cargo build --workspace"), "must name the repair: {err}");
+        assert!(
+            err.contains("cargo build --workspace"),
+            "must name the repair: {err}"
+        );
         assert!(
             mock.interactive_calls.borrow().is_empty(),
             "no container interaction may happen"
@@ -2044,15 +2130,23 @@ mod tests {
             .with_command_result_when("timeout", "/tmp/fgk-mnt/", Some(1));
 
         let cfg = test_config();
-        let result = run_agent(&mut mock, &cfg, &|name, _| {
-            if name == "add" {
-                adds.set(adds.get() + 1);
-            }
-            Ok(String::new())
-        }, false);
+        let result = run_agent(
+            &mut mock,
+            &cfg,
+            &|name, _| {
+                if name == "add" {
+                    adds.set(adds.get() + 1);
+                }
+                Ok(String::new())
+            },
+            false,
+        );
         let err = result.expect_err("a persistently out-of-sync stack must abort");
         assert!(err.contains("pre-flight"), "got: {err}");
-        assert!(err.contains("fuse-client restart"), "must point at manual repair: {err}");
+        assert!(
+            err.contains("fuse-client restart"),
+            "must point at manual repair: {err}"
+        );
         assert_eq!(adds.get(), 2, "exactly one rebuild, then abort");
         assert_eq!(mock.spawned.len(), 2);
         assert!(
@@ -2079,7 +2173,10 @@ mod tests {
             .flat_map(|(_, a)| a.iter().map(|s| s.to_string()))
             .collect();
         let i = args.iter().position(|a| a == "--oracle-socket");
-        assert!(i.is_some(), "spawn passes --oracle-socket when set: {args:?}");
+        assert!(
+            i.is_some(),
+            "spawn passes --oracle-socket when set: {args:?}"
+        );
         assert_eq!(args[i.unwrap() + 1], "/tmp/.tmpXYZ/oracle.sock");
         // and absent when unset
         let mut mock2 = base_mock().with_file("/home/user/secrets.yaml", b"DATA");
@@ -2095,14 +2192,11 @@ mod tests {
         );
     }
 
-
-                
     #[test]
     fn no_preauth_when_not_sudo() {
         let cfg = test_config();
 
-        let mut mock = base_mock()
-            .with_file("/home/user/secrets.yaml", b"DATA");
+        let mut mock = base_mock().with_file("/home/user/secrets.yaml", b"DATA");
 
         let result = run_agent(&mut mock, &cfg, &|_, _| Ok(String::new()), false);
         assert!(result.is_ok());
@@ -2285,7 +2379,8 @@ mod tests {
             "must mention --restart-container as the last resort: {err}"
         );
         assert!(
-            !mock.command_calls
+            !mock
+                .command_calls
                 .borrow()
                 .iter()
                 .any(|(_, a)| a.iter().any(|x| x == "rm")),
@@ -2307,11 +2402,13 @@ mod tests {
             .find(|(_, a)| a.first().map(|s| s.as_str()) == Some("exec"))
             .expect("an exec probe must happen before the session");
         assert!(
-            probe.1.contains(&"timeout".to_string())
-                && probe.1.contains(&"stat".to_string()),
+            probe.1.contains(&"timeout".to_string()) && probe.1.contains(&"stat".to_string()),
             "probe must be `timeout stat`: {probe:?}"
         );
-        let expected = format!("/fuse/{}", secret_name(Path::new("/home/user/secrets.yaml")));
+        let expected = format!(
+            "/fuse/{}",
+            secret_name(Path::new("/home/user/secrets.yaml"))
+        );
         assert!(
             probe.1.contains(&expected),
             "probe must stat the fuse-side secret path ({expected}): {probe:?}"
@@ -2420,8 +2517,7 @@ mod tests {
 
     #[test]
     fn fresh_start_no_cleanup_needed() {
-        let mut mock = base_mock()
-            .with_file("/home/user/secrets.yaml", b"DATA");
+        let mut mock = base_mock().with_file("/home/user/secrets.yaml", b"DATA");
 
         let cfg = test_config();
         let result = run_agent(&mut mock, &cfg, &|_, _| Ok(String::new()), false);

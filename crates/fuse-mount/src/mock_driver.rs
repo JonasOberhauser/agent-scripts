@@ -31,7 +31,11 @@ pub struct Creds {
 
 impl Default for Creds {
     fn default() -> Self {
-        Self { uid: 0, gid: 0, pid: std::process::id() }
+        Self {
+            uid: 0,
+            gid: 0,
+            pid: std::process::id(),
+        }
     }
 }
 
@@ -76,7 +80,10 @@ impl MockDriver {
             // SAFETY: close(2) on our own fd; the result only reports
             // double-close, which the ownership rules exclude.
             let _closed = unsafe { libc::close(fd) };
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "path too long"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "path too long",
+            ));
         }
         let dst = addr.sun_path.as_mut_ptr() as *mut u8;
         let src = bytes.as_ptr();
@@ -99,7 +106,11 @@ impl MockDriver {
         // SAFETY: fd is a fresh connected descriptor owned from here;
         // UnixStream closes it on drop.
         let sock = unsafe { UnixStream::from_raw_fd(fd) };
-        Ok(Self { sock, unique: 0, creds: Creds::default() })
+        Ok(Self {
+            sock,
+            unique: 0,
+            creds: Creds::default(),
+        })
     }
 
     fn next_unique(&mut self) -> u64 {
@@ -136,8 +147,7 @@ impl MockDriver {
             .map_err(|e| Errno(e.raw_os_error().unwrap_or(libc::EIO)))?;
         buf.truncate(n);
         let hdr = std::mem::size_of::<abi::OutHeader>();
-        let out = pod_decode::<abi::OutHeader>(&buf[..hdr])
-            .ok_or(Errno(libc::EIO))?;
+        let out = pod_decode::<abi::OutHeader>(&buf[..hdr]).ok_or(Errno(libc::EIO))?;
         if out.unique != unique {
             return Err(Errno(libc::EIO)); // stream desync
         }
@@ -166,7 +176,12 @@ impl MockDriver {
             return Err(Errno(libc::EIO));
         }
         let g = |off: usize| u32::from_le_bytes(reply[off..off + 4].try_into().unwrap_or([0; 4]));
-        Ok(abi::InitOut { major: g(0), minor: g(4), flags: g(8), ..Default::default() })
+        Ok(abi::InitOut {
+            major: g(0),
+            minor: g(4),
+            flags: g(8),
+            ..Default::default()
+        })
     }
 
     pub fn lookup(&mut self, name: &str) -> Result<abi::EntryOut, Errno> {
@@ -183,7 +198,11 @@ impl MockDriver {
         let reply = self.roundtrip(
             abi::Opcode::Getattr,
             ino,
-            &pod_bytes(&abi::GetattrIn { flags: 0, dummy: 0, fh: 0 }),
+            &pod_bytes(&abi::GetattrIn {
+                flags: 0,
+                dummy: 0,
+                fh: 0,
+            }),
         )?;
         pod_decode::<abi::AttrOut>(&reply).ok_or(Errno(libc::EIO))
     }
@@ -192,7 +211,10 @@ impl MockDriver {
         let reply = self.roundtrip(
             abi::Opcode::Open,
             ino,
-            &pod_bytes(&abi::OpenIn { flags: libc::O_RDONLY as u32, fuse_flags: 0 }),
+            &pod_bytes(&abi::OpenIn {
+                flags: libc::O_RDONLY as u32,
+                fuse_flags: 0,
+            }),
         )?;
         pod_decode::<abi::OpenOut>(&reply).ok_or(Errno(libc::EIO))
     }
@@ -201,7 +223,10 @@ impl MockDriver {
         let reply = self.roundtrip(
             abi::Opcode::Opendir,
             ino,
-            &pod_bytes(&abi::OpenIn { flags: libc::O_RDONLY as u32, fuse_flags: 0 }),
+            &pod_bytes(&abi::OpenIn {
+                flags: libc::O_RDONLY as u32,
+                fuse_flags: 0,
+            }),
         )?;
         pod_decode::<abi::OpenOut>(&reply).ok_or(Errno(libc::EIO))
     }
@@ -248,8 +273,7 @@ impl MockDriver {
             if off + hdr + namelen > data.len() {
                 break;
             }
-            let name =
-                String::from_utf8_lossy(&data[off + hdr..off + hdr + namelen]).into_owned();
+            let name = String::from_utf8_lossy(&data[off + hdr..off + hdr + namelen]).into_owned();
             out.push((d, name));
             off += (hdr + namelen).div_ceil(8) * 8;
         }
@@ -260,7 +284,12 @@ impl MockDriver {
         self.roundtrip(
             abi::Opcode::Release,
             ino,
-            &pod_bytes(&abi::ReleaseIn { fh, flags: 0, release_flags: 0, lock_owner: 0 }),
+            &pod_bytes(&abi::ReleaseIn {
+                fh,
+                flags: 0,
+                release_flags: 0,
+                lock_owner: 0,
+            }),
         )
         .map(|_| ())
     }
@@ -269,7 +298,12 @@ impl MockDriver {
         self.roundtrip(
             abi::Opcode::Releasedir,
             ino,
-            &pod_bytes(&abi::ReleaseIn { fh, flags: 0, release_flags: 0, lock_owner: 0 }),
+            &pod_bytes(&abi::ReleaseIn {
+                fh,
+                flags: 0,
+                release_flags: 0,
+                lock_owner: 0,
+            }),
         )
         .map(|_| ())
     }
@@ -278,7 +312,12 @@ impl MockDriver {
         self.roundtrip(
             abi::Opcode::Flush,
             fuser::FUSE_ROOT_ID,
-            &pod_bytes(&abi::FlushIn { fh, unused: 0, padding: 0, lock_owner: 0 }),
+            &pod_bytes(&abi::FlushIn {
+                fh,
+                unused: 0,
+                padding: 0,
+                lock_owner: 0,
+            }),
         )
         .map(|_| ())
     }
@@ -292,8 +331,8 @@ impl MockDriver {
     pub fn forget(&mut self, nodeid: u64, count: u64) -> std::io::Result<()> {
         let unique = self.next_unique();
         let header = abi::InHeader {
-            len: (std::mem::size_of::<abi::InHeader>()
-                + std::mem::size_of::<abi::ForgetOne>()) as u32,
+            len: (std::mem::size_of::<abi::InHeader>() + std::mem::size_of::<abi::ForgetOne>())
+                as u32,
             opcode: abi::Opcode::Forget as u32,
             unique,
             nodeid,
@@ -303,7 +342,10 @@ impl MockDriver {
             padding: 0,
         };
         let mut frame = pod_bytes(&header);
-        frame.extend_from_slice(&pod_bytes(&abi::ForgetOne { nodeid, nlookup: count }));
+        frame.extend_from_slice(&pod_bytes(&abi::ForgetOne {
+            nodeid,
+            nlookup: count,
+        }));
         self.sock.write_all(&frame)
     }
 }

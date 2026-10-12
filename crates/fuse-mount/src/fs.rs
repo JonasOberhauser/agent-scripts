@@ -27,8 +27,8 @@ use std::time::Duration;
 
 use fuse_protocol::oracle::{OracleCommand, OracleReply, OracleRequest};
 use fuser::{
-    FileAttr, FileType, Filesystem, KernelConfig, Request, ReplyAttr, ReplyData, ReplyDirectory,
-    ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs,
+    FileAttr, FileType, Filesystem, KernelConfig, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty,
+    ReplyEntry, ReplyOpen, ReplyStatfs, Request,
 };
 use tracing::warn;
 
@@ -134,7 +134,10 @@ fn mint_fino(
     );
     let _prev = s.identities.insert(
         fino,
-        FinoRecord { identity, path: path.to_path_buf() },
+        FinoRecord {
+            identity,
+            path: path.to_path_buf(),
+        },
     );
     fino
 }
@@ -153,7 +156,9 @@ impl Store {
     /// this method creates them), and the store lock cannot be
     /// poisoned without a daemon bug (see the expect message).
     pub fn serve(&self, name: &str, inner: &str, mode: u32) {
-        let mut s = self.0.lock()
+        let mut s = self
+            .0
+            .lock()
             .expect("store lock: never held across a panic — poisoning means a data-daemon bug");
         let path = PathBuf::from(name);
         let comps: Vec<String> = path
@@ -176,7 +181,10 @@ impl Store {
                     let _new = children.insert(comp.clone(), ());
                 }
                 Some(Node::File { .. }) => {
-                    warn!("cannot serve \"{name}\": \"{}\" is already a file", prefix.display());
+                    warn!(
+                        "cannot serve \"{name}\": \"{}\" is already a file",
+                        prefix.display()
+                    );
                     return;
                 }
                 None => unreachable!("parent chain is directories by construction"),
@@ -185,7 +193,10 @@ impl Store {
             match s.tree.get(&prefix) {
                 Some(Node::Dir { .. }) => {}
                 Some(Node::File { .. }) => {
-                    warn!("cannot serve \"{name}\": \"{}\" is already a file", prefix.display());
+                    warn!(
+                        "cannot serve \"{name}\": \"{}\" is already a file",
+                        prefix.display()
+                    );
                     return;
                 }
                 None => {
@@ -260,7 +271,9 @@ impl Store {
     /// Remove a secret: prune the tree node and its fino entry, then
     /// childless structural ancestors vanish with it.
     pub fn remove(&self, name: &str) {
-        let mut s = self.0.lock()
+        let mut s = self
+            .0
+            .lock()
             .expect("store lock: never held across a panic — poisoning means a data-daemon bug");
         let mut path = PathBuf::from(name);
         if !matches!(s.tree.get(&path), Some(Node::File { .. })) {
@@ -303,7 +316,9 @@ impl Store {
             return None;
         }
         let label = label.to_string_lossy().into_owned();
-        let s = self.0.lock()
+        let s = self
+            .0
+            .lock()
             .expect("store lock: never held across a panic — poisoning means a data-daemon bug");
         let outer_full = s.root_labels.get_by_right(&label)?;
         let ino = match s.tree.get(Path::new(outer_full.as_str()))? {
@@ -315,8 +330,12 @@ impl Store {
 
     /// The fino table entry (identity + address) for by-ino requests.
     fn fino_record(&self, ino: FuseIno) -> Option<FinoRecord> {
-        self.0.lock()
-            .expect("store lock: never held across a panic — poisoning means a data-daemon bug").identities.get(&ino).cloned()
+        self.0
+            .lock()
+            .expect("store lock: never held across a panic — poisoning means a data-daemon bug")
+            .identities
+            .get(&ino)
+            .cloned()
     }
 
     /// Observe a fresh host identity for a path (from Stat at
@@ -328,7 +347,9 @@ impl Store {
         path: &Path,
         identity: fuse_protocol::oracle::HostIdentity,
     ) -> Option<FuseIno> {
-        let mut s = self.0.lock()
+        let mut s = self
+            .0
+            .lock()
             .expect("store lock: never held across a panic — poisoning means a data-daemon bug");
         let current = match s.tree.get(path)? {
             Node::File { fino, .. } => *fino,
@@ -347,8 +368,13 @@ impl Store {
 
     /// The Serve-time mode fallback for a file path.
     fn mode_of(&self, path: &Path) -> Option<u32> {
-        match self.0.lock()
-            .expect("store lock: never held across a panic — poisoning means a data-daemon bug").tree.get(path)? {
+        match self
+            .0
+            .lock()
+            .expect("store lock: never held across a panic — poisoning means a data-daemon bug")
+            .tree
+            .get(path)?
+        {
             Node::File { mode, .. } => Some(*mode),
             _ => None,
         }
@@ -358,7 +384,9 @@ impl Store {
     /// Dir children get their fino minted on demand — a freshly
     /// served tree must list completely without prior lookups.
     fn dir_children(&self, _dir: FuseIno) -> Option<Vec<(FuseIno, bool, String)>> {
-        let s = self.0.lock()
+        let s = self
+            .0
+            .lock()
             .expect("store lock: never held across a panic — poisoning means a data-daemon bug");
         let mut out = Vec::new();
         for (outer_full, inner) in s.root_labels.iter() {
@@ -370,13 +398,14 @@ impl Store {
         Some(out)
     }
 
-
     /// Parent directory ino for readdir's `..`.
     fn parent_of(&self, ino: FuseIno) -> Option<FuseIno> {
         if ino == FuseIno::ROOT {
             return Some(FuseIno::ROOT);
         }
-        let s = self.0.lock()
+        let s = self
+            .0
+            .lock()
             .expect("store lock: never held across a panic — poisoning means a data-daemon bug");
         let path = &s.identities.get(&ino)?.path;
         let mut parent = path.clone();
@@ -471,19 +500,29 @@ fn open_secret_timeout(
 
     let s = send_line(
         socket,
-        &serde_json::to_string(&OracleRequest::Open { name: name.into(), pid, kdev, kino })
-            .expect("serializing Open: internal enum, infallible"),
+        &serde_json::to_string(&OracleRequest::Open {
+            name: name.into(),
+            pid,
+            kdev,
+            kino,
+        })
+        .expect("serializing Open: internal enum, infallible"),
     )?;
-    s.set_read_timeout(Some(timeout)).map_err(|e| e.to_string())?;
+    s.set_read_timeout(Some(timeout))
+        .map_err(|e| e.to_string())?;
 
     let mut buf = vec![0u8; 4096];
     let mut cmsg_buf = nix::cmsg_space!(libc::cmsghdr, std::os::unix::io::RawFd);
     let mut iov = [std::io::IoSliceMut::new(&mut buf)];
     // SAFETY: recvmsg writes into the provided buffers only; the
     // kernel places received descriptors into duplicated fds.
-    let msg =
-        nix::sys::socket::recvmsg::<()>(s.as_raw_fd(), &mut iov, Some(&mut cmsg_buf), nix::sys::socket::MsgFlags::empty())
-            .map_err(|e| e.to_string())?;
+    let msg = nix::sys::socket::recvmsg::<()>(
+        s.as_raw_fd(),
+        &mut iov,
+        Some(&mut cmsg_buf),
+        nix::sys::socket::MsgFlags::empty(),
+    )
+    .map_err(|e| e.to_string())?;
     let mut fd = None;
     let cmsgs = msg.cmsgs().map_err(|e| e.to_string())?;
     for c in cmsgs {
@@ -510,7 +549,10 @@ pub struct FusedFs {
 
 impl FusedFs {
     pub fn new(store: Store, oracle_socket: &str) -> Self {
-        Self { store, oracle: oracle_socket.to_string() }
+        Self {
+            store,
+            oracle: oracle_socket.to_string(),
+        }
     }
 
     fn file_attr(&self, ino: u64, size: u64, uid: u32, gid: u32, mode: u32) -> FileAttr {
@@ -567,7 +609,13 @@ impl Filesystem for FusedFs {
 
     fn destroy(&mut self) {}
 
-    fn lookup(&mut self, req: &Request<'_>, parent: u64, name: &std::ffi::OsStr, reply: ReplyEntry) {
+    fn lookup(
+        &mut self,
+        req: &Request<'_>,
+        parent: u64,
+        name: &std::ffi::OsStr,
+        reply: ReplyEntry,
+    ) {
         let Some((fino, is_dir)) = self.store.child(FuseIno(parent), name) else {
             tracing::info!("lookup {:?}: no such tree child", name);
             reply.error(libc::ENOENT);
@@ -584,15 +632,22 @@ impl Filesystem for FusedFs {
         };
         let name = id.path.to_string_lossy().into_owned();
         match stat_secret(&self.oracle, &name) {
-            Ok(OracleReply::StatOk { kdev, kino, size, mode, regular: true }) => {
+            Ok(OracleReply::StatOk {
+                kdev,
+                kino,
+                size,
+                mode,
+                regular: true,
+            }) => {
                 // Keep the fino for the same incarnation; a changed
                 // host file mints a new number — fresh lookups (like
                 // this one) answer the NEW identity.
-                let observed =
-                    fuse_protocol::oracle::HostIdentity { kdev, kino };
+                let observed = fuse_protocol::oracle::HostIdentity { kdev, kino };
                 tracing::info!(
                     "lookup {:?}: stat ok {:?} size={size} mode={mode:o} (recorded {:?})",
-                    name, observed, id.identity
+                    name,
+                    observed,
+                    id.identity
                 );
                 if let Some(nf) = self.store.observe(&id.path, observed) {
                     let attr = self.file_attr(nf.0, size, req.uid(), req.gid(), mode);
@@ -647,9 +702,14 @@ impl Filesystem for FusedFs {
             // Path stat: live attrs + incarnation check.
             let name = id.path.to_string_lossy().into_owned();
             match stat_secret(&self.oracle, &name) {
-                Ok(OracleReply::StatOk { kdev, kino, size, mode, regular: true }) => {
-                    let observed =
-                        fuse_protocol::oracle::HostIdentity { kdev, kino };
+                Ok(OracleReply::StatOk {
+                    kdev,
+                    kino,
+                    size,
+                    mode,
+                    regular: true,
+                }) => {
+                    let observed = fuse_protocol::oracle::HostIdentity { kdev, kino };
                     if id.identity != Some(observed) {
                         // The file this ino was minted for is gone (or
                         // never known — a ghost): ESTALE re-resolves,
@@ -686,7 +746,8 @@ impl Filesystem for FusedFs {
         let name = id.path.to_string_lossy().into_owned();
         tracing::info!(
             "open {name}: ino={ino} pid={} recorded {:?}",
-            req.pid(), id.identity
+            req.pid(),
+            id.identity
         );
         let Some(identity) = id.identity else {
             // A ghost fino (served without identity, never stat'ed):
@@ -790,7 +851,15 @@ impl Filesystem for FusedFs {
         ]
         .into_iter()
         .chain(children.into_iter().map(|(i, d, n)| {
-            (i.0, if d { FileType::Directory } else { FileType::RegularFile }, n)
+            (
+                i.0,
+                if d {
+                    FileType::Directory
+                } else {
+                    FileType::RegularFile
+                },
+                n,
+            )
         }))
         .collect();
         for (idx, (e_ino, kind, name)) in all.into_iter().enumerate() {
@@ -809,7 +878,9 @@ impl Filesystem for FusedFs {
         // Content sizes are live at open (no snapshots); only the
         // served-file count is known statically.
         let files = self.store.file_count() as u64 + 1;
-        reply.statfs(1_000_000, 1_000_000, 1_000_000, files, 1_000_000, 512, 255, 512);
+        reply.statfs(
+            1_000_000, 1_000_000, 1_000_000, files, 1_000_000, 512, 255, 512,
+        );
     }
 
     fn setattr(
@@ -834,7 +905,14 @@ impl Filesystem for FusedFs {
         reply.error(libc::EPERM);
     }
 
-    fn fsync(&mut self, _req: &Request<'_>, _ino: u64, _fh: u64, _datasync: bool, reply: ReplyEmpty) {
+    fn fsync(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        _fh: u64,
+        _datasync: bool,
+        reply: ReplyEmpty,
+    ) {
         reply.error(libc::EPERM);
     }
 }
@@ -860,6 +938,24 @@ fn apply_control_line(store: &Store, line: &str) -> bool {
         Ok(OracleCommand::Remove { name }) => {
             store.remove(&name);
             true
+        }
+        // #93 F2 handoff: the REAL daemon cannot surrender its mount
+        // session yet — extracting the live fuser connection fd is
+        // the follow-up (design: PR #97 thread). Answering nothing
+        // makes the server's take-back time out into the honest
+        // no-custody fallback; a WRONG answer would be worse.
+        Ok(OracleCommand::Surrender) => {
+            warn!(
+                "surrender requested but this daemon build cannot hand off its \
+                 mount session — the restart will use a fresh mount"
+            );
+            true
+        }
+        // The successor is serving: exit cleanly (fd copies close
+        // last, exactly the retirement contract).
+        Ok(OracleCommand::Retire) => {
+            tracing::info!("retired by the policy daemon — exiting 0");
+            std::process::exit(0);
         }
         Err(e) => {
             warn!(
@@ -934,8 +1030,19 @@ mod tests {
     }
 
     const FUZZ_OUTERS: &[&str] = &[
-        "s", "a/b", "home/u/.config/app/auth.json", "x", "a", "deep/one/two/three/f",
-        "dup", "dup", "..", "a/..", "\u{1F512}", "", "very/long/nnnnnnnnnn",
+        "s",
+        "a/b",
+        "home/u/.config/app/auth.json",
+        "x",
+        "a",
+        "deep/one/two/three/f",
+        "dup",
+        "dup",
+        "..",
+        "a/..",
+        "\u{1F512}",
+        "",
+        "very/long/nnnnnnnnnn",
     ];
 
     /// One deterministic inner label per outer (like the salt would
@@ -950,8 +1057,8 @@ mod tests {
                     .collect::<Vec<_>>()
                     .join("/")
             }
-            7 => "COLLISION".into(),           // collides across outers
-            8 => "single".into(), // non-parallel for nested outers
+            7 => "COLLISION".into(), // collides across outers
+            8 => "single".into(),    // non-parallel for nested outers
             _ => outer.to_string(),
         }
     }
@@ -969,9 +1076,9 @@ mod tests {
             let path = Path::new(outer);
             match st.tree.get(path) {
                 Some(Node::File { .. }) => {}
-                Some(Node::Dir { .. }) => unreachable!(
-                    "seed {seed}: served outer \"{outer}\" became a directory"
-                ),
+                Some(Node::Dir { .. }) => {
+                    unreachable!("seed {seed}: served outer \"{outer}\" became a directory")
+                }
                 None => unreachable!(
                     "seed {seed}: bijection holds an outer \"{outer}\" that left the tree \
                      (label leak: remove did not clean the bimap)"
@@ -987,7 +1094,11 @@ mod tests {
         lefts.sort();
         let n = lefts.len();
         lefts.dedup();
-        assert_eq!(lefts.len(), n, "seed {seed}: duplicate outers in the bijection");
+        assert_eq!(
+            lefts.len(),
+            n,
+            "seed {seed}: duplicate outers in the bijection"
+        );
     }
 
     #[test]
@@ -1043,12 +1154,20 @@ mod tests {
         let s = Store::default();
         s.serve("deep/one/two/three/f", "abcd", 0o400);
         assert_eq!(
-            s.0.lock().unwrap().root_labels.get_by_left("deep/one/two/three/f").map(String::as_str),
+            s.0.lock()
+                .unwrap()
+                .root_labels
+                .get_by_left("deep/one/two/three/f")
+                .map(String::as_str),
             Some("abcd")
         );
         s.remove("deep/one/two/three/f");
         assert!(
-            s.0.lock().unwrap().root_labels.get_by_left("deep/one/two/three/f").is_none(),
+            s.0.lock()
+                .unwrap()
+                .root_labels
+                .get_by_left("deep/one/two/three/f")
+                .is_none(),
             "a removed secret's bijection entry leaked (stale in the map)"
         );
     }
@@ -1103,7 +1222,10 @@ mod tests {
         s.serve("a/x", "x1", 0o400);
         let x1 = s.child(FuseIno::ROOT, OsStr::new("x1")).unwrap().0;
         s.serve("a/x", "x2", 0o400);
-        assert!(s.child(FuseIno::ROOT, OsStr::new("x1")).is_none(), "old label gone");
+        assert!(
+            s.child(FuseIno::ROOT, OsStr::new("x1")).is_none(),
+            "old label gone"
+        );
         let x2 = s.child(FuseIno::ROOT, OsStr::new("x2")).unwrap().0;
         assert_eq!(x1, x2, "relabel is not an incarnation change");
     }
@@ -1124,10 +1246,15 @@ mod tests {
         s.serve("a/x", "x1", 0o400);
         let x1 = s.child(FuseIno::ROOT, OsStr::new("x1")).unwrap().0;
         // lookup observed a replaced file: new fino for the path
-        let x2 = s.observe(Path::new("a/x"), fuse_protocol::oracle::HostIdentity {
-            kdev: fuse_protocol::KDev(52),
-            kino: fuse_protocol::Kino(777),
-        }).unwrap();
+        let x2 = s
+            .observe(
+                Path::new("a/x"),
+                fuse_protocol::oracle::HostIdentity {
+                    kdev: fuse_protocol::KDev(52),
+                    kino: fuse_protocol::Kino(777),
+                },
+            )
+            .unwrap();
         assert_ne!(x1, x2);
         let x3 = s.child(FuseIno::ROOT, OsStr::new("x1")).unwrap().0;
         assert_eq!(x2, x3, "the tree now answers the new identity");
@@ -1139,7 +1266,10 @@ mod tests {
         s.serve("a/b/c.txt", "c1", 0o400);
         assert_eq!(s.dir_children(FuseIno::ROOT).unwrap().len(), 1);
         s.remove("a/b/c.txt");
-        assert!(s.dir_children(FuseIno::ROOT).unwrap().is_empty(), "empty trees vanish");
+        assert!(
+            s.dir_children(FuseIno::ROOT).unwrap().is_empty(),
+            "empty trees vanish"
+        );
     }
 
     #[test]
@@ -1185,16 +1315,19 @@ mod tests {
         // connection). A listener that accepts and reads but never
         // answers must yield an error within the deadline instead.
         let listener = tmp_listener("hang");
-        let path = listener.local_addr().unwrap().as_pathname().unwrap().to_path_buf();
+        let path = listener
+            .local_addr()
+            .unwrap()
+            .as_pathname()
+            .unwrap()
+            .to_path_buf();
         // Accept, swallow the request, then never answer and never
         // close — the worst case.
         let _worst_case_peer = std::thread::spawn(move || {
             if let Ok((mut conn, _)) = listener.accept() {
                 let mut line = String::new();
-                let _ = std::io::BufRead::read_line(
-                    &mut std::io::BufReader::new(&mut conn),
-                    &mut line,
-                );
+                let _ =
+                    std::io::BufRead::read_line(&mut std::io::BufReader::new(&mut conn), &mut line);
                 std::thread::sleep(std::time::Duration::from_secs(300));
             }
         });
@@ -1207,7 +1340,10 @@ mod tests {
             fuse_protocol::oracle::Kino(2),
             std::time::Duration::from_millis(200),
         );
-        assert!(r.is_err(), "a lost reply must surface as an error, got: {r:?}");
+        assert!(
+            r.is_err(),
+            "a lost reply must surface as an error, got: {r:?}"
+        );
         assert!(
             start.elapsed() < std::time::Duration::from_secs(5),
             "the error must arrive at the deadline, not hang"
@@ -1220,14 +1356,17 @@ mod tests {
         // mid-adjudication): the empty reply must be an error, never a
         // hang — the production caller maps it to EIO.
         let listener = tmp_listener("eof");
-        let path = listener.local_addr().unwrap().as_pathname().unwrap().to_path_buf();
+        let path = listener
+            .local_addr()
+            .unwrap()
+            .as_pathname()
+            .unwrap()
+            .to_path_buf();
         let _worst_case_peer = std::thread::spawn(move || {
             if let Ok((mut conn, _)) = listener.accept() {
                 let mut line = String::new();
-                let _ = std::io::BufRead::read_line(
-                    &mut std::io::BufReader::new(&mut conn),
-                    &mut line,
-                );
+                let _ =
+                    std::io::BufRead::read_line(&mut std::io::BufReader::new(&mut conn), &mut line);
                 drop(conn);
             }
         });
@@ -1239,6 +1378,9 @@ mod tests {
             fuse_protocol::oracle::Kino(2),
             std::time::Duration::from_secs(5),
         );
-        assert!(r.is_err(), "EOF with no reply line must be an error, got: {r:?}");
+        assert!(
+            r.is_err(),
+            "EOF with no reply line must be an error, got: {r:?}"
+        );
     }
 }

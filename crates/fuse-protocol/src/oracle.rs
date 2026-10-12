@@ -59,14 +59,24 @@ pub enum OracleRequest {
     /// pread. Policy denial → Deny; incarnation replaced → Stale
     /// (fused answers ESTALE, kernel re-resolves); gone/not regular →
     /// Gone (ENOENT).
-    Open { name: String, pid: u32, kdev: KDev, kino: Kino },
+    Open {
+        name: String,
+        pid: u32,
+        kdev: KDev,
+        kino: Kino,
+    },
     /// A reader wants `size` bytes of `name` at `offset`. The policy
     /// daemon answers synchronously — including waiting out a pending
     /// until grant/expiry — then replies Allow or Deny.
     /// (Legacy path, pre-MR4; fused no longer sends it — reads are
     /// preads on adjudicated fds — but the semantics are the
     /// adjudication core Open reuses.)
-    Ask { name: String, pid: u32, offset: u64, size: u32 },
+    Ask {
+        name: String,
+        pid: u32,
+        offset: u64,
+        size: u32,
+    },
     /// First message of a persistent CONTROL connection: the policy
     /// daemon pushes Serve/Remove commands to it as secrets change.
     /// `version` is the data daemon's protocol VERSION — wire-optional
@@ -75,6 +85,15 @@ pub enum OracleRequest {
     Hello {
         #[serde(default)]
         version: Option<String>,
+    },
+    /// Answer to [`OracleCommand::Surrender`]: the custody batch. The
+    /// SCM_RIGHTS control message on this line carries fd[0] = the
+    /// mount connection fd, fd[1..] = the open host fds in table
+    /// order; the line itself names the session-state schema and the
+    /// opaque state JSON (schema-owned by the fused side).
+    SurrenderPayload {
+        session_schema: u32,
+        state: serde_json::Value,
     },
 }
 
@@ -108,6 +127,15 @@ pub enum OracleCommand {
     },
     /// Stop serving this secret (readers get ENOENT).
     Remove { name: String },
+    /// Handoff take-back (#93 F2, same-version pair): ship the mount
+    /// connection fd and the open host fds together with the
+    /// serialized session state to the server, KEEP your own copies,
+    /// stop serving new opens, and wait for [`OracleCommand::Retire`].
+    /// The payload arrives as a [`OracleRequest::SurrenderPayload`]
+    /// connection carrying SCM_RIGHTS.
+    Surrender,
+    /// The successor is serving: close your fd copies LAST and exit 0.
+    Retire,
 }
 
 /// Replies, both directions.
@@ -135,9 +163,14 @@ pub enum OracleReply {
     /// The read must fail; the FUSE errno is the policy daemon's call
     /// (EACCES for denials, ENOENT when the policy no longer knows the
     /// secret).
-    Deny { errno: i32, reason: String },
+    Deny {
+        errno: i32,
+        reason: String,
+    },
     Ok,
-    Error { message: String },
+    Error {
+        message: String,
+    },
 }
 
 #[cfg(test)]
@@ -160,7 +193,6 @@ mod tests {
             }
         );
     }
-
 
     #[test]
     fn serve_without_mode_parses_with_conservative_default() {
@@ -194,7 +226,10 @@ mod tests {
                 mode: 0o400,
             })
             .unwrap(),
-            serde_json::to_string(&OracleCommand::Remove { name: "s.yaml".into() }).unwrap(),
+            serde_json::to_string(&OracleCommand::Remove {
+                name: "s.yaml".into(),
+            })
+            .unwrap(),
             serde_json::to_string(&OracleReply::Allow).unwrap(),
             serde_json::to_string(&OracleReply::Deny {
                 errno: 13,
@@ -202,14 +237,22 @@ mod tests {
             })
             .unwrap(),
             serde_json::to_string(&OracleReply::Ok).unwrap(),
-            serde_json::to_string(&OracleReply::Error { message: "boom".into() }).unwrap(),
+            serde_json::to_string(&OracleReply::Error {
+                message: "boom".into(),
+            })
+            .unwrap(),
         ];
         // Each line parses back to an equal value of its own type.
         let m = &msgs[0];
         let back: OracleRequest = serde_json::from_str(m).unwrap();
         assert_eq!(
             back,
-            OracleRequest::Ask { name: "s.yaml".into(), pid: 42, offset: 3, size: 128 }
+            OracleRequest::Ask {
+                name: "s.yaml".into(),
+                pid: 42,
+                offset: 3,
+                size: 128
+            }
         );
         let back: OracleCommand = serde_json::from_str(&msgs[1]).unwrap();
         assert_eq!(
@@ -221,18 +264,31 @@ mod tests {
             }
         );
         let back: OracleCommand = serde_json::from_str(&msgs[2]).unwrap();
-        assert_eq!(back, OracleCommand::Remove { name: "s.yaml".into() });
+        assert_eq!(
+            back,
+            OracleCommand::Remove {
+                name: "s.yaml".into()
+            }
+        );
         let back: OracleReply = serde_json::from_str(&msgs[3]).unwrap();
         assert_eq!(back, OracleReply::Allow);
         let back: OracleReply = serde_json::from_str(&msgs[4]).unwrap();
         assert_eq!(
             back,
-            OracleReply::Deny { errno: 13, reason: "hash mismatch".into() }
+            OracleReply::Deny {
+                errno: 13,
+                reason: "hash mismatch".into()
+            }
         );
         let back: OracleReply = serde_json::from_str(&msgs[5]).unwrap();
         assert_eq!(back, OracleReply::Ok);
         let back: OracleReply = serde_json::from_str(&msgs[6]).unwrap();
-        assert_eq!(back, OracleReply::Error { message: "boom".into() });
+        assert_eq!(
+            back,
+            OracleReply::Error {
+                message: "boom".into()
+            }
+        );
     }
 
     #[test]
@@ -242,7 +298,12 @@ mod tests {
         })
         .unwrap();
         let back: OracleRequest = serde_json::from_str(&wire).unwrap();
-        assert_eq!(back, OracleRequest::Hello { version: Some("0.27.1".into()) });
+        assert_eq!(
+            back,
+            OracleRequest::Hello {
+                version: Some("0.27.1".into())
+            }
+        );
     }
 
     #[test]

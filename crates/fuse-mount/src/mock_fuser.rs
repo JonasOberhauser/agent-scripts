@@ -86,7 +86,11 @@ struct Bridge {
 
 impl Bridge {
     fn new(kernel: UnixStream) -> Self {
-        Self { kernel, pending: None, open_fhs: Vec::new() }
+        Self {
+            kernel,
+            pending: None,
+            open_fhs: Vec::new(),
+        }
     }
 
     /// Serve one driver until it hangs up. Requests are forwarded and
@@ -120,7 +124,10 @@ impl Bridge {
 
     fn observe_request(&mut self, request: &[u8]) {
         let hdr = std::mem::size_of::<abi::InHeader>();
-        let Some(h) = (request.len() >= hdr).then(|| pod_decode::<abi::InHeader>(&request[..hdr])).flatten() else {
+        let Some(h) = (request.len() >= hdr)
+            .then(|| pod_decode::<abi::InHeader>(&request[..hdr]))
+            .flatten()
+        else {
             return;
         };
         self.pending = Some((h.unique, h.opcode));
@@ -142,7 +149,10 @@ impl Bridge {
         if let Some((unique, opcode)) = self.pending.take() {
             if out.unique == unique
                 && out.error == 0
-                && matches!(abi::Opcode::from(opcode), abi::Opcode::Open | abi::Opcode::Opendir)
+                && matches!(
+                    abi::Opcode::from(opcode),
+                    abi::Opcode::Open | abi::Opcode::Opendir
+                )
                 && reply.len() == hdr + std::mem::size_of::<abi::OpenOut>()
             {
                 if let Some(o) = pod_decode::<abi::OpenOut>(&reply[hdr..]) {
@@ -168,8 +178,8 @@ impl Bridge {
                 lock_owner: 0,
             };
             let header = abi::InHeader {
-                len: (std::mem::size_of::<abi::InHeader>()
-                    + std::mem::size_of::<abi::ReleaseIn>()) as u32,
+                len: (std::mem::size_of::<abi::InHeader>() + std::mem::size_of::<abi::ReleaseIn>())
+                    as u32,
                 opcode: abi::Opcode::Release as u32,
                 unique: u64::MAX - fh, // never collides with driver uniques
                 nodeid: fuser::FUSE_ROOT_ID,
@@ -221,7 +231,10 @@ fn bind_seqpacket_listener(path: &Path) -> std::io::Result<OwnedFd> {
         // SAFETY: close(2) on our own fd; the result only reports
         // double-close, which the ownership rules exclude.
         let _closed = unsafe { libc::close(fd) };
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "path too long"));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path too long",
+        ));
     }
     let dst = addr.sun_path.as_mut_ptr() as *mut u8;
     let src = bytes.as_ptr();
@@ -282,15 +295,17 @@ pub fn serve(fs: FusedFs, control: &Path) {
     let kernel_sock = unsafe { UnixStream::from_raw_fd(f1) };
 
     let _session_thread = std::thread::spawn(move || {
-        let mut session =
-            fuser::Session::from_fd(fs, session_fd, fuser::SessionACL::All);
+        let mut session = fuser::Session::from_fd(fs, session_fd, fuser::SessionACL::All);
         match session.run() {
             Ok(()) => tracing::info!("mock fuser: session ended cleanly"),
             Err(e) => tracing::error!("mock fuser: session error: {e}"),
         }
     });
 
-    tracing::info!("mock fuser: forwarding FUSE frames at {}", control.display());
+    tracing::info!(
+        "mock fuser: forwarding FUSE frames at {}",
+        control.display()
+    );
     loop {
         let lfd = listener.as_raw_fd();
         let no_addr: *mut libc::sockaddr = std::ptr::null_mut();
@@ -341,7 +356,11 @@ mod codec_tests {
 
     #[test]
     fn short_and_long_slices_rejected() {
-        let h = abi::OutHeader { len: 16, error: 0, unique: 4 };
+        let h = abi::OutHeader {
+            len: 16,
+            error: 0,
+            unique: 4,
+        };
         let b = pod_bytes(&h);
         assert!(pod_decode::<abi::OutHeader>(&b[..15]).is_none());
         assert!(pod_decode::<abi::OutHeader>(&b).is_some());

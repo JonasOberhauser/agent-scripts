@@ -4,7 +4,6 @@ use std::path::{Path, PathBuf};
 use crate::io::{CommandOutput, PathState, SystemIo};
 use crate::IoError;
 
-
 /// One parsed `/proc/<pid>/`maps line: `Ok(Some((range, path)))` for a
 /// file-backed mapping, `Ok(None)` for a pathless segment, `Err` when
 /// the line does not match the documented 5-mandatory-field format
@@ -20,12 +19,16 @@ use crate::IoError;
 fn inspect_hint(e: &std::io::Error) -> &'static str {
     use std::io::ErrorKind::*;
     match e.kind() {
-        NotFound => "The process is invisible from this server's PID namespace \
-                     (container guest without --pidns=host?) or has already exited.",
-        PermissionDenied => "Permission denied: /proc ptrace checks failed \
+        NotFound => {
+            "The process is invisible from this server's PID namespace \
+                     (container guest without --pidns=host?) or has already exited."
+        }
+        PermissionDenied => {
+            "Permission denied: /proc ptrace checks failed \
                              (SELinux? daemon lacks CAP_SYS_PTRACE? uid mismatch?). \
                              On the host check `getenforce`, yama ptrace_scope, \
-                             and run the daemon with CAP_SYS_PTRACE.",
+                             and run the daemon with CAP_SYS_PTRACE."
+        }
         _ => "The process could not be inspected.",
     }
 }
@@ -36,15 +39,19 @@ fn inspect_hint(e: &std::io::Error) -> &'static str {
 fn map_files_hint(e: &std::io::Error) -> &'static str {
     use std::io::ErrorKind::*;
     match e.kind() {
-        NotFound => "Mapped file unreachable in this mount namespace — a guest \
-                     path that does not exist where the server runs.",
-        PermissionDenied => "Following `/proc/<pid>/`map_files requires \
+        NotFound => {
+            "Mapped file unreachable in this mount namespace — a guest \
+                     path that does not exist where the server runs."
+        }
+        PermissionDenied => {
+            "Following `/proc/<pid>/`map_files requires \
                              CAP_SYS_ADMIN or CAP_CHECKPOINT_RESTORE in the \
                              INITIAL user namespace (kernel fs/proc/base.c, \
                              proc_map_files_get_link) — not ptrace of the \
                              target, and not a rootless user namespace. Run \
                              the hashing process with one of those \
-                             capabilities (e.g. setcap cap_checkpoint_restore+ep).",
+                             capabilities (e.g. setcap cap_checkpoint_restore+ep)."
+        }
         _ => "The mapped file could not be read.",
     }
 }
@@ -206,7 +213,9 @@ impl SystemIo for RealSystemIo {
                     .open(path)
                     .map_err(|e| IoError(format!("open log {path:?}: {e}")))?;
                 let _cmd = cmd
-                    .stdout(std::process::Stdio::from(f.try_clone().map_err(|e| IoError(e.to_string()))?))
+                    .stdout(std::process::Stdio::from(
+                        f.try_clone().map_err(|e| IoError(e.to_string()))?,
+                    ))
                     .stderr(std::process::Stdio::from(f));
             }
             None => {
@@ -275,9 +284,7 @@ impl SystemIo for RealSystemIo {
     fn sha256_process_package(&self, pid: u32) -> Result<String, IoError> {
         use sha2::{Digest, Sha256};
         let exe = std::fs::read_link(format!("/proc/{pid}/exe"))
-            .map_err(|e| IoError(format!(
-                "read /proc/{pid}/exe: {e}. {}", inspect_hint(&e)
-            )))?;
+            .map_err(|e| IoError(format!("read /proc/{pid}/exe: {e}. {}", inspect_hint(&e))))?;
         // Collect (mapping-range, path) pairs.  The range addresses the
         // exact mapped inode via `/proc/<pid>/`map_files/, which works
         // even when the on-disk path was replaced or unlinked
@@ -471,7 +478,9 @@ impl MockSystemIo {
     }
 
     pub fn with_unix_response(self, response: &[u8]) -> Self {
-        self.unix_responses.borrow_mut().push_back(response.to_vec());
+        self.unix_responses
+            .borrow_mut()
+            .push_back(response.to_vec());
         self
     }
 
@@ -560,8 +569,10 @@ impl MockSystemIo {
     }
 
     fn record_spawn(&mut self, program: &str, args: &[&str]) {
-        self.spawned
-            .push((program.to_string(), args.iter().map(|s| s.to_string()).collect()));
+        self.spawned.push((
+            program.to_string(),
+            args.iter().map(|s| s.to_string()).collect(),
+        ));
     }
 
     /// Check whether a spawn call included all of the given argument
@@ -618,7 +629,9 @@ impl SystemIo for MockSystemIo {
         // Dead FUSE mount: the kernel holds the name, stat fails.
         // ENOTCONN is what a killed data daemon's mountpoint answers.
         if self.stale_mounts.borrow().contains(&key) {
-            return PathState::Unreachable("Transport endpoint is not connected (os error 107)".into());
+            return PathState::Unreachable(
+                "Transport endpoint is not connected (os error 107)".into(),
+            );
         }
         if self.dirs.contains(&key) || self.created_dirs.borrow().contains(&key) {
             return PathState::Dir;
@@ -675,9 +688,10 @@ impl SystemIo for MockSystemIo {
     }
 
     fn create_symlink(&mut self, original: &Path, link: &Path) -> Result<(), IoError> {
-        let _prev = self
-            .symlinks
-            .insert(link.to_string_lossy().to_string(), original.to_string_lossy().to_string());
+        let _prev = self.symlinks.insert(
+            link.to_string_lossy().to_string(),
+            original.to_string_lossy().to_string(),
+        );
         Ok(())
     }
 
@@ -764,7 +778,8 @@ impl SystemIo for MockSystemIo {
     }
 
     fn heal_terminal(&self) {
-        self.heal_terminal_calls.set(self.heal_terminal_calls.get() + 1);
+        self.heal_terminal_calls
+            .set(self.heal_terminal_calls.get() + 1);
     }
 
     fn sha256_file(&self, path: &Path) -> Result<String, IoError> {
@@ -818,9 +833,18 @@ impl SystemIo for MockSystemIo {
         for key in self.files.keys() {
             // CHILDREN only: the path itself (empty rest) would make a
             // directory its own entry and any walker loop forever.
-            if let Some(rest) = Path::new(key).strip_prefix(path).ok().filter(|r| !r.as_os_str().is_empty()) {
+            if let Some(rest) = Path::new(key)
+                .strip_prefix(path)
+                .ok()
+                .filter(|r| !r.as_os_str().is_empty())
+            {
                 // the first component below `path` — plain split idiom
-                let component = rest.to_string_lossy().split('/').next().unwrap_or("").to_string();
+                let component = rest
+                    .to_string_lossy()
+                    .split('/')
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
                 let full = path.join(&component);
                 if seen.insert(full.clone()) {
                     entries.push(full);
@@ -927,7 +951,10 @@ mod tests {
         let _status = child.wait().unwrap();
         // fresh pid without /proc entry: Process::new must fail
         let err = procfs::process::Process::new(pid as i32).expect_err("dead pid must fail");
-        assert!(!matches!(err, procfs::ProcError::Incomplete(_)), "real read, not skipped");
+        assert!(
+            !matches!(err, procfs::ProcError::Incomplete(_)),
+            "real read, not skipped"
+        );
     }
 
     use super::*;
@@ -952,20 +979,20 @@ mod tests {
 
     #[test]
     fn mock_busy_path_cannot_be_removed() {
-        let mut mock = MockSystemIo::new()
-            .with_dir("/mnt")
-            .with_busy_path("/mnt");
+        let mut mock = MockSystemIo::new().with_dir("/mnt").with_busy_path("/mnt");
         let result = mock.remove_path(Path::new("/mnt"));
         assert!(result.is_err(), "busy path should not be removable");
     }
 
     #[test]
     fn mock_spawn_failure() {
-        let mut mock = MockSystemIo::new()
-            .with_spawn_error("terminal required");
+        let mut mock = MockSystemIo::new().with_spawn_error("terminal required");
         let result = mock.spawn_independent("sudo", &[], None);
         assert!(result.is_err());
-        assert!(mock.spawned.is_empty(), "failed spawn should not be recorded");
+        assert!(
+            mock.spawned.is_empty(),
+            "failed spawn should not be recorded"
+        );
     }
 
     #[test]
@@ -983,21 +1010,25 @@ mod tests {
     fn mock_arg_scoped_rule_limited_and_unlimited() {
         use super::SystemIo;
         // Limited rule: fails exactly the first matching call, then expires.
-        let mock = MockSystemIo::new().with_command_result_when_n(
-            "podman",
-            "exec",
-            Some(1),
-            1,
-        );
-        let first = mock.run_command("podman", &["exec", "c1", "stat", "/x"]).unwrap();
+        let mock = MockSystemIo::new().with_command_result_when_n("podman", "exec", Some(1), 1);
+        let first = mock
+            .run_command("podman", &["exec", "c1", "stat", "/x"])
+            .unwrap();
         assert!(!first.success(), "first matching call must fail");
-        let second = mock.run_command("podman", &["exec", "c1", "stat", "/x"]).unwrap();
-        assert!(second.success(), "expired rule must fall through to defaults");
+        let second = mock
+            .run_command("podman", &["exec", "c1", "stat", "/x"])
+            .unwrap();
+        assert!(
+            second.success(),
+            "expired rule must fall through to defaults"
+        );
 
         // Unlimited rule (uses_left = None): keeps applying.
         let mock = MockSystemIo::new().with_command_result_when("podman", "exec", Some(1));
         for _ in 0..3 {
-            let r = mock.run_command("podman", &["exec", "c1", "stat", "/x"]).unwrap();
+            let r = mock
+                .run_command("podman", &["exec", "c1", "stat", "/x"])
+                .unwrap();
             assert!(!r.success());
         }
         // Non-matching argv unaffected.
@@ -1033,7 +1064,10 @@ mod tests {
             .with_stale_mount("/tmp/m");
         assert_eq!(mock.path_state(Path::new("/tmp/d")), PathState::Dir);
         assert_eq!(mock.path_state(Path::new("/tmp/f")), PathState::File);
-        assert_eq!(mock.path_state(Path::new("/tmp/nothing")), PathState::Missing);
+        assert_eq!(
+            mock.path_state(Path::new("/tmp/nothing")),
+            PathState::Missing
+        );
         match mock.path_state(Path::new("/tmp/m")) {
             PathState::Unreachable(why) => assert!(why.contains("os error 107"), "got: {why}"),
             other => panic!("dead mount must be Unreachable, got {other:?}"),
@@ -1059,7 +1093,8 @@ mod tests {
     #[test]
     fn mock_stale_mount_cleared_by_successful_lazy_unmount() {
         let mock = MockSystemIo::new().with_stale_mount("/tmp/mnt");
-        mock.run_command("fusermount", &["-uz", "/tmp/mnt"]).unwrap();
+        mock.run_command("fusermount", &["-uz", "/tmp/mnt"])
+            .unwrap();
         // After the lazy unmount the mountpoint remains as a plain dir.
         assert_eq!(mock.path_state(Path::new("/tmp/mnt")), PathState::Dir);
         mock.create_dir_all(Path::new("/tmp/mnt"))
@@ -1070,7 +1105,8 @@ mod tests {
     fn mock_stale_mount_survives_failed_and_unrelated_unmounts() {
         let mock = MockSystemIo::new().with_stale_mount("/tmp/mnt");
         // Unmounting a DIFFERENT path succeeds but must not clear /tmp/mnt.
-        mock.run_command("fusermount", &["-uz", "/tmp/other"]).unwrap();
+        mock.run_command("fusermount", &["-uz", "/tmp/other"])
+            .unwrap();
         assert_eq!(
             mock.path_state(Path::new("/tmp/mnt")),
             PathState::Unreachable("Transport endpoint is not connected (os error 107)".into()),
@@ -1078,10 +1114,10 @@ mod tests {
         );
         // A FAILING unmount of the right path must not clear it either.
         let mut failing = MockSystemIo::new().with_stale_mount("/tmp/mnt");
+        failing.command_results.insert("fusermount".into(), Some(1));
         failing
-            .command_results
-            .insert("fusermount".into(), Some(1));
-        failing.run_command("fusermount", &["-uz", "/tmp/mnt"]).unwrap();
+            .run_command("fusermount", &["-uz", "/tmp/mnt"])
+            .unwrap();
         assert!(
             failing.create_dir_all(Path::new("/tmp/mnt")).is_err(),
             "a failed unmount must leave the stale mount in place"
@@ -1104,7 +1140,8 @@ mod tests {
     #[test]
     fn mock_mkdir_only_on_missing() {
         let mock = MockSystemIo::new();
-        mock.mkdir(Path::new("/tmp/new")).expect("free name: mkdir works");
+        mock.mkdir(Path::new("/tmp/new"))
+            .expect("free name: mkdir works");
         assert_eq!(mock.path_state(Path::new("/tmp/new")), PathState::Dir);
         let err = mock
             .mkdir(Path::new("/tmp/new"))
@@ -1115,7 +1152,13 @@ mod tests {
     #[test]
     fn mock_spawn_contains_helper() {
         let mut mock = MockSystemIo::new();
-        let _out = mock.spawn_independent("flatpak-spawn", &["--host", "sudo", "-n", "fuse-server"], None).unwrap();
+        let _out = mock
+            .spawn_independent(
+                "flatpak-spawn",
+                &["--host", "sudo", "-n", "fuse-server"],
+                None,
+            )
+            .unwrap();
         assert!(mock.spawn_contains(0, &["sudo", "-n"]));
         assert!(mock.spawn_contains(0, &["fuse-server"]));
     }

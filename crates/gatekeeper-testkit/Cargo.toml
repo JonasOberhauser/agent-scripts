@@ -8,7 +8,10 @@ fuse-protocol = { path = "../fuse-protocol" }
 fuse-server = { path = "../fuse-server" }
 tempfile = "3"
 serde_json = "1"
+serde = { version = "1", features = ["derive"] }
 libc = "0.2"
+nix = { workspace = true }
+clap = { workspace = true }
 
 [dev-dependencies]
 fuse-mount = { path = "../fuse-mount" }

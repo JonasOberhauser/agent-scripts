@@ -8,7 +8,6 @@
 // the custom_parser lint exists only under the servyi driver.
 #![allow(unknown_lints)]
 #![allow(custom_parser)]
-
 #![allow(clippy::unwrap_used, clippy::panic, unused_results)]
 
 use std::io::{BufRead, BufReader, Read as _, Write};
@@ -20,10 +19,15 @@ use fuse_protocol::oracle::{OracleCommand, OracleReply, OracleRequest};
 use fuse_server::oracle_service::{run_oracle_server, OracleHub};
 use fuse_server::{ReadOutcome, ServerState};
 
-
 fn ask(path: &std::path::Path, name: &str, pid: u32, offset: u64, size: u32) -> OracleReply {
     let mut conn = std::os::unix::net::UnixStream::connect(path).unwrap();
-    let req = serde_json::to_string(&OracleRequest::Ask { name: name.into(), pid, offset, size }).unwrap();
+    let req = serde_json::to_string(&OracleRequest::Ask {
+        name: name.into(),
+        pid,
+        offset,
+        size,
+    })
+    .unwrap();
     conn.write_all(format!("{req}\n").as_bytes()).unwrap();
     let mut reader = BufReader::new(conn);
     let mut line = String::new();
@@ -167,7 +171,10 @@ fn failed_fd_pass_does_not_wedge_the_oracle() {
     }
     let reply: OracleReply =
         serde_json::from_str(String::from_utf8_lossy(&buf[..n]).trim()).unwrap();
-    assert!(matches!(reply, OracleReply::Allow), "later opens still serve: {reply:?}");
+    assert!(
+        matches!(reply, OracleReply::Allow),
+        "later opens still serve: {reply:?}"
+    );
     let fd = fd.expect("the fd must still arrive");
     // and it is the live host content
     let mut got = String::new();
@@ -208,13 +215,28 @@ fn open_passes_an_fd_and_stats_flow() {
 
     // Stat: live identity.
     let mut c = std::os::unix::net::UnixStream::connect(&oracle).unwrap();
-    writeln!(c, "{}", serde_json::to_string(&OracleRequest::Stat { name: "s".into() }).unwrap()).unwrap();
+    writeln!(
+        c,
+        "{}",
+        serde_json::to_string(&OracleRequest::Stat { name: "s".into() }).unwrap()
+    )
+    .unwrap();
     c.flush().unwrap();
     let mut line = String::new();
-    std::io::BufRead::read_line(&mut std::io::BufReader::new(c.try_clone().unwrap()), &mut line).unwrap();
+    std::io::BufRead::read_line(
+        &mut std::io::BufReader::new(c.try_clone().unwrap()),
+        &mut line,
+    )
+    .unwrap();
     let r: OracleReply = serde_json::from_str(line.trim()).unwrap();
     let (kdev, kino, size) = match r {
-        OracleReply::StatOk { kdev, kino, size, regular: true, .. } => (kdev, kino, size),
+        OracleReply::StatOk {
+            kdev,
+            kino,
+            size,
+            regular: true,
+            ..
+        } => (kdev, kino, size),
         other => panic!("stat: {other:?}"),
     };
     assert_eq!(size, 9);
@@ -222,9 +244,18 @@ fn open_passes_an_fd_and_stats_flow() {
     // Open with the right identity: fd arrives with the reply.
     use std::os::unix::io::{AsRawFd, FromRawFd};
     let mut c = std::os::unix::net::UnixStream::connect(&oracle).unwrap();
-    writeln!(c, "{}", serde_json::to_string(&OracleRequest::Open {
-        name: "s".into(), pid: 4242, kdev, kino,
-    }).unwrap()).unwrap();
+    writeln!(
+        c,
+        "{}",
+        serde_json::to_string(&OracleRequest::Open {
+            name: "s".into(),
+            pid: 4242,
+            kdev,
+            kino,
+        })
+        .unwrap()
+    )
+    .unwrap();
     c.flush().unwrap();
     let mut buf = vec![0u8; 4096];
     let mut cmsg = nix::cmsg_space!(libc::cmsghdr, std::os::unix::io::RawFd);
@@ -232,8 +263,12 @@ fn open_passes_an_fd_and_stats_flow() {
     let msg = {
         let raw = c.as_raw_fd();
         nix::sys::socket::recvmsg::<()>(
-            raw, &mut iov, Some(&mut cmsg), nix::sys::socket::MsgFlags::empty(),
-        ).unwrap()
+            raw,
+            &mut iov,
+            Some(&mut cmsg),
+            nix::sys::socket::MsgFlags::empty(),
+        )
+        .unwrap()
     };
     let mut fd = None;
     for cm in msg.cmsgs().unwrap() {
@@ -254,16 +289,27 @@ fn open_passes_an_fd_and_stats_flow() {
 
     // Open with a WRONG identity: the incarnation check answers Stale.
     let mut c = std::os::unix::net::UnixStream::connect(&oracle).unwrap();
-    writeln!(c, "{}", serde_json::to_string(&OracleRequest::Open {
-        name: "s".into(), pid: 4243, kdev, kino: fuse_protocol::Kino(kino.0.wrapping_add(1)),
-    }).unwrap()).unwrap();
+    writeln!(
+        c,
+        "{}",
+        serde_json::to_string(&OracleRequest::Open {
+            name: "s".into(),
+            pid: 4243,
+            kdev,
+            kino: fuse_protocol::Kino(kino.0.wrapping_add(1)),
+        })
+        .unwrap()
+    )
+    .unwrap();
     c.flush().unwrap();
     let mut line = String::new();
     std::io::BufRead::read_line(&mut std::io::BufReader::new(c), &mut line).unwrap();
     let r: OracleReply = serde_json::from_str(line.trim()).unwrap();
-    assert!(matches!(r, OracleReply::Stale), "replaced incarnation: {r:?}");
+    assert!(
+        matches!(r, OracleReply::Stale),
+        "replaced incarnation: {r:?}"
+    );
 }
-
 
 #[test]
 fn star_hash_ask_is_allowed_and_serves_offsets() {
@@ -301,7 +347,10 @@ fn second_pid_pends_then_grant_allows() {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     let id = loop {
         let Some(entry) = state.pending.iter().next() else {
-            assert!(std::time::Instant::now() < deadline, "pending never appeared");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "pending never appeared"
+            );
             std::thread::sleep(Duration::from_millis(10));
             continue;
         };
@@ -322,7 +371,10 @@ fn pending_expiry_denies_with_eacces() {
     match ask(&path, "s", 20, 0, 1) {
         OracleReply::Deny { errno, reason } => {
             assert_eq!(errno, libc::EACCES);
-            assert!(reason.contains("expired") || reason.contains("denied"), "{reason}");
+            assert!(
+                reason.contains("expired") || reason.contains("denied"),
+                "{reason}"
+            );
         }
         other => panic!("expected EACCES deny after expiry, got {other:?}"),
     }
@@ -345,7 +397,10 @@ fn deny_unblocks_the_reader_immediately_with_eperm() {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     let id = loop {
         let Some(entry) = state.pending.iter().next() else {
-            assert!(std::time::Instant::now() < deadline, "pending never appeared");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "pending never appeared"
+            );
             std::thread::sleep(Duration::from_millis(10));
             continue;
         };
@@ -423,15 +478,24 @@ fn stub_hashd_answer_carries_the_pid_hash_not_an_error() {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     let (pid_hash, hash_error) = loop {
         let Some(entry) = state.pending.iter().next() else {
-            assert!(std::time::Instant::now() < deadline, "pending never appeared");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "pending never appeared"
+            );
             std::thread::sleep(Duration::from_millis(10));
             continue;
         };
         break (entry.pid_hash.clone(), entry.hash_error.clone());
     };
-    assert_eq!(pid_hash.as_deref(), Some(canned.as_str()),
-        "a hashd that answered must land in the pending");
-    assert!(hash_error.is_none(), "no error expected, got: {hash_error:?}");
+    assert_eq!(
+        pid_hash.as_deref(),
+        Some(canned.as_str()),
+        "a hashd that answered must land in the pending"
+    );
+    assert!(
+        hash_error.is_none(),
+        "no error expected, got: {hash_error:?}"
+    );
     let _ = asker.join().unwrap();
 }
 
@@ -448,7 +512,10 @@ fn wrong_hash_pends_and_carries_the_hash_error() {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     let (pid_hash, hash_error) = loop {
         let Some(entry) = state.pending.iter().next() else {
-            assert!(std::time::Instant::now() < deadline, "pending never appeared");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "pending never appeared"
+            );
             std::thread::sleep(Duration::from_millis(10));
             continue;
         };
@@ -508,7 +575,11 @@ fn control_channel_replays_snapshot_and_pushes_updates() {
     let cmd: OracleCommand = serde_json::from_str(line.trim()).unwrap();
     assert_eq!(
         cmd,
-        OracleCommand::Serve { name: "seed".into(), inner: "d1".into(), mode: 0o400 }
+        OracleCommand::Serve {
+            name: "seed".into(),
+            inner: "d1".into(),
+            mode: 0o400
+        }
     );
 
     // Live push through the hub.
@@ -516,7 +587,14 @@ fn control_channel_replays_snapshot_and_pushes_updates() {
     line.clear();
     reader.read_line(&mut line).unwrap();
     let cmd: OracleCommand = serde_json::from_str(line.trim()).unwrap();
-    assert_eq!(cmd, OracleCommand::Serve { name: "seed".into(), inner: "d2".into(), mode: 0o600 });
+    assert_eq!(
+        cmd,
+        OracleCommand::Serve {
+            name: "seed".into(),
+            inner: "d2".into(),
+            mode: 0o600
+        }
+    );
 }
 
 #[test]
@@ -537,10 +615,14 @@ fn a_stuck_data_daemon_does_not_wedge_the_policy_daemon() {
     let hub = OracleHub::new();
     {
         let (st, hb, p) = (Arc::clone(&state), hub.clone(), oracle.clone());
-        std::thread::spawn(move || { let _ = run_oracle_server(&p, st, hb); });
+        std::thread::spawn(move || {
+            let _ = run_oracle_server(&p, st, hb);
+        });
     }
     for _ in 0..200 {
-        if oracle.exists() { break; }
+        if oracle.exists() {
+            break;
+        }
         std::thread::sleep(Duration::from_millis(10));
     }
 
@@ -573,9 +655,10 @@ fn a_stuck_data_daemon_does_not_wedge_the_policy_daemon() {
         hb2.serve("final", "x", 0o400);
         let _ = tx.send(());
     });
-    rx.recv_timeout(Duration::from_secs(8))
-        .expect("broadcast wedged on a stuck control peer — the hub lock \
-                 is held and the command socket is frozen (issue #77)");
+    rx.recv_timeout(Duration::from_secs(8)).expect(
+        "broadcast wedged on a stuck control peer — the hub lock \
+                 is held and the command socket is frozen (issue #77)",
+    );
 
     // And the policy daemon still answers work afterwards.
     assert_eq!(

@@ -94,10 +94,7 @@ pub fn policy_path() -> PathBuf {
 ///   no identity, opens answer ENOENT until the file returns or run-agent
 ///   re-adds (plain overwrite joins the hash set — nothing lost)
 pub fn load(state: &mut ServerState, hub: &OracleHub) -> LoadReport {
-    let path = state
-        .policy_path
-        .clone()
-        .unwrap_or_else(policy_path);
+    let path = state.policy_path.clone().unwrap_or_else(policy_path);
     let data = match std::fs::read(&path) {
         Ok(d) => d,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -111,7 +108,10 @@ pub fn load(state: &mut ServerState, hub: &OracleHub) -> LoadReport {
                 path.display()
             );
             state.policy_path = None;
-            return LoadReport { unreadable: true, ..Default::default() };
+            return LoadReport {
+                unreadable: true,
+                ..Default::default()
+            };
         }
     };
     // A policy store is small (names + hashes). Anything huge is
@@ -126,7 +126,10 @@ pub fn load(state: &mut ServerState, hub: &OracleHub) -> LoadReport {
             MAX_POLICY_BYTES
         );
         persist_locked(state);
-        return LoadReport { corrupted: true, ..Default::default() };
+        return LoadReport {
+            corrupted: true,
+            ..Default::default()
+        };
     }
     let file: PolicyFile = match serde_json::from_slice(&data) {
         Ok(f) => f,
@@ -146,7 +149,10 @@ pub fn load(state: &mut ServerState, hub: &OracleHub) -> LoadReport {
             );
             let _ = std::fs::rename(&path, &aside);
             persist_locked(state);
-            return LoadReport { corrupted: true, ..Default::default() };
+            return LoadReport {
+                corrupted: true,
+                ..Default::default()
+            };
         }
     };
     if file.version != fuse_protocol::VERSION {
@@ -174,7 +180,9 @@ pub fn load(state: &mut ServerState, hub: &OracleHub) -> LoadReport {
     // survives restarts.
     if file.lockdown {
         state.set_lockdown_from_load(true);
-        tracing::info!("policy store: lockdown ARMED (issue #66) — refusing new unauthorized access");
+        tracing::info!(
+            "policy store: lockdown ARMED (issue #66) — refusing new unauthorized access"
+        );
     }
     let mut report = LoadReport::default();
     for s in file.secrets {
@@ -203,7 +211,10 @@ pub fn load(state: &mut ServerState, hub: &OracleHub) -> LoadReport {
                 allowed_hashes: s
                     .hashes
                     .into_iter()
-                    .map(|h| PermittedHash { hash: h.hash, by: h.by })
+                    .map(|h| PermittedHash {
+                        hash: h.hash,
+                        by: h.by,
+                    })
                     .collect(),
                 access_count: s.access_count,
                 reading_pid: None,
@@ -268,7 +279,10 @@ pub(crate) fn persist_locked(state: &ServerState) {
             hashes: rec
                 .allowed_hashes
                 .iter()
-                .map(|ph| PolicyHash { hash: ph.hash.clone(), by: ph.by.clone() })
+                .map(|ph| PolicyHash {
+                    hash: ph.hash.clone(),
+                    by: ph.by.clone(),
+                })
                 .collect(),
             access_count: rec.access_count,
             unlimited: rec.unlimited_reads,
@@ -289,7 +303,6 @@ pub(crate) fn persist_locked(state: &ServerState) {
         );
     }
 }
-
 
 fn hex_to_bytes(h: &str) -> Vec<u8> {
     (0..h.len() / 2)
@@ -313,9 +326,7 @@ fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     tmp.as_file().sync_all()?;
     // persist() renames over the target; on any failure the temp is
     // dropped (unlinked) — no leaked `.tmp-*` litter (review).
-    let _file = tmp
-        .persist(path)
-        .map_err(|e| e.error)?;
+    let _file = tmp.persist(path).map_err(|e| e.error)?;
     // Directory fsync: durability of the rename by construction
     // instead of per-filesystem arguments (review). Some filesystems
     // reject directory fsync — that refusal is not an error here.
@@ -363,8 +374,11 @@ mod policy_tests {
         assert!(!p.exists(), "no store yet");
         load(&mut s, &hub);
         assert!(!s.anon_salt.as_bytes().is_empty(), "salt minted in memory");
-        assert_eq!(persisted_salt(&p), bytes_to_hex(s.anon_salt.as_bytes()),
-            "the minted salt is persisted before any registration");
+        assert_eq!(
+            persisted_salt(&p),
+            bytes_to_hex(s.anon_salt.as_bytes()),
+            "the minted salt is persisted before any registration"
+        );
     }
 
     #[test]
@@ -380,10 +394,16 @@ mod policy_tests {
         let hub = crate::oracle_service::OracleHub::new();
         let report = load(&mut s, &hub);
         assert!(report.corrupted, "aside happened");
-        assert_eq!(persisted_salt(&p), bytes_to_hex(s.anon_salt.as_bytes()),
-            "fresh salt minted and persisted after the aside");
-        assert_ne!(persisted_salt(&p), old_salt,
-            "the corrupt file's salt is never resurrected");
+        assert_eq!(
+            persisted_salt(&p),
+            bytes_to_hex(s.anon_salt.as_bytes()),
+            "fresh salt minted and persisted after the aside"
+        );
+        assert_ne!(
+            persisted_salt(&p),
+            old_salt,
+            "the corrupt file's salt is never resurrected"
+        );
     }
 
     #[test]
@@ -411,7 +431,10 @@ mod policy_tests {
         let hub = crate::oracle_service::OracleHub::new();
         let report = load(&mut s, &hub);
         assert_eq!(report.restored, 1, "pre-#47 grants load");
-        assert!(!s.anon_salt.as_bytes().is_empty(), "salt minted for the old store");
+        assert!(
+            !s.anon_salt.as_bytes().is_empty(),
+            "salt minted for the old store"
+        );
         assert_eq!(persisted_salt(&p), bytes_to_hex(s.anon_salt.as_bytes()));
     }
 
@@ -442,8 +465,10 @@ mod policy_tests {
         let report = load(&mut s2, &hub);
         assert_eq!(report.restored, 1);
         let inner2 = fuse_protocol::anonymize_path(&s2.anon_salt, "var/secrets/h.bin");
-        assert_eq!(inner1, inner2,
-            "the container-view name must not rotate across a restart");
+        assert_eq!(
+            inner1, inner2,
+            "the container-view name must not rotate across a restart"
+        );
     }
 
     #[test]
@@ -460,7 +485,10 @@ mod policy_tests {
                 std::fs::write(&p, "not json").unwrap();
             }
             let _ = load(&mut s, &hub);
-            assert!(!s.anon_salt.as_bytes().is_empty(), "{label}: salt must exist before serving");
+            assert!(
+                !s.anon_salt.as_bytes().is_empty(),
+                "{label}: salt must exist before serving"
+            );
         }
     }
 
@@ -487,8 +515,17 @@ mod policy_tests {
         let r = lock_secret(rec.value(), "s");
         let hashes: Vec<&str> = r.allowed_hashes.iter().map(|h| h.hash.as_str()).collect();
         assert!(hashes.contains(&"sha256-a"), "{hashes:?}");
-        assert!(hashes.contains(&"sha256-b"), "grant-forever hash survived: {hashes:?}");
-        let by = r.allowed_hashes.iter().find(|h| h.hash == "sha256-b").unwrap().by.clone();
+        assert!(
+            hashes.contains(&"sha256-b"),
+            "grant-forever hash survived: {hashes:?}"
+        );
+        let by = r
+            .allowed_hashes
+            .iter()
+            .find(|h| h.hash == "sha256-b")
+            .unwrap()
+            .by
+            .clone();
         assert_eq!(by.as_deref(), Some("goose"), "provenance survived");
         assert!(r.unlimited_reads, "grant-forever survived");
         assert!(r.access_count >= 1, "budget spent stays spent");
@@ -519,7 +556,8 @@ mod policy_tests {
         let report = crate::policy_store::load(&mut s, &OracleHub::new());
         assert!(report.corrupted);
         assert!(s.secrets.is_empty(), "fresh start, never half-resurrected");
-        let aside = std::fs::read_dir(p.parent().unwrap()).unwrap()
+        let aside = std::fs::read_dir(p.parent().unwrap())
+            .unwrap()
             .filter_map(|e| e.ok())
             .find(|e| e.file_name().to_string_lossy().contains("corrupt-"));
         assert!(aside.is_some(), "the corrupt file was renamed aside");
@@ -532,9 +570,12 @@ mod policy_tests {
         s.add("w", "/tmp/host/w", 3, "h1");
         // the file exists and parses with the mutation
         let d = std::fs::read(&p).unwrap();
-        let parsed: serde_json::Value = serde_json::from_slice(&d)
-            .expect("write-through produced parsable JSON");
-        assert!(parsed["secrets"][0]["name"] == "w", "mutation is IN the file");
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&d).expect("write-through produced parsable JSON");
+        assert!(
+            parsed["secrets"][0]["name"] == "w",
+            "mutation is IN the file"
+        );
         s.remove("w");
         let mut s2 = armed_state(&p);
         let report = crate::policy_store::load(&mut s2, &OracleHub::new());
@@ -562,7 +603,10 @@ mod policy_tests {
         // A mutation succeeds in memory but must NOT touch the store.
         s.add("x", "/tmp/host/x", 1, "h");
         assert!(s.secrets.contains_key("x"));
-        assert!(p.is_dir(), "the unreadable store was not overwritten (rename would have replaced it with a file)");
+        assert!(
+            p.is_dir(),
+            "the unreadable store was not overwritten (rename would have replaced it with a file)"
+        );
     }
 
     #[test]
@@ -645,7 +689,10 @@ mod policy_tests {
         let mut s = ServerState::new();
         s.policy_path = Some(p);
         s.add("x", "/tmp/host/x", 1, "h");
-        assert!(s.secrets.contains_key("x"), "operation succeeded despite unwritable store");
+        assert!(
+            s.secrets.contains_key("x"),
+            "operation succeeded despite unwritable store"
+        );
     }
 
     #[test]

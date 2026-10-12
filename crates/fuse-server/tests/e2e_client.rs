@@ -7,11 +7,10 @@
 // the custom_parser lint exists only under the servyi driver.
 #![allow(unknown_lints)]
 #![allow(custom_parser)]
-
 #![allow(clippy::unwrap_used, clippy::panic, unused_results)]
 
-use std::path::{Path, PathBuf};
 use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
@@ -69,14 +68,20 @@ fn run_client_completing(socket: &Path, line: &str) -> (String, i32) {
 
 /// run_client with extra environment (the respawned server inherits
 /// the CLIENT's environment — the tests below pin what that means).
-fn run_client_env(socket: &Path, args: &[&str], envs: &[(&str, &std::ffi::OsString)]) -> (String, String, i32) {
+fn run_client_env(
+    socket: &Path,
+    args: &[&str],
+    envs: &[(&str, &std::ffi::OsString)],
+) -> (String, String, i32) {
     let bin = client_binary();
     let mut cmd = Command::new(&bin);
     cmd.arg("--socket").arg(socket).args(args);
     for (k, v) in envs {
         cmd.env(k, v);
     }
-    let output = cmd.output().unwrap_or_else(|e| panic!("Failed to run fuse-client: {e}"));
+    let output = cmd
+        .output()
+        .unwrap_or_else(|e| panic!("Failed to run fuse-client: {e}"));
     (
         String::from_utf8_lossy(&output.stdout).to_string(),
         String::from_utf8_lossy(&output.stderr).to_string(),
@@ -111,7 +116,6 @@ fn with_state_file_in<T>(dir: &Path, f: impl FnOnce() -> T) -> T {
     );
     f()
 }
-
 
 fn wait_for_socket(path: &Path, what: &str) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -230,7 +234,8 @@ fn e2e_client_binary_against_server() {
     // ── 1. Status: should see existing.yaml ──
     let (stdout, stderr, code) = run_client(&socket, &["status"]);
     assert_eq!(
-        code, 0,
+        code,
+        0,
         "status failed: {stderr}{}",
         if stderr.contains("Version mismatch") {
             "\n\nHINT: `target/debug/fuse-client` is stale (cargo test does not rebuild \
@@ -239,18 +244,30 @@ fn e2e_client_binary_against_server() {
             ""
         }
     );
-    assert!(stdout.contains("existing.yaml"), "status should list existing.yaml: {stdout}");
-    assert!(stdout.contains("hash1"), "status should show hash: {stdout}");
+    assert!(
+        stdout.contains("existing.yaml"),
+        "status should list existing.yaml: {stdout}"
+    );
+    assert!(
+        stdout.contains("hash1"),
+        "status should show hash: {stdout}"
+    );
 
     // ── 2. Add a new secret via the binary ──
     let secret_file = dir.path().join("new-secret.txt");
     std::fs::write(&secret_file, b"TOPSECRET").unwrap();
 
-    let (stdout, stderr, code) = run_client(&socket, &[
-        "add", "new.yaml",
-        "--file", secret_file.to_str().unwrap(),
-        "--hash", "abc123",
-    ]);
+    let (stdout, stderr, code) = run_client(
+        &socket,
+        &[
+            "add",
+            "new.yaml",
+            "--file",
+            secret_file.to_str().unwrap(),
+            "--hash",
+            "abc123",
+        ],
+    );
     assert_eq!(code, 0, "add-secret failed: {stderr}");
     assert!(
         stdout.contains("added") && stdout.contains("/fuse/"),
@@ -260,31 +277,47 @@ fn e2e_client_binary_against_server() {
     // ── 3. Status: should now show both secrets ──
     let (stdout, stderr, code) = run_client(&socket, &["status"]);
     assert_eq!(code, 0, "status failed: {stderr}");
-    assert!(stdout.contains("existing.yaml"), "should still have existing.yaml: {stdout}");
-    assert!(stdout.contains("new.yaml"), "should have new.yaml: {stdout}");
+    assert!(
+        stdout.contains("existing.yaml"),
+        "should still have existing.yaml: {stdout}"
+    );
+    assert!(
+        stdout.contains("new.yaml"),
+        "should have new.yaml: {stdout}"
+    );
     assert!(stdout.contains("abc123"), "should show new hash: {stdout}");
 
     // ── 4. List mounts ──
     let (stdout, stderr, code) = run_client(&socket, &["mounts"]);
     assert_eq!(code, 0, "list-mounts failed: {stderr}");
-    assert!(stdout.contains("existing.yaml"), "mounts should list existing.yaml: {stdout}");
-    assert!(stdout.contains("new.yaml"), "mounts should list new.yaml: {stdout}");
+    assert!(
+        stdout.contains("existing.yaml"),
+        "mounts should list existing.yaml: {stdout}"
+    );
+    assert!(
+        stdout.contains("new.yaml"),
+        "mounts should list new.yaml: {stdout}"
+    );
 
     // ── 5. Version check ──
     let (stdout, stderr, code) = run_client(&socket, &["version"]);
     assert_eq!(code, 0, "get-version failed: {stderr}");
-    assert!(stdout.contains(VERSION), "version should be {VERSION}: {stdout}");
+    assert!(
+        stdout.contains(VERSION),
+        "version should be {VERSION}: {stdout}"
+    );
 
     // ── 6. Rotate hash ──
-    let (stdout, stderr, code) = run_client(&socket, &[
-        "rotate", "new.yaml", "--hash", "newhash",
-    ]);
+    let (stdout, stderr, code) = run_client(&socket, &["rotate", "new.yaml", "--hash", "newhash"]);
     assert_eq!(code, 0, "rotate-hash failed: {stderr}");
     assert!(stdout.contains("OK"), "rotate should print OK: {stdout}");
 
     // Verify the hash changed
     let (stdout, _, _) = run_client(&socket, &["status"]);
-    assert!(stdout.contains("newhash"), "status should show rotated hash: {stdout}");
+    assert!(
+        stdout.contains("newhash"),
+        "status should show rotated hash: {stdout}"
+    );
 
     // ── 7. Remove secret ──
     let (stdout, stderr, code) = run_client(&socket, &["remove", "new.yaml"]);
@@ -293,36 +326,68 @@ fn e2e_client_binary_against_server() {
 
     // Verify it's gone
     let (stdout, _, _) = run_client(&socket, &["status"]);
-    assert!(!stdout.contains("new.yaml"), "removed secret should not appear: {stdout}");
-    assert!(stdout.contains("existing.yaml"), "existing should still be there: {stdout}");
+    assert!(
+        !stdout.contains("new.yaml"),
+        "removed secret should not appear: {stdout}"
+    );
+    assert!(
+        stdout.contains("existing.yaml"),
+        "existing should still be there: {stdout}"
+    );
 
     // ── 7.5. grant-forever whitelists the observed package hash ──
-    state.create_pending("existing.yaml", 4242, Some("pkg_hash_x"), "hash mismatch", None);
+    state.create_pending(
+        "existing.yaml",
+        4242,
+        Some("pkg_hash_x"),
+        "hash mismatch",
+        None,
+    );
     let id = state.pending.iter().next().unwrap().id;
     let (stdout, stderr, code) = run_client(&socket, &["grant-forever", &id.to_string()]);
     assert_eq!(code, 0, "grant-forever failed: {stderr}");
-    assert!(stdout.contains("OK"), "grant-forever should print OK: {stdout}");
+    assert!(
+        stdout.contains("OK"),
+        "grant-forever should print OK: {stdout}"
+    );
     let probe = state.attempt_read("existing.yaml", 555, Some("pkg_hash_x"), 0, 5);
-    assert!(matches!(probe, fuse_server::ReadOutcome::Granted), "got: {probe:?}");
+    assert!(
+        matches!(probe, fuse_server::ReadOutcome::Granted),
+        "got: {probe:?}"
+    );
     let probe2 = state.attempt_read("existing.yaml", 556, Some("pkg_hash_x"), 0, 5);
-    assert!(matches!(probe2, fuse_server::ReadOutcome::Granted), "unlimited reads: {probe2:?}");
+    assert!(
+        matches!(probe2, fuse_server::ReadOutcome::Granted),
+        "unlimited reads: {probe2:?}"
+    );
     // A granted pending lingers until its (absent) reader removes it or
     // it expires — clean it up so the later pending assertions hold.
     state.remove_pending(id);
 
     // ── 8. Pending: should be empty ──
     let (stdout, _, _) = run_client(&socket, &["pending"]);
-    assert!(stdout.contains("No pending"), "should have no pending: {stdout}");
+    assert!(
+        stdout.contains("No pending"),
+        "should have no pending: {stdout}"
+    );
 
     // ── 9. Log path ──
     let (stdout, _, _) = run_client(&socket, &["logpath"]);
-    assert!(stdout.contains("Log path"), "should show log path: {stdout}");
+    assert!(
+        stdout.contains("Log path"),
+        "should show log path: {stdout}"
+    );
 
     // ── 10. Remove non-existent → should fail ──
     let (stdout, stderr, code) = run_client(&socket, &["remove", "nonexistent"]);
-    assert_eq!(code, 1, "removing nonexistent should exit 1: {stdout} {stderr}");
-    assert!(stderr.contains("not found") || stdout.contains("not found") || stderr.contains("Error"),
-        "should report error for missing secret: {stdout} | {stderr}");
+    assert_eq!(
+        code, 1,
+        "removing nonexistent should exit 1: {stdout} {stderr}"
+    );
+    assert!(
+        stderr.contains("not found") || stdout.contains("not found") || stderr.contains("Error"),
+        "should report error for missing secret: {stdout} | {stderr}"
+    );
 }
 
 /// The remediation round trip: a pending born while hashd was down
@@ -370,12 +435,21 @@ fn grant_forever_retries_hashd_after_remediation() {
     wait_for_server(&socket);
 
     let (stdout, stderr, code) = run_client(&socket, &["grant-forever", &id.to_string()]);
-    assert_eq!(code, 0, "grant-forever after starting hashd failed: {stderr}");
-    assert!(stdout.contains("OK"), "grant-forever should print OK: {stdout}");
+    assert_eq!(
+        code, 0,
+        "grant-forever after starting hashd failed: {stderr}"
+    );
+    assert!(
+        stdout.contains("OK"),
+        "grant-forever should print OK: {stdout}"
+    );
 
     // The live-retried hash became the whitelisted package: unlimited reads.
     let probe = state.attempt_read("netrc", 555, Some(&"c".repeat(64)), 0, 6);
-    assert!(matches!(probe, fuse_server::ReadOutcome::Granted), "got: {probe:?}");
+    assert!(
+        matches!(probe, fuse_server::ReadOutcome::Granted),
+        "got: {probe:?}"
+    );
 
     let _ = stub;
     std::env::remove_var(fuse_protocol::ENV_HASHD_SOCK);
@@ -405,9 +479,16 @@ fn restart_spares_processes_that_mention_fuse_server() {
         .expect("spawn innocent");
 
     let mut bystander = fuse_server_named_bystander(dir.path());
-    let (mut sacrificial, sacrificial_bin) = sacrificial_server_pid_as(dir.path(), "sacrificial-server");
+    let (mut sacrificial, sacrificial_bin) =
+        sacrificial_server_pid_as(dir.path(), "sacrificial-server");
     with_state_file_in(dir.path(), || {
-        write_state_with_pid(dir.path(), &dead_socket, None, sacrificial.id(), &sacrificial_bin);
+        write_state_with_pid(
+            dir.path(),
+            &dead_socket,
+            None,
+            sacrificial.id(),
+            &sacrificial_bin,
+        );
         // Bounded by the client's own 10s server wait.
         let _ = run_client(&dead_socket, &["restart"]);
     });
@@ -452,8 +533,10 @@ fn restart_of_one_stack_spares_the_other_live_stack() {
 
     // Stack B: a real policy server we prove stays alive.
     let mut b_server = Command::new(env!("CARGO_BIN_EXE_fuse-server"))
-        .arg("--socket").arg(&b_cmd)
-        .arg("--oracle-socket").arg(&b_oracle)
+        .arg("--socket")
+        .arg(&b_cmd)
+        .arg("--oracle-socket")
+        .arg(&b_oracle)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
@@ -480,9 +563,11 @@ fn restart_of_one_stack_spares_the_other_live_stack() {
 
     let spawned_pid = with_state_file_in(dir.path(), || {
         let (stdout, _stderr, _code) = run_client(&a_cmd, &["restart"]);
-        stdout
-            .lines()
-            .find_map(|l| l.trim().strip_prefix("Spawned pid ").and_then(|p| p.parse::<i32>().ok()))
+        stdout.lines().find_map(|l| {
+            l.trim()
+                .strip_prefix("Spawned pid ")
+                .and_then(|p| p.parse::<i32>().ok())
+        })
     });
 
     // THE assertion: stack B still answers — its server was never touched.
@@ -542,7 +627,8 @@ fn restart_respawns_on_the_state_files_oracle_rendezvous() {
     let spawned_pid = with_state_file_in(dir.path(), || {
         let (stdout, stderr, code) = run_client(&cmd_sock, &["restart"]);
         assert_eq!(
-            code, 0,
+            code,
+            0,
             "restart failed: {stderr}\n{stdout}\n(state: {})",
             std::fs::read_to_string(dir.path().join("state.json")).unwrap_or_default()
         );
@@ -551,9 +637,11 @@ fn restart_respawns_on_the_state_files_oracle_rendezvous() {
         wait_for_socket(&oracle_sock, "the respawned policy daemon");
         // And the client told us which pid it spawned — that, and only
         // that, is what the cleanup below may kill.
-        stdout
-            .lines()
-            .find_map(|l| l.trim().strip_prefix("Spawned pid ").and_then(|p| p.parse::<i32>().ok()))
+        stdout.lines().find_map(|l| {
+            l.trim()
+                .strip_prefix("Spawned pid ")
+                .and_then(|p| p.parse::<i32>().ok())
+        })
     });
 
     if let Some(pid) = spawned_pid {
@@ -580,7 +668,13 @@ fn completion_is_dynamic_against_live_server_state() {
         s
     });
     // One live pending so PendingIds completion has a real id.
-    state.create_pending("existing.yaml", 4242, Some("pkg_hash_x"), "hash mismatch", None);
+    state.create_pending(
+        "existing.yaml",
+        4242,
+        Some("pkg_hash_x"),
+        "hash mismatch",
+        None,
+    );
 
     let sock = socket.clone();
     let st = Arc::clone(&state);
@@ -592,22 +686,38 @@ fn completion_is_dynamic_against_live_server_state() {
     // ── First word: command names, prefix-filtered, from the table ──
     let (out, code) = run_client_completing(&socket, "fuse-client sta");
     assert_eq!(code, 0, "completion must exit 0: {out}");
-    assert_eq!(out.trim_end(), "status", "prefix sta completes to status only: {out}");
+    assert_eq!(
+        out.trim_end(),
+        "status",
+        "prefix sta completes to status only: {out}"
+    );
 
     // ── Secret-name argument from the LIVE status reply ──
     let (out, code) = run_client_completing(&socket, "fuse-client reset exi");
     assert_eq!(code, 0);
-    assert_eq!(out.trim_end(), "existing.yaml", "reset completes the real secret: {out}");
+    assert_eq!(
+        out.trim_end(),
+        "existing.yaml",
+        "reset completes the real secret: {out}"
+    );
 
     // Empty prefix after trailing space lists every candidate.
     let (out, _) = run_client_completing(&socket, "fuse-client reset ");
-    assert_eq!(out.trim_end(), "existing.yaml", "empty prefix lists all secrets: {out}");
+    assert_eq!(
+        out.trim_end(),
+        "existing.yaml",
+        "empty prefix lists all secrets: {out}"
+    );
 
     // ── Pending-id argument from the LIVE pending reply ──
     let id = state.pending.iter().next().unwrap().id;
     let (out, code) = run_client_completing(&socket, "fuse-client grant ");
     assert_eq!(code, 0);
-    assert_eq!(out.trim_end(), id.to_string(), "grant completes the real pending id: {out}");
+    assert_eq!(
+        out.trim_end(),
+        id.to_string(),
+        "grant completes the real pending id: {out}"
+    );
 
     // ── Arity guard: the SECOND argument of rotate (the hash) never
     //    completes into secret names ──
@@ -631,7 +741,10 @@ fn completion_is_dynamic_against_live_server_state() {
     );
     let (out, code) = run_client_completing(&dead, "fuse-client reset x");
     assert_eq!(code, 0);
-    assert_eq!(out, "", "offline argument completion degrades to empty: {out}");
+    assert_eq!(
+        out, "",
+        "offline argument completion degrades to empty: {out}"
+    );
 
     // ── bash's REAL invocation: COMP_LINE in the environment, no
     //    --complete flag on argv (complete -C spawns the bare binary) ──
@@ -640,7 +753,10 @@ fn completion_is_dynamic_against_live_server_state() {
         .arg("--socket")
         .arg(&socket)
         .env(fuse_protocol::COMP_LINE, "fuse-client grant ")
-        .env(fuse_protocol::COMP_POINT, "fuse-client grant ".len().to_string())
+        .env(
+            fuse_protocol::COMP_POINT,
+            "fuse-client grant ".len().to_string(),
+        )
         .output()
         .expect("bare COMP_LINE completion");
     let id = state.pending.iter().next().unwrap().id;
@@ -708,16 +824,29 @@ fn restart_respawns_on_the_stacks_own_policy_store() {
     // The stack's server: runs with the stack's OWN policy store (as
     // run-agent always arranges). Policy-only — no mount needed.
     let mut server = Command::new(env!("CARGO_BIN_EXE_fuse-server"))
-        .arg("--socket").arg(&cmd_sock)
-        .arg("--oracle-socket").arg(&oracle_sock)
-        .arg("--log-path").arg(dir.path().join("server.log"))
-        .arg("--secret").arg("s1").arg(&secret1).arg("aa")
+        .arg("--socket")
+        .arg(&cmd_sock)
+        .arg("--oracle-socket")
+        .arg(&oracle_sock)
+        .arg("--log-path")
+        .arg(dir.path().join("server.log"))
+        .arg("--secret")
+        .arg("s1")
+        .arg(&secret1)
+        .arg("aa")
         .env("FUSE_GATEKEEPER_POLICY", &stack_store)
         .env("RUST_LOG", "info")
-        .spawn().expect("spawn stack server");
+        .spawn()
+        .expect("spawn stack server");
     wait_for_socket(&cmd_sock, "stack server");
-    assert!(stack_store.exists(), "boot registration persists (store written)");
-    assert!(!xdg.join("gatekeeper").exists(), "default store untouched while the stack runs");
+    assert!(
+        stack_store.exists(),
+        "boot registration persists (store written)"
+    );
+    assert!(
+        !xdg.join("gatekeeper").exists(),
+        "default store untouched while the stack runs"
+    );
 
     let state = serde_json::json!({
         "version": VERSION,
@@ -740,23 +869,28 @@ fn restart_respawns_on_the_stacks_own_policy_store() {
     std::fs::write(dir.path().join("state.json"), state.to_string()).unwrap();
 
     let xdg_os: std::ffi::OsString = xdg.to_string_lossy().into_owned().into();
-    let state_os: std::ffi::OsString = dir.path().join("state.json").to_string_lossy().into_owned().into();
+    let state_os: std::ffi::OsString = dir
+        .path()
+        .join("state.json")
+        .to_string_lossy()
+        .into_owned()
+        .into();
     let _guard = STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _reset_state = EnvReset::new(fuse_protocol::ENV_STATE_FILE, Some(&state_os));
     let _reset_xdg = EnvReset::new("XDG_STATE_HOME", Some(&xdg_os));
-    let (stdout, stderr, code) = run_client_env(
-        &cmd_sock,
-        &["restart"],
-        &[("XDG_STATE_HOME", &xdg_os)],
-    );
+    let (stdout, stderr, code) =
+        run_client_env(&cmd_sock, &["restart"], &[("XDG_STATE_HOME", &xdg_os)]);
     assert_eq!(code, 0, "restart failed: {stderr}\n{stdout}");
 
     // The re-add (s2) must land in THE STACK'S store…
     let store: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&stack_store).unwrap()).unwrap();
     let names: Vec<&str> = store["secrets"]
-        .as_array().unwrap()
-        .iter().map(|s| s["name"].as_str().unwrap()).collect();
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["name"].as_str().unwrap())
+        .collect();
     assert!(
         names.contains(&"s2"),
         "the respawn armed the STACK's store (re-add s2 visible); got {names:?} \
@@ -769,10 +903,11 @@ fn restart_respawns_on_the_stacks_own_policy_store() {
     );
 
     // cleanup: exactly the pid the client reported spawning
-    if let Some(pid) = stdout
-        .lines()
-        .find_map(|l| l.trim().strip_prefix("Spawned pid ").and_then(|p| p.parse::<i32>().ok()))
-    {
+    if let Some(pid) = stdout.lines().find_map(|l| {
+        l.trim()
+            .strip_prefix("Spawned pid ")
+            .and_then(|p| p.parse::<i32>().ok())
+    }) {
         let _ = Command::new("kill").arg(pid.to_string()).output();
     }
     let _ = server.kill();
@@ -790,24 +925,34 @@ fn fused_binary_seam_substitutes_the_supervised_daemon() {
     let oracle_sock = dir.path().join("oracle.sock");
     let mnt = dir.path().join("mnt");
     std::fs::create_dir_all(&mnt).unwrap();
-    let fake = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/debug/fake-fused");
-    assert!(fake.exists(), "fake-fused not built (cargo build --workspace): {}", fake.display());
+    let fake =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/fake-fused");
+    assert!(
+        fake.exists(),
+        "fake-fused not built (cargo build --workspace): {}",
+        fake.display()
+    );
 
     let mut server = Command::new(env!("CARGO_BIN_EXE_fuse-server"))
-        .arg("--socket").arg(&cmd_sock)
-        .arg("--oracle-socket").arg(&oracle_sock)
-        .arg("--mount-point").arg(&mnt)
-        .arg("--fused-binary").arg(&fake)
+        .arg("--socket")
+        .arg(&cmd_sock)
+        .arg("--oracle-socket")
+        .arg(&oracle_sock)
+        .arg("--mount-point")
+        .arg(&mnt)
+        .arg("--fused-binary")
+        .arg(&fake)
         .env("RUST_LOG", "warn")
-        .spawn().expect("spawn server");
+        .spawn()
+        .expect("spawn server");
     wait_for_socket(&cmd_sock, "server");
 
     // the fake is alive and carries OUR mount point in its argv
     let probe = Command::new("pgrep")
         .arg("-f")
         .arg(format!("{}.*{}", fake.display(), mnt.display()))
-        .output().expect("pgrep");
+        .output()
+        .expect("pgrep");
     let found = String::from_utf8_lossy(&probe.stdout);
     assert!(
         probe.status.success() && !found.trim().is_empty(),
@@ -837,10 +982,14 @@ fn restart_appends_to_the_server_log_instead_of_truncating() {
     std::fs::write(&log, "PRE-RESTART LOG LINE THAT MUST SURVIVE\n").unwrap();
 
     let mut server = Command::new(env!("CARGO_BIN_EXE_fuse-server"))
-        .arg("--socket").arg(&cmd_sock)
-        .arg("--oracle-socket").arg(&oracle_sock)
-        .arg("--log-path").arg(&log)
-        .spawn().expect("spawn server");
+        .arg("--socket")
+        .arg(&cmd_sock)
+        .arg("--oracle-socket")
+        .arg(&oracle_sock)
+        .arg("--log-path")
+        .arg(&log)
+        .spawn()
+        .expect("spawn server");
     wait_for_socket(&cmd_sock, "server");
 
     let state = serde_json::json!({
@@ -857,7 +1006,12 @@ fn restart_appends_to_the_server_log_instead_of_truncating() {
     });
     std::fs::write(dir.path().join("state.json"), state.to_string()).unwrap();
 
-    let state_os: std::ffi::OsString = dir.path().join("state.json").to_string_lossy().into_owned().into();
+    let state_os: std::ffi::OsString = dir
+        .path()
+        .join("state.json")
+        .to_string_lossy()
+        .into_owned()
+        .into();
     let _guard = STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _reset_state = EnvReset::new(fuse_protocol::ENV_STATE_FILE, Some(&state_os));
     let (stdout, stderr, code) = run_client(&cmd_sock, &["restart"]);
@@ -869,14 +1023,13 @@ fn restart_appends_to_the_server_log_instead_of_truncating() {
         "the respawn truncated the log — restart forensics destroyed, #93 F4; after: {after:?}"
     );
 
-    if let Some(pid) = stdout
-        .lines()
-        .find_map(|l| l.trim().strip_prefix("Spawned pid ").and_then(|p| p.parse::<i32>().ok()))
-    {
+    if let Some(pid) = stdout.lines().find_map(|l| {
+        l.trim()
+            .strip_prefix("Spawned pid ")
+            .and_then(|p| p.parse::<i32>().ok())
+    }) {
         let _ = Command::new("kill").arg(pid.to_string()).output();
     }
     let _ = server.kill();
     let _ = server.wait();
 }
-
-

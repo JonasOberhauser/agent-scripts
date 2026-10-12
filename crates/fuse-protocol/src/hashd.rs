@@ -104,9 +104,7 @@ fn ask_once(socket: &str, pid: u32, answer_timeout: Duration) -> Result<String, 
         // The read timeout surfaces as WouldBlock/errno 11: hashd
         // accepted us but is busy hashing something big and answered
         // nothing — NOT unreachable (#38).
-        if e.kind() == std::io::ErrorKind::WouldBlock
-            || e.raw_os_error() == Some(libc::EAGAIN)
-        {
+        if e.kind() == std::io::ErrorKind::WouldBlock || e.raw_os_error() == Some(libc::EAGAIN) {
             HashdError::Busy(e.to_string())
         } else {
             HashdError::Unreachable(e.to_string())
@@ -146,7 +144,10 @@ fn connect_with_retry(socket: &str) -> Result<UnixStream, HashdError> {
 /// indefinitely on AF_UNIX — a retry loop would multiply the hang
 /// into forever. Nonblocking connect + poll, bounded by `deadline`;
 /// timeout surfaces as EAGAIN (busy: the #38 backlog semantics).
-fn connect_bounded(socket: &str, deadline: std::time::Instant) -> Result<UnixStream, std::io::Error> {
+fn connect_bounded(
+    socket: &str,
+    deadline: std::time::Instant,
+) -> Result<UnixStream, std::io::Error> {
     use std::os::unix::io::FromRawFd;
     let (af_unix, sock_stream, zero) = (libc::AF_UNIX, libc::SOCK_STREAM, 0);
     // SAFETY: socket(2) with plain constants has no preconditions.
@@ -200,7 +201,11 @@ fn connect_bounded(socket: &str, deadline: std::time::Instant) -> Result<UnixStr
                 let _cl = unsafe { libc::close(fd) };
                 return Err(std::io::Error::from_raw_os_error(libc::EAGAIN));
             }
-            let mut pfd = libc::pollfd { fd, events: libc::POLLOUT, revents: 0 };
+            let mut pfd = libc::pollfd {
+                fd,
+                events: libc::POLLOUT,
+                revents: 0,
+            };
             let n_fds = 1;
             let slice_ms = 25;
             let poll_ptr = &mut pfd as *mut libc::pollfd;
@@ -270,7 +275,9 @@ pub fn parse_reply(line: &str) -> Result<String, HashdError> {
         if hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit()) {
             return Ok(hash);
         }
-        return Err(HashdError::Other(format!("malformed hash in reply: {line:?}")));
+        return Err(HashdError::Other(format!(
+            "malformed hash in reply: {line:?}"
+        )));
     }
     match r.error {
         Some(e) if e.kind == "unprivileged" => Err(HashdError::Unprivileged(e.message)),
@@ -362,7 +369,6 @@ pub fn is_unprivileged_error(msg: &str) -> bool {
     msg.contains("hashd: insufficient privileges")
 }
 
-
 // Tests may hand-parse output/protocol lines: sanctioned by policy
 // (test + allow), NOT available to production code. unknown_lints:
 // the custom_parser lint exists only under the servyi driver.
@@ -400,10 +406,7 @@ mod tests {
             parse_reply(r#"{"error":{"kind":"io","message":"something else"}}"#),
             Err(HashdError::Other(_))
         ));
-        assert!(matches!(
-            parse_reply("garbage"),
-            Err(HashdError::Other(_))
-        ));
+        assert!(matches!(parse_reply("garbage"), Err(HashdError::Other(_))));
     }
 
     /// Bind a listener with an EXPLICIT tiny backlog and return its
@@ -459,7 +462,8 @@ mod tests {
         // Connected, never accepted, never answered — hashd "busy".
         let _holder = UnixStream::connect(&sock).unwrap();
         let t0 = std::time::Instant::now();
-        let e = ask_with_answer_timeout(&sock.display().to_string(), 1, Duration::from_millis(50)).unwrap_err();
+        let e = ask_with_answer_timeout(&sock.display().to_string(), 1, Duration::from_millis(50))
+            .unwrap_err();
         assert!(
             matches!(e, HashdError::Busy(_)),
             "an unanswered (busy) ask must classify Busy, got: {e:?}"
@@ -503,8 +507,9 @@ mod tests {
                 let _ = conn.write_all(format!("{{\"ok\":\"{}\"}}\n", "a".repeat(64)).as_bytes());
             }
         });
-        let got = ask_with_answer_timeout(&sock.display().to_string(), 7, Duration::from_millis(80))
-            .expect("retry recovers");
+        let got =
+            ask_with_answer_timeout(&sock.display().to_string(), 7, Duration::from_millis(80))
+                .expect("retry recovers");
         assert_eq!(got, "a".repeat(64));
     }
 
@@ -523,8 +528,7 @@ mod tests {
             // SAFETY: the fd was created by tiny_backlog_listener and
             // is owned exclusively by this thread from here on; std
             // closes it when the listener drops.
-            let listener =
-                unsafe { std::os::unix::net::UnixListener::from_raw_fd(fd) };
+            let listener = unsafe { std::os::unix::net::UnixListener::from_raw_fd(fd) };
             let reply = format!("{{\"ok\":\"{}\"}}\n", "a".repeat(64));
             for conn in listener.incoming().flatten() {
                 let mut conn = conn;
@@ -595,7 +599,10 @@ mod tests {
     fn actionable_unreachable_custom_socket_skips_install_hint() {
         let e = HashdError::Unreachable("refused".into());
         let text = actionable_error(&e, "/tmp/custom-hashd.sock", None);
-        assert!(text.contains("install -m 755 <hashd-binary> /usr/local/bin/hashd"), "no known binary: placeholder, got:\n{text}");
+        assert!(
+            text.contains("install -m 755 <hashd-binary> /usr/local/bin/hashd"),
+            "no known binary: placeholder, got:\n{text}"
+        );
         assert!(
             !text.contains("systemctl enable"),
             "custom socket: the unit files hard-code the default socket, so the \
@@ -628,10 +635,21 @@ mod tests {
 
     #[test]
     fn actionable_gone_and_other_stay_lean() {
-        let gone = actionable_error(&HashdError::Gone("no such process".into()), DEFAULT_SOCK, None);
+        let gone = actionable_error(
+            &HashdError::Gone("no such process".into()),
+            DEFAULT_SOCK,
+            None,
+        );
         assert_eq!(gone, "hashd: process gone — no such process");
-        assert!(!gone.contains("sudo"), "nothing to start for a gone process: {gone}");
-        let other = actionable_error(&HashdError::Other("disk on fire".into()), DEFAULT_SOCK, None);
+        assert!(
+            !gone.contains("sudo"),
+            "nothing to start for a gone process: {gone}"
+        );
+        let other = actionable_error(
+            &HashdError::Other("disk on fire".into()),
+            DEFAULT_SOCK,
+            None,
+        );
         assert_eq!(other, "hashd: disk on fire");
     }
 
@@ -655,10 +673,7 @@ mod tests {
             };
             conn.write_all(reply.as_bytes()).unwrap();
         });
-        assert_eq!(
-            ask(path2.to_str().unwrap(), 7).unwrap(),
-            "b".repeat(64)
-        );
+        assert_eq!(ask(path2.to_str().unwrap(), 7).unwrap(), "b".repeat(64));
         server.join().unwrap();
     }
 

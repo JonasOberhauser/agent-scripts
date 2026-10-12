@@ -93,6 +93,17 @@ pub struct ServerStateFile {
     /// old state files (empty = inherit, the old behavior).
     #[serde(default)]
     pub env: std::collections::HashMap<String, String>,
+    /// Handoff mode (#93 F2 seamless restart): set by the OLD server
+    /// when a restart put it into handoff mode — the rendezvous where
+    /// it serves the frozen handoff dialect to the new server, and the
+    /// supervised fused pid for identity cross-checks. Absent (old
+    /// state files, no pending handoff) = no handoff.
+    #[serde(default)]
+    pub handoff_socket: Option<String>,
+    /// The supervised data daemon's pid at the time handoff mode was
+    /// entered (additive, same as handoff_socket).
+    #[serde(default)]
+    pub supervised_pid: Option<u32>,
     pub secrets: Vec<StateSecretEntry>,
 }
 
@@ -222,11 +233,10 @@ impl Salt {
     /// anonymization must not quietly degrade.
     pub fn generate() -> Salt {
         let mut buf = [0u8; 32];
-        let mut f = std::fs::File::open("/dev/urandom")
-            .expect("/dev/urandom for the anonymization salt");
+        let mut f =
+            std::fs::File::open("/dev/urandom").expect("/dev/urandom for the anonymization salt");
         use std::io::Read as _;
-        f.read_exact(&mut buf)
-            .expect("32 bytes from /dev/urandom");
+        f.read_exact(&mut buf).expect("32 bytes from /dev/urandom");
         Salt(buf.to_vec())
     }
 
@@ -243,7 +253,6 @@ pub fn anonymize(salt: &Salt, component: &str) -> String {
     let d = h.finalize();
     d.iter().take(6).map(|b| format!("{b:02x}")).collect()
 }
-
 
 /// The container-view form of a full path: same components, each
 /// anonymized under the salt.
@@ -289,6 +298,22 @@ pub const PENDING_ONLY_HASH: &str = "!pending-only";
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Command {
+    /// Enter HANDOFF MODE (#93 F2 seamless restart): the server stops
+    /// its listeners, takes the mount-connection fd back from its
+    /// supervised fused, records the handoff rendezvous + supervised
+    /// pid into `state_file` (additive fields), and lingers serving
+    /// the frozen handoff dialect until the new server commits,
+    /// aborts, or the timeout degrades to today's behavior. Old
+    /// servers reply the standard unknown-command error and callers
+    /// fall back to SIGTERM.
+    Handoff {
+        state_file: String,
+        /// Handoff-mode linger timeout in seconds (tests want short
+        /// ones; production takes the default). Wire-optional.
+        #[serde(default)]
+        timeout_secs: Option<String>,
+    },
+
     /// Reset the access counter for one secret (or all when `name` is `None`).
     Reset { name: Option<String> },
     /// Return status of every secret.
@@ -355,9 +380,13 @@ pub enum Command {
 pub enum Response {
     /// AddSecret succeeded; `inner` is the anonymized container-view
     /// name (issue #47) the mount serves the secret under.
-    Added { inner: String },
+    Added {
+        inner: String,
+    },
     Ok,
-    Error { message: String },
+    Error {
+        message: String,
+    },
     #[serde(alias = "Status")]
     Status {
         secrets: Vec<SecretStatus>,
@@ -367,14 +396,24 @@ pub enum Response {
         #[serde(default)]
         lockdown: bool,
     },
-    MountList { mounts: Vec<MountEntry> },
-    PendingList { pending: Vec<PendingAccessInfo> },
+    MountList {
+        mounts: Vec<MountEntry>,
+    },
+    PendingList {
+        pending: Vec<PendingAccessInfo>,
+    },
     /// Server protocol version.
-    Version { version: String },
+    Version {
+        version: String,
+    },
     /// Server's log file path.
-    LogPath { path: String },
+    LogPath {
+        path: String,
+    },
     /// The outer->inner name map (issue #47), on demand.
-    Map { entries: Vec<MapEntry> },
+    Map {
+        entries: Vec<MapEntry>,
+    },
 }
 
 /// One row of the outer->inner name map.
@@ -393,9 +432,8 @@ mod tests {
         Salt::from_bytes(b"salt".to_vec()).unwrap()
     }
 
-
-#[test]
-fn an_empty_salt_is_unrepresentable() {
+    #[test]
+    fn an_empty_salt_is_unrepresentable() {
         // Review on #58: "why do you just allow calling the anonymize
         // path function with an empty salt?" — you cannot anymore:
         // Salt::from_bytes rejects empty, anonymize* only accept &Salt,
@@ -407,16 +445,22 @@ fn an_empty_salt_is_unrepresentable() {
 
     #[test]
     fn anonymize_is_deterministic_salt_sensitive_and_shaped() {
-    let a = anonymize(&s4lt(), "git.netrc");
-    let b = anonymize(&s4lt(), "git.netrc");
-    assert_eq!(a, b, "same salt + component -> same name (stability)");
-    assert_eq!(a.len(), 12, "12 hex chars");
-    assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
-    assert_ne!(a, anonymize(&Salt::from_bytes(b"other".to_vec()).unwrap(), "git.netrc"), "salt changes the name");
-    assert_ne!(anonymize(&s4lt(), "a"), anonymize(&s4lt(), "b"));
-    assert!(!anonymize_path(&s4lt(), "x/y/z.txt").contains('/'), "flat whole-path hash");
-}
-
+        let a = anonymize(&s4lt(), "git.netrc");
+        let b = anonymize(&s4lt(), "git.netrc");
+        assert_eq!(a, b, "same salt + component -> same name (stability)");
+        assert_eq!(a.len(), 12, "12 hex chars");
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(
+            a,
+            anonymize(&Salt::from_bytes(b"other".to_vec()).unwrap(), "git.netrc"),
+            "salt changes the name"
+        );
+        assert_ne!(anonymize(&s4lt(), "a"), anonymize(&s4lt(), "b"));
+        assert!(
+            !anonymize_path(&s4lt(), "x/y/z.txt").contains('/'),
+            "flat whole-path hash"
+        );
+    }
 
     #[test]
     fn collapse_to_first_points_of_difference_issue_example_1() {
@@ -498,7 +542,6 @@ fn an_empty_salt_is_unrepresentable() {
         // A missing patch component is still major.minor — compatible.
         assert!(versions_compatible("0.27", "0.27.0"));
     }
-
 
     use super::PendingAccessInfo;
 

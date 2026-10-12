@@ -119,10 +119,7 @@ fn check_mount<S: SystemIo>(
     let mut attempts = 0usize;
     let (ok, detail) = loop {
         attempts += 1;
-        let res = io.run_command(
-            "timeout",
-            &[&secs, "stat", "-c", "%s", &mount_side_str],
-        );
+        let res = io.run_command("timeout", &[&secs, "stat", "-c", "%s", &mount_side_str]);
         match &res {
             Ok(o) if o.success() => break (true, "mount answers".into()),
             Ok(o) if o.status == Some(124) => {
@@ -142,9 +139,7 @@ fn check_mount<S: SystemIo>(
                 let root = probe_mount_root(io, mount_point, timeout_secs);
                 // Mount up and serving OTHER names?  The name is
                 // genuinely missing — retrying cannot conjure it.
-                if matches!(root, RootProbe::Entries(_))
-                    || attempts >= MOUNT_APPEAR_RETRIES
-                {
+                if matches!(root, RootProbe::Entries(_)) || attempts >= MOUNT_APPEAR_RETRIES {
                     break (
                         false,
                         mount_one_failure_detail(&mount_side_str, &last_stderr, attempts, root),
@@ -167,7 +162,9 @@ fn check_mount<S: SystemIo>(
             Err(e) => {
                 break (
                     false,
-                    format!("pre-flight could not run `timeout stat` ({e}) — is coreutils installed?"),
+                    format!(
+                        "pre-flight could not run `timeout stat` ({e}) — is coreutils installed?"
+                    ),
                 );
             }
         }
@@ -193,11 +190,7 @@ enum RootProbe {
     Failed(String),
 }
 
-fn probe_mount_root<S: SystemIo>(
-    io: &S,
-    mount_point: &Path,
-    timeout_secs: u64,
-) -> RootProbe {
+fn probe_mount_root<S: SystemIo>(io: &S, mount_point: &Path, timeout_secs: u64) -> RootProbe {
     let secs = timeout_secs.to_string();
     let root_str = mount_point.display().to_string();
     match io.run_command("timeout", &[&secs, "ls", "-a", &root_str]) {
@@ -235,7 +228,10 @@ fn mount_one_failure_detail(
 ) -> String {
     let root_part = match root {
         RootProbe::Entries(names) => format!("mount root lists: {names}"),
-        RootProbe::Empty => "mount root lists NOTHING (empty store — sync problem or data daemon still starting)".into(),
+        RootProbe::Empty => {
+            "mount root lists NOTHING (empty store — sync problem or data daemon still starting)"
+                .into()
+        }
         RootProbe::Failed(why) => why,
     };
     format!(
@@ -351,7 +347,8 @@ mod tests {
             "should name the mount-side path: {mnt}"
         );
         assert!(
-            mnt.detail.contains(&format!("after {MOUNT_APPEAR_RETRIES} tries")),
+            mnt.detail
+                .contains(&format!("after {MOUNT_APPEAR_RETRIES} tries")),
             "should have retried before failing: {mnt}"
         );
     }
@@ -512,8 +509,7 @@ mod tests {
             },
         ];
         let results = run(&mock, &loaded, &mount_point(), DEFAULT_TIMEOUT_SECS);
-        let summary =
-            failure_summary(&results).expect("failures must produce a summary");
+        let summary = failure_summary(&results).expect("failures must produce a summary");
         assert!(
             summary.contains("p100_s0") && summary.contains("p100_s1"),
             "summary must list both secrets: {summary}"

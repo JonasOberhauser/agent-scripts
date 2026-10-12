@@ -12,7 +12,6 @@ use std::path::PathBuf;
 use clap::Parser;
 use tracing::{error, info};
 
-
 #[derive(Parser)]
 #[command(name = fuse_protocol::FUSED_BIN, about = "FUSE gatekeeper DATA daemon: secret bytes + mount; access decided by the policy daemon")]
 struct Cli {
@@ -35,14 +34,15 @@ fn main() {
     let cli = Cli::parse();
 
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::builder().parse_lossy(&cli.log_level),
-        )
+        .with_env_filter(tracing_subscriber::EnvFilter::builder().parse_lossy(&cli.log_level))
         .init();
 
     if !cli.mount_point.exists() {
         if let Err(e) = std::fs::create_dir_all(&cli.mount_point) {
-            error!("Failed to create mount point {}: {e}", cli.mount_point.display());
+            error!(
+                "Failed to create mount point {}: {e}",
+                cli.mount_point.display()
+            );
             std::process::exit(1);
         }
     }

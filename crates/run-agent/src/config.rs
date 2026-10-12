@@ -33,11 +33,7 @@ impl Runtime {
     /// Resolve to a concrete runtime name, probing the system.
     /// Returns `None` if the runtime is not available.
     /// When `wrapper` is set, detection runs `<wrapper> <runtime> --version`.
-    pub fn resolve<S: SystemIo>(
-        &self,
-        io: &S,
-        wrapper: Option<&str>,
-    ) -> Option<&'static str> {
+    pub fn resolve<S: SystemIo>(&self, io: &S, wrapper: Option<&str>) -> Option<&'static str> {
         match self {
             Runtime::Podman => {
                 if runtime_available(io, wrapper, "podman") {
@@ -67,11 +63,7 @@ impl Runtime {
 }
 
 /// Check whether `<wrapper>? <runtime> --version` succeeds.
-fn runtime_available<S: SystemIo>(
-    io: &S,
-    wrapper: Option<&str>,
-    runtime: &str,
-) -> bool {
+fn runtime_available<S: SystemIo>(io: &S, wrapper: Option<&str>, runtime: &str) -> bool {
     match wrapper {
         Some(w) => {
             let parts: Vec<&str> = w.split_whitespace().collect();
@@ -267,7 +259,7 @@ impl AgentConfig {
     }
 
     pub fn container_name(&self) -> String {
-        use sha2::{Sha256, Digest};
+        use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
         hasher.update(self.agent_path.to_string_lossy().as_bytes());
         let hash = format!("{:x}", hasher.finalize());
@@ -297,10 +289,7 @@ pub fn build_create_args(config: &AgentConfig, devices: &[String]) -> Vec<String
             config.container_config_dir()
         ),
         "-v".into(),
-        format!(
-            "{}:/workspace:slave,Z",
-            config.host_workspace().display()
-        ),
+        format!("{}:/workspace:slave,Z", config.host_workspace().display()),
     ];
 
     if let Some(plans) = &config.plans_path {
@@ -379,13 +368,14 @@ mod tests {
 
     #[test]
     fn secret_mapping_from_pair() {
-        let m = SecretMapping::from_pair(
-            "/home/jonas/key.json",
-            "/root/.config/opencode/auth.json",
-        )
-        .unwrap();
+        let m =
+            SecretMapping::from_pair("/home/jonas/key.json", "/root/.config/opencode/auth.json")
+                .unwrap();
         assert_eq!(m.host, PathBuf::from("/home/jonas/key.json"));
-        assert_eq!(m.container, PathBuf::from("/root/.config/opencode/auth.json"));
+        assert_eq!(
+            m.container,
+            PathBuf::from("/root/.config/opencode/auth.json")
+        );
     }
 
     #[test]
@@ -447,10 +437,7 @@ mod tests {
             log_level: "info".to_string(),
             plans_path: None,
         };
-        let args = build_create_args(
-            &cfg,
-            &["/dev/fuse".to_string(), "/dev/net/tun".to_string()],
-        );
+        let args = build_create_args(&cfg, &["/dev/fuse".to_string(), "/dev/net/tun".to_string()]);
         assert!(args.contains(&"run".to_string()));
         // Device passthrough enables nested rootless podman.
         let di = args
@@ -459,7 +446,10 @@ mod tests {
             .expect("--device present");
         assert_eq!(args[di + 1], "/dev/fuse");
         assert!(args.contains(&"-d".to_string()));
-        assert!(!args.contains(&"--rm".to_string()), "persistent container should NOT use --rm");
+        assert!(
+            !args.contains(&"--rm".to_string()),
+            "persistent container should NOT use --rm"
+        );
         assert!(args.contains(&"sleep".into()));
         assert!(args.contains(&"infinity".into()));
         assert!(args.contains(&"myimg".into()));

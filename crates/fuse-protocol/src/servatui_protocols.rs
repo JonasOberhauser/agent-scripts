@@ -25,16 +25,16 @@ pub fn print_response(resp: &Response, out: &mut dyn Console) {
                 let collapsed = crate::protocol::collapse_paths(
                     &secrets.iter().map(|s| s.name.clone()).collect::<Vec<_>>(),
                 );
-                out.print_line(&format!("{:<24} {:>8} {:>8}  HASH", "NAME", "READS", "SIZE"));
+                out.print_line(&format!(
+                    "{:<24} {:>8} {:>8}  HASH",
+                    "NAME", "READS", "SIZE"
+                ));
                 // One row per permitted hash (review on #45): the
                 // first shares the secret's row, the rest continue
                 // aligned under the HASH column as `by -- hash`.
                 const HASH_COL: usize = 44;
                 for (s, name) in secrets.iter().zip(&collapsed) {
-                    let lead = format!(
-                        "{:<24} {:>8} {:>8}  ",
-                        name, s.access_count, s.size
-                    );
+                    let lead = format!("{:<24} {:>8} {:>8}  ", name, s.access_count, s.size);
                     if s.allowed_hashes.is_empty() {
                         out.print_line(&format!("{lead}-"));
                         continue;
@@ -74,9 +74,12 @@ pub fn print_response(resp: &Response, out: &mut dyn Console) {
                 for p in pending {
                     out.print_line(&format!(
                         "  [{}] {} pid={} hash={} reason=\"{}\" expires_at={}",
-                        p.id, p.secret_name, p.pid,
+                        p.id,
+                        p.secret_name,
+                        p.pid,
                         p.pid_hash.as_deref().unwrap_or("<unknown>"),
-                        p.reason, p.expires_at
+                        p.reason,
+                        p.expires_at
                     ));
                 }
             }
@@ -159,7 +162,6 @@ pub fn pending_info(id: u64) -> PendingAccessInfo {
     }
 }
 
-
 // ═══════════════════════════════════════════════════════════════
 // Single command table — the one source of truth
 // ═══════════════════════════════════════════════════════════════
@@ -197,10 +199,9 @@ impl Completer {
     /// [`Completer::query`]. Mismatched variants yield none.
     pub fn values_from(self, resp: &Response) -> Vec<String> {
         match (self, resp) {
-            (
-                Completer::SecretNames { .. },
-                Response::Status { secrets, .. },
-            ) => secrets.iter().map(|s| s.name.clone()).collect(),
+            (Completer::SecretNames { .. }, Response::Status { secrets, .. }) => {
+                secrets.iter().map(|s| s.name.clone()).collect()
+            }
             (Completer::PendingIds, crate::Response::PendingList { pending }) => {
                 pending.iter().map(|p| p.id.to_string()).collect()
             }
@@ -235,12 +236,34 @@ pub struct CommandSpec {
 
 const NO_COMPLETE: Completer = Completer::None;
 
-fn parse_status(_: &str) -> Result<Command, String> { Ok(Command::Status) }
-fn parse_mounts(_: &str) -> Result<Command, String> { Ok(Command::ListMounts) }
-fn parse_reset(args: &str) -> Result<Command, String> {
-    Ok(Command::Reset { name: args.split_whitespace().next().map(|s| s.to_string()) })
+fn parse_status(_: &str) -> Result<Command, String> {
+    Ok(Command::Status)
 }
-fn parse_reset_all(_: &str) -> Result<Command, String> { Ok(Command::Reset { name: None }) }
+/// #93 F2 seamless restart: args = the stack's state-file path (the
+/// server records its handoff rendezvous there for the successor).
+/// Optional second arg = handoff-mode timeout in seconds (tests).
+fn parse_handoff(args: &str) -> Result<Command, String> {
+    let mut it = args.split_whitespace();
+    let Some(state_file) = it.next() else {
+        return Err("Usage: handoff STATE_FILE [TIMEOUT_SECS]".into());
+    };
+    let timeout_secs = it.next().map(str::to_string);
+    Ok(Command::Handoff {
+        state_file: state_file.to_string(),
+        timeout_secs,
+    })
+}
+fn parse_mounts(_: &str) -> Result<Command, String> {
+    Ok(Command::ListMounts)
+}
+fn parse_reset(args: &str) -> Result<Command, String> {
+    Ok(Command::Reset {
+        name: args.split_whitespace().next().map(|s| s.to_string()),
+    })
+}
+fn parse_reset_all(_: &str) -> Result<Command, String> {
+    Ok(Command::Reset { name: None })
+}
 fn parse_add(args: &str) -> Result<Command, String> {
     let parts: Vec<&str> = args.split_whitespace().collect();
     if parts.len() < 3 {
@@ -249,8 +272,7 @@ fn parse_add(args: &str) -> Result<Command, String> {
     // MR4: only the PATH crosses the wire — the file must exist and
     // be stat-able (mode snapshot for the read-only FUSE view), but no
     // client ever reads secret bytes.
-    let md = std::fs::metadata(parts[1])
-        .map_err(|e| format!("Error stating file: {e}"))?;
+    let md = std::fs::metadata(parts[1]).map_err(|e| format!("Error stating file: {e}"))?;
     if !md.is_file() {
         return Err(format!("{} is not a regular file", parts[1]));
     }
@@ -270,40 +292,61 @@ fn parse_remove(args: &str) -> Result<Command, String> {
     if name.is_empty() {
         return Err("Usage: remove NAME".into());
     }
-    Ok(Command::RemoveSecret { name: name.to_string() })
+    Ok(Command::RemoveSecret {
+        name: name.to_string(),
+    })
 }
 fn parse_rotate(args: &str) -> Result<Command, String> {
     let parts: Vec<&str> = args.split_whitespace().collect();
     if parts.len() < 2 {
         return Err("Usage: rotate NAME HASH".into());
     }
-    Ok(Command::RotateHash { name: parts[0].to_string(), new_hash: parts[1].to_string() })
+    Ok(Command::RotateHash {
+        name: parts[0].to_string(),
+        new_hash: parts[1].to_string(),
+    })
 }
-fn parse_pending(_: &str) -> Result<Command, String> { Ok(Command::ListPending) }
+fn parse_pending(_: &str) -> Result<Command, String> {
+    Ok(Command::ListPending)
+}
 fn parse_grant(args: &str) -> Result<Command, String> {
-    args.trim().parse::<u64>().map(|id| Command::Grant { id })
+    args.trim()
+        .parse::<u64>()
+        .map(|id| Command::Grant { id })
         .map_err(|_| "Usage: grant ID (ID must be a number)".into())
 }
 fn parse_grant_forever(args: &str) -> Result<Command, String> {
-    args.trim().parse::<u64>().map(|id| Command::GrantForever { id })
+    args.trim()
+        .parse::<u64>()
+        .map(|id| Command::GrantForever { id })
         .map_err(|_| "Usage: grant-forever ID (ID must be a number)".into())
 }
 fn parse_lockdown(_: &str) -> Result<Command, String> {
     Ok(Command::LockDown)
 }
 fn parse_deny(args: &str) -> Result<Command, String> {
-    args.trim().parse::<u64>().map(|id| Command::Deny { id })
+    args.trim()
+        .parse::<u64>()
+        .map(|id| Command::Deny { id })
         .map_err(|_| "Usage: deny ID (ID must be a number)".into())
 }
-fn parse_version(_: &str) -> Result<Command, String> { Ok(Command::GetVersion) }
-fn parse_show_map(_: &str) -> Result<Command, String> { Ok(Command::ShowMap) }
-fn parse_logpath(_: &str) -> Result<Command, String> { Ok(Command::GetLogPath) }
-
-fn offline_version(_args: &str, out: &mut dyn Console) -> Result<(), String> {
-    out.print_line(&format!("Client version: {} (server not running)", crate::VERSION));
-    Ok(())
+fn parse_version(_: &str) -> Result<Command, String> {
+    Ok(Command::GetVersion)
+}
+fn parse_show_map(_: &str) -> Result<Command, String> {
+    Ok(Command::ShowMap)
+}
+fn parse_logpath(_: &str) -> Result<Command, String> {
+    Ok(Command::GetLogPath)
 }
 
+fn offline_version(_args: &str, out: &mut dyn Console) -> Result<(), String> {
+    out.print_line(&format!(
+        "Client version: {} (server not running)",
+        crate::VERSION
+    ));
+    Ok(())
+}
 
 // ── clap patterns (const-table-safe: fn items coerce in const) ──
 
@@ -313,12 +356,24 @@ fn no_cli_args() -> Vec<clap::Arg> {
 
 /// `grant`/`grant-forever`/`deny`: the pending id.
 fn id_cli() -> Vec<clap::Arg> {
-    vec![clap::Arg::new("id").required(true).value_parser(clap::value_parser!(u64))]
+    vec![clap::Arg::new("id")
+        .required(true)
+        .value_parser(clap::value_parser!(u64))]
 }
 
 /// `remove`: the secret name.
 fn name_cli() -> Vec<clap::Arg> {
     vec![clap::Arg::new("name").required(true)]
+}
+
+/// `handoff STATE_FILE [TIMEOUT_SECS]`.
+fn handoff_cli() -> Vec<clap::Arg> {
+    vec![
+        clap::Arg::new("state_file").required(true),
+        clap::Arg::new("timeout_secs")
+            .required(false)
+            .value_parser(clap::value_parser!(u64)),
+    ]
 }
 
 /// `reset [--name NAME]`.
@@ -351,6 +406,7 @@ fn add_cli() -> Vec<clap::Arg> {
 /// base imports them — no command string is ever retyped.
 pub mod cmd {
     pub const STATUS: &str = "status";
+    pub const HANDOFF: &str = "handoff";
     pub const MOUNTS: &str = "mounts";
     pub const RESET: &str = "reset";
     pub const RESET_ALL: &str = "reset-all";
@@ -369,21 +425,134 @@ pub mod cmd {
 
 /// The complete wire command set, in protocol order.
 pub const COMMAND_TABLE: &[CommandSpec] = &[
-    CommandSpec { name: cmd::STATUS, help: "Show all secrets and access counts", parse: parse_status, complete: NO_COMPLETE, offline: None, cli_args: no_cli_args },
-    CommandSpec { name: cmd::MOUNTS, help: "List mounted secret files", parse: parse_mounts, complete: NO_COMPLETE, offline: None, cli_args: no_cli_args },
-    CommandSpec { name: cmd::RESET, help: "Reset access counter for one or all secrets", parse: parse_reset, complete: Completer::SecretNames { after_space: true }, offline: None, cli_args: reset_cli },
-    CommandSpec { name: cmd::RESET_ALL, help: "Reset all access counters", parse: parse_reset_all, complete: NO_COMPLETE, offline: None, cli_args: no_cli_args },
-    CommandSpec { name: cmd::ADD, help: "Add a new secret from a file", parse: parse_add, complete: NO_COMPLETE, offline: None, cli_args: add_cli },
-    CommandSpec { name: cmd::REMOVE, help: "Remove a secret", parse: parse_remove, complete: Completer::SecretNames { after_space: true }, offline: None, cli_args: name_cli },
-    CommandSpec { name: cmd::ROTATE, help: "Change the allowed binary hash", parse: parse_rotate, complete: Completer::SecretNames { after_space: false }, offline: None, cli_args: name_hash_cli },
-    CommandSpec { name: cmd::PENDING, help: "Show pending access requests", parse: parse_pending, complete: NO_COMPLETE, offline: None, cli_args: no_cli_args },
-    CommandSpec { name: cmd::GRANT, help: "Grant a pending access request", parse: parse_grant, complete: Completer::PendingIds, offline: None, cli_args: id_cli },
-    CommandSpec { name: cmd::GRANT_FOREVER, help: "Grant a pending access permanently (whitelists the observed package hash)", parse: parse_grant_forever, complete: Completer::PendingIds, offline: None, cli_args: id_cli },
-    CommandSpec { name: cmd::DENY, help: "Deny a pending access request", parse: parse_deny, complete: Completer::PendingIds, offline: None, cli_args: id_cli },
-    CommandSpec { name: cmd::LOCKDOWN, help: "Lock in current grants; deny all future unauthorized access immediately (persisted)", parse: parse_lockdown, complete: NO_COMPLETE, offline: None, cli_args: no_cli_args },
-    CommandSpec { name: cmd::SHOW_MAP, help: "Show the outer -> anonymized container-view name map", parse: parse_show_map, complete: NO_COMPLETE, offline: None, cli_args: no_cli_args },
-    CommandSpec { name: cmd::VERSION, help: "Show server version", parse: parse_version, complete: NO_COMPLETE, offline: Some(offline_version), cli_args: no_cli_args },
-    CommandSpec { name: cmd::LOGPATH, help: "Show server log file path", parse: parse_logpath, complete: NO_COMPLETE, offline: None, cli_args: no_cli_args },
+    CommandSpec {
+        name: cmd::STATUS,
+        help: "Show all secrets and access counts",
+        parse: parse_status,
+        complete: NO_COMPLETE,
+        offline: None,
+        cli_args: no_cli_args,
+    },
+    CommandSpec {
+        name: cmd::HANDOFF,
+        help: "Enter handoff mode: surrender the stack to a restarting server (seamless restart)",
+        parse: parse_handoff,
+        complete: NO_COMPLETE,
+        offline: None,
+        cli_args: handoff_cli,
+    },
+    CommandSpec {
+        name: cmd::MOUNTS,
+        help: "List mounted secret files",
+        parse: parse_mounts,
+        complete: NO_COMPLETE,
+        offline: None,
+        cli_args: no_cli_args,
+    },
+    CommandSpec {
+        name: cmd::RESET,
+        help: "Reset access counter for one or all secrets",
+        parse: parse_reset,
+        complete: Completer::SecretNames { after_space: true },
+        offline: None,
+        cli_args: reset_cli,
+    },
+    CommandSpec {
+        name: cmd::RESET_ALL,
+        help: "Reset all access counters",
+        parse: parse_reset_all,
+        complete: NO_COMPLETE,
+        offline: None,
+        cli_args: no_cli_args,
+    },
+    CommandSpec {
+        name: cmd::ADD,
+        help: "Add a new secret from a file",
+        parse: parse_add,
+        complete: NO_COMPLETE,
+        offline: None,
+        cli_args: add_cli,
+    },
+    CommandSpec {
+        name: cmd::REMOVE,
+        help: "Remove a secret",
+        parse: parse_remove,
+        complete: Completer::SecretNames { after_space: true },
+        offline: None,
+        cli_args: name_cli,
+    },
+    CommandSpec {
+        name: cmd::ROTATE,
+        help: "Change the allowed binary hash",
+        parse: parse_rotate,
+        complete: Completer::SecretNames { after_space: false },
+        offline: None,
+        cli_args: name_hash_cli,
+    },
+    CommandSpec {
+        name: cmd::PENDING,
+        help: "Show pending access requests",
+        parse: parse_pending,
+        complete: NO_COMPLETE,
+        offline: None,
+        cli_args: no_cli_args,
+    },
+    CommandSpec {
+        name: cmd::GRANT,
+        help: "Grant a pending access request",
+        parse: parse_grant,
+        complete: Completer::PendingIds,
+        offline: None,
+        cli_args: id_cli,
+    },
+    CommandSpec {
+        name: cmd::GRANT_FOREVER,
+        help: "Grant a pending access permanently (whitelists the observed package hash)",
+        parse: parse_grant_forever,
+        complete: Completer::PendingIds,
+        offline: None,
+        cli_args: id_cli,
+    },
+    CommandSpec {
+        name: cmd::DENY,
+        help: "Deny a pending access request",
+        parse: parse_deny,
+        complete: Completer::PendingIds,
+        offline: None,
+        cli_args: id_cli,
+    },
+    CommandSpec {
+        name: cmd::LOCKDOWN,
+        help: "Lock in current grants; deny all future unauthorized access immediately (persisted)",
+        parse: parse_lockdown,
+        complete: NO_COMPLETE,
+        offline: None,
+        cli_args: no_cli_args,
+    },
+    CommandSpec {
+        name: cmd::SHOW_MAP,
+        help: "Show the outer -> anonymized container-view name map",
+        parse: parse_show_map,
+        complete: NO_COMPLETE,
+        offline: None,
+        cli_args: no_cli_args,
+    },
+    CommandSpec {
+        name: cmd::VERSION,
+        help: "Show server version",
+        parse: parse_version,
+        complete: NO_COMPLETE,
+        offline: Some(offline_version),
+        cli_args: no_cli_args,
+    },
+    CommandSpec {
+        name: cmd::LOGPATH,
+        help: "Show server log file path",
+        parse: parse_logpath,
+        complete: NO_COMPLETE,
+        offline: None,
+        cli_args: no_cli_args,
+    },
 ];
 
 pub fn client_protocols() -> Vec<Protocol> {
@@ -401,8 +570,7 @@ pub fn client_protocols_with_snapshots(pending: PendingIds, secrets: SecretNames
     COMMAND_TABLE
         .iter()
         .map(|spec| {
-            let proto = cmd_protocol(spec.name, spec.help, spec.parse)
-                .clap_args((spec.cli_args)());
+            let proto = cmd_protocol(spec.name, spec.help, spec.parse).clap_args((spec.cli_args)());
             let proto = match spec.complete {
                 Completer::None => proto,
                 Completer::PendingIds => proto.complete(pending_completer(pending.clone())),
@@ -443,7 +611,10 @@ pub(crate) fn complete_first_secret(
         return Vec::new(); // a second argument has started
     }
     if !complete_after_space
-        && confirmed.chars().next_back().is_some_and(char::is_whitespace)
+        && confirmed
+            .chars()
+            .next_back()
+            .is_some_and(char::is_whitespace)
     {
         return Vec::new(); // e.g. `rotate NAME `: the hash is being typed
     }
@@ -474,9 +645,7 @@ fn name_completer(
 /// A completer closure over the shared pending snapshot: completes the
 /// numeric request-ID argument of `grant`/`deny` from whatever the poller
 /// last saw, without a server round-trip.
-fn pending_completer(
-    pending: PendingIds,
-) -> impl Fn(&str) -> Vec<String> + Send + Sync + 'static {
+fn pending_completer(pending: PendingIds) -> impl Fn(&str) -> Vec<String> + Send + Sync + 'static {
     move |s| {
         // #64: same snapshot discipline as the name completer — locked
         // briefly by the poller and here, never across a panic.
@@ -530,8 +699,7 @@ pub fn run_command_once(
             return Err(err.to_string());
         }
     }
-    let resp: crate::Response =
-        serde_json::from_slice(&raw).map_err(|e| e.to_string())?;
+    let resp: crate::Response = serde_json::from_slice(&raw).map_err(|e| e.to_string())?;
     conn.send_typed(&())?;
     Ok(resp)
 }
@@ -560,7 +728,10 @@ pub fn poll_secret_names(socket: &std::path::Path) -> Result<Vec<String>, String
 /// down, stale socket, ...). Connect failures already carry actionable
 /// messages from the transport layer.
 pub fn poll_pending_once(socket: &std::path::Path) -> Result<Vec<u64>, String> {
-    Ok(poll_pending_info(socket)?.into_iter().map(|p| p.id).collect())
+    Ok(poll_pending_info(socket)?
+        .into_iter()
+        .map(|p| p.id)
+        .collect())
 }
 
 #[cfg(test)]
@@ -583,8 +754,16 @@ mod completer_mapping_tests {
                 "query word {word:?} must be a table row"
             );
         }
-        assert_eq!(Completer::PendingIds.query().map(|(w, _)| w), Some("pending"));
-        assert_eq!(Completer::SecretNames { after_space: true }.query().map(|(w, _)| w), Some("status"));
+        assert_eq!(
+            Completer::PendingIds.query().map(|(w, _)| w),
+            Some("pending")
+        );
+        assert_eq!(
+            Completer::SecretNames { after_space: true }
+                .query()
+                .map(|(w, _)| w),
+            Some("status")
+        );
     }
 
     #[test]
@@ -623,7 +802,9 @@ mod completer_mapping_tests {
             Completer::PendingIds.values_from(&pending),
             vec!["7".to_string()]
         );
-        assert!(Completer::SecretNames { after_space: false }.values_from(&pending).is_empty());
+        assert!(Completer::SecretNames { after_space: false }
+            .values_from(&pending)
+            .is_empty());
     }
 }
 
@@ -674,7 +855,10 @@ mod tests {
         let mut cap = Cap(Vec::new());
         print_response(&resp, &mut cap);
         let status_out = cap.0.join("\n");
-        assert!(!status_out.contains("ab12"), "no inner in status: {status_out:?}");
+        assert!(
+            !status_out.contains("ab12"),
+            "no inner in status: {status_out:?}"
+        );
 
         let map = Response::Map {
             entries: vec![crate::protocol::MapEntry {
@@ -685,7 +869,10 @@ mod tests {
         let mut cap = Cap(Vec::new());
         print_response(&map, &mut cap);
         let out = cap.0.join("\n");
-        assert!(out.contains("var/home/jonas/secrets/zai.key -> ab12/cd34/ef56/789a"), "{out:?}");
+        assert!(
+            out.contains("var/home/jonas/secrets/zai.key -> ab12/cd34/ef56/789a"),
+            "{out:?}"
+        );
     }
 
     #[test]
@@ -714,7 +901,7 @@ mod tests {
                 },
                 crate::protocol::SecretStatus {
                     inner: "i0".into(),
-            name: "var/home/jonas/foo/secret2.txt".into(),
+                    name: "var/home/jonas/foo/secret2.txt".into(),
                     access_count: 0,
                     allowed_hashes: vec![crate::protocol::HashEntryStatus {
                         hash: crate::PENDING_ONLY_HASH.into(),
@@ -730,14 +917,23 @@ mod tests {
         print_response(&resp, &mut cap);
         let rows: Vec<String> = cap.0;
         assert!(rows.len() >= 4, "header + 2 + 1 rows: {rows:?}");
-        assert!(rows[1].contains(".../bar/secret.txt") && rows[1].contains("blah -- hash1"),
-            "first row carries name + first hash: {:?}", rows[1]);
+        assert!(
+            rows[1].contains(".../bar/secret.txt") && rows[1].contains("blah -- hash1"),
+            "first row carries name + first hash: {:?}",
+            rows[1]
+        );
         let cont = &rows[2];
-        assert!(cont.trim() == "bloo -- hash2", "continuation carries only the hash row: {cont:?}");
+        assert!(
+            cont.trim() == "bloo -- hash2",
+            "continuation carries only the hash row: {cont:?}"
+        );
         assert!(cont.starts_with(" "), "aligned under the HASH column");
         assert_eq!(cont.find("bloo"), Some(44), "HASH column start: {cont:?}");
-        assert!(rows[3].contains(".../foo/secret2.txt") && rows[3].contains("(manual approval only)"),
-            "single-entry secret stays on one row: {:?}", rows[3]);
+        assert!(
+            rows[3].contains(".../foo/secret2.txt") && rows[3].contains("(manual approval only)"),
+            "single-entry secret stays on one row: {:?}",
+            rows[3]
+        );
     }
 
     #[test]
@@ -747,7 +943,7 @@ mod tests {
             secrets: vec![
                 SecretStatus {
                     inner: "i0".into(),
-            name: "var/home/jonas/secrets/agent/github.netrc".into(),
+                    name: "var/home/jonas/secrets/agent/github.netrc".into(),
                     access_count: 0,
                     allowed_hashes: vec![crate::protocol::HashEntryStatus {
                         hash: crate::PENDING_ONLY_HASH.into(),
@@ -758,7 +954,7 @@ mod tests {
                 },
                 SecretStatus {
                     inner: "i0".into(),
-            name: "var/home/jonas/secrets/zai.key".into(),
+                    name: "var/home/jonas/secrets/zai.key".into(),
                     access_count: 1,
                     allowed_hashes: vec![crate::protocol::HashEntryStatus {
                         hash: crate::PENDING_ONLY_HASH.into(),
@@ -802,10 +998,7 @@ mod tests {
     #[test]
     fn remove_completes_all_names_on_empty_prefix() {
         let p = names(&["p1_s0", "p2_s1"]);
-        assert_eq!(
-            complete_first_secret(&p, "remove ", true).len(),
-            2
-        );
+        assert_eq!(complete_first_secret(&p, "remove ", true).len(), 2);
     }
 
     #[test]
@@ -850,13 +1043,19 @@ mod tests {
                 completer(&format!("{name} p1")),
                 vec![format!("{name} p1_s0")]
             );
-            assert!(completer(&format!("{name} zz")).is_empty(), "prefix filters");
+            assert!(
+                completer(&format!("{name} zz")).is_empty(),
+                "prefix filters"
+            );
         }
         // rotate's NAME argument completes, but `rotate NAME ` (hash
         // being typed) does not.
         let p = protocols.iter().find(|p| p.name == "rotate").unwrap();
         let completer = p.completer().unwrap();
-        assert!(completer("rotate p1_s0 ").is_empty(), "no completion for the hash");
+        assert!(
+            completer("rotate p1_s0 ").is_empty(),
+            "no completion for the hash"
+        );
 
         // The poller adds a secret: completion sees it immediately.
         *secrets.lock().unwrap() = vec!["p1_s0".to_string(), "p9_s8".to_string()];
@@ -891,14 +1090,16 @@ mod tests {
             pending_completions(&ids, "grant 4"),
             vec!["grant 4".to_string(), "grant 42".to_string()]
         );
-        assert_eq!(pending_completions(&ids, "deny 7"), vec!["deny 7".to_string()]);
+        assert_eq!(
+            pending_completions(&ids, "deny 7"),
+            vec!["deny 7".to_string()]
+        );
         // Empty prefix right after the space: all IDs.
         assert_eq!(pending_completions(&ids, "grant ").len(), 3);
         // No space yet / second token: nothing.
         assert!(pending_completions(&ids, "grant").is_empty());
         assert!(pending_completions(&ids, "grant 4 x").is_empty());
     }
-
 
     #[test]
     fn grant_deny_complete_from_live_snapshot() {
@@ -913,7 +1114,10 @@ mod tests {
             *shared.lock().unwrap() = vec![pending_info(5), pending_info(51)];
             let p = protocols.iter().find(|p| p.name == name).unwrap();
             let completer = p.completer().expect("completer registered");
-            assert_eq!(completer("grant 5"), vec!["grant 5".to_string(), "grant 51".to_string()]);
+            assert_eq!(
+                completer("grant 5"),
+                vec!["grant 5".to_string(), "grant 51".to_string()]
+            );
 
             // The poller updates the snapshot — the completer sees new IDs.
             *shared.lock().unwrap() = vec![pending_info(9)];
@@ -967,7 +1171,10 @@ mod tests {
             // a well-mannered server drains it before dropping the socket.
             line.clear();
             reader.read_line(&mut line).unwrap();
-            assert!(line.trim() == "null", "closing sentinel must be (), got: {line}");
+            assert!(
+                line.trim() == "null",
+                "closing sentinel must be (), got: {line}"
+            );
         });
 
         let ids = poll_pending_once(&path).expect("poll must succeed");
@@ -980,5 +1187,3 @@ mod tests {
         assert!(poll_pending_once(std::path::Path::new("/no-such-fuse.sock")).is_err());
     }
 }
-
-

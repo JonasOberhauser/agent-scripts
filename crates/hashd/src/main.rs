@@ -91,9 +91,7 @@ fn privileges_ok() -> bool {
             .split_whitespace()
             .next()?
             .to_string();
-        Some(
-            std::fs::read(format!("/proc/{}/map_files/{}", child.id(), range)).is_ok(),
-        )
+        Some(std::fs::read(format!("/proc/{}/map_files/{}", child.id(), range)).is_ok())
     })()
     .unwrap_or(false);
     let _ = child.kill();
@@ -114,7 +112,11 @@ fn handle(conn: std::os::unix::net::UnixStream) {
     }
     let trimmed = line.trim();
     let reply = if trimmed == "status" {
-        let state = if privileges_ok() { "privileged" } else { "unprivileged" };
+        let state = if privileges_ok() {
+            "privileged"
+        } else {
+            "unprivileged"
+        };
         format!("{{\"status\":\"{state}\"}}\n")
     } else {
         // request grammar: WORD pid — plain split, the exempt idiom
@@ -185,16 +187,18 @@ fn main() {
     // unprivileged fuse-server gets EACCES.
     {
         use std::os::unix::fs::PermissionsExt as _;
-        if let Err(e) =
-            std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o666))
-        {
+        if let Err(e) = std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o666)) {
             eprintln!("hashd: cannot open {socket} to unprivileged clients: {e}");
             std::process::exit(1);
         }
     }
     eprintln!(
         "hashd: listening on {socket} ({})",
-        if privileges_ok() { "privileged" } else { "unprivileged" }
+        if privileges_ok() {
+            "privileged"
+        } else {
+            "unprivileged"
+        }
     );
     serve_conns(listener, std::sync::Arc::new(handle));
 }

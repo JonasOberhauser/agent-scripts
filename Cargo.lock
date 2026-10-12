@@ -574,11 +574,14 @@ dependencies = [
 name = "gatekeeper-testkit"
 version = "0.32.0"
 dependencies = [
+ "clap",
  "fuse-mount",
  "fuse-protocol",
  "fuse-server",
  "fuser",
  "libc",
+ "nix 0.29.0",
+ "serde",
  "serde_json",
  "tempfile",
 ]

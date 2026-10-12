@@ -26,7 +26,6 @@
 // the custom_parser lint exists only under the servyi driver.
 #![allow(unknown_lints)]
 #![allow(custom_parser)]
-
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 use std::sync::Arc;
@@ -118,7 +117,12 @@ fn stack_up(seed: u64) -> Stack {
     let hub = OracleHub::new();
     let oracle = dir.path().join("oracle.sock");
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let (s2, h2, p2, st2) = (Arc::clone(&state), hub.clone(), oracle.clone(), Arc::clone(&stop));
+    let (s2, h2, p2, st2) = (
+        Arc::clone(&state),
+        hub.clone(),
+        oracle.clone(),
+        Arc::clone(&stop),
+    );
     // SAFETY per policy: the handle is intentionally un-joined — the
     // Stack::drop poison pill stops the loop; explicit discard.
     let _ = std::thread::spawn(move || {
@@ -126,27 +130,42 @@ fn stack_up(seed: u64) -> Stack {
     });
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
-        if oracle.exists() { break; }
+        if oracle.exists() {
+            break;
+        }
         std::thread::sleep(Duration::from_millis(10));
     }
 
     let control = dir.path().join("mock-fuse.sock");
     let log = std::fs::OpenOptions::new()
-        .create(true).append(true)
-        .open(dir.path().join("fused.log")).unwrap();
+        .create(true)
+        .append(true)
+        .open(dir.path().join("fused.log"))
+        .unwrap();
     #[allow(clippy::zombie_processes)]
     let child = std::process::Command::new(env!("CARGO_BIN_EXE_fused"))
-        .arg("--mount-point").arg(dir.path().join("mnt"))
-        .arg("--oracle-socket").arg(&oracle)
-        .arg("--mock-fuse").arg(&control)
+        .arg("--mount-point")
+        .arg(dir.path().join("mnt"))
+        .arg("--oracle-socket")
+        .arg(&oracle)
+        .arg("--mock-fuse")
+        .arg(&control)
         .env("RUST_LOG", "warn")
         .stdout(std::process::Stdio::from(log.try_clone().unwrap()))
         .stderr(log)
-        .spawn().expect("spawn fused");
+        .spawn()
+        .expect("spawn fused");
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
         if control.exists() {
-            return Stack { state, hub, fused: Fused { child, control }, stop, oracle_path: oracle, _dir: dir };
+            return Stack {
+                state,
+                hub,
+                fused: Fused { child, control },
+                stop,
+                oracle_path: oracle,
+                _dir: dir,
+            };
         }
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -178,13 +197,18 @@ fn drive_session(seed: u64, d: &mut MockDriver, names: &[String]) {
                 }
             }
             3 => {
-                let ino = if let Some(&i) = open_inos.last() { i } else { fuser::FUSE_ROOT_ID };
+                let ino = if let Some(&i) = open_inos.last() {
+                    i
+                } else {
+                    fuser::FUSE_ROOT_ID
+                };
                 if let Ok(_opened) = d.open(ino) {
                     open_inos.push(ino);
                 }
             }
             4 => {
-                let ino = open_inos.get((rng.next() % open_inos.len().max(1) as u64) as usize)
+                let ino = open_inos
+                    .get((rng.next() % open_inos.len().max(1) as u64) as usize)
                     .copied()
                     .unwrap_or(1 + rng.next() % 32);
                 if let Ok(opened) = d.open(ino) {
@@ -263,8 +287,12 @@ fn drive_seed(seed: u64) {
                 if let Ok(dh) = probe.opendir(fuser::FUSE_ROOT_ID) {
                     if let Ok(entries) = probe.readdir(dh.fh, 4096) {
                         let _ = probe.releasedir(fuser::FUSE_ROOT_ID, dh.fh);
-                        if entries.iter().any(|(_, n)| n == &inner) { break; }
-                    } else { break; }
+                        if entries.iter().any(|(_, n)| n == &inner) {
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
                 }
                 assert!(Instant::now() < deadline, "seed {seed}: Serve never landed");
                 std::thread::sleep(Duration::from_millis(25));
@@ -285,7 +313,11 @@ fn drive_seed(seed: u64) {
             .init()
             .unwrap_or_else(|e| panic!("seed {seed}: init failed after chaos: {e:?}"));
         let lookup = fresh.lookup(&inner);
-        assert!(lookup.is_ok(), "seed {seed}: lookup after chaos failed: {:?}", lookup.err());
+        assert!(
+            lookup.is_ok(),
+            "seed {seed}: lookup after chaos failed: {:?}",
+            lookup.err()
+        );
 
         // CONTAINMENT: the one-read budget is the ground truth. The
         // chaos session's opens all had pid-hashes that CANNOT match
@@ -294,7 +326,9 @@ fn drive_seed(seed: u64) {
         // was granted, which is exactly what must never happen. The
         // budget proves it end-to-end: still fresh.
         assert_eq!(
-            stack.state.attempt_read("s", 4242, Some("sha256-real"), 0, 4),
+            stack
+                .state
+                .attempt_read("s", 4242, Some("sha256-real"), 0, 4),
             ReadOutcome::Granted,
             "seed {seed}: the chaos session consumed the one-read budget — \
              something was AUTHORIZED without the hash"
@@ -302,7 +336,9 @@ fn drive_seed(seed: u64) {
         // And spending it now (as the honest holder) denies the next:
         assert!(
             !matches!(
-                stack.state.attempt_read("s", 4243, Some("sha256-real"), 0, 4),
+                stack
+                    .state
+                    .attempt_read("s", 4243, Some("sha256-real"), 0, 4),
                 ReadOutcome::Granted
             ),
             "seed {seed}: one-read semantics broken after chaos"
@@ -334,9 +370,13 @@ fn e2e_fuzz_the_daemons_survive_and_contain() {
 fn server_bin() -> std::path::PathBuf {
     // Cross-crate binary: the same path convention e2e_client and
     // fuse_e2e use (CARGO_BIN_EXE_ only reaches same-package bins).
-    let p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/debug/fuse-server");
-    assert!(p.exists(), "fuse-server not built (cargo build --workspace): {}", p.display());
+    let p =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/fuse-server");
+    assert!(
+        p.exists(),
+        "fuse-server not built (cargo build --workspace): {}",
+        p.display()
+    );
     p
 }
 
@@ -391,13 +431,18 @@ struct ProcStack {
 impl ProcStack {
     fn spawn_policy(&mut self) {
         let log = std::fs::OpenOptions::new()
-            .create(true).append(true)
-            .open(self.dir.path().join("policy.log")).unwrap();
+            .create(true)
+            .append(true)
+            .open(self.dir.path().join("policy.log"))
+            .unwrap();
         #[allow(clippy::zombie_processes)]
         let child = std::process::Command::new(server_bin())
-            .arg("--socket").arg(&self.cmd_sock)
-            .arg("--oracle-socket").arg(&self.oracle)
-            .arg("--pending-timeout").arg("1")
+            .arg("--socket")
+            .arg(&self.cmd_sock)
+            .arg("--oracle-socket")
+            .arg(&self.oracle)
+            .arg("--pending-timeout")
+            .arg("1")
             .arg("--secret")
             .arg("s")
             .arg(&self.host)
@@ -406,11 +451,14 @@ impl ProcStack {
             .env("RUST_LOG", "warn")
             .stdout(std::process::Stdio::from(log.try_clone().unwrap()))
             .stderr(log)
-            .spawn().expect("spawn fuse-server");
+            .spawn()
+            .expect("spawn fuse-server");
         self.policy = Some(child);
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            if std::os::unix::net::UnixStream::connect(&self.cmd_sock).is_ok() { break; }
+            if std::os::unix::net::UnixStream::connect(&self.cmd_sock).is_ok() {
+                break;
+            }
             assert!(Instant::now() < deadline, "policy daemon never answered");
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -423,22 +471,33 @@ impl ProcStack {
             let _ = std::fs::remove_file(&old.control);
         }
         let log = std::fs::OpenOptions::new()
-            .create(true).append(true)
-            .open(self.dir.path().join("fused.log")).unwrap();
+            .create(true)
+            .append(true)
+            .open(self.dir.path().join("fused.log"))
+            .unwrap();
         #[allow(clippy::zombie_processes)]
         let child = std::process::Command::new(env!("CARGO_BIN_EXE_fused"))
-            .arg("--mount-point").arg(&self.mount)
-            .arg("--oracle-socket").arg(&self.oracle)
-            .arg("--mock-fuse").arg(&self.control)
+            .arg("--mount-point")
+            .arg(&self.mount)
+            .arg("--oracle-socket")
+            .arg(&self.oracle)
+            .arg("--mock-fuse")
+            .arg(&self.control)
             .env("RUST_LOG", "warn")
             .stdout(std::process::Stdio::from(log.try_clone().unwrap()))
             .stderr(log)
-            .spawn().expect("respawn fused");
+            .spawn()
+            .expect("respawn fused");
         let control = self.control.clone();
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            if control.exists() { break; }
-            assert!(Instant::now() < deadline, "fused never bound the control socket");
+            if control.exists() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "fused never bound the control socket"
+            );
             std::thread::sleep(Duration::from_millis(20));
         }
         self.fused = Some(Fused { child, control });
@@ -466,15 +525,24 @@ impl ProcStack {
         let mount = dir.path().join("mnt");
         std::fs::create_dir_all(&mount).unwrap();
         let mut s = ProcStack {
-            dir, oracle, cmd_sock, policy_store, host,
+            dir,
+            oracle,
+            cmd_sock,
+            policy_store,
+            host,
             inner: String::new(),
-            policy: None, fused: None,
-            control, mount,
+            policy: None,
+            fused: None,
+            control,
+            mount,
         };
         s.spawn_policy();
         // The inner label the real daemon derived from its minted salt.
         s.inner = status_of_s(&s.cmd_sock).1;
-        assert!(!s.inner.is_empty(), "the policy daemon served no inner name");
+        assert!(
+            !s.inner.is_empty(),
+            "the policy daemon served no inner name"
+        );
         s.spawn_fused();
         s
     }
@@ -514,7 +582,9 @@ fn drive_kill_seed(seed: u64) {
             if let Ok(dh) = d.opendir(fuser::FUSE_ROOT_ID) {
                 if let Ok(entries) = d.readdir(dh.fh, 4096) {
                     let _ = d.releasedir(fuser::FUSE_ROOT_ID, dh.fh);
-                    if entries.iter().any(|(_, n)| n == &s.inner) { break; }
+                    if entries.iter().any(|(_, n)| n == &s.inner) {
+                        break;
+                    }
                 }
             }
             assert!(Instant::now() < deadline, "seed {seed}: Serve never landed");
@@ -527,7 +597,10 @@ fn drive_kill_seed(seed: u64) {
         let _ = d.release(e.nodeid, opened.fh);
         (e.nodeid, budget(&s.cmd_sock))
     };
-    assert_eq!(spent, 1, "seed {seed}: one open consumed exactly one budget");
+    assert_eq!(
+        spent, 1,
+        "seed {seed}: one open consumed exactly one budget"
+    );
 
     // The kill-timing chaos: 2-4 events, each a random daemon at a
     // random moment (between driver ops).
@@ -558,10 +631,15 @@ fn drive_kill_seed(seed: u64) {
                 if let Ok(dh) = d.opendir(fuser::FUSE_ROOT_ID) {
                     if let Ok(entries) = d.readdir(dh.fh, 4096) {
                         let _ = d.releasedir(fuser::FUSE_ROOT_ID, dh.fh);
-                        if entries.iter().any(|(_, n)| n == &s.inner) { break; }
+                        if entries.iter().any(|(_, n)| n == &s.inner) {
+                            break;
+                        }
                     }
                 }
-                assert!(Instant::now() < deadline, "seed {seed}: no replay after fused kill");
+                assert!(
+                    Instant::now() < deadline,
+                    "seed {seed}: no replay after fused kill"
+                );
                 std::thread::sleep(Duration::from_millis(25));
             }
             let after = budget(&s.cmd_sock);
@@ -570,7 +648,11 @@ fn drive_kill_seed(seed: u64) {
         // After either kill, a well-formed lookup still works.
         let mut d = s.driver();
         let look = d.lookup(&s.inner);
-        assert!(look.is_ok(), "seed {seed}: lookup broken after recovery: {:?}", look.err());
+        assert!(
+            look.is_ok(),
+            "seed {seed}: lookup broken after recovery: {:?}",
+            look.err()
+        );
         let _ = ino;
         // A subsequent open+read (if unspent) must still respect the
         // budget: update the local view when we spend.

@@ -9,12 +9,12 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clap::Parser;
 use tracing::{error, info, warn};
 
-use fuse_server::{OracleHub, ServerState};
+use fuse_server::{handoff, OracleHub, ServerState};
 
 #[derive(Parser)]
 #[command(name = fuse_protocol::SERVER_BIN, about = "FUSE gatekeeper POLICY daemon (decisions + command socket; data lives in fused)")]
@@ -71,16 +71,80 @@ extern "C" fn shutdown_handler(_sig: libc::c_int) {
     unsafe { libc::_exit(code) }
 }
 
-/// Supervised data daemon (kept alive by being our child; killed when
-/// we exit, per Rust child-process semantics on drop is NOT guaranteed —
-/// so we also store it to reap on shutdown).
-static SUPERVISED_FUSED: std::sync::Mutex<Option<std::process::Child>> =
-    std::sync::Mutex::new(None);
+// Supervised data daemon: lives in the handoff module (the conductor
+// needs it for take-back and retirement; the signal path predates
+// this and never touches the child — kill -9 leaves the orphan to
+// the restart path, by design).
+
+/// Spawn the supervised data daemon (#93 F2): resuming an inherited
+/// mount-connection fd when a handoff takeover provided one — the fd
+/// reaches the child at fd 3 by exec inheritance (pre_exec dup2, the
+/// async-signal-safe pair of fork and exec), with the serialized
+/// session state beside it; the child ADOPTS the session instead of
+/// mounting fresh.
+fn spawn_fused(
+    cli: &Cli,
+    mount_point: &Path,
+    takeover: Option<&handoff::Takeover>,
+) -> Result<std::process::Child, String> {
+    let exe = std::env::current_exe().expect("current exe");
+    let sibling = exe
+        .parent()
+        .map(|d| d.join(fuse_protocol::FUSED_BIN))
+        .filter(|p| p.exists());
+    let fused = cli.fused_binary.clone().or(sibling);
+    let Some(fused) = fused else {
+        return Err(format!(
+            "no data daemon found next to {} — build it (cargo build --workspace)",
+            exe.display()
+        ));
+    };
+    let mut cmd = std::process::Command::new(&fused);
+    let _args = cmd
+        .arg("--mount-point")
+        .arg(mount_point)
+        .arg(fuse_protocol::ORACLE_SOCKET_FLAG)
+        .arg(&cli.oracle_socket);
+    if let Some(tk) = takeover {
+        let raw = tk.mount_fd_raw();
+        let state_path = tk
+            .write_session_state()
+            .map_err(|e| format!("resume state: {e}"))?;
+        let _resume_args = cmd
+            .arg("--resume-fd")
+            .arg("3")
+            .arg("--resume-state")
+            .arg(&state_path);
+        // SAFETY: pre_exec runs between fork and exec; dup2(2) and
+        // close-on-nothing are async-signal-safe, the operand is a
+        // plain descriptor number of an open file this process owns.
+        let set_fd = move || {
+            // SAFETY: dup2(2) on one owned descriptor number —
+            // async-signal-safe between fork and exec by contract.
+            let rc = unsafe { libc::dup2(raw, 3) };
+            if rc == -1 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        };
+        use std::os::unix::process::CommandExt as _;
+        // SAFETY: the closure performs only dup2(2) — async-signal-
+        // safe between fork and exec, on a descriptor this process
+        // owns; the builder return is chained, not a result.
+        let _builder = unsafe { cmd.pre_exec(set_fd) };
+    }
+    cmd.spawn()
+        .map_err(|e| format!("spawn {}: {e}", fused.display()))
+}
 
 fn stale_socket(path: &Path) {
     if path.exists() {
         if std::os::unix::net::UnixStream::connect(path).is_ok() {
-            error!("Another server is running at {}. Kill it first.", path.display());
+            error!(
+                "Another server is running at {}. Kill it first.",
+                path.display()
+            );
             std::process::exit(1);
         }
         warn!("Removing stale socket at {}", path.display());
@@ -92,53 +156,71 @@ fn main() {
     let cli = Cli::parse();
 
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::builder()
-                .parse_lossy(&cli.log_level),
-        )
+        .with_env_filter(tracing_subscriber::EnvFilter::builder().parse_lossy(&cli.log_level))
         .init();
 
-    info!("fuse-server (policy daemon) v{} starting", fuse_protocol::VERSION);
+    info!(
+        "fuse-server (policy daemon) v{} starting",
+        fuse_protocol::VERSION
+    );
     info!("  socket:          {}", cli.socket.display());
     info!("  oracle-socket:   {}", cli.oracle_socket.display());
     info!("  pending-timeout: {}s", cli.pending_timeout);
+
+    // Boot-time records for the handoff conductor (#93 F2).
+    let _recorded = handoff::STACK_PATHS.set((cli.socket.clone(), cli.oracle_socket.clone()));
+
+    // NEW side (#93 F2): a pending handoff in the state file means an
+    // old server lingers with the custody — take it over BEFORE
+    // spawning anything, so the new fused can RESUME the mount
+    // session instead of mounting fresh. None = no handoff (or it
+    // declined); the spawn below is then the ordinary one.
+    let state_file = std::env::var_os(fuse_protocol::ENV_STATE_FILE).map(std::path::PathBuf::from);
+    let mut takeover = state_file.as_deref().and_then(handoff::resume_from_handoff);
+    if takeover.is_some() {
+        info!("  handoff: custody taken over — the new fused will resume the mount session");
+    }
+
     // --mount-point means SUPERVISE a data daemon at that mount point
     // (the one-command contract of the old monolith): spawn fused next
     // to this binary and keep it as a child; on our exit it dies too.
     if let Some(mp) = &cli.mount_point {
-        let exe = std::env::current_exe().expect("current exe");
-        let sibling = exe.parent().map(|d| d.join(fuse_protocol::FUSED_BIN)).filter(|p| p.exists());
-        // The seam (#94): an explicit --fused-binary wins over the
-        // exe-sibling default; without either, the loud #37 failure.
-        let fused = cli.fused_binary.clone().or(sibling);
-        match fused {
-            Some(fused) => {
-                info!("  mount-point:     {} (spawning supervised data daemon)", mp.display());
-                let child = std::process::Command::new(&fused)
-                    .arg("--mount-point").arg(mp)
-                    .arg(fuse_protocol::ORACLE_SOCKET_FLAG).arg(&cli.oracle_socket)
-                    .spawn();
-                match child {
-                    Ok(c) => {
-                        let _replaced = SUPERVISED_FUSED
-                            .lock()
-                            .expect("supervised-fused lock: set once at spawn")
-                            .replace(c);
-                    }
-                    Err(e) => error!("cannot spawn data daemon {}: {e}", fused.display()),
-                }
+        info!(
+            "  mount-point:     {} (spawning supervised data daemon)",
+            mp.display()
+        );
+        match spawn_fused(&cli, mp, takeover.as_ref()) {
+            Ok(c) => {
+                let _replaced = handoff::SUPERVISED
+                    .lock()
+                    .expect("supervised-fused lock: set once at spawn")
+                    .replace(c);
             }
-            None => {
-                // Serving adds with no data daemon looks "healthy" to
-                // every client while nothing ever reaches a mount —
-                // the PR #37 field-report trap.  Fail loudly instead.
-                error!(
-                    "--mount-point given but no data daemon found next to {} — build it \\
-                     (cargo build --workspace) or start `fused` manually; refusing to run \\
-                     mount-less",
-                    exe.display()
-                );
-                std::process::exit(1);
+            Err(e) => {
+                if takeover.is_some() {
+                    // The resume spawn failed: degrade to the fresh
+                    // mount. Dropping OUR custody copy is safe — the
+                    // old server holds its own until commit, and
+                    // without a resuming daemon the mount cannot be
+                    // served by this pair anyway.
+                    error!("resume spawn failed ({e}) — degrading to a fresh mount");
+                    takeover = None;
+                    match spawn_fused(&cli, mp, None) {
+                        Ok(c) => {
+                            let _replaced = handoff::SUPERVISED
+                                .lock()
+                                .expect("supervised-fused lock")
+                                .replace(c);
+                        }
+                        Err(e2) => error!("cannot spawn data daemon: {e2}"),
+                    }
+                } else {
+                    // The #37 field-report trap: serving adds with no
+                    // data daemon looks "healthy" while nothing reaches
+                    // a mount — fail loudly instead.
+                    error!("{e} — refusing to run mount-less");
+                    std::process::exit(1);
+                }
             }
         }
     }
@@ -184,9 +266,13 @@ fn main() {
             "  policy store:    {} restored, {} ghosts{}",
             report.restored,
             report.ghosts,
-            if report.corrupted { " — CORRUPT FILE RENAMED ASIDE, STARTED FRESH" }
-            else if report.unreadable { " — UNREADABLE, PERSISTENCE DISARMED (nothing will overwrite it)" }
-            else { "" }
+            if report.corrupted {
+                " — CORRUPT FILE RENAMED ASIDE, STARTED FRESH"
+            } else if report.unreadable {
+                " — UNREADABLE, PERSISTENCE DISARMED (nothing will overwrite it)"
+            } else {
+                ""
+            }
         );
     }
 
@@ -231,6 +317,35 @@ fn main() {
         }
     });
 
+    // Handoff commit watcher (#93 F2): the new pair counts as serving
+    // once the new fused's control connection (Hello) lands — then the
+    // old server may retire. On timeout we KEEP the custody (closing
+    // it would tear the mount) and leave the old server to its own
+    // timeout — the next restart retries the takeover.
+    if let Some(tk) = takeover {
+        let sock = tk.handoff_socket.clone();
+        let hub2 = OracleHub::clone(&hub);
+        let sf = state_file.clone();
+        // The watcher is fire-and-forget: its outcome is logged, the
+        // handle deliberately discarded.
+        let _watcher = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while Instant::now() < deadline {
+                if hub2.control_len() > 0 {
+                    handoff::commit_handoff(&sock);
+                    handoff::clear_pending_in_state_file(sf.as_deref());
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            error!(
+                "handoff: the new fused never connected — NOT committing; \
+                 custody stays here (the old server will time out and the \
+                 next restart retries the takeover)"
+            );
+        });
+    }
+
     // ── Oracle endpoint (fused: adjudication + content) ───────────
     // Blocks the main thread for the daemon's lifetime.
     if let Err(e) = fuse_server::run_oracle_server(&cli.oracle_socket, state, hub) {
@@ -252,8 +367,8 @@ fn parse_secret(
         return Err("NAME and HASH must be non-empty".into());
     }
     let file_path = std::path::PathBuf::from(file);
-    let host = std::fs::canonicalize(&file_path)
-        .map_err(|e| format!("cannot resolve {file}: {e}"))?;
+    let host =
+        std::fs::canonicalize(&file_path).map_err(|e| format!("cannot resolve {file}: {e}"))?;
     Ok((name.to_string(), host, hash.to_string()))
 }
 
@@ -267,8 +382,7 @@ mod secret_spec_tests {
         let dir = tempfile::tempdir().unwrap();
         let weird = dir.path().join("a:b:c.yaml");
         std::fs::write(&weird, b"DATA").unwrap();
-        let (name, file, hash) =
-            parse_secret("api", &weird.display().to_string(), "*").unwrap();
+        let (name, file, hash) = parse_secret("api", &weird.display().to_string(), "*").unwrap();
         assert_eq!(name, "api");
         assert_eq!(file, std::fs::canonicalize(&weird).unwrap());
         assert_eq!(hash, "*");

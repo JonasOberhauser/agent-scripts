@@ -1,5 +1,5 @@
+use fuse_protocol::{Command, CommandSpec, Response, COMMAND_TABLE};
 use servyi_servatui::{Plugin, Protocol, ShellAction};
-use fuse_protocol::{Command, CommandSpec, COMMAND_TABLE, Response};
 
 use crate::handler::handle_command;
 use crate::state::ServerState;

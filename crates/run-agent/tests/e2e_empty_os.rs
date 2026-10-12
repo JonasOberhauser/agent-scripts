@@ -41,7 +41,6 @@
 // the custom_parser lint exists only under the servyi driver.
 #![allow(unknown_lints)]
 #![allow(custom_parser)]
-
 #![allow(clippy::unwrap_used, clippy::panic, unused_results)]
 
 use std::io::Write as _;
@@ -291,7 +290,9 @@ fn require_environment(test: &str) {
         );
     }
     if find_fuse_server().is_none() {
-        missing.push("fuse-server binary (cargo build -p fuse-server, or set FUSE_SERVER_BIN)".to_string());
+        missing.push(
+            "fuse-server binary (cargo build -p fuse-server, or set FUSE_SERVER_BIN)".to_string(),
+        );
     }
     assert!(
         missing.is_empty(),
@@ -376,9 +377,11 @@ fn e2e_fully_qualified_image_creates_container_on_empty_os() {
 
     let ps = os.podman(&["ps", "-a", "--format", "{{.Names}}"]);
     let names = String::from_utf8_lossy(&ps.stdout).into_owned();
-    let created = names
-        .lines()
-        .any(|l| l.trim_start_matches('\'').trim_end_matches('\'').starts_with("agentbox-"));
+    let created = names.lines().any(|l| {
+        l.trim_start_matches('\'')
+            .trim_end_matches('\'')
+            .starts_with("agentbox-")
+    });
 
     let _ = os.podman(&["rm", "-f", "--all"]);
 
@@ -417,7 +420,9 @@ fn e2e_auto_build_creates_image_and_container() {
     let names = String::from_utf8_lossy(&ps.stdout).into_owned();
     let _ = os.podman(&["rm", "-f", "--all"]);
     assert!(
-        names.lines().any(|l| l.trim_start_matches('\'').starts_with("agentbox-")),
+        names
+            .lines()
+            .any(|l| l.trim_start_matches('\'').starts_with("agentbox-")),
         "container was not created; run-agent output:\n{text}\npodman ps -a:\n{names}"
     );
 }

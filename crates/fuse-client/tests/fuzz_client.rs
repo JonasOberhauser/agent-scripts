@@ -24,7 +24,6 @@
 // the custom_parser lint exists only under the servyi driver.
 #![allow(unknown_lints)]
 #![allow(custom_parser)]
-
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 use std::io::{BufRead, BufReader, Write};
@@ -55,24 +54,49 @@ impl Rng {
 /// characters, ANSI escapes (terminal-injection), separators, depth,
 /// size, and emptiness.
 const HOSTILE: &[&str] = &[
-    "s", "", "\u{1b}[31mRED\u{1b}[0m", "\u{1b}]0;title\u{07}",
-    "\u{7}", "\r\nCRLF-injected", "\u{2028}",
-    "a/b/../../../../c", "..",
+    "s",
+    "",
+    "\u{1b}[31mRED\u{1b}[0m",
+    "\u{1b}]0;title\u{07}",
+    "\u{7}",
+    "\r\nCRLF-injected",
+    "\u{2028}",
+    "a/b/../../../../c",
+    "..",
     "very-long-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    "\u{1F916}", "\u{1F512}", "HOME=/x", "$(rm -rf /)", "`id`", "; reboot",
+    "\u{1F916}",
+    "\u{1F512}",
+    "HOME=/x",
+    "$(rm -rf /)",
+    "`id`",
+    "; reboot",
 ];
 
 const GARBAGE: &[&str] = &[
-    "not json", "{", "{\"type\":", "{\"type\":\"Status\",\"secrets\":42}",
-    "{\"type\":\"unknown-variant\"}", "[]", "null", "\"bare string\"",
+    "not json",
+    "{",
+    "{\"type\":",
+    "{\"type\":\"Status\",\"secrets\":42}",
+    "{\"type\":\"unknown-variant\"}",
+    "[]",
+    "null",
+    "\"bare string\"",
     "{\"type\":\"Version\",\"version\":99}",
 ];
 
 /// An out-of-date daemon's version strings — every historical minor,
 /// garbage, and empty (the mixed-vintage #37/#48 class).
 const STALE_VERSIONS: &[&str] = &[
-    "0.26.0", "0.27.0", "0.28.0", "0.29.0", "0.30.0", "0.31.0",
-    "0.32.0-major-bump", "", "not a version", "999.999.999",
+    "0.26.0",
+    "0.27.0",
+    "0.28.0",
+    "0.29.0",
+    "0.30.0",
+    "0.31.0",
+    "0.32.0-major-bump",
+    "",
+    "not a version",
+    "999.999.999",
 ];
 
 fn json_s(rng: &mut Rng) -> String {
@@ -140,7 +164,10 @@ fn random_reply(rng: &mut Rng, vintage: bool) -> String {
                     )
                 })
                 .collect();
-            format!("{{\"type\":\"PendingList\",\"pending\":[{}]}}", pend.join(","))
+            format!(
+                "{{\"type\":\"PendingList\",\"pending\":[{}]}}",
+                pend.join(",")
+            )
         }
         3 => format!("{{\"type\":\"Added\",\"inner\":{}}}", json_s(rng)),
         4 => format!(
@@ -199,7 +226,9 @@ fn fake_daemon(listener: UnixListener, seed0: u64, vintage: bool) {
     // thread per seed and exhausts the marathon — the same class the
     // oracle stop seam fixed, handled locally here).
     use std::io::ErrorKind;
-    listener.set_nonblocking(true).expect("nonblocking listener");
+    listener
+        .set_nonblocking(true)
+        .expect("nonblocking listener");
     let mut conn_n = 0u64;
     let idle_after = Duration::from_secs(3);
     let mut last_activity = Instant::now();
@@ -209,7 +238,9 @@ fn fake_daemon(listener: UnixListener, seed0: u64, vintage: bool) {
                 last_activity = Instant::now();
                 conn_n += 1;
                 let mut rng = Rng(seed0 ^ conn_n.wrapping_mul(0x9E3779B97F4A7C15));
-                let Ok(stream) = conn.try_clone() else { continue };
+                let Ok(stream) = conn.try_clone() else {
+                    continue;
+                };
                 let mut w = conn;
                 let mut reader = BufReader::new(stream);
                 let mut line = String::new();
@@ -252,7 +283,11 @@ fn client_bin() -> PathBuf {
 
 /// Spawn the real client; return Some(exit_code) or None on a
 /// deadline kill (a hang finding).
-fn run_client(socket: &std::path::Path, state_file: &std::path::Path, argv: &[String]) -> Option<i32> {
+fn run_client(
+    socket: &std::path::Path,
+    state_file: &std::path::Path,
+    argv: &[String],
+) -> Option<i32> {
     let mut cmd = Command::new(client_bin());
     let _ = cmd
         .arg("--socket")

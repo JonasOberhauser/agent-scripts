@@ -44,9 +44,13 @@ impl OracleHub {
     }
 
     fn broadcast(&self, cmd: &OracleCommand) {
-        self.snapshot.lock()
-            .expect("oracle hub lock: never held across a panic — poisoning means a server bug").push(cmd.clone());
-        let mut controls = self.controls.lock()
+        self.snapshot
+            .lock()
+            .expect("oracle hub lock: never held across a panic — poisoning means a server bug")
+            .push(cmd.clone());
+        let mut controls = self
+            .controls
+            .lock()
             .expect("oracle hub lock: never held across a panic — poisoning means a server bug");
         controls.retain(|stream| {
             let mut w = stream;
@@ -79,8 +83,147 @@ impl OracleHub {
     }
 
     pub fn remove(&self, name: &str) {
-        self.broadcast(&OracleCommand::Remove { name: name.to_string() });
+        self.broadcast(&OracleCommand::Remove {
+            name: name.to_string(),
+        });
     }
+
+    /// How many live control connections (handoff commit gating: the
+    /// new pair counts as serving once its fused said Hello, #93 F2).
+    ///
+    /// # Panics
+    /// Panics only on lock poisoning (the hub lock is poison-free by
+    /// contract).
+    pub fn control_len(&self) -> usize {
+        self.controls
+            .lock()
+            .expect("oracle hub lock: never held across a panic — poisoning means a server bug")
+            .len()
+    }
+
+    /// Lifecycle words (#93 F2 handoff): control connections only —
+    /// NEVER the snapshot, or a reconnecting/new daemon would replay a
+    /// stale Surrender/Retire at itself.
+    pub(crate) fn push_control_only(&self, cmd: &OracleCommand) {
+        let mut controls = self
+            .controls
+            .lock()
+            .expect("oracle hub lock: never held across a panic — poisoning means a server bug");
+        controls.retain(|stream| {
+            let mut w = stream;
+            match serde_json::to_string(cmd) {
+                Ok(line) => {
+                    if writeln!(w, "{line}").and_then(|_| w.flush()).is_ok() {
+                        true
+                    } else {
+                        info!("oracle: data daemon control connection went away");
+                        false
+                    }
+                }
+                Err(e) => {
+                    warn!("oracle: cannot serialize command: {e}");
+                    true
+                }
+            }
+        });
+    }
+}
+
+/// The first-line read's result: (line-without-LF, unread leftover,
+/// received fds).
+pub(crate) type FirstLine = (Vec<u8>, Vec<u8>, Vec<std::os::unix::io::OwnedFd>);
+
+/// Read the first line of a connection WITH its inbound SCM_RIGHTS
+/// batch (if any): recvmsg collects the ancillary data plain `read`
+/// would drop. Returns (line-without-LF, unread leftover bytes, fds).
+pub(crate) fn read_first_line_with_fds(stream: &UnixStream) -> Result<FirstLine, String> {
+    use std::os::unix::io::{AsRawFd, FromRawFd as _, OwnedFd, RawFd};
+    const CHUNK: usize = 4096;
+    let mut buf = vec![0u8; CHUNK];
+    let mut cmsg_space = nix::cmsg_space!([RawFd; 64]);
+    let mut iov = [std::io::IoSliceMut::new(&mut buf)];
+    let msg = nix::sys::socket::recvmsg::<()>(
+        stream.as_raw_fd(),
+        &mut iov,
+        Some(&mut cmsg_space),
+        nix::sys::socket::MsgFlags::empty(),
+    )
+    .map_err(|e| format!("recvmsg: {e}"))?;
+    let mut fds = Vec::new();
+    for c in msg.cmsgs().map_err(|e| format!("cmsg decode: {e}"))? {
+        if let nix::sys::socket::ControlMessageOwned::ScmRights(rights) = c {
+            for fd in rights {
+                // SAFETY: recvmsg dup'd these into this process;
+                // owning them makes the compiler close what we do
+                // not keep.
+                let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+                fds.push(owned);
+            }
+        }
+    }
+    let n = msg.bytes;
+    let all = buf[..n].to_vec();
+    let split = all.iter().position(|&b| b == b'\n').map(|i| i + 1);
+    match split {
+        Some(i) => Ok((all[..i].to_vec(), all[i..].to_vec(), fds)),
+        None => Ok((all, Vec::new(), fds)),
+    }
+}
+
+/// A reader that serves stashed leftover bytes before the underlying
+/// stream — so the cmsg-aware first read costs the line loop nothing.
+struct LeftoverReader<S: std::io::Read> {
+    inner: S,
+    buf: Vec<u8>,
+    pos: usize,
+}
+
+impl<S: std::io::Read> LeftoverReader<S> {
+    fn new(inner: S, buf: Vec<u8>) -> Self {
+        Self { inner, buf, pos: 0 }
+    }
+}
+
+impl<S: std::io::Read> std::io::Read for LeftoverReader<S> {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        if self.pos < self.buf.len() {
+            let n = (self.buf.len() - self.pos).min(out.len());
+            out[..n].copy_from_slice(&self.buf[self.pos..self.pos + n]);
+            self.pos += n;
+            return Ok(n);
+        }
+        self.inner.read(out)
+    }
+}
+
+/// A surrendered custody batch awaiting the handoff conductor
+/// (#93 F2): the fds live in the mailbox until taken — keeping them
+/// OPEN is the whole point (the mount dies with the last fd).
+pub(crate) struct Surrendered {
+    pub schema: u32,
+    pub state: serde_json::Value,
+    pub fds: Vec<std::os::unix::io::OwnedFd>,
+}
+
+static SURRENDER_MAILBOX: std::sync::LazyLock<std::sync::Mutex<Vec<Surrendered>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
+
+/// # Panics
+/// Panics only on lock poisoning of the mailbox contract.
+pub(crate) fn stash_surrender(s: Surrendered) {
+    SURRENDER_MAILBOX
+        .lock()
+        .expect("surrender mailbox: no panics under the lock by contract")
+        .push(s);
+}
+
+/// # Panics
+/// Panics only on lock poisoning of the mailbox contract.
+pub(crate) fn take_surrender_payload() -> Option<Surrendered> {
+    SURRENDER_MAILBOX
+        .lock()
+        .expect("surrender mailbox: no panics under the lock by contract")
+        .pop()
 }
 
 /// Package hash for the reader, ALWAYS via the hashd helper: this
@@ -88,10 +231,7 @@ impl OracleHub {
 /// `/proc/<pid>/map_files` itself (that is hashd's one job). Failures
 /// carry the commands that fix them, so a pending shown to a human
 /// says what to run.
-pub(crate) fn compute_pid_hash(
-    state: &ServerState,
-    pid: u32,
-) -> (Option<String>, Option<String>) {
+pub(crate) fn compute_pid_hash(state: &ServerState, pid: u32) -> (Option<String>, Option<String>) {
     // Resolved once at construction (immutable field, borrowed for
     // the whole call — no guard to own it out of): production keeps
     // the ambient env->default resolution; in-process harnesses pin
@@ -190,8 +330,7 @@ fn open_secret(
     use std::os::unix::io::AsRawFd;
 
     let reply_line = |r: &OracleReply| -> String {
-        serde_json::to_string(r)
-            .expect("serializing oracle reply: internal enum, infallible")
+        serde_json::to_string(r).expect("serializing oracle reply: internal enum, infallible")
     };
 
     let Some(host) = state.host_path(name) else {
@@ -258,7 +397,13 @@ fn open_secret(
     }
 }
 
-fn adjudicate(state: &ServerState, name: &str, pid: u32, offset: usize, size: usize) -> OracleReply {
+fn adjudicate(
+    state: &ServerState,
+    name: &str,
+    pid: u32,
+    offset: usize,
+    size: usize,
+) -> OracleReply {
     let (pid_hash, hash_error) = compute_pid_hash(state, pid);
     match state.attempt_read(name, pid, pid_hash.as_deref(), offset, size) {
         ReadOutcome::Granted => OracleReply::Allow,
@@ -277,11 +422,14 @@ fn adjudicate(state: &ServerState, name: &str, pid: u32, offset: usize, size: us
                 .denial_reason()
                 .unwrap_or_else(|| "access denied".into());
             let timeout = *state
-            .pending_timeout
-            .lock()
-            .expect("pending-timeout lock: never held across a panic");
+                .pending_timeout
+                .lock()
+                .expect("pending-timeout lock: never held across a panic");
             if timeout.is_zero() {
-                return OracleReply::Deny { errno: libc::EACCES, reason };
+                return OracleReply::Deny {
+                    errno: libc::EACCES,
+                    reason,
+                };
             }
             let id = state.create_pending_with_hash_error(
                 name,
@@ -314,7 +462,10 @@ fn adjudicate(state: &ServerState, name: &str, pid: u32, offset: usize, size: us
                 // the panel; cleanup drops the anonymous ones.
                 if Instant::now() > deadline {
                     warn!("Pending access {id} timed out");
-                    return OracleReply::Deny { errno: libc::EACCES, reason: format!("pending {id} expired: {reason}") };
+                    return OracleReply::Deny {
+                        errno: libc::EACCES,
+                        reason: format!("pending {id} expired: {reason}"),
+                    };
                 }
                 if state.is_pending_denied(id) {
                     // An operator deny releases the blocked reader AT
@@ -332,17 +483,44 @@ fn adjudicate(state: &ServerState, name: &str, pid: u32, offset: usize, size: us
     }
 }
 
-/// One accepted connection: control (`hello` first) or asks.
+/// One accepted connection: control (`hello` first), asks, or a
+/// handoff SURRENDER payload (the one request that carries SCM_RIGHTS
+/// inbound — read with cmsg support before any buffered reader can
+/// swallow the batch).
 fn handle_conn(state: &Arc<ServerState>, hub: &OracleHub, conn: UnixStream) {
-    let mut reader = BufReader::new(match conn.try_clone() {
-        Ok(c) => c,
-        Err(_) => return,
-    });
     let mut stream = conn;
-    let mut first = String::new();
-    if reader.read_line(&mut first).is_err() {
-        return;
+    let (first_raw, leftover, fds) = match read_first_line_with_fds(&stream) {
+        Ok(x) => x,
+        Err(_) => return,
+    };
+    let first = String::from_utf8_lossy(&first_raw).to_string();
+    // The surrender payload: stash the batch, connection's job is done.
+    if !fds.is_empty() {
+        match serde_json::from_str::<OracleRequest>(first.trim()) {
+            Ok(OracleRequest::SurrenderPayload {
+                session_schema,
+                state: payload,
+            }) => {
+                stash_surrender(Surrendered {
+                    schema: session_schema,
+                    state: payload,
+                    fds,
+                });
+                return;
+            }
+            _ => {
+                warn!("oracle: unexpected inbound SCM_RIGHTS on a non-surrender line — dropped");
+                return;
+            }
+        }
     }
+    let mut reader = BufReader::new(LeftoverReader::new(
+        match stream.try_clone() {
+            Ok(c) => c,
+            Err(_) => return,
+        },
+        leftover,
+    ));
     // Control connection: hello — register and hold the stream open;
     // the hub writes commands into it.
     if let Ok(OracleRequest::Hello { version }) = serde_json::from_str(first.trim()) {
@@ -357,18 +535,31 @@ fn handle_conn(state: &Arc<ServerState>, hub: &OracleHub, conn: UnixStream) {
                     "data daemon reports protocol v{} vs server v{} — mixed vintages; \
                      its mount may silently miss content. Rebuild (cargo build \
                      --workspace) and restart the data daemon (fused).",
-                    v, fuse_protocol::VERSION
+                    v,
+                    fuse_protocol::VERSION
                 );
             }
             _ => {}
         }
-        let _ = writeln!(stream, "{}", serde_json::to_string(&OracleReply::Ok)
-                .expect("serializing Ok ack: internal enum, infallible"));
+        let _ = writeln!(
+            stream,
+            "{}",
+            serde_json::to_string(&OracleReply::Ok)
+                .expect("serializing Ok ack: internal enum, infallible")
+        );
         // Replay the content snapshot: late joiners get every secret.
-        for cmd in hub.snapshot.lock()
-            .expect("oracle hub lock: never held across a panic — poisoning means a server bug").iter() {
-            let _ = writeln!(stream, "{}", serde_json::to_string(cmd)
-                .expect("serializing replayed command: internal enum, infallible"));
+        for cmd in hub
+            .snapshot
+            .lock()
+            .expect("oracle hub lock: never held across a panic — poisoning means a server bug")
+            .iter()
+        {
+            let _ = writeln!(
+                stream,
+                "{}",
+                serde_json::to_string(cmd)
+                    .expect("serializing replayed command: internal enum, infallible")
+            );
         }
         let _ = stream.flush();
         // Bound the hub's writes to this connection (issue #77): a
@@ -381,35 +572,57 @@ fn handle_conn(state: &Arc<ServerState>, hub: &OracleHub, conn: UnixStream) {
         // (logged below); the daemon's reconnect re-syncs from the
         // snapshot.
         let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(2)));
-        hub.controls.lock()
-            .expect("oracle hub lock: never held across a panic — poisoning means a server bug").push(stream);
+        hub.controls
+            .lock()
+            .expect("oracle hub lock: never held across a panic — poisoning means a server bug")
+            .push(stream);
         return;
     }
     // Otherwise: one or more requests on this connection.
     let mut line = first;
     loop {
         match serde_json::from_str::<OracleRequest>(line.trim()) {
-            Ok(OracleRequest::Ask { name, pid, offset, size }) => {
+            Ok(OracleRequest::Ask {
+                name,
+                pid,
+                offset,
+                size,
+            }) => {
                 let reply = adjudicate(state, &name, pid, offset as usize, size as usize);
-                let _ = writeln!(stream, "{}", serde_json::to_string(&reply)
-                .expect("serializing reply line: internal enum, infallible"));
+                let _ = writeln!(
+                    stream,
+                    "{}",
+                    serde_json::to_string(&reply)
+                        .expect("serializing reply line: internal enum, infallible")
+                );
                 let _ = stream.flush();
             }
             Ok(OracleRequest::Stat { name }) => {
                 let reply = stat_secret(state, &name);
-                let _ = writeln!(stream, "{}", serde_json::to_string(&reply)
-                .expect("serializing reply line: internal enum, infallible"));
+                let _ = writeln!(
+                    stream,
+                    "{}",
+                    serde_json::to_string(&reply)
+                        .expect("serializing reply line: internal enum, infallible")
+                );
                 let _ = stream.flush();
             }
-            Ok(OracleRequest::Open { name, pid, kdev, kino }) => {
+            Ok(OracleRequest::Open {
+                name,
+                pid,
+                kdev,
+                kino,
+            }) => {
                 open_secret(state, &name, pid, kdev, kino, &mut stream);
             }
             _ => {
                 let _ = writeln!(
                     stream,
                     "{}",
-                    serde_json::to_string(&OracleReply::Error { message: "malformed request".into() })
-                        .expect("serializing Error reply: internal enum, infallible")
+                    serde_json::to_string(&OracleReply::Error {
+                        message: "malformed request".into()
+                    })
+                    .expect("serializing Error reply: internal enum, infallible")
                 );
                 return;
             }
@@ -426,7 +639,11 @@ fn handle_conn(state: &Arc<ServerState>, hub: &OracleHub, conn: UnixStream) {
 pub static ORACLE_HUB: std::sync::LazyLock<OracleHub> = std::sync::LazyLock::new(OracleHub::new);
 
 /// Run the oracle listener. Blocks.
-pub fn run_oracle_server(socket_path: &std::path::Path, state: Arc<ServerState>, hub: OracleHub) -> Result<(), String> {
+pub fn run_oracle_server(
+    socket_path: &std::path::Path,
+    state: Arc<ServerState>,
+    hub: OracleHub,
+) -> Result<(), String> {
     let stop = std::sync::atomic::AtomicBool::new(false);
     run_oracle_server_with_stop(socket_path, state, hub, &stop)
 }
@@ -459,11 +676,23 @@ pub fn run_oracle_server_with_stop(
 }
 
 /// Convenience for callers/tests: one blocking ask against a listener.
-pub fn ask(socket_path: &std::path::Path, name: &str, pid: u32, offset: u64, size: u32) -> Result<OracleReply, String> {
+pub fn ask(
+    socket_path: &std::path::Path,
+    name: &str,
+    pid: u32,
+    offset: u64,
+    size: u32,
+) -> Result<OracleReply, String> {
     let mut conn = UnixStream::connect(socket_path).map_err(|e| e.to_string())?;
-    let req = serde_json::to_string(&OracleRequest::Ask { name: name.into(), pid, offset, size })
+    let req = serde_json::to_string(&OracleRequest::Ask {
+        name: name.into(),
+        pid,
+        offset,
+        size,
+    })
+    .map_err(|e| e.to_string())?;
+    conn.write_all(format!("{req}\n").as_bytes())
         .map_err(|e| e.to_string())?;
-    conn.write_all(format!("{req}\n").as_bytes()).map_err(|e| e.to_string())?;
     let mut reader = BufReader::new(conn.try_clone().map_err(|e| e.to_string())?);
     let mut line = String::new();
     let _n = reader.read_line(&mut line).map_err(|e| e.to_string())?;
@@ -473,4 +702,3 @@ pub fn ask(socket_path: &std::path::Path, name: &str, pid: u32, offset: u64, siz
 /// Unused import guard for PendingAccessInfo (kept for API parity in tests).
 #[allow(dead_code)]
 fn _pending_type_witness(_: Option<PendingAccessInfo>) {}
-

@@ -68,7 +68,9 @@ pub struct RealMountStack {
 /// every hand-rolled harness used; `CARGO_BIN_EXE_` only reaches
 /// same-package bins).
 pub fn bin(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/debug").join(name)
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/debug")
+        .join(name)
 }
 
 impl RealMountStack {
@@ -96,14 +98,20 @@ impl RealMountStack {
         // The policy daemon loads secrets from files (--secret N:F:H).
         let mut policy = Command::new(bin("fuse-server"));
         let _ = policy
-            .arg("--socket").arg(&socket)
-            .arg("--oracle-socket").arg(&oracle)
-            .arg("--pending-timeout").arg(stack.pending_timeout.as_secs().max(1).to_string())
+            .arg("--socket")
+            .arg(&socket)
+            .arg("--oracle-socket")
+            .arg(&oracle)
+            .arg("--pending-timeout")
+            .arg(stack.pending_timeout.as_secs().max(1).to_string())
             // The store is ALWAYS armed for real-mount stacks: the
             // container view's salt lands in it at first registration
             // (inner names are derived from it), and the kill-point
             // respawns load through it.
-            .env(fuse_protocol::ENV_POLICY_FILE, root.path().join("policy.json"))
+            .env(
+                fuse_protocol::ENV_POLICY_FILE,
+                root.path().join("policy.json"),
+            )
             .env("RUST_LOG", "fuse_mount=info,fuse_server=info");
         if let Some(stub) = &hashd {
             let _ = policy.env(fuse_protocol::ENV_HASHD_SOCK, stub.path());
@@ -125,7 +133,8 @@ impl RealMountStack {
             secrets.push((spec.name.clone(), f, spec.hash.clone()));
         }
         let policy = policy
-            .stdout(server_log.try_clone().expect("testkit: clone log")).stderr(server_log)
+            .stdout(server_log.try_clone().expect("testkit: clone log"))
+            .stderr(server_log)
             .spawn()
             .expect("testkit: spawn fuse-server (policy) — is target/debug built?");
 
@@ -133,10 +142,13 @@ impl RealMountStack {
         wait_connect(&socket, "command socket", root.path());
 
         let data = Command::new(bin("fused"))
-            .arg("--mount-point").arg(&mount)
-            .arg("--oracle-socket").arg(&oracle)
+            .arg("--mount-point")
+            .arg(&mount)
+            .arg("--oracle-socket")
+            .arg(&oracle)
             .env("RUST_LOG", "info")
-            .stdout(fused_log.try_clone().expect("testkit: clone log")).stderr(fused_log)
+            .stdout(fused_log.try_clone().expect("testkit: clone log"))
+            .stderr(fused_log)
             .spawn()
             .expect("testkit: spawn fused (data) — is target/debug built?");
 
@@ -148,7 +160,10 @@ impl RealMountStack {
         // name the mount actually serves.
         let deadline = Instant::now() + Duration::from_secs(10);
         while !root.path().join("policy.json").exists() {
-            assert!(Instant::now() < deadline, "testkit: policy store never written");
+            assert!(
+                Instant::now() < deadline,
+                "testkit: policy store never written"
+            );
             std::thread::sleep(Duration::from_millis(50));
         }
         for (name, _, _) in &secrets {
@@ -167,7 +182,16 @@ impl RealMountStack {
             );
         }
 
-        Self { mount, socket, oracle, procs: vec![policy, data], root, secrets, pending_secs: stack.pending_timeout.as_secs().max(1), _hashd: hashd }
+        Self {
+            mount,
+            socket,
+            oracle,
+            procs: vec![policy, data],
+            root,
+            secrets,
+            pending_secs: stack.pending_timeout.as_secs().max(1),
+            _hashd: hashd,
+        }
     }
 
     /// The mount point (a real kernel FUSE mount while the data
@@ -215,7 +239,8 @@ impl RealMountStack {
     /// Panics if the client binary cannot be spawned.
     pub fn client(&self, args: &[&str]) -> Output {
         Command::new(bin("fuse-client"))
-            .arg("--socket").arg(&self.socket)
+            .arg("--socket")
+            .arg(&self.socket)
             .args(args)
             .env("RUST_LOG", "fuse_mount=info,fuse_server=info")
             .output()
@@ -235,17 +260,25 @@ impl RealMountStack {
 
     fn respawn_log(&self, tag: &str, name: &str) -> std::fs::File {
         std::fs::OpenOptions::new()
-            .create(true).append(true)
+            .create(true)
+            .append(true)
             .open(self.root.path().join(format!("{name}-{tag}.log")))
             .expect("testkit: open respawn log")
     }
 
     fn policy_cmd(&self, log: std::fs::File) -> Command {
         let mut cmd = Command::new(bin("fuse-server"));
-        let _ = cmd.arg("--socket").arg(&self.socket)
-            .arg("--oracle-socket").arg(&self.oracle)
-            .arg("--pending-timeout").arg(self.pending_secs.to_string())
-            .env(fuse_protocol::ENV_POLICY_FILE, self.root.path().join("policy.json"))
+        let _ = cmd
+            .arg("--socket")
+            .arg(&self.socket)
+            .arg("--oracle-socket")
+            .arg(&self.oracle)
+            .arg("--pending-timeout")
+            .arg(self.pending_secs.to_string())
+            .env(
+                fuse_protocol::ENV_POLICY_FILE,
+                self.root.path().join("policy.json"),
+            )
             .env("RUST_LOG", "fuse_mount=info,fuse_server=info")
             .stdout(Stdio::from(log.try_clone().expect("testkit: clone log")))
             .stderr(log);
@@ -294,11 +327,7 @@ impl RealMountStack {
             let _ = cmd.env(fuse_protocol::ENV_HASHD_SOCK, stub.path());
         }
         for (name, path, hash) in &self.secrets {
-            let _ = cmd
-                .arg("--secret")
-                .arg(name)
-                .arg(path)
-                .arg(hash);
+            let _ = cmd.arg("--secret").arg(name).arg(path).arg(hash);
         }
         self.procs[0] = cmd.spawn().expect("testkit: respawn fuse-server (secrets)");
         self.wait_live_accept("respawned policy daemon (secrets)");
@@ -317,8 +346,11 @@ impl RealMountStack {
         }
         let log = self.respawn_log(tag, "fused-respawn");
         let mut cmd = Command::new(bin("fused"));
-        let _ = cmd.arg("--mount-point").arg(&self.mount)
-            .arg("--oracle-socket").arg(&self.oracle)
+        let _ = cmd
+            .arg("--mount-point")
+            .arg(&self.mount)
+            .arg("--oracle-socket")
+            .arg(&self.oracle)
             .env("RUST_LOG", "info")
             .stdout(Stdio::from(log.try_clone().expect("testkit: clone log")))
             .stderr(log);
@@ -339,7 +371,11 @@ impl RealMountStack {
             }
             std::thread::sleep(Duration::from_millis(50));
         };
-        assert!(live, "testkit: {what} never accepted: {}", self.dump_logs(what));
+        assert!(
+            live,
+            "testkit: {what} never accepted: {}",
+            self.dump_logs(what)
+        );
     }
 }
 
@@ -356,7 +392,11 @@ pub(crate) fn dump_logs_under(root: &Path, what: &str) -> String {
             if let Ok(t) = std::fs::read_to_string(&p) {
                 let lines: Vec<&str> = t.lines().collect();
                 let start = lines.len().saturating_sub(25);
-                s.push_str(&format!("== {} ==\n{}\n", p.display(), lines[start..].join("\n")));
+                s.push_str(&format!(
+                    "== {} ==\n{}\n",
+                    p.display(),
+                    lines[start..].join("\n")
+                ));
             }
         }
     }
@@ -456,14 +496,20 @@ fn fusermount3_state() -> String {
     match std::fs::metadata("/usr/bin/fusermount3") {
         Ok(m) => {
             let mode = m.mode();
-            format!("present, mode {:o}, uid {} (setuid: {})", mode, m.uid(), mode & 0o4000 != 0)
+            format!(
+                "present, mode {:o}, uid {} (setuid: {})",
+                mode,
+                m.uid(),
+                mode & 0o4000 != 0
+            )
         }
         Err(_) => String::from("absent"),
     }
 }
 
 fn probe_env() -> String {
-    let id = Command::new("id").output()
+    let id = Command::new("id")
+        .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_else(|e| format!("id failed: {e}"));
     let caps = Command::new("sh")
@@ -557,7 +603,11 @@ mod tests {
 
         // Budget spent BEFORE the kill must still be spent AFTER it.
         let err = split.read("s").expect_err("one-read budget must survive");
-        assert_eq!(err.raw_os_error(), Some(libc::EACCES), "spent budget survives kill -9: {err}");
+        assert_eq!(
+            err.raw_os_error(),
+            Some(libc::EACCES),
+            "spent budget survives kill -9: {err}"
+        );
 
         // The explicit path clears it, and the fresh read works.
         let out = split.client(&["reset", "--name", "s"]);
@@ -573,15 +623,15 @@ mod tests {
             eprintln!("skipping: real-mount tier unavailable here (CI exercises it)");
             return;
         }
-        let mut split = Stack::new()
-            .secret("s", b"KIT-DK", "*")
-            .spawn_real_mount();
+        let mut split = Stack::new().secret("s", b"KIT-DK", "*").spawn_real_mount();
         assert_eq!(split.read("s").expect("read before kill"), b"KIT-DK");
 
         split.kill_data();
         split.respawn_data("kit-dk");
 
-        let err = split.read("s").expect_err("budget survives the data daemon's death");
+        let err = split
+            .read("s")
+            .expect_err("budget survives the data daemon's death");
         assert_eq!(err.raw_os_error(), Some(libc::EACCES), "{err}");
         let out = split.client(&["reset", "--name", "s"]);
         assert!(out.status.success(), "reset after remount: {out:?}");

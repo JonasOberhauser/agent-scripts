@@ -28,7 +28,6 @@ mod tests {
         assert_eq!(f.oracle_socket, None);
     }
 
-
     use fuse_protocol::*;
 
     #[test]
@@ -81,14 +80,17 @@ mod tests {
         let resp = Response::Status {
             secrets: vec![SecretStatus {
                 inner: String::new(),
-            name: "a".into(),
+                name: "a".into(),
                 access_count: 2,
-                allowed_hashes: vec![HashEntryStatus { hash: "deadbeef".into(), by: None }],
+                allowed_hashes: vec![HashEntryStatus {
+                    hash: "deadbeef".into(),
+                    by: None,
+                }],
                 size: 42,
                 unlimited: false,
             }],
-        lockdown: false,
-    };
+            lockdown: false,
+        };
         let json = serde_json::to_string(&resp).unwrap();
         let back: Response = serde_json::from_str(&json).unwrap();
         assert_eq!(resp, back);
