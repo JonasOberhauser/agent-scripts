@@ -167,7 +167,7 @@ fn run_control(conn: UnixStream, oracle: &std::path::Path, custody: &Custody) ->
     false
 }
 
-/// The SurrenderPayload connection: one line + SCM_RIGHTS[fd].
+/// The SurrenderPayload connection: one line + SCM_RIGHTS\[fd\].
 fn surrender(oracle: &std::path::Path, custody: &Custody) -> Result<(), String> {
     let conn = UnixStream::connect(oracle).map_err(|e| e.to_string())?;
     let session = Session {

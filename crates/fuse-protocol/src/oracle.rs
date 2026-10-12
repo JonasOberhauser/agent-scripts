@@ -86,7 +86,7 @@ pub enum OracleRequest {
         #[serde(default)]
         version: Option<String>,
     },
-    /// Answer to [`OracleCommand::Surrender`]: the custody batch. The
+    /// Answer to \[`OracleCommand::Surrender`\]: the custody batch. The
     /// SCM_RIGHTS control message on this line carries fd\[0\] = the
     /// mount connection fd, fd\[1..\] = the open host fds in table
     /// order; the line itself names the session-state schema and the
@@ -130,8 +130,8 @@ pub enum OracleCommand {
     /// Handoff take-back (#93 F2, same-version pair): ship the mount
     /// connection fd and the open host fds together with the
     /// serialized session state to the server, KEEP your own copies,
-    /// stop serving new opens, and wait for [`OracleCommand::Retire`].
-    /// The payload arrives as a [`OracleRequest::SurrenderPayload`]
+    /// stop serving new opens, and wait for \[`OracleCommand::Retire`\].
+    /// The payload arrives as a \[`OracleRequest::SurrenderPayload`\]
     /// connection carrying SCM_RIGHTS.
     Surrender,
     /// The successor is serving: close your fd copies LAST and exit 0.

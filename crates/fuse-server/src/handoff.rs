@@ -398,7 +398,7 @@ pub fn clear_pending_in_state_file(state_file: Option<&Path>) {
 /// batch and the state. `None` when there is nothing to resume.
 ///
 /// On `Commit`-able success the caller spawns the new fused with the
-/// inherited fd and THEN calls [`commit_handoff`]. A failure here is
+/// inherited fd and THEN calls \[`commit_handoff`\]. A failure here is
 /// NOT an abort of the old server — the next attempt re-runs this and
 /// the old side still holds everything (review on #97: resumable).
 /// # Panics

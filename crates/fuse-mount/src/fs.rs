@@ -266,7 +266,7 @@ impl Store {
 
     /// # Panics
     /// Never in operation — same lock-poisoning reasoning as
-    /// [`Store::serve`].
+    /// \[`Store::serve`\].
     ///
     /// Remove a secret: prune the tree node and its fino entry, then
     /// childless structural ancestors vanish with it.
@@ -486,7 +486,7 @@ pub fn open_secret(
     open_secret_timeout(socket, name, pid, kdev, kino, OPEN_REPLY_TIMEOUT)
 }
 
-/// The test seam for [`open_secret`]: an explicit reply deadline.
+/// The test seam for \[`open_secret`\]: an explicit reply deadline.
 fn open_secret_timeout(
     socket: &str,
     name: &str,

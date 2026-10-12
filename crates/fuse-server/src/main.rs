@@ -277,7 +277,7 @@ fn main() {
     }
 
     let hub = OracleHub::clone(&fuse_server::ORACLE_HUB);
-    // num_args = 3: flat [name, file, hash, ...] triples; chunk them.
+    // num_args = 3: flat \[name, file, hash, ...\] triples; chunk them.
     for spec in cli.secret.chunks(3) {
         match parse_secret(&spec[0], &spec[1], &spec[2]) {
             Ok((name, host, hash)) => {

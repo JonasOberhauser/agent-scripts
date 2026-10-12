@@ -648,7 +648,7 @@ pub fn run_oracle_server(
     run_oracle_server_with_stop(socket_path, state, hub, &stop)
 }
 
-/// Like [`run_oracle_server`], with a stop seam for long-running test
+/// Like \[`run_oracle_server`\], with a stop seam for long-running test
 /// harnesses (the e2e fuzz marathon): set the flag and connect once
 /// (the poison pill wakes the blocking accept) — the loop exits and
 /// the thread reclaims. Without it, every stack-up leaked one immortal
