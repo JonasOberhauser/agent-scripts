@@ -455,7 +455,7 @@ dependencies = [
 
 [[package]]
 name = "fuse-client"
-version = "0.33.0"
+version = "0.34.0"
 dependencies = [
  "clap",
  "crossterm",
@@ -477,7 +477,7 @@ dependencies = [
 
 [[package]]
 name = "fuse-mount"
-version = "0.33.0"
+version = "0.34.0"
 dependencies = [
  "bimap",
  "clap",
@@ -499,7 +499,7 @@ dependencies = [
 
 [[package]]
 name = "fuse-protocol"
-version = "0.33.0"
+version = "0.34.0"
 dependencies = [
  "clap",
  "libc",
@@ -513,7 +513,7 @@ dependencies = [
 
 [[package]]
 name = "fuse-server"
-version = "0.33.0"
+version = "0.34.0"
 dependencies = [
  "clap",
  "dashmap",
@@ -626,7 +626,7 @@ dependencies = [
 
 [[package]]
 name = "hashd"
-version = "0.33.0"
+version = "0.34.0"
 dependencies = [
  "fuse-protocol",
  "procfs",
@@ -1068,7 +1068,7 @@ checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
 
 [[package]]
 name = "run-agent"
-version = "0.33.0"
+version = "0.34.0"
 dependencies = [
  "clap",
  "fuse-protocol",

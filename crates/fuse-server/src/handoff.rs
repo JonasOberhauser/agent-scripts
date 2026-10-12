@@ -32,6 +32,15 @@ use fuse_protocol::ServerStateFile;
 
 use crate::OracleHub;
 
+/// The take-back window: how long the old fused may take to
+/// surrender after the word goes out.
+const TAKE_BACK_TIMEOUT: Duration = Duration::from_secs(10);
+/// The linger/accept poll cadence.
+const HANDOFF_POLL: Duration = Duration::from_millis(50);
+/// How long the old fused gets to exit on the Retire word before the
+/// supervisor falls back to the hard kill.
+const RETIRE_GRACE: Duration = Duration::from_secs(5);
+
 /// The custody batch the old side holds between take-back and commit.
 #[derive(Default)]
 pub struct Custody {
@@ -62,7 +71,7 @@ pub(crate) fn take_back(
     hub.push_control_only(&OracleCommand::Surrender);
     // The daemon needs a moment; its payload connection lands on the
     // oracle listener this server still owns during handoff entry.
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + TAKE_BACK_TIMEOUT;
     let mut custody_from_mailbox: Option<crate::oracle_service::Surrendered> = None;
     while custody_from_mailbox.is_none() && Instant::now() < deadline {
         // Probe via the pending-payload mailbox the oracle server
@@ -130,6 +139,11 @@ pub(crate) fn serve_handoff(
     while Instant::now() < deadline {
         match listener.accept() {
             Ok((conn, _)) => {
+                // The rendezvous grants fds: never answer a stranger.
+                if !peer_is_same_uid(&conn) {
+                    warn!("handoff: refused a non-same-uid peer on the rendezvous");
+                    continue;
+                }
                 let _ = conn.set_nonblocking(false);
                 let last =
                     serve_one_handoff_conn(conn, &custody, &mut committed_to, &mut fd_taken_by);
@@ -138,11 +152,11 @@ pub(crate) fn serve_handoff(
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(50));
+                std::thread::sleep(HANDOFF_POLL);
             }
             Err(e) => {
                 warn!("handoff: accept: {e}");
-                std::thread::sleep(Duration::from_millis(50));
+                std::thread::sleep(HANDOFF_POLL);
             }
         }
     }
@@ -163,7 +177,7 @@ fn retire_fused(child: &mut std::process::Child) {
     // Best effort: the graceful word first (it closes its own copies).
     let hub = OracleHub::clone(&crate::ORACLE_HUB);
     hub.push_control_only(&OracleCommand::Retire);
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + RETIRE_GRACE;
     while Instant::now() < deadline {
         match child.try_wait() {
             Ok(Some(_)) => return,
@@ -172,6 +186,37 @@ fn retire_fused(child: &mut std::process::Child) {
     }
     let _ = child.kill();
     let _ = child.wait();
+}
+
+/// The handoff rendezvous GRANTS FILE DESCRIPTORS to whoever it
+/// answers — it must never answer a stranger. Same effective uid only
+/// (SO_PEERCRED on both directions: the old server checks every
+/// caller, the new server verifies the old one before adopting its
+/// custody). The socket file itself is created 0600; the uid check is
+/// the load-bearing half (the default rendezvous lives in /tmp).
+pub(crate) fn peer_is_same_uid(stream: &UnixStream) -> bool {
+    use std::os::unix::io::AsRawFd as _;
+    let fd = stream.as_raw_fd();
+    let sol = libc::SOL_SOCKET;
+    let opt = libc::SO_PEERCRED;
+    let len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let mut len_out = len;
+    let mut ucred: std::mem::MaybeUninit<libc::ucred> = std::mem::MaybeUninit::uninit();
+    let cred_ptr = ucred.as_mut_ptr().cast();
+    let len_ptr = &mut len_out as *mut libc::socklen_t;
+    // SAFETY: getsockopt(2) with a valid fd, SOL_SOCKET/SO_PEERCRED,
+    // and properly sized out-pointers — pure kernel query, no
+    // allocation, operands are hoisted bindings.
+    let rc = unsafe { libc::getsockopt(fd, sol, opt, cred_ptr, len_ptr) };
+    if rc != 0 {
+        return false;
+    }
+    // SAFETY: the getsockopt above returned 0, so the ucred out-
+    // pointer was fully initialized by the kernel.
+    let ucred = unsafe { ucred.assume_init() };
+    // SAFETY: getuid(2) is async-signal-safe and cannot fail.
+    let our_uid = unsafe { libc::getuid() };
+    ucred.uid == our_uid
 }
 
 /// #97's zombie lesson baked in: kill(0) succeeds and /proc lists
@@ -356,8 +401,7 @@ impl Takeover {
     /// Write the serialized session state where the resuming fused
     /// reads it (beside the oracle socket — the stack's own space).
     pub fn write_session_state(&self) -> Result<std::path::PathBuf, String> {
-        let mut path = self.handoff_socket.clone();
-        let _was = path.set_extension("resume.json");
+        let path = self.resume_state_path();
         let session = fuse_protocol::handoff::HandoffSession {
             session_schema: self.custody.session_schema,
             payload: self
@@ -372,6 +416,19 @@ impl Takeover {
         )
         .map_err(|e| format!("write {}: {e}", path.display()))?;
         Ok(path)
+    }
+
+    /// Where the resuming fused reads its session from.
+    fn resume_state_path(&self) -> std::path::PathBuf {
+        let mut path = self.handoff_socket.clone();
+        let _was = path.set_extension("resume.json");
+        path
+    }
+
+    /// Remove the resume artifact once adopted (or on degrade — the
+    /// next attempt re-serializes it fresh).
+    pub fn discard_resume_state(&self) {
+        let _ = std::fs::remove_file(self.resume_state_path());
     }
 }
 
@@ -623,6 +680,14 @@ fn enter_handoff_mode_inner(state_file: &Path, timeout: Duration) -> Result<(), 
     let _ = std::fs::remove_file(&handoff_sock);
     let listener = UnixListener::bind(&handoff_sock)
         .map_err(|e| format!("bind {}: {e}", handoff_sock.display()))?;
+    // The rendezvous grants fds: owner-only on the socket file (the
+    // uid check on accept is the load-bearing half — the default
+    // rendezvous path lives in world-writable /tmp).
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = 0o600;
+        let _ = std::fs::set_permissions(&handoff_sock, std::fs::Permissions::from_mode(mode));
+    }
     info!(
         "handoff: lingering at {} (timeout {timeout:?})",
         handoff_sock.display()

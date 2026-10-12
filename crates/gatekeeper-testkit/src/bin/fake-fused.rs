@@ -138,7 +138,7 @@ fn run_control(conn: UnixStream, oracle: &std::path::Path, custody: &Custody) ->
     };
     let hello = serde_json::json!({
         "type": "hello",
-        "version": env!("CARGO_PKG_VERSION"),
+        "version": fuse_protocol::VERSION,
     });
     if writeln!(writer, "{hello}")
         .and_then(|_| writer.flush())

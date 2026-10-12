@@ -704,7 +704,11 @@ fn restart_server(app: &App, log_path: Option<&str>) {
     if app
         .run_cli_command_raw(
             fuse_protocol::cmd::HANDOFF,
-            &format!("{} 120", fuse_protocol::state_file().display()),
+            &format!(
+                "{} {}",
+                fuse_protocol::state_file().display(),
+                fuse_protocol::handoff::HANDOFF_TIMEOUT.as_secs(),
+            ),
         )
         .is_ok()
     {

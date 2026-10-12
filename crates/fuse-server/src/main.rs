@@ -138,6 +138,13 @@ fn spawn_fused(
         .map_err(|e| format!("spawn {}: {e}", fused.display()))
 }
 
+/// How long the commit watcher waits for the new fused's Hello before
+/// declaring the takeover not-yet-served (custody kept, old server
+/// times out on its own — the next restart retries).
+const COMMIT_WATCH_TIMEOUT: Duration = Duration::from_secs(15);
+/// The watcher's poll cadence.
+const WATCH_POLL: Duration = Duration::from_millis(50);
+
 fn stale_socket(path: &Path) {
     if path.exists() {
         if std::os::unix::net::UnixStream::connect(path).is_ok() {
@@ -329,14 +336,15 @@ fn main() {
         // The watcher is fire-and-forget: its outcome is logged, the
         // handle deliberately discarded.
         let _watcher = std::thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(15);
+            let deadline = Instant::now() + COMMIT_WATCH_TIMEOUT;
             while Instant::now() < deadline {
                 if hub2.control_len() > 0 {
                     handoff::commit_handoff(&sock);
                     handoff::clear_pending_in_state_file(sf.as_deref());
+                    tk.discard_resume_state();
                     return;
                 }
-                std::thread::sleep(Duration::from_millis(50));
+                std::thread::sleep(WATCH_POLL);
             }
             error!(
                 "handoff: the new fused never connected — NOT committing; \

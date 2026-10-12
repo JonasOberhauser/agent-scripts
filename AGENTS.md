@@ -103,6 +103,15 @@ and one-read access state live in the daemon-owned policy store
 write-through on every mutation (never a shutdown flush — `kill -9`
 has no hook). Operational consequences:
 
+- **Seamless restarts (handoff)**: `fuse-client restart` asks the old
+  server for HANDOFF MODE — it takes the mount-connection fd back from
+  its fused, lingers on a private rendezvous (`<oracle>.handoff`,
+  0600, same-uid-only via SO_PEERCRED — the rendezvous GRANTS file
+  descriptors and must never answer a stranger), and the new server
+  takes custody over the frozen, split, resumable dialect (see
+  `fuse_protocol::handoff`) before spawning its fused with the fd by
+  exec inheritance. The mount session survives the restart; a
+  pre-handoff old server falls back to the SIGTERM flow byte for byte.
 - **Killing the daemons no longer resets approvals** — what used to be
   an implicit reset (kill the gatekeeper, budgets come back) is gone;
   access state persists. Treat "restart to clear a grant" as dead.
