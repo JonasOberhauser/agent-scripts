@@ -87,8 +87,8 @@ pub enum OracleRequest {
         version: Option<String>,
     },
     /// Answer to [`OracleCommand::Surrender`]: the custody batch. The
-    /// SCM_RIGHTS control message on this line carries fd[0] = the
-    /// mount connection fd, fd[1..] = the open host fds in table
+    /// SCM_RIGHTS control message on this line carries fd\[0\] = the
+    /// mount connection fd, fd\[1..\] = the open host fds in table
     /// order; the line itself names the session-state schema and the
     /// opaque state JSON (schema-owned by the fused side).
     SurrenderPayload {

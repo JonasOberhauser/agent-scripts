@@ -35,7 +35,7 @@ use crate::OracleHub;
 /// The custody batch the old side holds between take-back and commit.
 #[derive(Default)]
 pub struct Custody {
-    /// fd[0] = the mount connection; the rest are open host fds in
+    /// fd\[0\] = the mount connection; the rest are open host fds in
     /// table order (matching the state payload's table).
     pub fds: Vec<OwnedFd>,
     pub session: Option<serde_json::Value>,
@@ -346,7 +346,7 @@ pub struct Takeover {
 }
 
 impl Takeover {
-    /// The mount-connection fd (custody fd[0]) as a raw number for the
+    /// The mount-connection fd (custody fd\[0\]) as a raw number for the
     /// child's pre_exec dup2 — the OwnedFd stays owned HERE, keeping
     /// the kernel connection open for the whole daemon lifetime.
     pub fn mount_fd_raw(&self) -> std::os::unix::io::RawFd {

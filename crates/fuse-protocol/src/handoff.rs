@@ -94,7 +94,7 @@ pub enum HandoffReply {
         fused_pid: Option<u32>,
     },
     /// Answer to GetFd — the SCM_RIGHTS batch rides this line:
-    /// fd[0] = the mount connection fd, fd[1..] = open host fds in
+    /// fd\[0\] = the mount connection fd, fd\[1..\] = open host fds in
     /// table order (matching the state's `open_fds` entries).
     Fd { fd_count: u32 },
     /// Answer to GetState — opaque passthrough.
