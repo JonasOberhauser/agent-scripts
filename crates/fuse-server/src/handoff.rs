@@ -178,8 +178,9 @@ fn retire_fused(child: &mut std::process::Child) {
 /// unreaped corpses — liveness is the scheduler state, not the pid's
 /// existence.
 fn pid_alive(pid: u32) -> bool {
+    let pid_t = pid as libc::pid_t;
     // SAFETY: kill(0) — a pure liveness probe, no signal delivered.
-    let rc = unsafe { libc::kill(pid as i32, 0) };
+    let rc = unsafe { libc::kill(pid_t, 0) };
     if rc != 0 {
         return false;
     }
@@ -563,6 +564,22 @@ pub static SUPERVISED: Mutex<Option<std::process::Child>> = Mutex::new(None);
 /// Panics only on lock poisoning (the supervised/custody locks are
 /// poison-free by contract).
 pub fn enter_handoff_mode(state_file: &Path, timeout: Duration) -> Result<(), String> {
+    if let Err(e) = enter_handoff_mode_inner(state_file, timeout) {
+        // The Ok already reached the client — it will NOT send TERM.
+        // Degrade honestly to the legacy shutdown contract: sockets
+        // unlinked, process gone; its restart spawns fresh (a fresh
+        // mount, exactly the pre-handoff behavior).
+        tracing::error!("handoff mode failed ({e}) — degrading to the legacy shutdown");
+        if let Some((cmd_sock, oracle_sock)) = STACK_PATHS.get() {
+            let _ = std::fs::remove_file(cmd_sock);
+            let _ = std::fs::remove_file(oracle_sock);
+        }
+        std::process::exit(0);
+    }
+    Ok(())
+}
+
+fn enter_handoff_mode_inner(state_file: &Path, timeout: Duration) -> Result<(), String> {
     std::thread::sleep(Duration::from_millis(250));
     let Some((cmd_sock, oracle_sock)) = STACK_PATHS.get() else {
         return Err("stack paths not recorded (no handoff for this boot)".into());

@@ -227,9 +227,10 @@ fn kill9_of_the_lingering_old_server_degrades_to_a_fresh_mount() {
 
     // The uncatchable signal: nobody can serve the rendezvous.
     let old_pid = hs.stack.policy_pid();
+    let pid_t = old_pid as libc::pid_t;
     let sig = libc::SIGKILL;
     // SAFETY: one verified pid, the stack's own child.
-    unsafe { libc::kill(old_pid as i32, sig) };
+    unsafe { libc::kill(pid_t, sig) };
     let _ = hs.stack.wait_policy();
 
     let mut successor = hs.stack.restart_policy();
