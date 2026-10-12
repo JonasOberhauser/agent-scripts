@@ -319,3 +319,176 @@ fn _bin_witness() -> std::path::PathBuf {
 fn _child_witness(c: &mut Child) {
     let _ = c.try_wait();
 }
+
+// ═══ Review proofs: each criticism of the review comment, pinned ═══
+// These encode the DESIRED behavior; against the current code they
+// fail — that is the point. Each test names the finding it proves.
+
+/// Speak one handoff command over a fresh connection; reply line only
+/// (fds sent as SCM_RIGHTS are dropped with the socket — sufficient:
+/// the REPLY SHAPE is the assertion surface).
+fn speak(sock: &std::path::Path, req: &fuse_protocol::handoff::HandoffRequest) -> String {
+    use std::io::{BufRead, BufReader, Write};
+    let mut c = std::os::unix::net::UnixStream::connect(sock).expect("connect rendezvous");
+    let body = serde_json::to_string(req).expect("internal enum");
+    c.write_all(format!("{body}\n").as_bytes()).expect("write");
+    let _ = c.flush();
+    let mut line = String::new();
+    BufReader::new(&c).read_line(&mut line).expect("read reply");
+    line
+}
+
+fn handoff_sock_of(hs: &HandoffStack) -> std::path::PathBuf {
+    hs.stack
+        .state_file()
+        .parent()
+        .unwrap()
+        .join("oracle.sock.handoff")
+}
+
+/// **B1-a**: a LIVE fused that does not surrender (the REAL fused of
+/// today — warns and serves nothing on Surrender) must mean handoff
+/// mode is REFUSED: the stack sockets stay up, no rendezvous appears.
+/// Today the server enters handoff mode anyway — unlinks both stack
+/// sockets while the daemon still holds the mount — and every real
+/// restart walks into it.
+#[test]
+fn b1_no_custody_live_mute_fused_refuses_handoff_mode() {
+    // A stayer that never connects to the oracle: live, mute on
+    // Surrender — exactly the real fused's current behavior.
+    let stayer = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/debug/fake-fused");
+    let stack = Stack::new()
+        .fused_binary(&stayer)
+        .spawn_supervised();
+    // give the fake a moment to boot; it must NOT be asked to
+    // surrender in this test — the take-back must simply find nothing
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let out = stack.request_handoff(Some(3));
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    // DESIRED: the server REFUSES (non-zero exit or an explicit
+    // refusal line), because there is no custody to hand off.
+    assert!(
+        !out.status.success() || stderr.contains("refus") || stdout.contains("refus"),
+        "B1: a live non-surrendering fused (the real fused today) must REFUSE \
+         handoff mode — instead the server entered it: {stderr}{stdout}"
+    );
+}
+
+/// **B1-b**: a successor DECLINING the takeover (no custody) must
+/// send Abort so the old pair retires promptly. Today the decline
+/// path returns without Abort; the old server lingers the full
+/// timeout with the stack sockets unlinked.
+#[test]
+fn b2_decline_sends_abort_and_retires_the_old_pair() {
+    let hs = HandoffStack::new();
+    let old_pid = hs.stack.policy_pid();
+    hs.handoff(Some(120));
+    let sock = handoff_sock_of(&hs);
+
+    // STATUS, then decline WITHOUT further commands — the shape of
+    // every decline in resume_from_handoff.
+    let reply = speak(&sock, &fuse_protocol::handoff::HandoffRequest::Status);
+    assert!(reply.contains("status"), "precondition: {reply}");
+
+    // DESIRED: the mere disconnect-without-commit of a decliner must
+    // not strand the stack: within a short bound the old server must
+    // be gone (Abort on decline, or the conductor's short idle
+    // deadline for un-committed sessions).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !pid_dead(old_pid) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(
+        pid_dead(old_pid),
+        "B1: a declined takeover stranded the old server (no Abort) — \
+         it lingers with the stack sockets unlinked: {}",
+        hs.stack.dump_server_log()
+    );
+}
+
+/// **B3-a**: the takeover slot must not be inheritable by CLAIMING a
+/// dead taker's pid — SO_PEERCRED already knows the real one. A
+/// different process asserting the dead first taker's pid must get
+/// Error, not the fd batch.
+#[test]
+fn b3_claiming_a_dead_takers_pid_must_not_inherit_the_slot() {
+    let hs = HandoffStack::new();
+    hs.handoff(Some(120));
+    let sock = handoff_sock_of(&hs);
+
+    // First taker: a genuinely dead pid (spawn + kill + reap).
+    let mut corpse = std::process::Command::new("sleep").arg("0.05").spawn().unwrap();
+    let corpse_pid = corpse.id();
+    let _ = corpse.wait();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
+    // A DIFFERENT live process (this test) CLAIMS the corpse's pid.
+    let reply = speak(
+        &sock,
+        &fuse_protocol::handoff::HandoffRequest::GetFd {
+            attempt: 1,
+            requester_pid: corpse_pid,
+        },
+    );
+    assert!(
+        reply.contains("error"),
+        "B3: claiming a dead taker's pid inherited the slot and was \
+         handed the custody batch: {reply}"
+    );
+}
+
+/// **B3-b**: Commit must be refused from a process that never took
+/// custody (the kernel-verified pid != fd_taken_by). Today ANY
+/// same-uid process can retire the old pair mid-takeover.
+#[test]
+fn b3_commit_without_custody_is_refused() {
+    let hs = HandoffStack::new();
+    hs.handoff(Some(120));
+    let sock = handoff_sock_of(&hs);
+
+    // No GetFd first: a naked Commit from a stranger-ish process.
+    let reply = speak(
+        &sock,
+        &fuse_protocol::handoff::HandoffRequest::Commit {
+            new_server_pid: std::process::id(),
+        },
+    );
+    assert!(
+        reply.contains("error"),
+        "B3: a Commit from a process that never took custody was \
+         accepted — the old pair retires mid-takeover: {reply}"
+    );
+}
+
+/// **M1**: the linger deadline must not yank custody from a LIVE
+/// mid-takeover successor. With the taker alive at the deadline, the
+/// supervised daemon must survive past it.
+#[test]
+fn m1_live_taker_suspends_the_deadline() {
+    let hs = HandoffStack::new();
+    hs.handoff(Some(2)); // SHORT timeout: the wall clock expires fast
+    let sock = handoff_sock_of(&hs);
+
+    // Take custody as a LIVE taker (this test process).
+    let reply = speak(
+        &sock,
+        &fuse_protocol::handoff::HandoffRequest::GetFd {
+            attempt: 1,
+            requester_pid: std::process::id(),
+        },
+    );
+    assert!(reply.contains("fd"), "precondition: {reply}");
+
+    let fake = hs.stack.daemon_pids();
+    assert!(!fake.is_empty(), "precondition: daemon alive");
+    // Past the deadline + margin, taker still live.
+    std::thread::sleep(std::time::Duration::from_millis(3500));
+    assert!(
+        !hs.stack.daemon_pids().is_empty(),
+        "M1: the wall-clock deadline retired the daemon while a LIVE \
+         taker held custody mid-takeover: {}",
+        hs.stack.dump_server_log()
+    );
+}
