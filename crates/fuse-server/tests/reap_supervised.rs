@@ -20,18 +20,14 @@ fn a_sigtermd_policy_daemon_reaps_its_supervised_daemon() {
     let mut stack = Stack::new()
         .pending_timeout(std::time::Duration::from_secs(5))
         .spawn_supervised();
-    let old_policy = stack.policy_pid();
     let daemons = stack.daemon_pids();
     assert!(!daemons.is_empty(), "the supervised daemon must be alive to start");
     let daemon = daemons[0];
 
-    // The client's fallback kill (#106): SIGTERM to the policy pid.
-    let pid_t = old_policy as libc::pid_t;
-    let sig = libc::SIGTERM;
-    // SAFETY: one verified pid, the stack's own policy daemon.
-    unsafe { libc::kill(pid_t, sig) };
-    // Reap the policy child (the test owns it via the kit).
-    let _ = stack.kill_policy();
+    // The client's fallback kill (#106): SIGTERM — the catchable
+    // signal whose handler is the code under test (SIGKILL, the
+    // kit's kill_policy, would skip it entirely).
+    stack.terminate_policy();
 
     // The daemon must die WITH its supervisor: an orphaned daemon
     // holds the mount (a real stack) and leaks one process per
