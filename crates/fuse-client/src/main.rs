@@ -490,6 +490,49 @@ fn pid_cmdline_names_server(cmdline: &[u8], server_binary: &str) -> bool {
             .is_some_and(|a| Path::new(server_binary).file_name().is_some_and(|b| a == b))
 }
 
+/// #97's zombie lesson: kill(0) succeeds and /proc lists unreaped
+/// corpses — the scheduler state is the honest answer.
+fn pid_alive(pid: u32) -> bool {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    let state = stat
+        .rsplit(')')
+        .next()
+        .map(|rest| rest.split_whitespace().next().unwrap_or("Z").to_string())
+        .unwrap_or_else(|| "Z".into());
+    state != "Z" && state != "X"
+}
+
+/// Pids whose argv contains `--socket <path>` as EXACT ADJACENT
+/// TOKENS (no substring sweep: `pkill -f` matched the client's own
+/// command line, and its `--`-leading pattern parsed as an option).
+fn orphans_by_socket_arg(socket: &str) -> Vec<u32> {
+    let me = std::process::id();
+    let mut hits = Vec::new();
+    let Ok(dir) = std::fs::read_dir("/proc") else {
+        return hits;
+    };
+    for e in dir.flatten() {
+        let Some(pid) = e.file_name().to_string_lossy().parse::<u32>().ok() else {
+            continue;
+        };
+        if pid == me {
+            continue;
+        }
+        let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+            continue;
+        };
+        let argv: Vec<&[u8]> = raw.split(|&b| b == 0).filter(|a| !a.is_empty()).collect();
+        let flag = b"--socket" as &[u8];
+        let sock = socket.as_bytes();
+        if argv.windows(2).any(|w| w[0] == flag && w[1] == sock) {
+            hits.push(pid);
+        }
+    }
+    hits
+}
+
 fn server_kill_spec(state: &ServerStateFile) -> ServerKillSpec {
     if state.server_pid != 0 {
         let cmdline = std::fs::read(format!("/proc/{}/cmdline", state.server_pid));
@@ -536,6 +579,22 @@ fn respawn_argv(state: &ServerStateFile) -> Vec<String> {
 fn read_state_file() -> Option<ServerStateFile> {
     let data = std::fs::read(fuse_protocol::state_file()).ok()?;
     serde_json::from_slice(&data).ok()
+}
+
+/// Rewrite the state file with the successor's pid (additive: every
+/// other field is carried over verbatim from the state we respawned).
+fn record_successor_pid(state: &ServerStateFile, pid: u32) {
+    let mut next = state.clone();
+    next.server_pid = pid;
+    next.handoff_socket = None;
+    next.supervised_pid = None;
+    if let Ok(bytes) = serde_json::to_vec(&next) {
+        let path = fuse_protocol::state_file();
+        let tmp = path.with_extension("pid.tmp");
+        if std::fs::write(&tmp, &bytes).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    }
 }
 
 fn start_server_from_state(app: &App, state: &ServerStateFile, log_path: Option<&str>) {
@@ -638,7 +697,15 @@ fn start_server_from_state(app: &App, state: &ServerStateFile, log_path: Option<
     // editing it (nothing enforces this).
     let _cmd = unsafe { cmd_mut.pre_exec(setsid_cb) };
     match cmd.spawn() {
-        Ok(child) => eprintln!("  Spawned pid {}", child.id()),
+        Ok(child) => {
+            eprintln!("  Spawned pid {}", child.id());
+            // Record the successor's pid: the NEXT restart walks the
+            // precise NamedPid kill instead of the orphan scan. The
+            // live report's round-2 failure was exactly this file
+            // still naming a dead pid (or none), routing restart #2
+            // into the broken orphan kill.
+            record_successor_pid(state, child.id());
+        }
         Err(e) => {
             eprintln!("Failed to start server: {e}");
             eprintln!("Start it manually with: run-agent ...");
@@ -701,51 +768,76 @@ fn restart_server(app: &App, log_path: Option<&str>) {
     // its fds survive). A server that predates the command replies
     // unknown-command and we degrade to the SIGTERM flow below, byte
     // for byte today's behavior.
-    if app
-        .run_cli_command_raw(
-            fuse_protocol::cmd::HANDOFF,
-            &format!(
-                "{} {}",
-                fuse_protocol::state_file().display(),
-                fuse_protocol::handoff::HANDOFF_TIMEOUT.as_secs(),
-            ),
-        )
-        .is_ok()
+    match app.run_cli_command_raw(
+        fuse_protocol::cmd::HANDOFF,
+        &format!(
+            "{} {}",
+            fuse_protocol::state_file().display(),
+            fuse_protocol::handoff::HANDOFF_TIMEOUT.as_secs(),
+        ),
+    ) {
+        Ok(_) => {
+            eprintln!("Old server entered handoff mode — the mount session survives the restart.");
+        }
+        Err(ref e) if e.contains("handoff unavailable") => {
+            // The server SPEAKS handoff but declined (the supervised
+            // fused cannot surrender until fd extraction lands, or no
+            // supervised daemon runs). Honest reason, same fallback.
+            eprintln!("Handoff refused by the old server: {e}");
+            eprintln!("Falling back to SIGTERM (fresh mount).");
+        }
+        Err(_) => {
+            eprintln!("Old server does not speak handoff — falling back to SIGTERM (fresh mount).");
+        }
+    }
     {
-        eprintln!("Old server entered handoff mode — the mount session survives the restart.");
-    } else {
-        eprintln!("Old server does not speak handoff — falling back to SIGTERM (fresh mount).");
+        // The legacy path (kept verbatim from the pre-handoff flow).
         eprintln!("Stopping old server...");
         match server_kill_spec(&state) {
             ServerKillSpec::NamedPid { pid, .. } => {
-                // The state file NAMES the server and the pid-reuse guard
-                // passed: signal exactly this process.
-                // SAFETY: a plain signal to one verified pid; no
-                // process-group or pattern semantics involved.
+                // The state file NAMES the server and the pid-reuse
+                // guard passed: signal exactly this process, then WAIT
+                // for the death — the successor's stale-socket probe
+                // refuses to run against a still-dying old server
+                // (the live report's round-2 failure).
                 let sig = libc::SIGTERM;
                 // SAFETY: a plain signal to one verified pid; no
                 // process-group or pattern semantics involved.
                 let _killed = unsafe { libc::kill(pid, sig) };
+                let pid_u = u32::try_from(pid).unwrap_or(0);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while pid_alive(pid_u) && std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
             }
             ServerKillSpec::OrphanBySocket { socket } => {
                 // Unnamed or pid-reused: match orphans by the stack's OWN
-                // socket path — `--socket <path>` in the command line.
-                // Precise on multi-stack machines; a bare-name sweep
-                // here took down the developer's production gate stack
-                // (observed live).
-                let pat = format!("--socket {socket}");
-                if let Some(w) = &state.runtime_wrapper {
-                    let wparts: Vec<&str> = w.split_whitespace().collect();
-                    let mut kill_args: Vec<&str> = wparts[1..].to_vec();
-                    kill_args.extend(&["pkill", "-f", &pat]);
-                    let _ = std::process::Command::new(wparts[0])
-                        .args(&kill_args)
-                        .output();
-                } else {
-                    let _ = std::process::Command::new("pkill")
-                        .arg("-f")
-                        .arg(&pat)
-                        .output();
+                // socket path, as EXACT ADJACENT ARGV TOKENS. The old
+                // `pkill -f "--socket <path>"` child was broken twice:
+                // a pattern starting with `--` is parsed as an OPTION
+                // (rc=2, kills nothing — the live report's root cause),
+                // and a substring sweep also matched the client itself.
+                // The in-process scan is precise on multi-stack
+                // machines and cannot signal us.
+                for pid in orphans_by_socket_arg(&socket) {
+                    if pid == std::process::id() {
+                        continue; // never ourselves
+                    }
+                    let pid_t = pid as libc::pid_t;
+                    let sig = libc::SIGTERM;
+                    // SAFETY: one verified pid whose argv names this
+                    // stack's socket; no group or pattern semantics.
+                    let _killed = unsafe { libc::kill(pid_t, sig) };
+                }
+                // The signal returning does not mean the target died —
+                // the successor's stale-socket probe would see a
+                // still-dying old server as "another server running"
+                // (the live report's round-2 failure). Wait it out.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while std::os::unix::net::UnixStream::connect(&socket).is_ok()
+                    && std::time::Instant::now() < deadline
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
                 }
             }
         }
