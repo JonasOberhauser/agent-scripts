@@ -697,6 +697,19 @@ pub fn commit_handoff(socket: &Path) {
 pub static STACK_PATHS: std::sync::OnceLock<(std::path::PathBuf, std::path::PathBuf)> =
     std::sync::OnceLock::new();
 
+/// The supervised daemon's pid, published at spawn for the
+/// async-signal-safe shutdown handler (#93 F2) — the Child handle
+/// lives behind the SUPERVISED Mutex, which the handler must never
+/// touch.
+pub static SUPERVISED_FUSED_PID: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
+/// Set when a handoff takeover holds the supervised daemon (the
+/// conductor owns its retirement; the signal handler must not reap
+/// what a successor may be mid-adopting).
+pub static HANDOFF_ENGAGED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// The supervised fused child (moved here from main for the mode's
 /// duration; None when the server runs without supervision).
 pub static SUPERVISED: Mutex<Option<std::process::Child>> = Mutex::new(None);
@@ -768,6 +781,10 @@ pub fn engage_handoff(state_file: &Path, timeout: Duration) -> Result<(), String
         let mode = 0o600;
         let _ = std::fs::set_permissions(&handoff_sock, std::fs::Permissions::from_mode(mode));
     }
+
+    // The takeover now owns the supervised daemon's life: the signal
+    // handler must not reap it out from under the successor.
+    HANDOFF_ENGAGED.store(true, std::sync::atomic::Ordering::SeqCst);
 
     // The conductor: grace for the reply, then stop presenting the
     // stack sockets and linger. It owns the rest of the process.

@@ -502,3 +502,75 @@ fn m1_live_taker_suspends_the_deadline() {
         hs.stack.dump_server_log()
     );
 }
+
+/// **The live report** (2026-10-13): `fuse-client restart` against a
+/// stack whose daemon cannot surrender — "falling back to SIGTERM" —
+/// left the successor never starting: the TERM'd old server ORPHANED
+/// its supervised daemon (the orphan holds the mount; the successor
+/// dies on it — F2, the original #93 shape). The fallback path,
+/// driven exactly as the client drives it (refuse → SIGTERM →
+/// respawn): the old daemon must NOT survive.
+#[test]
+fn f2_the_term_fallback_reaps_the_supervised_daemon() {
+    // A daemon that CANNOT surrender (/bin/sleep — the real fused of
+    // today, live-report shape): handoff refused, fallback taken.
+    let mut stack = Stack::new()
+        .pending_timeout(std::time::Duration::from_secs(5))
+        .fused_binary(std::path::Path::new("/bin/sleep"))
+        .spawn_supervised();
+    let old_policy = stack.policy_pid();
+    // /bin/sleep is not pgrep-able by the daemon-binary pattern —
+    // find the supervised child by parentage (PPID == the policy).
+    let daemon_pid = std::fs::read_dir("/proc")
+        .expect("proc")
+        .filter_map(|e| e.ok())
+        .filter_map(|e| e.file_name().to_string_lossy().parse::<u32>().ok())
+        .find(|pid| {
+            std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .map(|stat| {
+                    let after = stat.rsplit(')').next().unwrap_or_default();
+                    after.split_whitespace().nth(1) == Some(&old_policy.to_string())
+                })
+                .unwrap_or(false)
+        })
+        .expect("the supervised child by PPID");
+
+    // 1. The restart asks for handoff — refused (no custody).
+    let out = stack.request_handoff(None);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.status.success() || text.contains("unavailable"),
+        "the mute daemon must refuse handoff: {text}"
+    );
+
+    // 2. The client's fallback: SIGTERM the old policy daemon (the
+    //    signal-handler path under test).
+    let pid_t = old_policy as libc::pid_t;
+    let sig = libc::SIGTERM;
+    // SAFETY: one verified pid, the stack's own child.
+    unsafe { libc::kill(pid_t, sig) };
+    let _ = stack.wait_policy();
+
+    // 3. The orphan IS the regression: the daemon must die WITH its
+    //    supervisor (the handler reaps it), not outlive it holding
+    //    the mount for the successor to die on.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !pid_dead(daemon_pid) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(
+        pid_dead(daemon_pid),
+        "F2: the TERM fallback orphaned the supervised daemon — it holds \
+         the mount and the successor dies on it (the live report's shape)"
+    );
+
+    // 4. And the successor serves — the stack is not stranded.
+    let mut successor = stack.restart_policy();
+    stack.wait_serving();
+    let _ = successor.kill();
+    let _ = successor.wait();
+}

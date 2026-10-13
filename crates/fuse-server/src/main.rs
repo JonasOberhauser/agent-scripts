@@ -54,15 +54,30 @@ static CLEANUP_SOCKETS: OnceLock<(std::ffi::CString, std::ffi::CString)> = OnceL
 
 extern "C" fn shutdown_handler(_sig: libc::c_int) {
     if let Some((cmd, oracle)) = CLEANUP_SOCKETS.get() {
-        // Signal-handler context — only unlink(2) (async-signal-safe)
-        // on CStrings precomputed before the handler was armed; no
-        // allocation, locks, or Rust runtime calls. One op per block.
+        // Signal-handler context — only unlink(2) and kill(2)
+        // (async-signal-safe) on precomputed values; no allocation,
+        // locks, or Rust runtime calls. One op per block.
         let cmd_ptr = cmd.as_ptr();
         // SAFETY: see above.
         let _unlinked = unsafe { libc::unlink(cmd_ptr) };
         let oracle_ptr = oracle.as_ptr();
         // SAFETY: see above.
         let _unlinked = unsafe { libc::unlink(oracle_ptr) };
+    }
+    // REAP the supervised data daemon (#93 F2): without it, a TERM'd
+    // server orphans its daemon, the orphan holds the mount, and the
+    // NEXT restart dies on the busy mount point (observed live as the
+    // second-restart failure). SKIPPED while a handoff takeover holds
+    // the daemon — the conductor owns its retirement then, and a
+    // successor may be mid-adoption of its custody.
+    let engaged = HANDOFF_ENGAGED.load(std::sync::atomic::Ordering::SeqCst);
+    let pid = SUPERVISED_FUSED_PID.load(std::sync::atomic::Ordering::SeqCst);
+    if pid != 0 && !engaged {
+        let child = pid as libc::pid_t;
+        let term = libc::SIGTERM;
+        // SAFETY: a plain SIGTERM to one recorded child pid; no
+        // pointers, no allocation; operands are bindings.
+        let _killed = unsafe { libc::kill(child, term) };
     }
     let code = 130;
     // SAFETY: _exit(2) is the async-signal-safe way out of a handler; it
@@ -71,10 +86,7 @@ extern "C" fn shutdown_handler(_sig: libc::c_int) {
     unsafe { libc::_exit(code) }
 }
 
-// Supervised data daemon: lives in the handoff module (the conductor
-// needs it for take-back and retirement; the signal path predates
-// this and never touches the child — kill -9 leaves the orphan to
-// the restart path, by design).
+use fuse_server::handoff::{HANDOFF_ENGAGED, SUPERVISED_FUSED_PID};
 
 /// Spawn the supervised data daemon (#93 F2): resuming an inherited
 /// mount-connection fd when a handoff takeover provided one — the fd
@@ -198,6 +210,7 @@ fn main() {
         );
         match spawn_fused(&cli, mp, takeover.as_ref()) {
             Ok(c) => {
+                SUPERVISED_FUSED_PID.store(c.id(), std::sync::atomic::Ordering::SeqCst);
                 let _replaced = handoff::SUPERVISED
                     .lock()
                     .expect("supervised-fused lock: set once at spawn")
@@ -214,6 +227,7 @@ fn main() {
                     takeover = None;
                     match spawn_fused(&cli, mp, None) {
                         Ok(c) => {
+                            SUPERVISED_FUSED_PID.store(c.id(), std::sync::atomic::Ordering::SeqCst);
                             let _replaced = handoff::SUPERVISED
                                 .lock()
                                 .expect("supervised-fused lock")
