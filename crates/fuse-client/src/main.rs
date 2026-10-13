@@ -491,6 +491,45 @@ fn pid_cmdline_names_server(cmdline: &[u8], server_binary: &str) -> bool {
         })
 }
 
+/// The kernel-verified pid serving `path`'s listening socket, by
+/// connecting and asking SO_PEERCRED (review on #105: no /proc
+/// scanning, no argv patterns — the socket names its owner).
+fn socket_listener_pid(path: &std::path::Path) -> Option<u32> {
+    use std::os::unix::io::AsRawFd as _;
+    let stream = std::os::unix::net::UnixStream::connect(path).ok()?;
+    let fd = stream.as_raw_fd();
+    let sol = libc::SOL_SOCKET;
+    let opt = libc::SO_PEERCRED;
+    let len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let mut len_out = len;
+    let mut ucred: std::mem::MaybeUninit<libc::ucred> = std::mem::MaybeUninit::uninit();
+    let cred_ptr = ucred.as_mut_ptr().cast();
+    let len_ptr = &mut len_out as *mut libc::socklen_t;
+    // SAFETY: getsockopt(2) with a valid connected fd and properly
+    // sized out-pointers — a pure kernel query.
+    let rc = unsafe { libc::getsockopt(fd, sol, opt, cred_ptr, len_ptr) };
+    if rc != 0 {
+        return None;
+    }
+    // SAFETY: rc == 0 — the kernel initialized the out-pointer.
+    let ucred = unsafe { ucred.assume_init() };
+    u32::try_from(ucred.pid).ok()
+}
+
+/// Rewrite the state file with the successor's pid (additive: every
+/// other field is carried over verbatim from the state we respawned).
+fn record_successor_pid(state: &ServerStateFile, pid: u32) {
+    let mut next = state.clone();
+    next.server_pid = pid;
+    if let Ok(bytes) = serde_json::to_vec(&next) {
+        let path = fuse_protocol::state_file();
+        let tmp = path.with_extension("pid.tmp");
+        if std::fs::write(&tmp, &bytes).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    }
+}
+
 fn server_kill_spec(state: &ServerStateFile) -> ServerKillSpec {
     if state.server_pid != 0 {
         let cmdline = std::fs::read(format!("/proc/{}/cmdline", state.server_pid));
@@ -617,7 +656,14 @@ fn start_server_from_state(app: &App, state: &ServerStateFile, log_path: Option<
     // editing it (nothing enforces this).
     let _cmd = unsafe { cmd_mut.pre_exec(setsid_cb) };
     match cmd.spawn() {
-        Ok(child) => eprintln!("  Spawned pid {}", child.id()),
+        Ok(child) => {
+            eprintln!("  Spawned pid {}", child.id());
+            // Record the successor's pid: the NEXT restart walks the
+            // precise NamedPid kill instead of the orphan path. The
+            // live report's round-2 failure was exactly this file
+            // still naming a dead pid.
+            record_successor_pid(state, child.id());
+        }
         Err(e) => {
             eprintln!("Failed to start server: {e}");
             eprintln!("Start it manually with: run-agent ...");
@@ -686,29 +732,47 @@ fn restart_server(app: &App, log_path: Option<&str>) {
             let _killed = unsafe { libc::kill(pid, sig) };
         }
         ServerKillSpec::OrphanBySocket { socket } => {
-            // Unnamed or pid-reused: match orphans by the stack's OWN
-            // socket path — `--socket <path>` in the command line.
-            // Precise on multi-stack machines; a bare-name sweep
-            // here took down the developer's production gate stack
-            // (observed live).
-            let pat = format!("--socket {socket}");
-            if let Some(w) = &state.runtime_wrapper {
-                let wparts: Vec<&str> = w.split_whitespace().collect();
-                let mut kill_args: Vec<&str> = wparts[1..].to_vec();
-                kill_args.extend(&["pkill", "-f", &pat]);
-                let _ = std::process::Command::new(wparts[0]).args(&kill_args).output();
-            } else {
-                let _ = std::process::Command::new("pkill")
-                    .arg("-f")
-                    .arg(&pat)
-                    .output();
+            // Unnamed or pid-reused: ask the SOCKET who serves it.
+            // The old form was a `pkill -f "--socket <path>"` child,
+            // broken twice (live report 2026-10-13): a `--`-leading
+            // argument parses as an OPTION ("unrecognized option",
+            // rc 2) so NOTHING was ever signaled — and a substring
+            // sweep would also have matched the client's own command
+            // line. SO_PEERCRED hands us the listener's kernel-
+            // verified pid: connect, ask, signal exactly that pid.
+            if let Some(pid) = socket_listener_pid(Path::new(&socket)) {
+                if let Some(w) = &state.runtime_wrapper {
+                    // The privileged wrapper signals for us.
+                    let wparts: Vec<&str> = w.split_whitespace().collect();
+                    let mut kill_args: Vec<&str> = wparts[1..].to_vec();
+                    let pid_str = pid.to_string();
+                    kill_args.extend(&["kill", &pid_str]);
+                    let _ = std::process::Command::new(wparts[0])
+                        .args(&kill_args)
+                        .output();
+                } else {
+                    let pid_t = pid as libc::pid_t;
+                    let sig = libc::SIGTERM;
+                    // SAFETY: one kernel-verified pid — the socket's
+                    // own listener; no group or pattern semantics.
+                    let _killed = unsafe { libc::kill(pid_t, sig) };
+                }
             }
         }
     }
-    std::thread::sleep(std::time::Duration::from_secs(2));
 
-    for _ in 0..30 {
-        if !app.server_running() { break; }
+    // WAIT for the death before the successor spawns: the successor's
+    // stale-socket probe refuses to run against a still-serving old
+    // server ("Another server is running") — the live report's
+    // "Server did not start within 10s". A signal returning has never
+    // meant the target died; refusing to stop is a loud failure, not
+    // something to walk the successor into.
+    let stop_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while app.server_running() {
+        if std::time::Instant::now() > stop_deadline {
+            eprintln!("Old server did not stop within 10s. Kill it manually and re-run.");
+            std::process::exit(1);
+        }
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
 
