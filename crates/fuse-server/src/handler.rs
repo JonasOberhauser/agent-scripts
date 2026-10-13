@@ -2,12 +2,18 @@ use fuse_protocol::{Command, Response};
 
 use crate::state::ServerState;
 
-pub fn handle_command(cmd: Command, state: &ServerState, hub: &crate::oracle_service::OracleHub) -> Response {
+pub fn handle_command(
+    cmd: Command,
+    state: &ServerState,
+    hub: &crate::oracle_service::OracleHub,
+) -> Response {
     match cmd {
         Command::Reset { name } => {
             let n = state.reset(name.as_deref());
             if name.is_some() && n == 0 {
-                Response::Error { message: "secret not found".into() }
+                Response::Error {
+                    message: "secret not found".into(),
+                }
             } else {
                 Response::Ok
             }
@@ -18,9 +24,10 @@ pub fn handle_command(cmd: Command, state: &ServerState, hub: &crate::oracle_ser
             tracing::info!("lockdown armed (issue #66): current grants keep working; new unauthorized access is refused");
             Response::Ok
         }
-        Command::Status => {
-            Response::Status { secrets: state.status(), lockdown: state.lockdown() }
-        }
+        Command::Status => Response::Status {
+            secrets: state.status(),
+            lockdown: state.lockdown(),
+        },
 
         Command::ShowMap => Response::Map {
             entries: state
@@ -33,7 +40,12 @@ pub fn handle_command(cmd: Command, state: &ServerState, hub: &crate::oracle_ser
                 .collect(),
         },
 
-        Command::AddSecret { name, path, hash, mode } => {
+        Command::AddSecret {
+            name,
+            path,
+            hash,
+            mode,
+        } => {
             // MR4: register by stat — the policy daemon holds the host
             // PATH and identity, never bytes (see register_secret).
             match register_secret(state, hub, &name, &path, &hash, mode) {
@@ -47,7 +59,9 @@ pub fn handle_command(cmd: Command, state: &ServerState, hub: &crate::oracle_ser
                 hub.remove(&name);
                 Response::Ok
             } else {
-                Response::Error { message: "secret not found".into() }
+                Response::Error {
+                    message: "secret not found".into(),
+                }
             }
         }
 
@@ -55,23 +69,27 @@ pub fn handle_command(cmd: Command, state: &ServerState, hub: &crate::oracle_ser
             if state.rotate_hash(&name, &new_hash) {
                 Response::Ok
             } else {
-                Response::Error { message: "secret not found".into() }
+                Response::Error {
+                    message: "secret not found".into(),
+                }
             }
         }
 
-        Command::ListMounts => {
-            Response::MountList { mounts: state.list_mounts() }
-        }
+        Command::ListMounts => Response::MountList {
+            mounts: state.list_mounts(),
+        },
 
-        Command::ListPending => {
-            Response::PendingList { pending: state.list_pending() }
-        }
+        Command::ListPending => Response::PendingList {
+            pending: state.list_pending(),
+        },
 
         Command::Grant { id } => {
             if state.grant_pending(id) {
                 Response::Ok
             } else {
-                Response::Error { message: format!("pending access {id} not found or expired") }
+                Response::Error {
+                    message: format!("pending access {id} not found or expired"),
+                }
             }
         }
 
@@ -97,7 +115,9 @@ pub fn handle_command(cmd: Command, state: &ServerState, hub: &crate::oracle_ser
             if state.deny_pending(id) {
                 Response::Ok
             } else {
-                Response::Error { message: format!("pending access {id} not found") }
+                Response::Error {
+                    message: format!("pending access {id} not found"),
+                }
             }
         }
 
@@ -122,10 +142,9 @@ fn register_secret(
     hash: &str,
     mode: u32,
 ) -> Result<String, String> {
-    let host = std::fs::canonicalize(path)
-        .map_err(|e| format!("cannot resolve {path}: {e}"))?;
-    let md = std::fs::metadata(&host)
-        .map_err(|e| format!("cannot stat {}: {e}", host.display()))?;
+    let host = std::fs::canonicalize(path).map_err(|e| format!("cannot resolve {path}: {e}"))?;
+    let md =
+        std::fs::metadata(&host).map_err(|e| format!("cannot stat {}: {e}", host.display()))?;
     if !md.is_file() {
         return Err(format!("{} is not a regular file", host.display()));
     }
@@ -156,7 +175,13 @@ mod tests {
     fn reset_specific() {
         let s = seeded();
         s.attempt_read("a.yaml", 1, Some("hash_a"), 0, 1024);
-        let resp = handle_command(Command::Reset { name: Some("a.yaml".into()) }, &s, &hub());
+        let resp = handle_command(
+            Command::Reset {
+                name: Some("a.yaml".into()),
+            },
+            &s,
+            &hub(),
+        );
         assert_eq!(resp, Response::Ok);
         let out = s.attempt_read("a.yaml", 1, Some("hash_a"), 0, 1024);
         assert!(matches!(out, ReadOutcome::Granted));
@@ -165,7 +190,13 @@ mod tests {
     #[test]
     fn reset_nonexistent_errors() {
         let s = seeded();
-        let resp = handle_command(Command::Reset { name: Some("nope".into()) }, &s, &hub());
+        let resp = handle_command(
+            Command::Reset {
+                name: Some("nope".into()),
+            },
+            &s,
+            &hub(),
+        );
         assert!(matches!(resp, Response::Error { .. }));
     }
 
@@ -186,7 +217,13 @@ mod tests {
             Response::Status { secrets, .. } => {
                 let a = secrets.iter().find(|e| e.name == "a.yaml").unwrap();
                 assert_eq!(a.access_count, 1);
-                assert_eq!(a.allowed_hashes.iter().map(|h| h.hash.as_str()).collect::<Vec<_>>(), vec!["hash_a"]);
+                assert_eq!(
+                    a.allowed_hashes
+                        .iter()
+                        .map(|h| h.hash.as_str())
+                        .collect::<Vec<_>>(),
+                    vec!["hash_a"]
+                );
                 assert_eq!(a.size, 3);
             }
             _ => panic!("expected Status"),
@@ -199,7 +236,12 @@ mod tests {
         let src = std::env::temp_dir().join("mr4-new.bin");
         std::fs::write(&src, b"DATA").unwrap();
         let resp = handle_command(
-            Command::AddSecret { name: "new".into(), path: src.to_str().unwrap().into(), hash: "h".into(), mode: 0o600 },
+            Command::AddSecret {
+                name: "new".into(),
+                path: src.to_str().unwrap().into(),
+                hash: "h".into(),
+                mode: 0o600,
+            },
             &s,
             &hub(),
         );
@@ -223,7 +265,10 @@ mod tests {
     fn rotate_hash_flow() {
         let s = seeded();
         let resp = handle_command(
-            Command::RotateHash { name: "a.yaml".into(), new_hash: "xyz".into() },
+            Command::RotateHash {
+                name: "a.yaml".into(),
+                new_hash: "xyz".into(),
+            },
             &s,
             &hub(),
         );

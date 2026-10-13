@@ -171,17 +171,32 @@ impl FuzzSystemIo {
                 "spawn {program}: No such file or directory (os error 2)"
             )));
         }
-        let stderr = if rng.chance(45) { rng.pick(STDERR_CORPUS).to_string() } else { String::new() };
+        let stderr = if rng.chance(45) {
+            rng.pick(STDERR_CORPUS).to_string()
+        } else {
+            String::new()
+        };
         let (status, stdout) = match rng.next() % 100 {
-            0..=44 => (Some(0), if rng.chance(70) { rng.pick(STDOUT_CORPUS).to_string() } else { String::new() }),
+            0..=44 => (
+                Some(0),
+                if rng.chance(70) {
+                    rng.pick(STDOUT_CORPUS).to_string()
+                } else {
+                    String::new()
+                },
+            ),
             45..=64 => (Some(1), String::new()),
             65..=74 => (Some(124), String::new()), // timeout(1) kill
             75..=79 => (Some(137), String::new()), // SIGKILL
             80..=84 => (Some(126), String::new()), // not executable
-            85..=89 => (None, String::new()),    // killed by signal, no code
+            85..=89 => (None, String::new()),      // killed by signal, no code
             _ => (Some(0), String::new()),
         };
-        Ok(CommandOutput { stdout, stderr, status })
+        Ok(CommandOutput {
+            stdout,
+            stderr,
+            status,
+        })
     }
 }
 
@@ -202,21 +217,33 @@ impl SystemIo for FuzzSystemIo {
             .ok_or_else(|| IoError("No such file or directory (os error 2)".into()))
     }
     fn write_file(&mut self, path: &Path, data: &[u8]) -> Result<(), IoError> {
-        self.files.borrow_mut().insert(path.to_string_lossy().into_owned(), data.to_vec());
+        self.files
+            .borrow_mut()
+            .insert(path.to_string_lossy().into_owned(), data.to_vec());
         Ok(())
     }
-    fn set_file_mode(&self, _path: &Path, _mode: u32) -> Result<(), IoError> { Ok(()) }
+    fn set_file_mode(&self, _path: &Path, _mode: u32) -> Result<(), IoError> {
+        Ok(())
+    }
     fn file_exists(&self, path: &Path) -> bool {
         let key = path.to_string_lossy().into_owned();
-        self.files.borrow().contains_key(&key) || self.dirs.borrow().contains(&key) || self.symlinks.borrow().contains_key(&key)
+        self.files.borrow().contains_key(&key)
+            || self.dirs.borrow().contains(&key)
+            || self.symlinks.borrow().contains_key(&key)
     }
     fn path_state(&self, path: &Path) -> PathState {
         let key = path.to_string_lossy().into_owned();
         if self.stale_mounts.borrow().contains(&key) {
-            return PathState::Unreachable("Transport endpoint is not connected (os error 107)".into());
+            return PathState::Unreachable(
+                "Transport endpoint is not connected (os error 107)".into(),
+            );
         }
-        if self.dirs.borrow().contains(&key) { return PathState::Dir; }
-        if self.files.borrow().contains_key(&key) { return PathState::File; }
+        if self.dirs.borrow().contains(&key) {
+            return PathState::Dir;
+        }
+        if self.files.borrow().contains_key(&key) {
+            return PathState::File;
+        }
         PathState::Missing
     }
     fn mkdir(&self, path: &Path) -> Result<(), IoError> {
@@ -257,7 +284,8 @@ impl SystemIo for FuzzSystemIo {
              fuzz chaos (an infinite rebuild/recycle loop); reproduce with \
              FUZZ_SEED={} cargo test -p run-agent --test fuzz_orchestrator \
              orchestrator_chaos_single_seed_repro",
-            self.seed, self.seed
+            self.seed,
+            self.seed
         );
         self.budget.set(left - 1);
         self.commands.borrow_mut().push((
@@ -292,7 +320,9 @@ impl SystemIo for FuzzSystemIo {
     ) -> Result<u32, IoError> {
         let mut rng = self.rng.borrow_mut();
         if rng.chance(6) {
-            return Err(IoError("spawn fuse-server: No such file or directory (os error 2)".into()));
+            return Err(IoError(
+                "spawn fuse-server: No such file or directory (os error 2)".into(),
+            ));
         }
         if program.contains("fuse-server")
             && !self.dirs.borrow().contains("/tmp/fgk-mnt")
@@ -332,17 +362,23 @@ impl SystemIo for FuzzSystemIo {
         Ok("fuzz-package".into())
     }
     fn is_symlink(&self, path: &Path) -> bool {
-        self.symlinks.borrow().contains_key(&path.to_string_lossy().into_owned())
+        self.symlinks
+            .borrow()
+            .contains_key(&path.to_string_lossy().into_owned())
     }
     fn is_dir(&self, path: &Path) -> bool {
-        self.dirs.borrow().contains(&path.to_string_lossy().into_owned())
+        self.dirs
+            .borrow()
+            .contains(&path.to_string_lossy().into_owned())
     }
     fn list_dir(&self, path: &Path) -> Result<Vec<PathBuf>, IoError> {
         let pfx = format!("{}/", path.to_string_lossy());
         let mut out = Vec::new();
         for k in self.files.borrow().keys() {
             if let Some(rest) = k.strip_prefix(&pfx) {
-                if !rest.contains('/') { out.push(P::from(rest)); }
+                if !rest.contains('/') {
+                    out.push(P::from(rest));
+                }
             }
         }
         Ok(out)
@@ -457,7 +493,9 @@ fn drive(seed: u64) {
     // bare `pkill fuse-server` sweep and `pkill -x fuse-server`,
     // which a flags-only check silently lets through.
     for (prog, args) in commands.iter() {
-        if prog != "pkill" { continue; }
+        if prog != "pkill" {
+            continue;
+        }
         let joined = args.join(" ");
         assert!(
             joined.contains("--socket") && joined.contains("/tmp/fgk.sock"),

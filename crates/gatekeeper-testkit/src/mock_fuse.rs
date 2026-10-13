@@ -76,7 +76,11 @@ impl MockFuseStack {
             control.display(),
             policy.dump_logs("mock-fuse spawn")
         );
-        Self { policy, child, control }
+        Self {
+            policy,
+            child,
+            control,
+        }
     }
 
     /// The mock control socket — hand it to
@@ -162,7 +166,9 @@ mod tests {
         let opened = d.open(entry.nodeid).expect("open");
         assert_eq!(d.read(opened.fh, 0, 4096).expect("read"), b"KIT-MOCK");
         d.release(entry.nodeid, opened.fh).expect("release");
-        let second = d.open(entry.nodeid).expect_err("one-read denies the second open");
+        let second = d
+            .open(entry.nodeid)
+            .expect_err("one-read denies the second open");
         assert_eq!(second.0, libc::EACCES);
     }
 }

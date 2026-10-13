@@ -15,7 +15,6 @@ const BIN_NAME: &str = env!("CARGO_PKG_NAME");
 /// /tmp when no state file is known).
 const CLIENT_LOG_BASE: &str = "fuse-gatekeeper-client.log";
 
-
 /// The client-LOCAL commands (never on the wire): declared once,
 /// referenced everywhere.
 mod local {
@@ -48,14 +47,12 @@ fn build_cli(protocols: &[servyi_servatui::Protocol]) -> clap::Command {
                 .action(clap::ArgAction::SetTrue)
                 .help("Shell completion mode (also auto-engaged when COMP_LINE is set)"),
         )
-        .subcommand(
-            clap::Command::new(local::RESTART).about(
-                "Restart the fuse-server from the state file: stop the old \
+        .subcommand(clap::Command::new(local::RESTART).about(
+            "Restart the fuse-server from the state file: stop the old \
 daemon (and its supervised data daemon), clean up socket and mount \
 point, respawn with the same configuration and re-add every secret \
 from the state file's host paths.",
-            ),
-        )
+        ))
         .subcommand(
             clap::Command::new(local::COMPLETIONS)
                 .about("Emit the delegating shell-completion scripts (bash | zsh | fish)")
@@ -82,7 +79,11 @@ fn main() {
     let filter = tracing_subscriber::EnvFilter::builder()
         .with_default_directive(tracing_subscriber::filter::LevelFilter::INFO.into())
         .from_env_lossy();
-    if let Ok(file) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+    if let Ok(file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    {
         tracing_subscriber::fmt()
             .with_env_filter(filter)
             .with_writer(std::sync::Mutex::new(file))
@@ -120,15 +121,12 @@ fn main() {
     // Local commands (restart/completions) are not table rows: they
     // have no protocol, so they dispatch to None.
     let dispatch = matches.subcommand().and_then(|(name, sub)| {
-        protocols
-            .iter()
-            .find(|p| p.name == name)
-            .map(|proto| {
-                (
-                    name.to_string(),
-                    servyi_servatui::cli::args_string(&proto.clap_args, sub),
-                )
-            })
+        protocols.iter().find(|p| p.name == name).map(|proto| {
+            (
+                name.to_string(),
+                servyi_servatui::cli::args_string(&proto.clap_args, sub),
+            )
+        })
     });
     let app = App::builder(&socket).protocol_all(protocols).build();
 
@@ -147,19 +145,17 @@ fn main() {
     }
 
     match dispatch {
-        Some((name, args)) => {
-            match app.run_cli_command(&name, &args) {
-                Ok(lines) => {
-                    for line in lines {
-                        println!("{line}");
-                    }
-                }
-                Err(e) => {
-                    eprintln!("Error: {e}");
-                    std::process::exit(1);
+        Some((name, args)) => match app.run_cli_command(&name, &args) {
+            Ok(lines) => {
+                for line in lines {
+                    println!("{line}");
                 }
             }
-        }
+            Err(e) => {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        },
         None => {
             let pending: fuse_protocol::PendingIds =
                 std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -198,18 +194,14 @@ fn main() {
             );
             let mut display = servatui_display::Display::new();
             let panel_sink = std::sync::Arc::clone(&log_sink);
-            let panel = pending_layer::PendingPanelLayer::new(
-                pending,
-                Box::new(talk),
-                panel_error,
-            )
-            .with_collapsed_names(collapsed_names.clone())
-            .with_log_window(Box::new(move |line: &str| {
-                panel_sink
-                    .lock()
-                    .expect("panel log sink lock: TUI callback, single consumer")
-                    .push(line.to_string());
-            }));
+            let panel = pending_layer::PendingPanelLayer::new(pending, Box::new(talk), panel_error)
+                .with_collapsed_names(collapsed_names.clone())
+                .with_log_window(Box::new(move |line: &str| {
+                    panel_sink
+                        .lock()
+                        .expect("panel log sink lock: TUI callback, single consumer")
+                        .push(line.to_string());
+                }));
             let _layer_id = display.add_layer(Box::new(panel));
             display.set_log_sink(log_sink);
             if let Err(e) = display.run(&socket, &protocols) {
@@ -282,7 +274,7 @@ fn one_shot_query(
 /// server — the single kind→query mapping (shared shape with the TUI
 /// completers): PendingIds → `pending`, SecretNames → `status`.
 fn live_candidates(socket: &std::path::Path, word: &str) -> Vec<String> {
-    use fuse_protocol::{COMMAND_TABLE, Response};
+    use fuse_protocol::{Response, COMMAND_TABLE};
     let Some(spec) = COMMAND_TABLE.iter().find(|s| s.name == word) else {
         return Vec::new();
     };
@@ -431,7 +423,10 @@ fn check_version_or_restart(app: &App) {
         return;
     }
 
-    eprintln!("Version mismatch: client={}, server={}", CLIENT_VERSION, server_version);
+    eprintln!(
+        "Version mismatch: client={}, server={}",
+        CLIENT_VERSION, server_version
+    );
     eprint!("Restart server to update? [y/N] ");
     let _flushed = std::io::Write::flush(&mut std::io::stdout()).ok();
     let mut input = String::new();
@@ -452,7 +447,11 @@ fn check_version_or_restart(app: &App) {
         let mut s = String::new();
         let _ = std::io::stdin().read_line(&mut s);
         let t = s.trim();
-        if t.is_empty() { fuse_protocol::DEFAULT_LOG_PATH.to_string() } else { t.to_string() }
+        if t.is_empty() {
+            fuse_protocol::DEFAULT_LOG_PATH.to_string()
+        } else {
+            t.to_string()
+        }
     });
 
     restart_server(app, Some(&log_path));
@@ -486,9 +485,53 @@ fn pid_cmdline_names_server(cmdline: &[u8], server_binary: &str) -> bool {
     // that names the same binary — the old ends_with("/x") missed
     // spellings like "./fuse-server".
     argv0 == server_binary
-        || Path::new(argv0.as_ref()).file_name().is_some_and(|a| {
-            Path::new(server_binary).file_name().is_some_and(|b| a == b)
-        })
+        || Path::new(argv0.as_ref())
+            .file_name()
+            .is_some_and(|a| Path::new(server_binary).file_name().is_some_and(|b| a == b))
+}
+
+/// Pids whose argv contains `--socket <path>` as EXACT ADJACENT
+/// TOKENS — never a substring sweep (`pkill -f` matched the client's
+/// own command line, and its `--`-leading pattern parsed as an
+/// option and signaled nothing).
+fn orphans_by_socket_arg(socket: &str) -> Vec<u32> {
+    let me = std::process::id();
+    let mut hits = Vec::new();
+    let Ok(dir) = std::fs::read_dir("/proc") else {
+        return hits;
+    };
+    for e in dir.flatten() {
+        let Some(pid) = e.file_name().to_string_lossy().parse::<u32>().ok() else {
+            continue;
+        };
+        if pid == me {
+            continue;
+        }
+        let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+            continue;
+        };
+        let argv: Vec<&[u8]> = raw.split(|&b| b == 0).filter(|a| !a.is_empty()).collect();
+        let flag = b"--socket" as &[u8];
+        let sock = socket.as_bytes();
+        if argv.windows(2).any(|w| w[0] == flag && w[1] == sock) {
+            hits.push(pid);
+        }
+    }
+    hits
+}
+
+/// Rewrite the state file with the successor's pid (additive: every
+/// other field is carried over verbatim from the state we respawned).
+fn record_successor_pid(state: &ServerStateFile, pid: u32) {
+    let mut next = state.clone();
+    next.server_pid = pid;
+    if let Ok(bytes) = serde_json::to_vec(&next) {
+        let path = fuse_protocol::state_file();
+        let tmp = path.with_extension("pid.tmp");
+        if std::fs::write(&tmp, &bytes).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    }
 }
 
 fn server_kill_spec(state: &ServerStateFile) -> ServerKillSpec {
@@ -498,12 +541,16 @@ fn server_kill_spec(state: &ServerStateFile) -> ServerKillSpec {
             .map(|c| pid_cmdline_names_server(&c, &state.server_binary))
             .unwrap_or(false);
         if verified {
-            return ServerKillSpec::NamedPid { pid: state.server_pid as i32 };
+            return ServerKillSpec::NamedPid {
+                pid: state.server_pid as i32,
+            };
         }
         // pid gone or reused: fall through to the socket-scoped match,
         // never a name sweep.
     }
-    ServerKillSpec::OrphanBySocket { socket: state.socket.clone() }
+    ServerKillSpec::OrphanBySocket {
+        socket: state.socket.clone(),
+    }
 }
 
 /// The argv the restart respawns the server with, as DATA: extracting
@@ -530,7 +577,6 @@ fn respawn_argv(state: &ServerStateFile) -> Vec<String> {
     argv
 }
 
-
 fn read_state_file() -> Option<ServerStateFile> {
     let data = std::fs::read(fuse_protocol::state_file()).ok()?;
     serde_json::from_slice(&data).ok()
@@ -554,11 +600,18 @@ fn start_server_from_state(app: &App, state: &ServerStateFile, log_path: Option<
     };
 
     eprintln!("  Binary:   {}", state.server_binary);
-    eprintln!("  Wrapper:  {}", state.runtime_wrapper.as_deref().unwrap_or("(none)"));
+    eprintln!(
+        "  Wrapper:  {}",
+        state.runtime_wrapper.as_deref().unwrap_or("(none)")
+    );
     eprintln!("  Program:  {spawn_prog}");
     eprintln!("  Args:     {}", spawn_args.join(" "));
 
-    if std::process::Command::new(&spawn_prog).arg("--help").output().is_err() {
+    if std::process::Command::new(&spawn_prog)
+        .arg("--help")
+        .output()
+        .is_err()
+    {
         eprintln!("  WARNING: cannot execute '{spawn_prog}' — check PATH");
     }
 
@@ -567,9 +620,14 @@ fn start_server_from_state(app: &App, state: &ServerStateFile, log_path: Option<
         let wparts: Vec<&str> = w.split_whitespace().collect();
         let mut umount_args: Vec<&str> = wparts[1..].to_vec();
         umount_args.extend(&["fusermount", "-uz", &state.mount_point]);
-        let _ = std::process::Command::new(wparts[0]).args(&umount_args).output();
+        let _ = std::process::Command::new(wparts[0])
+            .args(&umount_args)
+            .output();
     } else {
-        let _ = std::process::Command::new("fusermount").arg("-uz").arg(&state.mount_point).output();
+        let _ = std::process::Command::new("fusermount")
+            .arg("-uz")
+            .arg(&state.mount_point)
+            .output();
     }
     let _ = std::fs::remove_file(&state.socket);
     let _ = std::fs::remove_dir_all(&state.mount_point);
@@ -582,10 +640,17 @@ fn start_server_from_state(app: &App, state: &ServerStateFile, log_path: Option<
     // APPEND (#93 F4): truncating destroyed the pre-restart log lines —
     // exactly the forensics a failed restart needs.
     let log_file = std::fs::OpenOptions::new()
-        .create(true).append(true)
+        .create(true)
+        .append(true)
         .open(&log_path_buf)
-        .unwrap_or_else(|e| { eprintln!("open log file: {e}"); std::process::exit(1); });
-    let log_file2 = log_file.try_clone().unwrap_or_else(|e| { eprintln!("dup log fd: {e}"); std::process::exit(1); });
+        .unwrap_or_else(|e| {
+            eprintln!("open log file: {e}");
+            std::process::exit(1);
+        });
+    let log_file2 = log_file.try_clone().unwrap_or_else(|e| {
+        eprintln!("dup log fd: {e}");
+        std::process::exit(1);
+    });
     eprintln!("  Log:       {}", log_path_buf.display());
 
     use std::os::unix::process::CommandExt;
@@ -617,7 +682,15 @@ fn start_server_from_state(app: &App, state: &ServerStateFile, log_path: Option<
     // editing it (nothing enforces this).
     let _cmd = unsafe { cmd_mut.pre_exec(setsid_cb) };
     match cmd.spawn() {
-        Ok(child) => eprintln!("  Spawned pid {}", child.id()),
+        Ok(child) => {
+            eprintln!("  Spawned pid {}", child.id());
+            // Record the successor's pid: the NEXT restart walks the
+            // precise NamedPid kill instead of the orphan scan. The
+            // live report's round-2 failure was exactly this file
+            // still naming a dead pid, routing restart #2 into the
+            // broken orphan kill.
+            record_successor_pid(state, child.id());
+        }
         Err(e) => {
             eprintln!("Failed to start server: {e}");
             eprintln!("Start it manually with: run-agent ...");
@@ -628,7 +701,9 @@ fn start_server_from_state(app: &App, state: &ServerStateFile, log_path: Option<
     eprintln!("Waiting for server...");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
-        if app.server_running() { break; }
+        if app.server_running() {
+            break;
+        }
         if std::time::Instant::now() > deadline {
             eprintln!("Server did not start within 10s. Start it manually.");
             std::process::exit(1);
@@ -684,31 +759,54 @@ fn restart_server(app: &App, log_path: Option<&str>) {
             // SAFETY: a plain signal to one verified pid; no
             // process-group or pattern semantics involved.
             let _killed = unsafe { libc::kill(pid, sig) };
+            // Death is awaited below (shared with the orphan path)
+            // before the successor spawns — see the wait's note.
         }
         ServerKillSpec::OrphanBySocket { socket } => {
             // Unnamed or pid-reused: match orphans by the stack's OWN
-            // socket path — `--socket <path>` in the command line.
-            // Precise on multi-stack machines; a bare-name sweep
-            // here took down the developer's production gate stack
-            // (observed live).
-            let pat = format!("--socket {socket}");
+            // socket path. The old form was a `pkill -f "--socket
+            // <path>"` child, broken twice (live report 2026-10-13):
+            // a `--`-leading argument parses as an OPTION —
+            // "pkill: unrecognized option", rc 2, NOTHING is
+            // signaled, the old server survives and the successor
+            // dies on its stale-socket probe — and a substring sweep
+            // also matched the client's own command line. The direct
+            // path is now an in-process scan over exact ADJACENT
+            // ARGV TOKENS (self-excluded, precise on multi-stack
+            // machines); the privileged-wrapper path keeps a pkill
+            // child but with the `--` end-of-options sentinel.
             if let Some(w) = &state.runtime_wrapper {
                 let wparts: Vec<&str> = w.split_whitespace().collect();
                 let mut kill_args: Vec<&str> = wparts[1..].to_vec();
-                kill_args.extend(&["pkill", "-f", &pat]);
-                let _ = std::process::Command::new(wparts[0]).args(&kill_args).output();
-            } else {
-                let _ = std::process::Command::new("pkill")
-                    .arg("-f")
-                    .arg(&pat)
+                kill_args.extend(&["pkill", "-f", "--", "--socket", &socket]);
+                let _ = std::process::Command::new(wparts[0])
+                    .args(&kill_args)
                     .output();
+            } else {
+                for pid in orphans_by_socket_arg(&socket) {
+                    let pid_t = pid as libc::pid_t;
+                    let sig = libc::SIGTERM;
+                    // SAFETY: one pid whose argv names this stack's
+                    // socket as exact tokens; no group or pattern
+                    // semantics; our own pid is excluded by the scan.
+                    let _killed = unsafe { libc::kill(pid_t, sig) };
+                }
             }
         }
     }
-    std::thread::sleep(std::time::Duration::from_secs(2));
 
-    for _ in 0..30 {
-        if !app.server_running() { break; }
+    // WAIT for the death before the successor spawns: the successor's
+    // stale-socket probe refuses to run against a still-serving old
+    // server ("Another server is running") — the live report's
+    // "Server did not start within 10s". A signal returning has never
+    // meant the target died; if the old server refuses to stop, FAIL
+    // LOUDLY instead of walking the successor into the refusal.
+    let stop_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while app.server_running() {
+        if std::time::Instant::now() > stop_deadline {
+            eprintln!("Old server did not stop within 10s. Kill it manually and re-run.");
+            std::process::exit(1);
+        }
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
 
@@ -716,9 +814,14 @@ fn restart_server(app: &App, log_path: Option<&str>) {
         let wparts: Vec<&str> = w.split_whitespace().collect();
         let mut umount_args: Vec<&str> = wparts[1..].to_vec();
         umount_args.extend(&["fusermount", "-uz", &state.mount_point]);
-        let _ = std::process::Command::new(wparts[0]).args(&umount_args).output();
+        let _ = std::process::Command::new(wparts[0])
+            .args(&umount_args)
+            .output();
     } else {
-        let _ = std::process::Command::new("fusermount").arg("-uz").arg(&state.mount_point).output();
+        let _ = std::process::Command::new("fusermount")
+            .arg("-uz")
+            .arg(&state.mount_point)
+            .output();
     }
     let _ = std::fs::remove_file(&state.socket);
     let _ = std::fs::remove_dir_all(&state.mount_point);
@@ -731,8 +834,12 @@ fn check_start_server(app: &App) {
     eprint!("Server is not running. Start it? [y/N] ");
     let _flushed = std::io::Write::flush(&mut std::io::stdout()).ok();
     let mut input = String::new();
-    if std::io::stdin().read_line(&mut input).is_err() { return; }
-    if input.trim().to_lowercase() != "y" { return; }
+    if std::io::stdin().read_line(&mut input).is_err() {
+        return;
+    }
+    if input.trim().to_lowercase() != "y" {
+        return;
+    }
 
     match read_state_file() {
         Some(state) => start_server_from_state(app, &state, None),
@@ -928,8 +1035,14 @@ fn completion_scripts_delegate_to_the_binary() {
     let bash = completion_script("bash").expect("bash");
     let zsh = completion_script("zsh").expect("zsh");
     let fish = completion_script("fish").expect("fish");
-    assert!(bash.contains("complete -C fuse-client fuse-client"), "{bash}");
-    assert!(zsh.contains("bashcompinit") && zsh.contains("complete -C"), "{zsh}");
+    assert!(
+        bash.contains("complete -C fuse-client fuse-client"),
+        "{bash}"
+    );
+    assert!(
+        zsh.contains("bashcompinit") && zsh.contains("complete -C"),
+        "{zsh}"
+    );
     assert!(fish.contains("--complete"), "{fish}");
     assert!(completion_script("tcsh").is_none());
     assert!(completion_script("").is_none());
@@ -939,7 +1052,6 @@ fn completion_scripts_delegate_to_the_binary() {
 #[cfg(test)]
 mod tests {
     use super::*;
-
 
     #[test]
     fn respawn_argv_carries_the_oracle_rendezvous() {

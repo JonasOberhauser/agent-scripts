@@ -44,14 +44,14 @@ fn main() {
         if reader.read_line(&mut line).is_err() {
             continue;
         }
-            // request grammar: WORD args — plain split
-            let mut words = line.split(' ');
-            let reply = match (words.next(), words.next()) {
-                (Some("add"), Some(name)) => {
-                    format!("{{\"type\":\"added\",\"inner\":\"stub-{name}\"}}\n")
-                }
-                _ => "{\"type\":\"ok\"}\n".to_string(),
-            };
+        // request grammar: WORD args — plain split
+        let mut words = line.split(' ');
+        let reply = match (words.next(), words.next()) {
+            (Some("add"), Some(name)) => {
+                format!("{{\"type\":\"added\",\"inner\":\"stub-{name}\"}}\n")
+            }
+            _ => "{\"type\":\"ok\"}\n".to_string(),
+        };
         let _ = w.write_all(reply.as_bytes());
         let _ = w.flush();
     }

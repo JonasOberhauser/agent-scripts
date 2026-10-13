@@ -44,13 +44,26 @@ impl Rng {
 
 /// Hostile-but-plausible field values for random command fill-ins.
 const NAMES: &[&str] = &[
-    "", "s", "../..", "a/b/../../../c", "root", "\u{1F512}", "\0bad",
+    "",
+    "s",
+    "../..",
+    "a/b/../../../c",
+    "root",
+    "\u{1F512}",
+    "\0bad",
     "very-long-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    "HOME=/x", "-x", "--socket", "p42_s0_x",
+    "HOME=/x",
+    "-x",
+    "--socket",
+    "p42_s0_x",
 ];
-const HASHES: &[&str] = &["", "*", "sha256-real",
+const HASHES: &[&str] = &[
+    "",
+    "*",
+    "sha256-real",
     "0000000000000000000000000000000000000000000000000000000000000000",
-    "\u{7F}"];
+    "\u{7F}",
+];
 
 /// Random JSON-ish payloads: valid shapes with random fields, wrong
 /// types, truncated valid JSON, and pure garbage.
@@ -116,8 +129,10 @@ fn daemon_chaos_marathon() {
                 let _ = fuse_server::handler::handle_command(cmd, &state, &hub);
             }
         }
-        if matches!(state.attempt_read("s", 4242, Some("sha256-wrong"), 0, 4), ReadOutcome::Granted)
-        {
+        if matches!(
+            state.attempt_read("s", 4242, Some("sha256-wrong"), 0, 4),
+            ReadOutcome::Granted
+        ) {
             panic!("seed {seed}: chaos AUTHORIZED a wrong-hash read");
         }
         seed += 1;
@@ -153,8 +168,10 @@ fn command_socket_chaos_never_panics_and_never_authorizes() {
 
         // Containment after chaos: wrong hash NEVER granted, right
         // hash granted exactly once (one-read), then denied.
-        if matches!(state.attempt_read("s", 4242, Some("sha256-wrong"), 0, 4), ReadOutcome::Granted)
-        {
+        if matches!(
+            state.attempt_read("s", 4242, Some("sha256-wrong"), 0, 4),
+            ReadOutcome::Granted
+        ) {
             panic!("seed {seed}: chaos on the command socket AUTHORIZED a wrong-hash read")
         }
         assert_eq!(
@@ -162,8 +179,10 @@ fn command_socket_chaos_never_panics_and_never_authorizes() {
             ReadOutcome::Granted,
             "seed {seed}: the right hash must still grant after chaos"
         );
-        if matches!(state.attempt_read("s", 4242, Some("sha256-real"), 0, 4), ReadOutcome::Granted)
-        {
+        if matches!(
+            state.attempt_read("s", 4242, Some("sha256-real"), 0, 4),
+            ReadOutcome::Granted
+        ) {
             panic!("seed {seed}: one-read semantics broken after chaos")
         }
     }
@@ -189,7 +208,9 @@ fn oracle_env_kit(
     Arc<ServerState>,
     std::path::PathBuf,
 ) {
-    let handle = gatekeeper_testkit::Stack::new().state_from(build).spawn_in_process();
+    let handle = gatekeeper_testkit::Stack::new()
+        .state_from(build)
+        .spawn_in_process();
     let host = handle.scratch(&format!("fuzz-oracle-host-{seed}"));
     std::fs::write(&host, b"FUZZ-DATA").unwrap();
     handle.state().add("s", &host, 9, "sha256-real"); // non-wildcard
@@ -241,7 +262,9 @@ fn oracle_socket_random_access_stays_alive_and_contained() {
                 ),
                 1 => format!(
                     "{{\"type\":\"open\",\"name\":\"s\",\"pid\":{},\"kdev\":{},\"kino\":{}}}",
-                    rng.next() % 1_000_000, rng.next(), rng.next()
+                    rng.next() % 1_000_000,
+                    rng.next(),
+                    rng.next()
                 ),
                 2 => "{\"type\":\"hello\"}".into(),
                 3 => "{\"type\":\"stat\",\"name\":\"s\"}".into(),
@@ -263,9 +286,9 @@ fn oracle_socket_random_access_stays_alive_and_contained() {
         // LIVENESS after chaos: stat is unadjudicated — it must answer
         // instantly. (An ask would block in a pending by design.)
         let reply = send_line(&sock, "{\"type\":\"stat\",\"name\":\"s\"}")
-        .unwrap_or_else(|| panic!("seed {seed}: oracle wedged after chaos (stat unanswered)"));
+            .unwrap_or_else(|| panic!("seed {seed}: oracle wedged after chaos (stat unanswered)"));
         let parsed: OracleReply = serde_json::from_str(reply.trim())
-        .unwrap_or_else(|e| panic!("seed {seed}: unreadable reply after chaos: {reply} ({e})"));
+            .unwrap_or_else(|e| panic!("seed {seed}: unreadable reply after chaos: {reply} ({e})"));
         assert!(
             matches!(parsed, OracleReply::StatOk { .. }),
             "seed {seed}: stat degraded after chaos: {reply}"
@@ -280,7 +303,7 @@ fn oracle_socket_random_access_stays_alive_and_contained() {
         )
         .unwrap_or_else(|| panic!("seed {seed}: containment probe unanswered"));
         let parsed: OracleReply = serde_json::from_str(reply.trim())
-        .unwrap_or_else(|e| panic!("seed {seed}: unreadable containment reply: {reply} ({e})"));
+            .unwrap_or_else(|e| panic!("seed {seed}: unreadable containment reply: {reply} ({e})"));
         assert!(
             !matches!(parsed, OracleReply::Allow),
             "seed {seed}: random access was AUTHORIZED (hash gate broken): {reply}"

@@ -14,7 +14,6 @@
 // the custom_parser lint exists only under the servyi driver.
 #![allow(unknown_lints)]
 #![allow(custom_parser)]
-
 #![allow(clippy::unwrap_used, clippy::panic, unused_results)]
 
 use std::sync::Arc;
@@ -72,20 +71,34 @@ fn typed_client_round_trips_every_command() {
     ok("reset-all", Command::Reset { name: None });
     let src = dir.path().join("c1.bin");
     std::fs::write(&src, b"CONTRACT").unwrap();
-    ok("add", Command::AddSecret {
-        name: "t".into(),
-        path: src.to_str().unwrap().into(),
-        hash: "h".into(),
-        mode: 0o400,
-    });
-    ok("rotate", Command::RotateHash { name: "t".into(), new_hash: "h2".into() });
-    ok("reset", Command::Reset { name: Some("t".into()) });
+    ok(
+        "add",
+        Command::AddSecret {
+            name: "t".into(),
+            path: src.to_str().unwrap().into(),
+            hash: "h".into(),
+            mode: 0o400,
+        },
+    );
+    ok(
+        "rotate",
+        Command::RotateHash {
+            name: "t".into(),
+            new_hash: "h2".into(),
+        },
+    );
+    ok(
+        "reset",
+        Command::Reset {
+            name: Some("t".into()),
+        },
+    );
     ok("remove", Command::RemoveSecret { name: "t".into() });
 
     // Rejection sweep — the envelope contract.  Before the fix these
     // died as "missing field `type`", destroying the reason.
-    let rejected = |name: &str, cmd: Command, needle: &str| {
-        match run_command_once(&socket, name, &cmd) {
+    let rejected =
+        |name: &str, cmd: Command, needle: &str| match run_command_once(&socket, name, &cmd) {
             Err(e) => {
                 assert!(
                     e.contains(needle),
@@ -97,11 +110,12 @@ fn typed_client_round_trips_every_command() {
                 );
             }
             Ok(_) => panic!("{name} should have been rejected"),
-        }
-    };
+        };
     rejected(
         "remove",
-        Command::RemoveSecret { name: "ghost".into() },
+        Command::RemoveSecret {
+            name: "ghost".into(),
+        },
         "not found",
     );
     rejected("grant", Command::Grant { id: 999 }, "not found");

@@ -73,7 +73,10 @@ pub struct PendingAccess {
 pub enum ReadOutcome {
     Granted,
     AlreadyAccessed,
-    HashMismatch { got: String, expected: String },
+    HashMismatch {
+        got: String,
+        expected: String,
+    },
     /// Issue #66: the lockdown is armed — refuse immediately, no
     /// pending, no wait. Current grants keep flowing.
     DeniedLocked,
@@ -109,7 +112,9 @@ pub fn lock_secret<'a>(rec: &'a Mutex<SecretRecord>, name: &str) -> MutexGuard<'
             guard.access_count = 1;
             guard.reading_pid = None;
             guard.read_progress = 0;
-            error!("Secret '{name}' mutex poisoned — access revoked. Use 'reset {name}' to re-enable.");
+            error!(
+                "Secret '{name}' mutex poisoned — access revoked. Use 'reset {name}' to re-enable."
+            );
             guard
         }
     }
@@ -238,16 +243,20 @@ impl ServerState {
         // the snapshot must follow the mutation in program order, and
         // concurrent write_atomic calls must never interleave
         // (review blocker on #57).
-        let _pl = self.persist_lock
-                .lock()
-                .expect("persist lock: mutations never panic while holding it");
+        let _pl = self
+            .persist_lock
+            .lock()
+            .expect("persist lock: mutations never panic while holding it");
         if let Some(existing) = self.secrets.get(&name) {
             let mut rec = lock_secret(existing.value(), &name);
             // MR2: the incoming hash JOINS the permitted set — a second
             // container pinning a different reader package must not
             // evict the first one's approval.
             if !rec.allowed_hashes.iter().any(|ph| ph.hash == hash) {
-                rec.allowed_hashes.push(PermittedHash { hash: hash.clone(), by: None });
+                rec.allowed_hashes.push(PermittedHash {
+                    hash: hash.clone(),
+                    by: None,
+                });
             }
             // Plain overwrite (no change detection, see MR1): refresh
             // only the adjudication facts. This branch PERSISTS —
@@ -283,9 +292,10 @@ impl ServerState {
     ///
     /// Panics if the persist lock was poisoned by a panicking mutation.
     pub fn remove(&self, name: &str) -> bool {
-        let _pl = self.persist_lock
-                .lock()
-                .expect("persist lock: mutations never panic while holding it");
+        let _pl = self
+            .persist_lock
+            .lock()
+            .expect("persist lock: mutations never panic while holding it");
         let existed = self.secrets.remove(name).is_some();
         if existed {
             crate::policy_store::persist_locked(self);
@@ -322,7 +332,8 @@ impl ServerState {
             let end = offset.saturating_add(size).min(rec.size);
             rec.read_progress = rec.read_progress.max(end);
             drop(rec);
-            let _pl = self.persist_lock
+            let _pl = self
+                .persist_lock
                 .lock()
                 .expect("persist lock: mutations never panic while holding it");
             crate::policy_store::persist_locked(self);
@@ -350,7 +361,8 @@ impl ServerState {
             let end = offset.saturating_add(size).min(rec.size);
             rec.read_progress = end;
             drop(rec);
-            let _pl = self.persist_lock
+            let _pl = self
+                .persist_lock
                 .lock()
                 .expect("persist lock: mutations never panic while holding it");
             crate::policy_store::persist_locked(self);
@@ -381,9 +393,10 @@ impl ServerState {
     ///
     /// Panics if the persist lock was poisoned by a panicking mutation.
     pub fn arm_lockdown(&self) {
-        let _pl = self.persist_lock
-                .lock()
-                .expect("persist lock: mutations never panic while holding it");
+        let _pl = self
+            .persist_lock
+            .lock()
+            .expect("persist lock: mutations never panic while holding it");
         self.lockdown.store(true, Ordering::SeqCst);
         crate::policy_store::persist_locked(self);
     }
@@ -400,9 +413,10 @@ impl ServerState {
     ///
     /// Panics if the persist lock was poisoned by a panicking mutation.
     pub fn reset(&self, name: Option<&str>) -> usize {
-        let _pl = self.persist_lock
-                .lock()
-                .expect("persist lock: mutations never panic while holding it");
+        let _pl = self
+            .persist_lock
+            .lock()
+            .expect("persist lock: mutations never panic while holding it");
         let count = match name {
             Some(n) => {
                 if let Some(entry) = self.secrets.get(n) {
@@ -418,7 +432,8 @@ impl ServerState {
                 }
             }
             None => {
-                let entries: Vec<(String, Arc<Mutex<SecretRecord>>)> = self.secrets
+                let entries: Vec<(String, Arc<Mutex<SecretRecord>>)> = self
+                    .secrets
                     .iter()
                     .map(|e| (e.key().clone(), Arc::clone(e.value())))
                     .collect();
@@ -445,14 +460,18 @@ impl ServerState {
     ///
     /// Panics if the persist lock was poisoned by a panicking mutation.
     pub fn rotate_hash(&self, name: &str, new_hash: &str) -> bool {
-        let _pl = self.persist_lock
-                .lock()
-                .expect("persist lock: mutations never panic while holding it");
+        let _pl = self
+            .persist_lock
+            .lock()
+            .expect("persist lock: mutations never panic while holding it");
         let rotated = if let Some(entry) = self.secrets.get(name) {
             let rec_arc = Arc::clone(entry.value());
             drop(entry);
             let mut rec = lock_secret(&rec_arc, name);
-            rec.allowed_hashes = vec![PermittedHash { hash: new_hash.to_string(), by: None }];
+            rec.allowed_hashes = vec![PermittedHash {
+                hash: new_hash.to_string(),
+                by: None,
+            }];
             true
         } else {
             false
@@ -471,14 +490,7 @@ impl ServerState {
         reason: &str,
         process_name: Option<&str>,
     ) -> u64 {
-        self.create_pending_with_hash_error(
-            secret_name,
-            pid,
-            pid_hash,
-            None,
-            reason,
-            process_name,
-        )
+        self.create_pending_with_hash_error(secret_name, pid, pid_hash, None, reason, process_name)
     }
 
     /// Like [`Self::create_pending`], recording why a failed package-hash
@@ -497,21 +509,24 @@ impl ServerState {
         process_name: Option<&str>,
     ) -> u64 {
         let id = self.next_pending_id.fetch_add(1, Ordering::SeqCst);
-        let _prev = self.pending.insert(id, PendingAccess {
+        let _prev = self.pending.insert(
             id,
-            secret_name: secret_name.to_string(),
-            process_name: process_name.map(|s| s.to_string()),
-            pid,
-            pid_hash: pid_hash.map(|s| s.to_string()),
-            hash_error: hash_error.map(|s| s.to_string()),
-            reason: reason.to_string(),
-            expires_at: Instant::now()
-                + *self
-                    .pending_timeout
-                    .lock()
-                    .expect("pending-timeout lock: never held across a panic"),
-            granted: false,
-        });
+            PendingAccess {
+                id,
+                secret_name: secret_name.to_string(),
+                process_name: process_name.map(|s| s.to_string()),
+                pid,
+                pid_hash: pid_hash.map(|s| s.to_string()),
+                hash_error: hash_error.map(|s| s.to_string()),
+                reason: reason.to_string(),
+                expires_at: Instant::now()
+                    + *self
+                        .pending_timeout
+                        .lock()
+                        .expect("pending-timeout lock: never held across a panic"),
+                granted: false,
+            },
+        );
         id
     }
 
@@ -569,9 +584,10 @@ impl ServerState {
     ///
     /// Panics if the persist lock was poisoned by a panicking mutation.
     pub fn grant_pending_forever(&self, id: u64) -> Result<(), String> {
-        let _pl = self.persist_lock
-                .lock()
-                .expect("persist lock: mutations never panic while holding it");
+        let _pl = self
+            .persist_lock
+            .lock()
+            .expect("persist lock: mutations never panic while holding it");
         let (secret_name, package_hash, process_name) = {
             let entry = self
                 .pending
@@ -596,7 +612,11 @@ impl ServerState {
                 })?;
             (entry.secret_name.clone(), hash, entry.process_name.clone())
         };
-        if let Some(rec_arc) = self.secrets.get(&secret_name).map(|e| Arc::clone(e.value())) {
+        if let Some(rec_arc) = self
+            .secrets
+            .get(&secret_name)
+            .map(|e| Arc::clone(e.value()))
+        {
             let mut rec = lock_secret(&rec_arc, &secret_name);
             tracing::info!(
                 "grant-forever {id}: whitelisting package {} for '{secret_name}' (unlimited reads)",
@@ -643,7 +663,8 @@ impl ServerState {
     }
 
     pub fn is_pending_granted(&self, id: u64) -> bool {
-        self.pending.get(&id)
+        self.pending
+            .get(&id)
             .map(|p| p.granted && p.expires_at > Instant::now())
             .unwrap_or(false)
     }
@@ -657,7 +678,8 @@ impl ServerState {
         // Issue #66: an expired ask WITH a package hash stays listed
         // as a remembered denial (grant disabled, forever+deny live);
         // without a hash there is nothing to learn — drop it.
-        self.pending.retain(|_, p| p.expires_at > now || p.pid_hash.is_some());
+        self.pending
+            .retain(|_, p| p.expires_at > now || p.pid_hash.is_some());
     }
 
     pub fn list_pending(&self) -> Vec<fuse_protocol::PendingAccessInfo> {
@@ -702,10 +724,13 @@ impl ServerState {
     ///
     /// Panics if the persist lock was poisoned by a panicking mutation.
     pub fn granted_read(&self, name: &str, pid: u32, offset: usize, size: usize) -> bool {
-        let _pl = self.persist_lock
-                .lock()
-                .expect("persist lock: mutations never panic while holding it");
-        let Some(entry) = self.secrets.get(name) else { return false; };
+        let _pl = self
+            .persist_lock
+            .lock()
+            .expect("persist lock: mutations never panic while holding it");
+        let Some(entry) = self.secrets.get(name) else {
+            return false;
+        };
         let rec_arc = Arc::clone(entry.value());
         drop(entry);
         let mut rec = lock_secret(&rec_arc, name);
@@ -719,44 +744,52 @@ impl ServerState {
     }
 
     pub fn status(&self) -> Vec<fuse_protocol::SecretStatus> {
-        let entries: Vec<(String, Arc<Mutex<SecretRecord>>)> = self.secrets
+        let entries: Vec<(String, Arc<Mutex<SecretRecord>>)> = self
+            .secrets
             .iter()
             .map(|e| (e.key().clone(), Arc::clone(e.value())))
             .collect();
 
-        entries.iter().map(|(name, rec_arc)| {
-            let rec = lock_secret(rec_arc, name);
-            fuse_protocol::SecretStatus {
-                inner: fuse_protocol::anonymize_path(&self.anon_salt, name),
-                name: name.clone(),
-                access_count: rec.access_count,
-                allowed_hashes: rec
-                    .allowed_hashes
-                    .iter()
-                    .map(|ph| fuse_protocol::HashEntryStatus {
-                        hash: ph.hash.clone(),
-                        by: ph.by.clone(),
-                    })
-                    .collect(),
-                size: rec.size,
-                unlimited: rec.unlimited_reads,
-            }
-        }).collect()
+        entries
+            .iter()
+            .map(|(name, rec_arc)| {
+                let rec = lock_secret(rec_arc, name);
+                fuse_protocol::SecretStatus {
+                    inner: fuse_protocol::anonymize_path(&self.anon_salt, name),
+                    name: name.clone(),
+                    access_count: rec.access_count,
+                    allowed_hashes: rec
+                        .allowed_hashes
+                        .iter()
+                        .map(|ph| fuse_protocol::HashEntryStatus {
+                            hash: ph.hash.clone(),
+                            by: ph.by.clone(),
+                        })
+                        .collect(),
+                    size: rec.size,
+                    unlimited: rec.unlimited_reads,
+                }
+            })
+            .collect()
     }
 
     pub fn list_mounts(&self) -> Vec<fuse_protocol::MountEntry> {
-        let entries: Vec<(String, Arc<Mutex<SecretRecord>>)> = self.secrets
+        let entries: Vec<(String, Arc<Mutex<SecretRecord>>)> = self
+            .secrets
             .iter()
             .map(|e| (e.key().clone(), Arc::clone(e.value())))
             .collect();
 
-        entries.iter().map(|(name, rec_arc)| {
-            let rec = lock_secret(rec_arc, name);
-            fuse_protocol::MountEntry {
-                name: name.clone(),
-                size: rec.size,
-            }
-        }).collect()
+        entries
+            .iter()
+            .map(|(name, rec_arc)| {
+                let rec = lock_secret(rec_arc, name);
+                fuse_protocol::MountEntry {
+                    name: name.clone(),
+                    size: rec.size,
+                }
+            })
+            .collect()
     }
 }
 
@@ -775,7 +808,6 @@ mod tests {
         let rec = lock_secret(entry.value(), name);
         (rec.access_count, rec.reading_pid, rec.read_progress)
     }
-
 
     // ── issue #66: shorter pending + retro-active lockdown ───────
 
@@ -869,7 +901,8 @@ mod tests {
         assert!(!s.grant_pending(id));
         // Grant-forever still whitelists the observed hash — the
         // retro-active escape hatch.
-        s.grant_pending_forever(id).expect("retro grant-forever works");
+        s.grant_pending_forever(id)
+            .expect("retro grant-forever works");
         // And deny removes it from the panel.
         let id2 = s.create_pending(
             "secrets.yaml",
@@ -965,8 +998,10 @@ mod tests {
         s.add("secrets.yaml", "/tmp/host/secrets.yaml", 9, "sha256-other");
         match s.attempt_read("secrets.yaml", 100, Some("wrong"), 0, 1024) {
             ReadOutcome::HashMismatch { expected, .. } => {
-                assert!(expected.contains("abc123") && expected.contains("sha256-other"),
-                    "denial names every permitted hash: {expected}");
+                assert!(
+                    expected.contains("abc123") && expected.contains("sha256-other"),
+                    "denial names every permitted hash: {expected}"
+                );
             }
             other => panic!("expected mismatch, got {other:?}"),
         }
@@ -980,7 +1015,11 @@ mod tests {
         assert!(s.rotate_hash("secrets.yaml", "sha256-newpackage"));
         s.add("secrets.yaml", "/tmp/host/secrets.yaml", 9, "abc123"); // re-add, same content size
         let out = s.attempt_read("secrets.yaml", 100, Some("sha256-newpackage"), 0, 1024);
-        assert_eq!(out, ReadOutcome::Granted, "rotated hash must survive re-add");
+        assert_eq!(
+            out,
+            ReadOutcome::Granted,
+            "rotated hash must survive re-add"
+        );
         let out = s.attempt_read("secrets.yaml", 101, Some("abc123"), 0, 1024);
         assert!(
             !matches!(out, ReadOutcome::Granted),
@@ -1023,7 +1062,11 @@ mod tests {
         {
             let entry = s.secrets.get("secrets.yaml").unwrap();
             let rec = lock_secret(entry.value(), "secrets.yaml");
-            assert_eq!(rec.size, b"DIFFERENT-LONGER-CONTENT".len(), "size refreshes");
+            assert_eq!(
+                rec.size,
+                b"DIFFERENT-LONGER-CONTENT".len(),
+                "size refreshes"
+            );
         }
         // explicit reset is the only way to a fresh cycle
         s.reset(Some("secrets.yaml"));
@@ -1053,7 +1096,10 @@ mod tests {
         let out = s.attempt_read("secrets.yaml", 100, Some("wrong"), 0, 1024);
         assert_eq!(
             out,
-            ReadOutcome::HashMismatch { got: "wrong".into(), expected: "abc123".into() }
+            ReadOutcome::HashMismatch {
+                got: "wrong".into(),
+                expected: "abc123".into()
+            }
         );
     }
 
@@ -1146,8 +1192,7 @@ mod tests {
         let err = s.grant_pending_forever(id).unwrap_err();
         assert!(err.contains("no package hash"), "got: {err}");
         assert!(
-            err.contains("hashd unreachable")
-                && err.contains("sudo systemd-run --unit=fuse-hashd"),
+            err.contains("hashd unreachable") && err.contains("sudo systemd-run --unit=fuse-hashd"),
             "the recorded reason and its remediation must be embedded verbatim: {err}"
         );
     }
@@ -1232,7 +1277,10 @@ mod tests {
     #[test]
     fn missing_secret_not_found() {
         let s = sample_state();
-        assert_eq!(s.attempt_read("nope", 100, Some("abc123"), 0, 1024), ReadOutcome::NotFound);
+        assert_eq!(
+            s.attempt_read("nope", 100, Some("abc123"), 0, 1024),
+            ReadOutcome::NotFound
+        );
     }
 
     #[test]

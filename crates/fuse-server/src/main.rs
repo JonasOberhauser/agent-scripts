@@ -80,7 +80,10 @@ static SUPERVISED_FUSED: std::sync::Mutex<Option<std::process::Child>> =
 fn stale_socket(path: &Path) {
     if path.exists() {
         if std::os::unix::net::UnixStream::connect(path).is_ok() {
-            error!("Another server is running at {}. Kill it first.", path.display());
+            error!(
+                "Another server is running at {}. Kill it first.",
+                path.display()
+            );
             std::process::exit(1);
         }
         warn!("Removing stale socket at {}", path.display());
@@ -92,13 +95,13 @@ fn main() {
     let cli = Cli::parse();
 
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::builder()
-                .parse_lossy(&cli.log_level),
-        )
+        .with_env_filter(tracing_subscriber::EnvFilter::builder().parse_lossy(&cli.log_level))
         .init();
 
-    info!("fuse-server (policy daemon) v{} starting", fuse_protocol::VERSION);
+    info!(
+        "fuse-server (policy daemon) v{} starting",
+        fuse_protocol::VERSION
+    );
     info!("  socket:          {}", cli.socket.display());
     info!("  oracle-socket:   {}", cli.oracle_socket.display());
     info!("  pending-timeout: {}s", cli.pending_timeout);
@@ -107,16 +110,24 @@ fn main() {
     // to this binary and keep it as a child; on our exit it dies too.
     if let Some(mp) = &cli.mount_point {
         let exe = std::env::current_exe().expect("current exe");
-        let sibling = exe.parent().map(|d| d.join(fuse_protocol::FUSED_BIN)).filter(|p| p.exists());
+        let sibling = exe
+            .parent()
+            .map(|d| d.join(fuse_protocol::FUSED_BIN))
+            .filter(|p| p.exists());
         // The seam (#94): an explicit --fused-binary wins over the
         // exe-sibling default; without either, the loud #37 failure.
         let fused = cli.fused_binary.clone().or(sibling);
         match fused {
             Some(fused) => {
-                info!("  mount-point:     {} (spawning supervised data daemon)", mp.display());
+                info!(
+                    "  mount-point:     {} (spawning supervised data daemon)",
+                    mp.display()
+                );
                 let child = std::process::Command::new(&fused)
-                    .arg("--mount-point").arg(mp)
-                    .arg(fuse_protocol::ORACLE_SOCKET_FLAG).arg(&cli.oracle_socket)
+                    .arg("--mount-point")
+                    .arg(mp)
+                    .arg(fuse_protocol::ORACLE_SOCKET_FLAG)
+                    .arg(&cli.oracle_socket)
                     .spawn();
                 match child {
                     Ok(c) => {
@@ -184,9 +195,13 @@ fn main() {
             "  policy store:    {} restored, {} ghosts{}",
             report.restored,
             report.ghosts,
-            if report.corrupted { " — CORRUPT FILE RENAMED ASIDE, STARTED FRESH" }
-            else if report.unreadable { " — UNREADABLE, PERSISTENCE DISARMED (nothing will overwrite it)" }
-            else { "" }
+            if report.corrupted {
+                " — CORRUPT FILE RENAMED ASIDE, STARTED FRESH"
+            } else if report.unreadable {
+                " — UNREADABLE, PERSISTENCE DISARMED (nothing will overwrite it)"
+            } else {
+                ""
+            }
         );
     }
 
@@ -252,8 +267,8 @@ fn parse_secret(
         return Err("NAME and HASH must be non-empty".into());
     }
     let file_path = std::path::PathBuf::from(file);
-    let host = std::fs::canonicalize(&file_path)
-        .map_err(|e| format!("cannot resolve {file}: {e}"))?;
+    let host =
+        std::fs::canonicalize(&file_path).map_err(|e| format!("cannot resolve {file}: {e}"))?;
     Ok((name.to_string(), host, hash.to_string()))
 }
 
@@ -267,8 +282,7 @@ mod secret_spec_tests {
         let dir = tempfile::tempdir().unwrap();
         let weird = dir.path().join("a:b:c.yaml");
         std::fs::write(&weird, b"DATA").unwrap();
-        let (name, file, hash) =
-            parse_secret("api", &weird.display().to_string(), "*").unwrap();
+        let (name, file, hash) = parse_secret("api", &weird.display().to_string(), "*").unwrap();
         assert_eq!(name, "api");
         assert_eq!(file, std::fs::canonicalize(&weird).unwrap());
         assert_eq!(hash, "*");

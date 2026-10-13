@@ -15,7 +15,6 @@
 // the custom_parser lint exists only under the servyi driver.
 #![allow(unknown_lints)]
 #![allow(custom_parser)]
-
 #![allow(clippy::unwrap_used, clippy::panic, unused_results)]
 
 use std::io::Write as _;
@@ -36,11 +35,13 @@ fn fuse_available() -> bool {
 
 /// Can this context compute package hashes (follow its own map_files)?
 fn hashing_available() -> bool {
-    let range = std::fs::read_to_string("/proc/self/maps").ok().and_then(|maps| {
-        maps.lines()
-            .find(|l| l.contains('/'))
-            .and_then(|l| l.split_whitespace().next().map(str::to_string))
-    });
+    let range = std::fs::read_to_string("/proc/self/maps")
+        .ok()
+        .and_then(|maps| {
+            maps.lines()
+                .find(|l| l.contains('/'))
+                .and_then(|l| l.split_whitespace().next().map(str::to_string))
+        });
     let Some(range) = range else { return false };
     let ok = std::fs::read(format!("/proc/self/map_files/{range}")).is_ok();
     if !ok {
@@ -64,13 +65,14 @@ impl Split {
     /// (The `tag` argument is vestigial: kit identity is minted, not
     /// named — review on #82. It survives for log-file naming.)
     fn new(tag: &str, secrets: &[(&str, &[u8], &str)]) -> Split {
-        let mut stack = gatekeeper_testkit::Stack::new()
-            .pending_timeout(Duration::from_secs(5));
+        let mut stack = gatekeeper_testkit::Stack::new().pending_timeout(Duration::from_secs(5));
         for (name, content, hash) in secrets {
             stack = stack.secret(name, content, hash);
         }
         let _ = tag;
-        Split { inner: stack.spawn_real_mount() }
+        Split {
+            inner: stack.spawn_real_mount(),
+        }
     }
 
     /// Like [`Split::new`], but the policy daemon hashes readers via
@@ -85,7 +87,9 @@ impl Split {
         for (name, content, hash) in secrets {
             stack = stack.secret(name, content, hash);
         }
-        Split { inner: stack.spawn_real_mount() }
+        Split {
+            inner: stack.spawn_real_mount(),
+        }
     }
 
     fn mount(&self) -> &Path {
@@ -149,18 +153,25 @@ fn write_out(out: &std::process::Output) -> String {
 
 #[test]
 fn e2e_read_secret() {
-    if !fuse_available() { return; }
+    if !fuse_available() {
+        return;
+    }
     let _g = serial();
     let split = Split::new("read", &[("s", b"TOPSECRET", "*")]);
     match split.read("s") {
         Ok(b) => assert_eq!(b, b"TOPSECRET"),
-        Err(e) => panic!("read through the mount failed: {e}\n{}", split.dump_logs("read failure")),
+        Err(e) => panic!(
+            "read through the mount failed: {e}\n{}",
+            split.dump_logs("read failure")
+        ),
     }
 }
 
 #[test]
 fn e2e_root_is_directory() {
-    if !fuse_available() { return; }
+    if !fuse_available() {
+        return;
+    }
     let _g = serial();
     let split = Split::new("root", &[("s", b"X", "*")]);
     assert!(std::fs::metadata(split.mount()).unwrap().is_dir());
@@ -168,7 +179,9 @@ fn e2e_root_is_directory() {
 
 #[test]
 fn e2e_nonexistent_file_enoent() {
-    if !fuse_available() { return; }
+    if !fuse_available() {
+        return;
+    }
     let _g = serial();
     let split = Split::new("enoent", &[("s", b"X", "*")]);
     let err = std::fs::read(split.path("nope")).unwrap_err();
@@ -182,7 +195,9 @@ fn e2e_path_shaped_names_serve_flat() {
     // one directory of whole-path hashes. Nested outer paths serve
     // as single flat entries; the mount root is a directory and
     // nothing else is.
-    if !fuse_available() { return; }
+    if !fuse_available() {
+        return;
+    }
     let _g = serial();
     let split = Split::new("paths", &[("a/b/c.txt", b"NESTED", "*")]);
     assert!(split.mount().is_dir(), "the mount root is a directory");
@@ -202,7 +217,9 @@ fn e2e_re_add_unchanged_content_preserves_state_end_to_end() {
     // SAME name. Re-adding with unchanged content must NOT reset the
     // approval/read state — here proven through the full stack
     // (socket add → oracle → mount → read), not just the state unit.
-    if !fuse_available() { return; }
+    if !fuse_available() {
+        return;
+    }
     let _g = serial();
     let split = Split::new("readd", &[("s", b"KEEP", "*")]);
     assert_eq!(std::fs::read(split.path("s")).unwrap(), b"KEEP");
@@ -236,7 +253,9 @@ fn e2e_grants_survive_a_policy_daemon_kill() {
     // restart it on the same sockets + policy store, and the spent
     // one-read budget SURVIVES (fail-safe: no free re-reads after a
     // kill). Then reset — the explicit policy path — and read again.
-    if !fuse_available() { return; }
+    if !fuse_available() {
+        return;
+    }
     let _g = serial();
     let mut split = Split::new("mr5", &[("s", b"KEEP", "*")]);
     assert_eq!(split.read("s").unwrap(), b"KEEP");
@@ -250,14 +269,21 @@ fn e2e_grants_survive_a_policy_daemon_kill() {
 
     // Budget spent BEFORE the kill must still be spent AFTER it.
     let err = split.read("s").unwrap_err();
-    assert_eq!(err.raw_os_error(), Some(libc::EACCES), "spent budget survives kill -9: {err}");
+    assert_eq!(
+        err.raw_os_error(),
+        Some(libc::EACCES),
+        "spent budget survives kill -9: {err}"
+    );
 
     // The explicit path clears it, and the fresh read works.
     let out = split.client(&["reset", "--name", "s"]);
     assert!(out.status.success(), "reset failed: {}", write_out(&out));
     match split.read("s") {
         Ok(b) => assert_eq!(b, b"KEEP"),
-        Err(e) => panic!("post-reset read failed: {e}\n{}", split.dump_logs("mr5 failure")),
+        Err(e) => panic!(
+            "post-reset read failed: {e}\n{}",
+            split.dump_logs("mr5 failure")
+        ),
     }
 }
 
@@ -270,7 +296,9 @@ fn e2e_fused_kill9_policy_untouched_a_fresh_data_daemon_remounts() {
     // remounts, the control-channel snapshot replays, and reads work
     // under the SAME one-read budget (spent stays spent — the budget
     // lives in the policy daemon, which never died).
-    if !fuse_available() { return; }
+    if !fuse_available() {
+        return;
+    }
     let _g = serial();
     let mut split = Split::new("datakill", &[("s", b"DK", "*")]);
     assert_eq!(split.read("s").unwrap(), b"DK");
@@ -281,7 +309,11 @@ fn e2e_fused_kill9_policy_untouched_a_fresh_data_daemon_remounts() {
 
     // Policy untouched: the cmd socket answers status immediately.
     let out = split.client(&["status"]);
-    assert!(out.status.success(), "policy must not notice fused's death: {}", write_out(&out));
+    assert!(
+        out.status.success(),
+        "policy must not notice fused's death: {}",
+        write_out(&out)
+    );
 
     // Fresh data daemon on the same rendezvous; the snapshot replays.
     split.respawn_data("datakill");
@@ -289,7 +321,8 @@ fn e2e_fused_kill9_policy_untouched_a_fresh_data_daemon_remounts() {
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
         if let Ok(rd) = std::fs::read_dir(split.mount()) {
-            if rd.filter_map(|e| e.ok())
+            if rd
+                .filter_map(|e| e.ok())
                 .any(|e| e.file_name().to_string_lossy() == split.inner("s"))
             {
                 listed = true;
@@ -298,16 +331,28 @@ fn e2e_fused_kill9_policy_untouched_a_fresh_data_daemon_remounts() {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    assert!(listed, "remounted data daemon never re-listed the secret: {}", split.dump_logs("datakill"));
+    assert!(
+        listed,
+        "remounted data daemon never re-listed the secret: {}",
+        split.dump_logs("datakill")
+    );
 
     // The budget survived (policy-side state): the next open pends
     // out the 5s timeout and denies, not grants.
     let err = split.read("s").unwrap_err();
-    assert_eq!(err.raw_os_error(), Some(libc::EACCES), "budget must survive the data daemon's death: {err}");
+    assert_eq!(
+        err.raw_os_error(),
+        Some(libc::EACCES),
+        "budget must survive the data daemon's death: {err}"
+    );
 
     // And the explicit reset restores reads through the new mount.
     let out = split.client(&["reset", "--name", "s"]);
-    assert!(out.status.success(), "reset after remount: {}", write_out(&out));
+    assert!(
+        out.status.success(),
+        "reset after remount: {}",
+        write_out(&out)
+    );
     assert_eq!(split.read("s").unwrap(), b"DK");
 }
 
@@ -316,7 +361,9 @@ fn e2e_policy_kill9_before_any_read_a_store_only_respawn_serves() {
     // Kill point corner (#50): the policy daemon dies BEFORE the
     // first read — no budget consumed, no pinned fds. The pure-load
     // respawn must serve reads on the first attempt.
-    if !fuse_available() { return; }
+    if !fuse_available() {
+        return;
+    }
     let _g = serial();
     let mut split = Split::new("earlykill", &[("s", b"EARLY", "*")]);
     split.kill_policy();
@@ -331,12 +378,18 @@ fn e2e_policy_kill9_before_any_read_a_store_only_respawn_serves() {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    assert!(ok, "first read after an early kill + store-only respawn failed: {}", split.dump_logs("earlykill"));
+    assert!(
+        ok,
+        "first read after an early kill + store-only respawn failed: {}",
+        split.dump_logs("earlykill")
+    );
 }
 
 #[test]
 fn e2e_one_read_per_secret_without_reset() {
-    if !fuse_available() { return; }
+    if !fuse_available() {
+        return;
+    }
     let _g = serial();
     let split = Split::new("oneread", &[("s", b"ONCE", "*")]);
     assert_eq!(std::fs::read(split.path("s")).unwrap(), b"ONCE");
@@ -344,7 +397,11 @@ fn e2e_one_read_per_secret_without_reset() {
         .map(|_| ());
     let _ = err; // metadata alone doesn't consume the read budget
     let err = std::fs::read(split.path("s")).unwrap_err();
-    assert_eq!(err.raw_os_error(), Some(libc::EACCES), "second read must be denied (budget spent; 5s pending expired)");
+    assert_eq!(
+        err.raw_os_error(),
+        Some(libc::EACCES),
+        "second read must be denied (budget spent; 5s pending expired)"
+    );
 }
 
 #[test]
@@ -352,7 +409,9 @@ fn e2e_host_edit_is_visible_on_next_open() {
     // THE MR4 property: content is read from the host at open time —
     // a source edit after the mount is up serves fresh bytes to the
     // next open (snapshot semantics would serve the stale copy).
-    if !fuse_available() { return; }
+    if !fuse_available() {
+        return;
+    }
     let _g = serial();
     let split = Split::new("fresh", &[("s", b"OLD-BYTES", "*")]);
     assert_eq!(split.read("s").unwrap(), b"OLD-BYTES");
@@ -361,7 +420,10 @@ fn e2e_host_edit_is_visible_on_next_open() {
     assert!(out.status.success(), "reset failed: {}", write_out(&out));
     match split.read("s") {
         Ok(b) => assert_eq!(b, b"NEW-BYTES", "fresh bytes must serve"),
-        Err(e) => panic!("read after host edit failed: {e}\n{}", split.dump_logs("freshness failure")),
+        Err(e) => panic!(
+            "read after host edit failed: {e}\n{}",
+            split.dump_logs("freshness failure")
+        ),
     }
 }
 
@@ -370,7 +432,9 @@ fn e2e_ghost_opens_to_enoent() {
     // Frozen tree + live host: deleting the source leaves the name
     // listed (structure is frozen) but its OPEN must fail ENOENT —
     // never stale bytes.
-    if !fuse_available() { return; }
+    if !fuse_available() {
+        return;
+    }
     let _g = serial();
     let split = Split::new("ghost", &[("s", b"G", "*")]);
     assert_eq!(split.read("s").unwrap(), b"G");
@@ -389,7 +453,9 @@ fn e2e_ghost_heals_when_the_host_file_returns() {
     // bytes served, and the read cycle state intact (the ghost period
     // consumed nothing). The re-add half of the promise is covered by
     // the policy re-add tests; this is the file-returns half.
-    if !fuse_available() { return; }
+    if !fuse_available() {
+        return;
+    }
     let _g = serial();
     let split = Split::new("heal", &[("s", b"V1", "*")]);
     assert_eq!(split.read("s").unwrap(), b"V1");
@@ -421,7 +487,9 @@ fn e2e_atomic_replace_serves_fresh_bytes_and_a_new_inode() {
     // The standard safe-write flow (temp + rename-over) lands a NEW
     // incarnation at the same path: the mount must serve the new
     // bytes on the next open, under a new inode number.
-    if !fuse_available() { return; }
+    if !fuse_available() {
+        return;
+    }
     let _g = serial();
     let split = Split::new("atomic", &[("s", b"V1-CONTENT", "*")]);
     let ino1 = {
@@ -436,7 +504,10 @@ fn e2e_atomic_replace_serves_fresh_bytes_and_a_new_inode() {
     assert!(out.status.success());
     match split.read("s") {
         Ok(b) => assert_eq!(b, b"V2-CONTENT", "replaced incarnation serves fresh"),
-        Err(e) => panic!("read after replace failed: {e}\n{}", split.dump_logs("replace failure")),
+        Err(e) => panic!(
+            "read after replace failed: {e}\n{}",
+            split.dump_logs("replace failure")
+        ),
     }
     // TTL lets the kernel re-lookup and observe the new fino.
     std::thread::sleep(Duration::from_millis(1200));
@@ -452,7 +523,9 @@ fn e2e_open_fd_pins_its_incarnation_across_a_host_rewrite() {
     // Accepted MR4 semantics (AGENTS.md): an already-adjudicated open
     // keeps reading ITS incarnation — a rename-over does not swap
     // bytes under a live descriptor.
-    if !fuse_available() { return; }
+    if !fuse_available() {
+        return;
+    }
     let _g = serial();
     let split = Split::new("pin", &[("s", b"AAAAAAAAAA", "*")]);
     use std::io::{Read as _, Seek, SeekFrom};
@@ -472,7 +545,9 @@ fn e2e_open_fd_pins_its_incarnation_across_a_host_rewrite() {
 
 #[test]
 fn e2e_reset_allows_reread() {
-    if !fuse_available() { return; }
+    if !fuse_available() {
+        return;
+    }
     let _g = serial();
     let split = Split::new("reset", &[("s", b"R", "*")]);
     assert_eq!(std::fs::read(split.path("s")).unwrap(), b"R");
@@ -483,7 +558,9 @@ fn e2e_reset_allows_reread() {
 
 #[test]
 fn e2e_multiple_secrets_independent() {
-    if !fuse_available() { return; }
+    if !fuse_available() {
+        return;
+    }
     let _g = serial();
     let split = Split::new("multi", &[("a", b"AAA", "*"), ("b", b"BBB", "*")]);
     assert_eq!(std::fs::read(split.path("a")).unwrap(), b"AAA");
@@ -492,7 +569,9 @@ fn e2e_multiple_secrets_independent() {
 
 #[test]
 fn e2e_multi_chunk_read_succeeds() {
-    if !fuse_available() { return; }
+    if !fuse_available() {
+        return;
+    }
     let _g = serial();
     let data: Vec<u8> = (0..=255u8).cycle().take(4096).collect();
     let split = Split::new("chunk", &[("s", &data, "*")]);
@@ -500,14 +579,19 @@ fn e2e_multi_chunk_read_succeeds() {
     use std::io::Read as _;
     let mut buf = Vec::new();
     f.read_to_end(&mut buf).unwrap();
-    assert_eq!(buf, data, "chunked streaming read must reassemble the whole secret");
+    assert_eq!(
+        buf, data,
+        "chunked streaming read must reassemble the whole secret"
+    );
 }
 
 // ── metadata through the mount ──────────────────────────────────
 
 #[test]
 fn e2e_readdir_lists_secrets() {
-    if !fuse_available() { return; }
+    if !fuse_available() {
+        return;
+    }
     let _g = serial();
     let split = Split::new("readdir", &[("a", b"A", "*"), ("b", b"B", "*")]);
     let names: Vec<String> = std::fs::read_dir(split.mount())
@@ -520,13 +604,17 @@ fn e2e_readdir_lists_secrets() {
     let ib = split.inner("b");
     assert!(names.contains(&ia), "{ia} in {names:?}");
     assert!(names.contains(&ib), "{ib} in {names:?}");
-    assert!(!names.contains(&"a".to_string()) && !names.contains(&"b".to_string()),
-        "clear host names must never appear inside the container: {names:?}");
+    assert!(
+        !names.contains(&"a".to_string()) && !names.contains(&"b".to_string()),
+        "clear host names must never appear inside the container: {names:?}"
+    );
 }
 
 #[test]
 fn e2e_getattr_reports_size() {
-    if !fuse_available() { return; }
+    if !fuse_available() {
+        return;
+    }
     let _g = serial();
     let split = Split::new("getattr", &[("s", b"12345", "*")]);
     assert_eq!(std::fs::metadata(split.path("s")).unwrap().len(), 5);
@@ -534,7 +622,9 @@ fn e2e_getattr_reports_size() {
 
 #[test]
 fn e2e_source_mode_is_passed_through() {
-    if !fuse_available() { return; }
+    if !fuse_available() {
+        return;
+    }
     let _g = serial();
     // The policy daemon's --secret loader uses the conservative 0400;
     // mode through the socket (`add` with mode) covers the passthrough:
@@ -549,12 +639,18 @@ fn e2e_source_mode_is_passed_through() {
     // its cached attrs until they expire.
     std::thread::sleep(Duration::from_millis(1200));
     let md = std::fs::metadata(split.path("s")).unwrap();
-    assert_eq!(md.permissions().mode() & 0o777, 0o400, "source mode passes through, masked read-only");
+    assert_eq!(
+        md.permissions().mode() & 0o777,
+        0o400,
+        "source mode passes through, masked read-only"
+    );
 }
 
 #[test]
 fn e2e_source_mode_passthrough_masks_write_bits() {
-    if !fuse_available() { return; }
+    if !fuse_available() {
+        return;
+    }
     let _g = serial();
     let split = Split::new("mode2", &[("s", b"X", "*")]);
     // Dynamically add a secret whose source file is 0644: the view must
@@ -564,7 +660,14 @@ fn e2e_source_mode_passthrough_masks_write_bits() {
     std::fs::write(&f, b"M").unwrap();
     use std::os::unix::fs::PermissionsExt as _;
     std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644)).unwrap();
-    let out = split.client(&["add", "m", "--file", &f.display().to_string(), "--hash", "*"]);
+    let out = split.client(&[
+        "add",
+        "m",
+        "--file",
+        &f.display().to_string(),
+        "--hash",
+        "*",
+    ]);
     assert!(out.status.success(), "add failed: {}", write_out(&out));
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -583,7 +686,9 @@ fn e2e_source_mode_passthrough_masks_write_bits() {
 
 #[test]
 fn e2e_statfs_works() {
-    if !fuse_available() { return; }
+    if !fuse_available() {
+        return;
+    }
     let _g = serial();
     let split = Split::new("statfs", &[("s", b"0123456789", "*")]);
     // statfs through std: use `nix`-free approach — command success on
@@ -593,7 +698,9 @@ fn e2e_statfs_works() {
 
 #[test]
 fn e2e_symlink_to_fuse_file() {
-    if !fuse_available() { return; }
+    if !fuse_available() {
+        return;
+    }
     let _g = serial();
     let split = Split::new("symlink", &[("s", b"VIA-Link", "*")]);
     let link = tempfile::tempdir().unwrap();
@@ -606,13 +713,22 @@ fn e2e_symlink_to_fuse_file() {
 
 #[test]
 fn e2e_dynamic_add_visible() {
-    if !fuse_available() { return; }
+    if !fuse_available() {
+        return;
+    }
     let _g = serial();
     let split = Split::new("add", &[("existing", b"E", "*")]);
     let src = tempfile::tempdir().unwrap();
     let f = src.path().join("new.secret");
     std::fs::write(&f, b"FRESH").unwrap();
-    let out = split.client(&["add", "fresh", "--file", &f.display().to_string(), "--hash", "*"]);
+    let out = split.client(&[
+        "add",
+        "fresh",
+        "--file",
+        &f.display().to_string(),
+        "--hash",
+        "*",
+    ]);
     assert!(out.status.success(), "add failed: {}", write_out(&out));
     // The content must appear through the mount (hub -> fused).
     let mut seen = false;
@@ -645,7 +761,9 @@ fn e2e_dynamic_add_visible() {
 
 #[test]
 fn e2e_pending_does_not_block_other_reads() {
-    if !fuse_available() { return; }
+    if !fuse_available() {
+        return;
+    }
     let _g = serial();
     let split = Split::new("pend", &[("s", b"P", "*"), ("other", b"O", "*")]);
     assert_eq!(std::fs::read(split.path("s")).unwrap(), b"P");
@@ -665,21 +783,28 @@ fn e2e_pending_does_not_block_other_reads() {
     let _ = reader.join();
 }
 
-
 #[test]
 fn e2e_hash_mismatch_denied() {
-    if !fuse_available() { return; }
-    if !hashing_available() { return; }
+    if !fuse_available() {
+        return;
+    }
+    if !hashing_available() {
+        return;
+    }
     let _g = serial();
     let pkg = package_hash_of_self();
     let split = Split::new_with_hashd("hash", &[("s", b"H", "definitely_not_our_package")]);
     let err = std::fs::read(split.path("s")).unwrap_err();
-    assert_eq!(err.raw_os_error(), Some(libc::EACCES), "wrong hash must pend out to deny");
+    assert_eq!(
+        err.raw_os_error(),
+        Some(libc::EACCES),
+        "wrong hash must pend out to deny"
+    );
     // …and with the right hash it serves immediately.
     drop(split);
     let split2 = Split::new_with_hashd("hash-ok", &[("s", b"H", &pkg)]);
     assert_eq!(std::fs::read(split2.path("s")).unwrap(), b"H");
-    }
+}
 
 fn package_hash_of_self() -> String {
     use fuse_protocol::io::SystemIo as _;
@@ -690,8 +815,12 @@ fn package_hash_of_self() -> String {
 
 #[test]
 fn e2e_different_binary_denied() {
-    if !fuse_available() { return; }
-    if !hashing_available() { return; }
+    if !fuse_available() {
+        return;
+    }
+    if !hashing_available() {
+        return;
+    }
     let _g = serial();
     // Our package hash whitelisted; a DIFFERENT binary must be denied.
     let pkg = package_hash_of_self();
@@ -705,13 +834,20 @@ fn e2e_different_binary_denied() {
     );
     let _ = split.client(&["reset", "--name", "s"]);
     let out = Command::new("cat").arg(split.path("s")).output().unwrap();
-    assert!(!out.status.success(), "different package must stay denied after reset");
+    assert!(
+        !out.status.success(),
+        "different package must stay denied after reset"
+    );
 }
 
 #[test]
 fn e2e_grant_forever_full_flow() {
-    if !fuse_available() { return; }
-    if !hashing_available() { return; }
+    if !fuse_available() {
+        return;
+    }
+    if !hashing_available() {
+        return;
+    }
     let _g = serial();
     let _pkg = package_hash_of_self();
     let split = Split::new_with_hashd("gf", &[("s", b"FOREVER", "not_our_hash")]);
@@ -729,8 +865,15 @@ fn e2e_grant_forever_full_flow() {
         }
         std::thread::sleep(Duration::from_millis(100));
     };
-    assert!(out.status.success(), "grant-forever failed: {}", write_out(&out));
-    let data = reader.join().unwrap().expect("blocked read served after grant-forever");
+    assert!(
+        out.status.success(),
+        "grant-forever failed: {}",
+        write_out(&out)
+    );
+    let data = reader
+        .join()
+        .unwrap()
+        .expect("blocked read served after grant-forever");
     assert_eq!(data, b"FOREVER");
     // Unlimited: repeated reads need no further approval.
     for _ in 0..3 {
@@ -742,20 +885,22 @@ fn e2e_grant_forever_full_flow() {
 
 fn first_pending_id(pending_text: &str) -> Option<u64> {
     // Format: "  [ID] name pid=..." (print_response PendingList).
-    pending_text
-        .lines()
-        .find_map(|l| {
-            let t = l.trim_start();
-            let rest = t.strip_prefix('[')?;
-            let id = rest.split(']').next()?;
-            id.parse().ok()
-        })
+    pending_text.lines().find_map(|l| {
+        let t = l.trim_start();
+        let rest = t.strip_prefix('[')?;
+        let id = rest.split(']').next()?;
+        id.parse().ok()
+    })
 }
 
 #[test]
 fn e2e_ld_preload_changes_package_hash_and_is_denied() {
-    if !fuse_available() { return; }
-    if !hashing_available() { return; }
+    if !fuse_available() {
+        return;
+    }
+    if !hashing_available() {
+        return;
+    }
     let _g = serial();
     // Baseline package hash serves; the same binary under LD_PRELOAD is
     // a different package and must be denied.
@@ -780,15 +925,19 @@ fn e2e_ld_preload_changes_package_hash_and_is_denied() {
 
 #[test]
 fn e2e_package_hash_works_with_deleted_mapped_library() {
-    if !fuse_available() { return; }
-    if !hashing_available() { return; }
+    if !fuse_available() {
+        return;
+    }
+    if !hashing_available() {
+        return;
+    }
     let _g = serial();
     // Our package (with the test binary's mapped set) whitelisted; the
     // deleted-mapped-library scenario lives in the package-hash e2e of
     // fuse-protocol; here we assert the split stack accepts our hash.
     let split = Split::new("deleted", &[("s", b"V", &package_hash_of_self())]);
     assert_eq!(std::fs::read(split.path("s")).unwrap(), b"V");
-    }
+}
 
 #[test]
 fn e2e_policy_kill9_the_mount_survives_and_a_store_only_respawn_resyncs() {
@@ -804,13 +953,14 @@ fn e2e_policy_kill9_the_mount_survives_and_a_store_only_respawn_resyncs() {
     //           reconnects, reads work again, and a NEW add served by
     //           the respawned policy becomes visible through the
     //           mount — re-sync, not just survival.
-    if !fuse_available() { return; }
+    if !fuse_available() {
+        return;
+    }
     let _g = serial();
     let mut split = Split::new("restart", &[("s", b"R1", "*")]);
 
     // Pinned fd: open BEFORE the kill (consumes this cycle's read).
-    let mut pinned = std::fs::File::open(split.path("s"))
-        .expect("open before the kill");
+    let mut pinned = std::fs::File::open(split.path("s")).expect("open before the kill");
     let mut buf = [0u8; 2];
     std::io::Read::read_exact(&mut pinned, &mut buf).unwrap();
     assert_eq!(&buf, b"R1");
@@ -818,7 +968,8 @@ fn e2e_policy_kill9_the_mount_survives_and_a_store_only_respawn_resyncs() {
     split.kill_policy();
 
     // Dead window: the mount survives...
-    let names = std::fs::read_dir(split.mount()).unwrap()
+    let names = std::fs::read_dir(split.mount())
+        .unwrap()
         .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
         .collect::<Vec<_>>();
     assert!(
@@ -835,8 +986,15 @@ fn e2e_policy_kill9_the_mount_survives_and_a_store_only_respawn_resyncs() {
     // connections — the bounded-open discipline), never hangs.
     let t0 = Instant::now();
     let err = split.read("s").unwrap_err();
-    assert!(t0.elapsed() < Duration::from_secs(5), "fresh open under a dead policy must fail fast, hung {t0:?}");
-    assert_eq!(err.raw_os_error(), Some(libc::EIO), "fresh open under a dead policy: {err}");
+    assert!(
+        t0.elapsed() < Duration::from_secs(5),
+        "fresh open under a dead policy must fail fast, hung {t0:?}"
+    );
+    assert_eq!(
+        err.raw_os_error(),
+        Some(libc::EIO),
+        "fresh open under a dead policy: {err}"
+    );
 
     // Respawn with NO --secret: the store alone must re-register.
     split.respawn_policy("restart");
@@ -845,7 +1003,11 @@ fn e2e_policy_kill9_the_mount_survives_and_a_store_only_respawn_resyncs() {
     // replay re-serves; budget was spent pre-kill (MR5 persistence),
     // so reset — the explicit policy path — then read.
     let out = split.client(&["reset", "--name", "s"]);
-    assert!(out.status.success(), "reset after respawn: {}", write_out(&out));
+    assert!(
+        out.status.success(),
+        "reset after respawn: {}",
+        write_out(&out)
+    );
     let mut ok = false;
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
@@ -856,15 +1018,30 @@ fn e2e_policy_kill9_the_mount_survives_and_a_store_only_respawn_resyncs() {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    assert!(ok, "read after store-only respawn never recovered: {}", split.dump_logs("restart"));
+    assert!(
+        ok,
+        "read after store-only respawn never recovered: {}",
+        split.dump_logs("restart")
+    );
 
     // Re-sync proof: a NEW secret served by the respawned policy
     // becomes visible through the reconnected mount.
     let src = tempfile::tempdir().unwrap();
     let f = src.path().join("post-restart.secret");
     std::fs::write(&f, b"AFTER").unwrap();
-    let out = split.client(&["add", "late", "--file", &f.display().to_string(), "--hash", "*"]);
-    assert!(out.status.success(), "post-respawn add failed: {}", write_out(&out));
+    let out = split.client(&[
+        "add",
+        "late",
+        "--file",
+        &f.display().to_string(),
+        "--hash",
+        "*",
+    ]);
+    assert!(
+        out.status.success(),
+        "post-respawn add failed: {}",
+        write_out(&out)
+    );
     let mut seen = false;
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
@@ -875,7 +1052,11 @@ fn e2e_policy_kill9_the_mount_survives_and_a_store_only_respawn_resyncs() {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    assert!(seen, "post-respawn add never became visible (no re-sync): {}", split.dump_logs("restart"));
+    assert!(
+        seen,
+        "post-respawn add never became visible (no re-sync): {}",
+        split.dump_logs("restart")
+    );
 }
 
 /// Keep the writer import used (build hygiene for helper fns above).

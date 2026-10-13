@@ -20,7 +20,6 @@
 #![allow(custom_parser)]
 #![allow(clippy::unwrap_used, clippy::panic, unused_results)]
 
-
 use std::io::Write;
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
@@ -145,7 +144,11 @@ fn curl(listener: &TcpListener) -> Option<(Fixture, TcpStream)> {
     let mut stdin = child.stdin.take();
     // Belt and braces: never write, never close, never flush EOF.
     let _ = stdin.as_mut().map(|s| s.flush());
-    let fixture = Fixture { child, _stdin: stdin, exe };
+    let fixture = Fixture {
+        child,
+        _stdin: stdin,
+        exe,
+    };
     // Accept and stay silent; the stream stays open (returned to the
     // caller) so curl keeps blocking until the test is done.
     let (conn, _) = listener.accept().expect("accept curl");
@@ -266,14 +269,21 @@ fn curl_package_hash_is_deterministic() {
         return;
     }
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let Some((curl1, _conn1)) = curl(&listener) else { return };
-    let Some((curl2, _conn2)) = curl(&listener) else { return };
+    let Some((curl1, _conn1)) = curl(&listener) else {
+        return;
+    };
+    let Some((curl2, _conn2)) = curl(&listener) else {
+        return;
+    };
     let io = RealSystemIo::new();
-    let h1 = io.sha256_process_package(curl1.pid()).expect("hash curl #1");
-    let h2 = io.sha256_process_package(curl2.pid()).expect("hash curl #2");
+    let h1 = io
+        .sha256_process_package(curl1.pid())
+        .expect("hash curl #1");
+    let h2 = io
+        .sha256_process_package(curl2.pid())
+        .expect("hash curl #2");
     assert_eq!(h1, h2, "same binary, same library set, same hash");
 }
-
 
 /// The package hash covers the library closure: it must differ from
 /// the bare executable's sha256 (the old, pre-package hash).
@@ -285,7 +295,9 @@ fn curl_package_hash_covers_libraries() {
         return;
     }
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let Some((c, _conn)) = curl(&listener) else { return };
+    let Some((c, _conn)) = curl(&listener) else {
+        return;
+    };
     let io = RealSystemIo::new();
     let package = io.sha256_process_package(c.pid()).expect("hash curl");
     let binary = io.sha256_file(c.exe()).expect("hash the curl binary file");
@@ -294,7 +306,6 @@ fn curl_package_hash_covers_libraries() {
         "the package hash must not collapse to the bare binary hash"
     );
 }
-
 
 // ── ssh client ────────────────────────────────────────────────────
 
@@ -308,14 +319,17 @@ fn ssh_client_package_hash_is_deterministic() {
         return;
     }
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let Some((ssh1, _conn1)) = ssh_client(&listener) else { return };
-    let Some((ssh2, _conn2)) = ssh_client(&listener) else { return };
+    let Some((ssh1, _conn1)) = ssh_client(&listener) else {
+        return;
+    };
+    let Some((ssh2, _conn2)) = ssh_client(&listener) else {
+        return;
+    };
     let io = RealSystemIo::new();
     let h1 = io.sha256_process_package(ssh1.pid()).expect("hash ssh #1");
     let h2 = io.sha256_process_package(ssh2.pid()).expect("hash ssh #2");
     assert_eq!(h1, h2, "same binary, same library set, same hash");
 }
-
 
 #[test]
 fn ssh_client_package_hash_covers_libraries() {
@@ -323,7 +337,9 @@ fn ssh_client_package_hash_covers_libraries() {
         return;
     }
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let Some((s, _conn)) = ssh_client(&listener) else { return };
+    let Some((s, _conn)) = ssh_client(&listener) else {
+        return;
+    };
     let io = RealSystemIo::new();
     let package = io.sha256_process_package(s.pid()).expect("hash ssh");
     let binary = io.sha256_file(s.exe()).expect("hash the ssh binary file");
@@ -333,7 +349,6 @@ fn ssh_client_package_hash_covers_libraries() {
     );
 }
 
-
 /// Two different network clients are two different packages.
 /// Two different network clients are two different packages.
 #[test]
@@ -342,14 +357,17 @@ fn ssh_client_and_curl_packages_differ() {
         return;
     }
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let Some((c, _cconn)) = curl(&listener) else { return };
-    let Some((s, _sconn)) = ssh_client(&listener) else { return };
+    let Some((c, _cconn)) = curl(&listener) else {
+        return;
+    };
+    let Some((s, _sconn)) = ssh_client(&listener) else {
+        return;
+    };
     let io = RealSystemIo::new();
     let curl_hash = io.sha256_process_package(c.pid()).expect("hash curl");
     let ssh_hash = io.sha256_process_package(s.pid()).expect("hash ssh");
     assert_ne!(curl_hash, ssh_hash, "ssh and curl are different packages");
 }
-
 
 // ── ssh-agent ─────────────────────────────────────────────────────
 
@@ -402,17 +420,20 @@ fn curl_and_ssh_agent_packages_differ() {
         return;
     }
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let Some((c, _conn)) = curl(&listener) else { return };
+    let Some((c, _conn)) = curl(&listener) else {
+        return;
+    };
     let Some(agent) = ssh_agent() else { return };
     let io = RealSystemIo::new();
     let curl_hash = io.sha256_process_package(c.pid()).expect("hash curl");
-    let agent_hash = io.sha256_process_package(agent.pid()).expect("hash ssh-agent");
+    let agent_hash = io
+        .sha256_process_package(agent.pid())
+        .expect("hash ssh-agent");
     assert_ne!(
         curl_hash, agent_hash,
         "curl and ssh-agent are different packages"
     );
 }
-
 
 // ── the init-ns capability gate, as a regression test ────────────
 //
@@ -441,7 +462,10 @@ fn inner_ssh_agent_package_hash() {
         std::fs::read_to_string("/proc/self/uid_map").ok(),
         std::fs::read_to_string("/proc/self/status")
             .ok()
-            .and_then(|s| s.lines().find(|l| l.starts_with("CapEff:")).map(|l| l.trim().to_string())),
+            .and_then(|s| s
+                .lines()
+                .find(|l| l.starts_with("CapEff:"))
+                .map(|l| l.trim().to_string())),
         std::fs::read_link("/proc/self/ns/user").ok(),
         std::fs::read_link("/proc/1/ns/user").ok(),
     );
@@ -456,8 +480,14 @@ fn inner_ssh_agent_package_hash() {
         std::fs::read_link(format!("/proc/{}/exe", agent.pid())).ok(),
         std::fs::read_to_string(format!("/proc/{}/status", agent.pid()))
             .ok()
-            .and_then(|s| s.lines().find(|l| l.starts_with("State:")).map(|l| l.trim().to_string())),
-        maps.as_deref().map(str::lines).map(Iterator::count).unwrap_or(usize::MAX),
+            .and_then(|s| s
+                .lines()
+                .find(|l| l.starts_with("State:"))
+                .map(|l| l.trim().to_string())),
+        maps.as_deref()
+            .map(str::lines)
+            .map(Iterator::count)
+            .unwrap_or(usize::MAX),
         std::fs::read_dir(format!("/proc/{}/map_files", agent.pid())).is_ok(),
     );
     let io = RealSystemIo::new();
@@ -483,7 +513,12 @@ fn rootless_userns_cannot_follow_map_files() {
     let out = Command::new("unshare")
         .args(["--user", "--map-root-user"])
         .arg(std::env::current_exe().expect("current exe"))
-        .args(["--exact", "inner_ssh_agent_package_hash", "--nocapture", "--test-threads=1"])
+        .args([
+            "--exact",
+            "inner_ssh_agent_package_hash",
+            "--nocapture",
+            "--test-threads=1",
+        ])
         .env(INNER_MARKER_ENV, "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

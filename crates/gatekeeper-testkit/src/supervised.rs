@@ -7,7 +7,7 @@
 use std::path::PathBuf;
 use std::process::{Child, Command};
 
-use crate::{Stack, bin};
+use crate::{bin, Stack};
 
 /// A live supervision stack: the policy daemon child plus everything
 /// needed to observe and drive the supervision lifecycle. Dropping it
@@ -41,13 +41,20 @@ impl SupervisedStack {
         let log = std::fs::File::create(root.path().join("server.log"))
             .expect("testkit: create server.log");
         let mut policy = Command::new(bin("fuse-server"))
-            .arg("--socket").arg(&socket)
-            .arg("--oracle-socket").arg(&oracle)
-            .arg("--mount-point").arg(&mount)
-            .arg("--fused-binary").arg(&daemon_binary)
+            .arg("--socket")
+            .arg(&socket)
+            .arg("--oracle-socket")
+            .arg(&oracle)
+            .arg("--mount-point")
+            .arg(&mount)
+            .arg("--fused-binary")
+            .arg(&daemon_binary)
             .arg("--pending-timeout")
             .arg(stack.pending_timeout.as_secs().max(1).to_string())
-            .env(fuse_protocol::ENV_POLICY_FILE, root.path().join("policy.json"))
+            .env(
+                fuse_protocol::ENV_POLICY_FILE,
+                root.path().join("policy.json"),
+            )
             .env("RUST_LOG", "fuse_server=info")
             .stdout(log.try_clone().expect("testkit: clone log"))
             .stderr(log)

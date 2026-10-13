@@ -37,7 +37,6 @@
 // the custom_parser lint exists only under the servyi driver.
 #![allow(unknown_lints)]
 #![allow(custom_parser)]
-
 #![allow(clippy::unwrap_used, clippy::panic, unused_results)]
 
 use std::io::{Read, Write as _};
@@ -46,8 +45,6 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 // ── stub fuse-server (compiled at test time) ────────────────────
-
-
 
 fn compile_stub_fuse_server(_dir: &Path) -> PathBuf {
     // The stub is a cargo EXAMPLE (crates/run-agent/examples/): cargo
@@ -187,11 +184,7 @@ impl Seam {
             .expect("spawn podman")
     }
 
-    fn run(
-        &self,
-        image: Option<&str>,
-        timeout_secs: u64,
-    ) -> RunOutcome {
+    fn run(&self, image: Option<&str>, timeout_secs: u64) -> RunOutcome {
         self.run_with(image, timeout_secs, &[], None)
     }
 
@@ -419,7 +412,8 @@ fn auto_yes_builds_trivial_image_and_reaches_creation() {
     );
     let dir = tempfile::tempdir().expect("tempdir");
     let dockerfile = dir.path().join("trivial.Dockerfile");
-    std::fs::write(&dockerfile, "FROM scratch\nCMD [\"true\"]\n").expect("write trivial Dockerfile");
+    std::fs::write(&dockerfile, "FROM scratch\nCMD [\"true\"]\n")
+        .expect("write trivial Dockerfile");
     let seam = Seam::new(&dir, "trivial");
 
     let out = seam.run_with(None, 120, &["--yes"], Some(&dockerfile));

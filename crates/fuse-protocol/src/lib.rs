@@ -97,12 +97,16 @@ pub fn state_file() -> std::path::PathBuf {
 
 pub use error::IoError;
 pub use io::{CommandOutput, IoProvider, PathState, SystemIo, Transport};
-pub use protocol::{Command, PENDING_ONLY_HASH, HashEntryStatus, MapEntry, MountEntry, PendingAccessInfo, Response, SecretStatus, ServerStateFile, StateSecretEntry, Salt, anonymize, anonymize_path, collapse_paths, versions_compatible};
+pub use protocol::{
+    anonymize, anonymize_path, collapse_paths, versions_compatible, Command, HashEntryStatus,
+    MapEntry, MountEntry, PendingAccessInfo, Response, Salt, SecretStatus, ServerStateFile,
+    StateSecretEntry, PENDING_ONLY_HASH,
+};
 pub use real_io::{MockSystemIo, RealSystemIo};
-pub use servatui_protocols::{cmd, CommandSpec, Completer, COMMAND_TABLE,
-    client_protocols, client_protocols_with_snapshots, pending_info, poll_pending_info,
-    poll_pending_once, poll_secret_names, print_response, run_command_once, PendingIds,
-    SecretNames,
+pub use servatui_protocols::{
+    client_protocols, client_protocols_with_snapshots, cmd, pending_info, poll_pending_info,
+    poll_pending_once, poll_secret_names, print_response, run_command_once, CommandSpec, Completer,
+    PendingIds, SecretNames, COMMAND_TABLE,
 };
 
 #[cfg(test)]

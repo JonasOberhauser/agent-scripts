@@ -18,7 +18,6 @@
 #![allow(custom_parser)]
 #![allow(clippy::unwrap_used, clippy::panic, unused_results)]
 
-
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::os::unix::net::UnixStream;
 use std::process::{Child, Command, Stdio};
@@ -68,7 +67,9 @@ fn ask(socket: &std::path::Path, request: &str) -> String {
         .write_all(format!("{request}\n").as_bytes())
         .expect("send request");
     let mut line = String::new();
-    BufReader::new(stream).read_line(&mut line).expect("read reply");
+    BufReader::new(stream)
+        .read_line(&mut line)
+        .expect("read reply");
     line
 }
 
@@ -90,17 +91,15 @@ fn speaks_the_protocol_over_a_real_socket() {
     let st: serde_json::Value =
         serde_json::from_str(reply.trim()).expect("status reply is JSON: {reply:?}");
     assert!(
-        st.get("status").is_some_and(|v| v == "privileged" || v == "unprivileged"),
+        st.get("status")
+            .is_some_and(|v| v == "privileged" || v == "unprivileged"),
         "any well-formed status reply counts, got: {reply:?}"
     );
 
     // Hash a real process: in a privileged context this must be a
     // 64-hex digest; unprivileged contexts fail classified. Either way
     // the reply is well-formed — never garbage, never silence.
-    let reply = ask(
-        &hashd.socket,
-        &format!("hash {}", std::process::id()),
-    );
+    let reply = ask(&hashd.socket, &format!("hash {}", std::process::id()));
     let v: serde_json::Value =
         serde_json::from_str(reply.trim()).expect("hash reply is JSON: {reply:?}");
     if let Some(h) = v.get("ok").and_then(|x| x.as_str()) {
@@ -139,7 +138,10 @@ fn socket_is_connectable_by_unprivileged_clients() {
     );
     for tool in ["setpriv", "python3"] {
         assert!(
-            Command::new(tool).arg("--version").output().is_ok_and(|o| o.status.success()),
+            Command::new(tool)
+                .arg("--version")
+                .output()
+                .is_ok_and(|o| o.status.success()),
             "refusing to skip: needs {tool} on PATH"
         );
     }

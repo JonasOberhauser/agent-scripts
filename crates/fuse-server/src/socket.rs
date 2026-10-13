@@ -8,10 +8,7 @@ use crate::protocols::server_protocols;
 use crate::state::ServerState;
 
 /// Run the CRUD socket server using servatui. Blocks the calling thread.
-pub fn run_socket_server(
-    socket_path: &Path,
-    state: Arc<ServerState>,
-) -> Result<(), String> {
+pub fn run_socket_server(socket_path: &Path, state: Arc<ServerState>) -> Result<(), String> {
     info!("Socket server listening at {}", socket_path.display());
 
     let handle = ServerHandle {
@@ -130,8 +127,7 @@ mod tests {
         let sock = dir.path().join("poll.sock");
         let state = Arc::new(ServerState::new());
         state.add("s.yaml", "/tmp/host/s.yaml", 4, "h1");
-        let id_a =
-            state.create_pending("s.yaml", 42, Some("h42"), "read request", Some("checker"));
+        let id_a = state.create_pending("s.yaml", 42, Some("h42"), "read request", Some("checker"));
         let id_b = state.create_pending("s.yaml", 43, None, "read request", None);
 
         let sock2 = sock.clone();

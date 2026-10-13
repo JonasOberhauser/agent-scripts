@@ -44,9 +44,13 @@ impl OracleHub {
     }
 
     fn broadcast(&self, cmd: &OracleCommand) {
-        self.snapshot.lock()
-            .expect("oracle hub lock: never held across a panic — poisoning means a server bug").push(cmd.clone());
-        let mut controls = self.controls.lock()
+        self.snapshot
+            .lock()
+            .expect("oracle hub lock: never held across a panic — poisoning means a server bug")
+            .push(cmd.clone());
+        let mut controls = self
+            .controls
+            .lock()
             .expect("oracle hub lock: never held across a panic — poisoning means a server bug");
         controls.retain(|stream| {
             let mut w = stream;
@@ -79,7 +83,9 @@ impl OracleHub {
     }
 
     pub fn remove(&self, name: &str) {
-        self.broadcast(&OracleCommand::Remove { name: name.to_string() });
+        self.broadcast(&OracleCommand::Remove {
+            name: name.to_string(),
+        });
     }
 }
 
@@ -88,10 +94,7 @@ impl OracleHub {
 /// `/proc/<pid>/map_files` itself (that is hashd's one job). Failures
 /// carry the commands that fix them, so a pending shown to a human
 /// says what to run.
-pub(crate) fn compute_pid_hash(
-    state: &ServerState,
-    pid: u32,
-) -> (Option<String>, Option<String>) {
+pub(crate) fn compute_pid_hash(state: &ServerState, pid: u32) -> (Option<String>, Option<String>) {
     // Resolved once at construction (immutable field, borrowed for
     // the whole call — no guard to own it out of): production keeps
     // the ambient env->default resolution; in-process harnesses pin
@@ -190,8 +193,7 @@ fn open_secret(
     use std::os::unix::io::AsRawFd;
 
     let reply_line = |r: &OracleReply| -> String {
-        serde_json::to_string(r)
-            .expect("serializing oracle reply: internal enum, infallible")
+        serde_json::to_string(r).expect("serializing oracle reply: internal enum, infallible")
     };
 
     let Some(host) = state.host_path(name) else {
@@ -258,7 +260,13 @@ fn open_secret(
     }
 }
 
-fn adjudicate(state: &ServerState, name: &str, pid: u32, offset: usize, size: usize) -> OracleReply {
+fn adjudicate(
+    state: &ServerState,
+    name: &str,
+    pid: u32,
+    offset: usize,
+    size: usize,
+) -> OracleReply {
     let (pid_hash, hash_error) = compute_pid_hash(state, pid);
     match state.attempt_read(name, pid, pid_hash.as_deref(), offset, size) {
         ReadOutcome::Granted => OracleReply::Allow,
@@ -277,11 +285,14 @@ fn adjudicate(state: &ServerState, name: &str, pid: u32, offset: usize, size: us
                 .denial_reason()
                 .unwrap_or_else(|| "access denied".into());
             let timeout = *state
-            .pending_timeout
-            .lock()
-            .expect("pending-timeout lock: never held across a panic");
+                .pending_timeout
+                .lock()
+                .expect("pending-timeout lock: never held across a panic");
             if timeout.is_zero() {
-                return OracleReply::Deny { errno: libc::EACCES, reason };
+                return OracleReply::Deny {
+                    errno: libc::EACCES,
+                    reason,
+                };
             }
             let id = state.create_pending_with_hash_error(
                 name,
@@ -314,7 +325,10 @@ fn adjudicate(state: &ServerState, name: &str, pid: u32, offset: usize, size: us
                 // the panel; cleanup drops the anonymous ones.
                 if Instant::now() > deadline {
                     warn!("Pending access {id} timed out");
-                    return OracleReply::Deny { errno: libc::EACCES, reason: format!("pending {id} expired: {reason}") };
+                    return OracleReply::Deny {
+                        errno: libc::EACCES,
+                        reason: format!("pending {id} expired: {reason}"),
+                    };
                 }
                 if state.is_pending_denied(id) {
                     // An operator deny releases the blocked reader AT
@@ -357,18 +371,31 @@ fn handle_conn(state: &Arc<ServerState>, hub: &OracleHub, conn: UnixStream) {
                     "data daemon reports protocol v{} vs server v{} — mixed vintages; \
                      its mount may silently miss content. Rebuild (cargo build \
                      --workspace) and restart the data daemon (fused).",
-                    v, fuse_protocol::VERSION
+                    v,
+                    fuse_protocol::VERSION
                 );
             }
             _ => {}
         }
-        let _ = writeln!(stream, "{}", serde_json::to_string(&OracleReply::Ok)
-                .expect("serializing Ok ack: internal enum, infallible"));
+        let _ = writeln!(
+            stream,
+            "{}",
+            serde_json::to_string(&OracleReply::Ok)
+                .expect("serializing Ok ack: internal enum, infallible")
+        );
         // Replay the content snapshot: late joiners get every secret.
-        for cmd in hub.snapshot.lock()
-            .expect("oracle hub lock: never held across a panic — poisoning means a server bug").iter() {
-            let _ = writeln!(stream, "{}", serde_json::to_string(cmd)
-                .expect("serializing replayed command: internal enum, infallible"));
+        for cmd in hub
+            .snapshot
+            .lock()
+            .expect("oracle hub lock: never held across a panic — poisoning means a server bug")
+            .iter()
+        {
+            let _ = writeln!(
+                stream,
+                "{}",
+                serde_json::to_string(cmd)
+                    .expect("serializing replayed command: internal enum, infallible")
+            );
         }
         let _ = stream.flush();
         // Bound the hub's writes to this connection (issue #77): a
@@ -381,35 +408,57 @@ fn handle_conn(state: &Arc<ServerState>, hub: &OracleHub, conn: UnixStream) {
         // (logged below); the daemon's reconnect re-syncs from the
         // snapshot.
         let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(2)));
-        hub.controls.lock()
-            .expect("oracle hub lock: never held across a panic — poisoning means a server bug").push(stream);
+        hub.controls
+            .lock()
+            .expect("oracle hub lock: never held across a panic — poisoning means a server bug")
+            .push(stream);
         return;
     }
     // Otherwise: one or more requests on this connection.
     let mut line = first;
     loop {
         match serde_json::from_str::<OracleRequest>(line.trim()) {
-            Ok(OracleRequest::Ask { name, pid, offset, size }) => {
+            Ok(OracleRequest::Ask {
+                name,
+                pid,
+                offset,
+                size,
+            }) => {
                 let reply = adjudicate(state, &name, pid, offset as usize, size as usize);
-                let _ = writeln!(stream, "{}", serde_json::to_string(&reply)
-                .expect("serializing reply line: internal enum, infallible"));
+                let _ = writeln!(
+                    stream,
+                    "{}",
+                    serde_json::to_string(&reply)
+                        .expect("serializing reply line: internal enum, infallible")
+                );
                 let _ = stream.flush();
             }
             Ok(OracleRequest::Stat { name }) => {
                 let reply = stat_secret(state, &name);
-                let _ = writeln!(stream, "{}", serde_json::to_string(&reply)
-                .expect("serializing reply line: internal enum, infallible"));
+                let _ = writeln!(
+                    stream,
+                    "{}",
+                    serde_json::to_string(&reply)
+                        .expect("serializing reply line: internal enum, infallible")
+                );
                 let _ = stream.flush();
             }
-            Ok(OracleRequest::Open { name, pid, kdev, kino }) => {
+            Ok(OracleRequest::Open {
+                name,
+                pid,
+                kdev,
+                kino,
+            }) => {
                 open_secret(state, &name, pid, kdev, kino, &mut stream);
             }
             _ => {
                 let _ = writeln!(
                     stream,
                     "{}",
-                    serde_json::to_string(&OracleReply::Error { message: "malformed request".into() })
-                        .expect("serializing Error reply: internal enum, infallible")
+                    serde_json::to_string(&OracleReply::Error {
+                        message: "malformed request".into()
+                    })
+                    .expect("serializing Error reply: internal enum, infallible")
                 );
                 return;
             }
@@ -426,7 +475,11 @@ fn handle_conn(state: &Arc<ServerState>, hub: &OracleHub, conn: UnixStream) {
 pub static ORACLE_HUB: std::sync::LazyLock<OracleHub> = std::sync::LazyLock::new(OracleHub::new);
 
 /// Run the oracle listener. Blocks.
-pub fn run_oracle_server(socket_path: &std::path::Path, state: Arc<ServerState>, hub: OracleHub) -> Result<(), String> {
+pub fn run_oracle_server(
+    socket_path: &std::path::Path,
+    state: Arc<ServerState>,
+    hub: OracleHub,
+) -> Result<(), String> {
     let stop = std::sync::atomic::AtomicBool::new(false);
     run_oracle_server_with_stop(socket_path, state, hub, &stop)
 }
@@ -459,11 +512,23 @@ pub fn run_oracle_server_with_stop(
 }
 
 /// Convenience for callers/tests: one blocking ask against a listener.
-pub fn ask(socket_path: &std::path::Path, name: &str, pid: u32, offset: u64, size: u32) -> Result<OracleReply, String> {
+pub fn ask(
+    socket_path: &std::path::Path,
+    name: &str,
+    pid: u32,
+    offset: u64,
+    size: u32,
+) -> Result<OracleReply, String> {
     let mut conn = UnixStream::connect(socket_path).map_err(|e| e.to_string())?;
-    let req = serde_json::to_string(&OracleRequest::Ask { name: name.into(), pid, offset, size })
+    let req = serde_json::to_string(&OracleRequest::Ask {
+        name: name.into(),
+        pid,
+        offset,
+        size,
+    })
+    .map_err(|e| e.to_string())?;
+    conn.write_all(format!("{req}\n").as_bytes())
         .map_err(|e| e.to_string())?;
-    conn.write_all(format!("{req}\n").as_bytes()).map_err(|e| e.to_string())?;
     let mut reader = BufReader::new(conn.try_clone().map_err(|e| e.to_string())?);
     let mut line = String::new();
     let _n = reader.read_line(&mut line).map_err(|e| e.to_string())?;
@@ -473,4 +538,3 @@ pub fn ask(socket_path: &std::path::Path, name: &str, pid: u32, offset: u64, siz
 /// Unused import guard for PendingAccessInfo (kept for API parity in tests).
 #[allow(dead_code)]
 fn _pending_type_witness(_: Option<PendingAccessInfo>) {}
-

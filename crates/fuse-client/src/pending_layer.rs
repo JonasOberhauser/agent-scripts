@@ -27,8 +27,8 @@ use fuse_protocol::{
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Wrap;
 use ratatui::widgets::Paragraph;
+use ratatui::widgets::Wrap;
 use servatui_display::{DisplayLayer, EventResult, LayerCtx, StackIntent};
 use servyi_servatui::tui::WidgetEntry;
 use unicode_width::UnicodeWidthStr;
@@ -61,10 +61,16 @@ const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 /// rendering are single code paths.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Button {
-    Deny { id: u64 },
-    Grant { id: u64 },
+    Deny {
+        id: u64,
+    },
+    Grant {
+        id: u64,
+    },
     /// Permanent grant (issue #11): whitelist the observed package hash.
-    GrantForever { id: u64 },
+    GrantForever {
+        id: u64,
+    },
     DenyAll,
     GrantAll,
 }
@@ -122,9 +128,7 @@ impl Button {
             Button::Deny { id } | Button::Grant { id } | Button::GrantForever { id } => {
                 vec![one(*id)]
             }
-            Button::DenyAll | Button::GrantAll => {
-                snapshot.iter().map(|p| one(p.id)).collect()
-            }
+            Button::DenyAll | Button::GrantAll => snapshot.iter().map(|p| one(p.id)).collect(),
         }
     }
 
@@ -205,7 +209,9 @@ pub(crate) fn sync_slots(slots: &mut Slots, incoming: &[PendingAccessInfo]) {
         }
     }
     for req in incoming {
-        let shown = slots.iter().any(|s| s.as_ref().is_some_and(|r| r.id == req.id));
+        let shown = slots
+            .iter()
+            .any(|s| s.as_ref().is_some_and(|r| r.id == req.id));
         if !shown {
             if let Some(free) = slots.iter_mut().find(|s| s.is_none()) {
                 *free = Some(req.clone());
@@ -225,11 +231,7 @@ fn occupied(slots: &Slots) -> Vec<usize> {
 /// the cursor somewhere nothing renders).
 fn occupied_live(slots: &Slots, disabled: &std::collections::HashSet<u64>) -> Vec<usize> {
     (0..slots.len())
-        .filter(|&i| {
-            slots[i]
-                .as_ref()
-                .is_some_and(|r| !disabled.contains(&r.id))
-        })
+        .filter(|&i| slots[i].as_ref().is_some_and(|r| !disabled.contains(&r.id)))
         .collect()
 }
 
@@ -244,14 +246,21 @@ pub(crate) fn cursor_after_action(slots: &Slots, slot: usize) -> Cursor {
         .copied()
         .or_else(|| occ.first().copied());
     match next {
-        Some(i) => Cursor::Request { slot: i, sel: Sel::Grant },
+        Some(i) => Cursor::Request {
+            slot: i,
+            sel: Sel::Grant,
+        },
         None => Cursor::All { grant: true },
     }
 }
 
 /// Move the cursor one line up (requests, then the all-row, wrapping;
 /// freed slots are skipped).
-pub(crate) fn cursor_up(slots: &Slots, cur: Cursor, disabled: &std::collections::HashSet<u64>) -> Cursor {
+pub(crate) fn cursor_up(
+    slots: &Slots,
+    cur: Cursor,
+    disabled: &std::collections::HashSet<u64>,
+) -> Cursor {
     let occ = occupied_live(slots, disabled);
     if occ.is_empty() {
         // Everything (including the all-row) is disabled: arrows are
@@ -262,8 +271,13 @@ pub(crate) fn cursor_up(slots: &Slots, cur: Cursor, disabled: &std::collections:
         Cursor::Request { slot, sel } => {
             let idx = occ.iter().position(|&i| i == slot);
             match idx {
-                Some(0) => Cursor::All { grant: sel != Sel::Deny },
-                Some(i) => Cursor::Request { slot: occ[i - 1], sel },
+                Some(0) => Cursor::All {
+                    grant: sel != Sel::Deny,
+                },
+                Some(i) => Cursor::Request {
+                    slot: occ[i - 1],
+                    sel,
+                },
                 None => Cursor::Request { slot: occ[0], sel },
             }
         }
@@ -281,7 +295,11 @@ pub(crate) fn cursor_up(slots: &Slots, cur: Cursor, disabled: &std::collections:
 
 /// Move the cursor one line down (requests, then the all-row, wrapping;
 /// freed slots are skipped).
-pub(crate) fn cursor_down(slots: &Slots, cur: Cursor, disabled: &std::collections::HashSet<u64>) -> Cursor {
+pub(crate) fn cursor_down(
+    slots: &Slots,
+    cur: Cursor,
+    disabled: &std::collections::HashSet<u64>,
+) -> Cursor {
     let occ = occupied_live(slots, disabled);
     if occ.is_empty() {
         return cur;
@@ -290,8 +308,13 @@ pub(crate) fn cursor_down(slots: &Slots, cur: Cursor, disabled: &std::collection
         Cursor::Request { slot, sel } => {
             let idx = occ.iter().position(|&i| i == slot);
             match idx {
-                Some(i) if i + 1 < occ.len() => Cursor::Request { slot: occ[i + 1], sel },
-                Some(_) => Cursor::All { grant: sel != Sel::Deny },
+                Some(i) if i + 1 < occ.len() => Cursor::Request {
+                    slot: occ[i + 1],
+                    sel,
+                },
+                Some(_) => Cursor::All {
+                    grant: sel != Sel::Deny,
+                },
                 None => Cursor::Request { slot: occ[0], sel },
             }
         }
@@ -335,7 +358,11 @@ fn all_row_rect(panel: Rect) -> Rect {
 /// (grant on the left, deny on the right). Shared by request rows and
 /// the all-row (only the labels differ).
 fn button_pair(row: Rect, all: bool) -> (Rect, Rect) {
-    let (deny_l, grant_l) = if all { ("[deny all]", "[grant all]") } else { ("[deny]", "[grant]") };
+    let (deny_l, grant_l) = if all {
+        ("[deny all]", "[grant all]")
+    } else {
+        ("[deny]", "[grant]")
+    };
     let deny = Rect {
         x: row.x + row.width.saturating_sub(deny_l.len() as u16),
         y: row.y,
@@ -433,10 +460,15 @@ fn button_spans_styled(button: Button, selected: bool, disabled: bool) -> Vec<Sp
     if disabled {
         let label = button.label();
         let word = &label[1..label.len() - 1];
-        let brackets = Style::default().fg(button.color()).add_modifier(Modifier::DIM);
+        let brackets = Style::default()
+            .fg(button.color())
+            .add_modifier(Modifier::DIM);
         return vec![
             Span::styled("[", brackets),
-            Span::styled(word.to_string(), Style::default().add_modifier(Modifier::DIM)),
+            Span::styled(
+                word.to_string(),
+                Style::default().add_modifier(Modifier::DIM),
+            ),
             Span::styled("]", brackets),
         ];
     }
@@ -501,7 +533,11 @@ fn requester_and_secret(req: &PendingAccessInfo, collapsed: Option<&str>) -> Str
 /// identity lives in its suffix (`.../x/x1/bar.txt`), so a tail-cut
 /// (what plain truncation does) would eat the basename and make the
 /// row disagree with the status table even further.
-fn fit_requester_and_secret(req: &PendingAccessInfo, collapsed: Option<&str>, max: usize) -> String {
+fn fit_requester_and_secret(
+    req: &PendingAccessInfo,
+    collapsed: Option<&str>,
+    max: usize,
+) -> String {
     let whole = requester_and_secret(req, collapsed);
     if whole.width() <= max {
         let mut out = whole;
@@ -578,7 +614,11 @@ fn grid_row_line_styled_collapsed(
     collapsed: Option<&str>,
 ) -> Line<'static> {
     let all = matches!(row, GridRow::All);
-    let (deny_l, grant_l) = if all { ("[deny all]", "[grant all]") } else { ("[deny]", "[grant]") };
+    let (deny_l, grant_l) = if all {
+        ("[deny all]", "[grant all]")
+    } else {
+        ("[deny]", "[grant]")
+    };
     let forever_w = if all { 0 } else { "[forever]".len() + 1 };
     let buttons_w = deny_l.len() + 1 + grant_l.len() + forever_w;
     let mut spans: Vec<Span<'static>> = Vec::new();
@@ -597,11 +637,19 @@ fn grid_row_line_styled_collapsed(
         GridRow::All => {}
     }
     let content_w: usize = spans.iter().map(|s| s.content.width()).sum();
-    spans.push(Span::raw(" ".repeat(
-        (width as usize).saturating_sub(content_w + buttons_w),
-    )));
-    let deny = if all { Button::DenyAll } else { Button::Deny { id: 0 } };
-    let grant = if all { Button::GrantAll } else { Button::Grant { id: 0 } };
+    spans.push(Span::raw(
+        " ".repeat((width as usize).saturating_sub(content_w + buttons_w)),
+    ));
+    let deny = if all {
+        Button::DenyAll
+    } else {
+        Button::Deny { id: 0 }
+    };
+    let grant = if all {
+        Button::GrantAll
+    } else {
+        Button::Grant { id: 0 }
+    };
     let sel = if disabled { None } else { sel_here };
     // Issue #66: remembered denials (expired asks) render grant dim —
     // forever and deny stay live buttons.
@@ -609,7 +657,11 @@ fn grid_row_line_styled_collapsed(
         GridRow::Request(req) => req.expired,
         GridRow::All => false,
     };
-    let grant_sel = if grant_dim { None } else { sel.filter(|s| *s == Sel::Grant) };
+    let grant_sel = if grant_dim {
+        None
+    } else {
+        sel.filter(|s| *s == Sel::Grant)
+    };
     if let GridRow::Request(_) = row {
         spans.extend(button_spans_styled(
             Button::GrantForever { id: 0 },
@@ -618,7 +670,11 @@ fn grid_row_line_styled_collapsed(
         ));
         spans.push(Span::raw(" "));
     }
-    spans.extend(button_spans_styled(grant, grant_sel.is_some(), disabled || grant_dim));
+    spans.extend(button_spans_styled(
+        grant,
+        grant_sel.is_some(),
+        disabled || grant_dim,
+    ));
     spans.push(Span::raw(" "));
     spans.extend(button_spans_styled(deny, sel == Some(Sel::Deny), disabled));
     Line::from(spans)
@@ -673,7 +729,11 @@ fn service(
     match req {
         PanelRequest::Poll => {
             match poll_pending_info(socket) {
-                Ok(list) => *pending.lock().expect("pending snapshot lock: poller discipline") = list,
+                Ok(list) => {
+                    *pending
+                        .lock()
+                        .expect("pending snapshot lock: poller discipline") = list
+                }
                 Err(e) => tracing::warn!("pending poll failed: {e}"),
             }
             // The same tick refreshes the secret-name snapshot that
@@ -682,9 +742,13 @@ fn service(
             // difference (issue #34).
             match poll_secret_names(socket) {
                 Ok(names) => {
-                    *secrets.lock().expect("names snapshot lock: poller discipline") = names.clone();
+                    *secrets
+                        .lock()
+                        .expect("names snapshot lock: poller discipline") = names.clone();
                     let rendered = fuse_protocol::collapse_paths(&names);
-                    let mut c = collapsed.lock().expect("collapsed-map lock: poller discipline");
+                    let mut c = collapsed
+                        .lock()
+                        .expect("collapsed-map lock: poller discipline");
                     c.clear();
                     c.extend(names.into_iter().zip(rendered));
                 }
@@ -707,16 +771,23 @@ fn service(
                     // human actually sees (stderr is hidden behind the
                     // alternate screen): push every line, including any
                     // remediation commands embedded by the server.
-                    log.lock().expect("log-window lock: action-path discipline").extend(
-                        format!("pending action '{name}' failed: {e}")
-                            .lines()
-                            .map(str::to_string),
-                    );
-                    *error.lock().expect("last-error lock: action-path discipline") = Some(format!("{name}: {e}"));
+                    log.lock()
+                        .expect("log-window lock: action-path discipline")
+                        .extend(
+                            format!("pending action '{name}' failed: {e}")
+                                .lines()
+                                .map(str::to_string),
+                        );
+                    *error
+                        .lock()
+                        .expect("last-error lock: action-path discipline") =
+                        Some(format!("{name}: {e}"));
                 }
                 None => {
                     tracing::info!("pending action '{name}' ok");
-                    *error.lock().expect("last-error lock: action-path discipline") = None;
+                    *error
+                        .lock()
+                        .expect("last-error lock: action-path discipline") = None;
                 }
             }
         }
@@ -735,11 +806,7 @@ pub(crate) struct DirectTalk {
 
 #[cfg(test)]
 impl DirectTalk {
-    pub(crate) fn new(
-        socket: impl Into<PathBuf>,
-        secrets: SecretNames,
-        error: LastError,
-    ) -> Self {
+    pub(crate) fn new(socket: impl Into<PathBuf>, secrets: SecretNames, error: LastError) -> Self {
         Self {
             socket: socket.into(),
             secrets,
@@ -753,7 +820,15 @@ impl DirectTalk {
 #[cfg(test)]
 impl ServerTalk for DirectTalk {
     fn request(&self, snapshot: &PendingIds, req: PanelRequest) {
-        service(&self.socket, snapshot, &self.secrets, &self.collapsed, &self.error, &self.log, req);
+        service(
+            &self.socket,
+            snapshot,
+            &self.secrets,
+            &self.collapsed,
+            &self.error,
+            &self.log,
+            req,
+        );
     }
 }
 
@@ -780,7 +855,15 @@ pub(crate) fn spawn_worker(
             let follow_up = matches!(req, PanelRequest::Action { .. });
             service(&socket, &snapshot, &secrets, &collapsed, &error, &log, req);
             if follow_up {
-                service(&socket, &snapshot, &secrets, &collapsed, &error, &log, PanelRequest::Poll);
+                service(
+                    &socket,
+                    &snapshot,
+                    &secrets,
+                    &collapsed,
+                    &error,
+                    &log,
+                    PanelRequest::Poll,
+                );
             }
         }
     });
@@ -814,7 +897,10 @@ fn cursor_of_child(child: &GridChild) -> Cursor {
             Button::Grant { .. } | Button::GrantAll => Sel::Grant,
             Button::Deny { .. } | Button::DenyAll => Sel::Deny,
         };
-        Cursor::Request { slot: child.row, sel }
+        Cursor::Request {
+            slot: child.row,
+            sel,
+        }
     }
 }
 
@@ -984,12 +1070,19 @@ impl PendingPanelLayer {
 }
 
 impl DisplayLayer for PendingPanelLayer {
-    fn on_overlay(&mut self, ctx: &mut LayerCtx<'_>, widgets: &mut Vec<WidgetEntry>) -> StackIntent {
+    fn on_overlay(
+        &mut self,
+        ctx: &mut LayerCtx<'_>,
+        widgets: &mut Vec<WidgetEntry>,
+    ) -> StackIntent {
         // Self-polling: the panel owns the 1s poll cadence (the frame
         // loop ticks every ~100ms, so a fresh request appears within one
         // interval). The request itself never blocks the frame.
         let now = Instant::now();
-        if self.last_poll.is_none_or(|t| now.duration_since(t) >= POLL_INTERVAL) {
+        if self
+            .last_poll
+            .is_none_or(|t| now.duration_since(t) >= POLL_INTERVAL)
+        {
             self.last_poll = Some(now);
             self.talk.request(&self.pending, PanelRequest::Poll);
         }
@@ -1021,7 +1114,11 @@ impl DisplayLayer for PendingPanelLayer {
         let has_new = snapshot.iter().any(|p| !self.seen.contains(&p.id));
         self.seen.retain(|id| snapshot.iter().any(|p| p.id == *id));
         self.seen.extend(snapshot.iter().map(|p| p.id));
-        let intent = if has_new { StackIntent::Top } else { StackIntent::Keep };
+        let intent = if has_new {
+            StackIntent::Top
+        } else {
+            StackIntent::Keep
+        };
 
         // Capture the hover hit from the PREVIOUS frame's grid before
         // the clear — the same geometry the input handlers used, and
@@ -1057,9 +1154,7 @@ impl DisplayLayer for PendingPanelLayer {
             let area = panel;
             widgets.push(WidgetEntry {
                 name: PANEL_NAME,
-                widget: Box::new(
-                    Paragraph::new(hint).wrap(Wrap { trim: true }),
-                ),
+                widget: Box::new(Paragraph::new(hint).wrap(Wrap { trim: true })),
                 area,
             });
             return intent;
@@ -1070,11 +1165,10 @@ impl DisplayLayer for PendingPanelLayer {
             widget: Box::new(Paragraph::new(title_line(
                 occupied(&self.slots).len(),
                 snapshot.len(),
-                self
-                .error
-                .lock()
-                .expect("last-error lock: render-path discipline")
-                .as_deref(),
+                self.error
+                    .lock()
+                    .expect("last-error lock: render-path discipline")
+                    .as_deref(),
                 panel.width,
             ))),
             area: panel,
@@ -1122,12 +1216,11 @@ impl DisplayLayer for PendingPanelLayer {
                             row.width,
                             None,
                             true,
-                            self
-                            .collapsed
-                            .lock()
-                            .expect("collapsed-map lock: render-path discipline")
-                            .get(&req.secret_name)
-                            .map(String::as_str),
+                            self.collapsed
+                                .lock()
+                                .expect("collapsed-map lock: render-path discipline")
+                                .get(&req.secret_name)
+                                .map(String::as_str),
                         )
                     } else {
                         grid_row_line_hover(
@@ -1135,12 +1228,11 @@ impl DisplayLayer for PendingPanelLayer {
                             row.width,
                             sel_here,
                             hovered.as_ref(),
-                            self
-                            .collapsed
-                            .lock()
-                            .expect("collapsed-map lock: render-path discipline")
-                            .get(&req.secret_name)
-                            .map(String::as_str),
+                            self.collapsed
+                                .lock()
+                                .expect("collapsed-map lock: render-path discipline")
+                                .get(&req.secret_name)
+                                .map(String::as_str),
                         )
                     }
                 }
@@ -1163,8 +1255,16 @@ impl DisplayLayer for PendingPanelLayer {
         // cleared at frame start, so last frame's children are gone —
         // a hit-test run before re-registering never finds them.
         let (deny, grant) = button_pair(all_row, true);
-        self.grid.children.push(GridChild { row: MAX_SHOWN, button: Button::DenyAll, rect: deny });
-        self.grid.children.push(GridChild { row: MAX_SHOWN, button: Button::GrantAll, rect: grant });
+        self.grid.children.push(GridChild {
+            row: MAX_SHOWN,
+            button: Button::DenyAll,
+            rect: deny,
+        });
+        self.grid.children.push(GridChild {
+            row: MAX_SHOWN,
+            button: Button::GrantAll,
+            rect: grant,
+        });
         let all_hovered = if mouse_shows && hovered_child.is_some_and(|h| h.row == MAX_SHOWN) {
             hovered_child.map(|h| h.button)
         } else {
@@ -1184,7 +1284,13 @@ impl DisplayLayer for PendingPanelLayer {
         let all_line = if all_disabled {
             grid_row_line_styled(GridRow::All, all_row.width, None, true)
         } else {
-            grid_row_line_hover(GridRow::All, all_row.width, sel_here, all_hovered.as_ref(), None)
+            grid_row_line_hover(
+                GridRow::All,
+                all_row.width,
+                sel_here,
+                all_hovered.as_ref(),
+                None,
+            )
         };
         widgets.push(WidgetEntry {
             name: PANEL_NAME,
@@ -1204,7 +1310,12 @@ impl DisplayLayer for PendingPanelLayer {
                         return EventResult::Swallow;
                     }
                     // Presses on panel rows (not the log underneath):
-                    if self.grid.rows.iter().any(|area| contains(area, m.column, m.row)) {
+                    if self
+                        .grid
+                        .rows
+                        .iter()
+                        .any(|area| contains(area, m.column, m.row))
+                    {
                         return EventResult::Swallow;
                     }
                     EventResult::Pass
@@ -1217,7 +1328,11 @@ impl DisplayLayer for PendingPanelLayer {
                     // the highlight, off it the keyboard wins.
                     self.hover.set(Some((m.column, m.row)));
                     let hovering = self.grid.hit(m.column, m.row).is_some();
-                    self.owner.set(if hovering { Owner::Mouse } else { Owner::Keyboard });
+                    self.owner.set(if hovering {
+                        Owner::Mouse
+                    } else {
+                        Owner::Keyboard
+                    });
                     let over_panel = self
                         .grid
                         .rows
@@ -1297,12 +1412,16 @@ impl DisplayLayer for PendingPanelLayer {
                     }
                     KeyCode::Enter => {
                         let button = match self.cursor {
-                            Cursor::Request { slot, sel } => {
-                                Button::at_cursor(self.slots.get(slot).and_then(|s| s.as_ref()), false, sel)
-                            }
-                            Cursor::All { grant } => {
-                                Button::at_cursor(None, true, if grant { Sel::Grant } else { Sel::Deny })
-                            }
+                            Cursor::Request { slot, sel } => Button::at_cursor(
+                                self.slots.get(slot).and_then(|s| s.as_ref()),
+                                false,
+                                sel,
+                            ),
+                            Cursor::All { grant } => Button::at_cursor(
+                                None,
+                                true,
+                                if grant { Sel::Grant } else { Sel::Deny },
+                            ),
                         };
                         if let Some(button) = button {
                             let row = match self.cursor {
@@ -1345,8 +1464,8 @@ mod tests {
     use super::*;
     use crossterm::event::KeyModifiers;
     use fuse_protocol::pending_info;
-    use std::sync::{Arc, Mutex};
     use std::path::Path;
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     fn ids(list: &[u64]) -> Vec<PendingAccessInfo> {
@@ -1391,8 +1510,7 @@ mod tests {
     fn slots_fill_top_down_and_overflow_hides() {
         let mut slots = empty_slots();
         sync_slots(&mut slots, &ids(&[1, 2, 3, 4, 5, 6]));
-        let shown: Vec<Option<u64>> =
-            slots.iter().map(|s| s.as_ref().map(|r| r.id)).collect();
+        let shown: Vec<Option<u64>> = slots.iter().map(|s| s.as_ref().map(|r| r.id)).collect();
         assert_eq!(
             shown,
             vec![Some(1), Some(2), Some(3), Some(4), Some(5)],
@@ -1406,14 +1524,12 @@ mod tests {
         sync_slots(&mut slots, &ids(&[1, 2, 3]));
         // Request 2 handled: its slot frees, 1 and 3 keep their lines.
         sync_slots(&mut slots, &ids(&[1, 3]));
-        let shown: Vec<Option<u64>> =
-            slots.iter().map(|s| s.as_ref().map(|r| r.id)).collect();
+        let shown: Vec<Option<u64>> = slots.iter().map(|s| s.as_ref().map(|r| r.id)).collect();
         assert_eq!(shown, vec![Some(1), None, Some(3), None, None]);
         // New request 9: takes the TOPMOST free slot (index 1), not the
         // bottom-most.
         sync_slots(&mut slots, &ids(&[1, 3, 9]));
-        let shown: Vec<Option<u64>> =
-            slots.iter().map(|s| s.as_ref().map(|r| r.id)).collect();
+        let shown: Vec<Option<u64>> = slots.iter().map(|s| s.as_ref().map(|r| r.id)).collect();
         assert_eq!(shown, vec![Some(1), Some(9), Some(3), None, None]);
     }
 
@@ -1421,12 +1537,30 @@ mod tests {
     fn cursor_advances_to_next_and_wraps_to_all() {
         let mut slots = empty_slots();
         sync_slots(&mut slots, &ids(&[1, 2, 3]));
-        assert_eq!(cursor_after_action(&slots, 0), Cursor::Request { slot: 1, sel: Sel::Grant });
+        assert_eq!(
+            cursor_after_action(&slots, 0),
+            Cursor::Request {
+                slot: 1,
+                sel: Sel::Grant
+            }
+        );
         // Acting on the last request wraps cyclically to the first.
-        assert_eq!(cursor_after_action(&slots, 2), Cursor::Request { slot: 0, sel: Sel::Grant });
+        assert_eq!(
+            cursor_after_action(&slots, 2),
+            Cursor::Request {
+                slot: 0,
+                sel: Sel::Grant
+            }
+        );
         // Only request 2 left (slot 1): handling it wraps to itself.
         sync_slots(&mut slots, &ids(&[2]));
-        assert_eq!(cursor_after_action(&slots, 1), Cursor::Request { slot: 1, sel: Sel::Grant });
+        assert_eq!(
+            cursor_after_action(&slots, 1),
+            Cursor::Request {
+                slot: 1,
+                sel: Sel::Grant
+            }
+        );
         // None left: the all-row.
         sync_slots(&mut slots, &ids(&[]));
         assert_eq!(cursor_after_action(&slots, 1), Cursor::All { grant: true });
@@ -1436,16 +1570,21 @@ mod tests {
     fn cursor_stays_on_request_when_new_ones_appear_above() {
         let mut slots = empty_slots();
         sync_slots(&mut slots, &ids(&[5, 6]));
-        let cursor = Cursor::Request { slot: 1, sel: Sel::Grant }; // on request 6
+        let cursor = Cursor::Request {
+            slot: 1,
+            sel: Sel::Grant,
+        }; // on request 6
         sync_slots(&mut slots, &ids(&[4, 5, 6]));
         // 4 took the topmost FREE slot (2): positions of 5 and 6 are
         // unchanged, so the cursor still points at request 6.
-        let shown: Vec<Option<u64>> =
-            slots.iter().map(|s| s.as_ref().map(|r| r.id)).collect();
+        let shown: Vec<Option<u64>> = slots.iter().map(|s| s.as_ref().map(|r| r.id)).collect();
         assert_eq!(shown, vec![Some(5), Some(6), Some(4), None, None]);
         assert_eq!(
             cursor_up(&slots, cursor, &Default::default()),
-            Cursor::Request { slot: 0, sel: Sel::Grant }
+            Cursor::Request {
+                slot: 0,
+                sel: Sel::Grant
+            }
         );
     }
 
@@ -1460,27 +1599,57 @@ mod tests {
         let mut slots = empty_slots();
         sync_slots(&mut slots, &ids(&[1, 2, 3]));
         let disabled: std::collections::HashSet<u64> = [2u64].into_iter().collect();
-        let c = Cursor::Request { slot: 0, sel: Sel::Grant };
+        let c = Cursor::Request {
+            slot: 0,
+            sel: Sel::Grant,
+        };
         assert_eq!(
             cursor_down(&slots, c, &disabled),
-            Cursor::Request { slot: 2, sel: Sel::Grant },
+            Cursor::Request {
+                slot: 2,
+                sel: Sel::Grant
+            },
             "the in-flight slot 1 is skipped"
         );
         assert_eq!(
-            cursor_up(&slots, Cursor::Request { slot: 2, sel: Sel::Grant }, &disabled),
-            Cursor::Request { slot: 0, sel: Sel::Grant },
+            cursor_up(
+                &slots,
+                Cursor::Request {
+                    slot: 2,
+                    sel: Sel::Grant
+                },
+                &disabled
+            ),
+            Cursor::Request {
+                slot: 0,
+                sel: Sel::Grant
+            },
             "up skips the in-flight row and lands on the live one above"
         );
         assert_eq!(
-            cursor_up(&slots, Cursor::Request { slot: 0, sel: Sel::Grant }, &disabled),
+            cursor_up(
+                &slots,
+                Cursor::Request {
+                    slot: 0,
+                    sel: Sel::Grant
+                },
+                &disabled
+            ),
             Cursor::All { grant: true },
             "up from the top live row wraps to the all-row"
         );
 
         // Everything in flight: arrows do nothing at all.
         let all: std::collections::HashSet<u64> = [1u64, 2, 3].into_iter().collect();
-        let c = Cursor::Request { slot: 0, sel: Sel::Grant };
-        assert_eq!(cursor_down(&slots, c, &all), c, "all disabled: Down is a no-op");
+        let c = Cursor::Request {
+            slot: 0,
+            sel: Sel::Grant,
+        };
+        assert_eq!(
+            cursor_down(&slots, c, &all),
+            c,
+            "all disabled: Down is a no-op"
+        );
         assert_eq!(cursor_up(&slots, c, &all), c, "all disabled: Up is a no-op");
     }
 
@@ -1490,13 +1659,30 @@ mod tests {
         let mut slots = empty_slots();
         sync_slots(&mut slots, &ids(&[1, 2, 3]));
         sync_slots(&mut slots, &ids(&[1, 3]));
-        let c = Cursor::Request { slot: 0, sel: Sel::Grant };
+        let c = Cursor::Request {
+            slot: 0,
+            sel: Sel::Grant,
+        };
         let c = cursor_down(&slots, c, &Default::default());
-        assert_eq!(c, Cursor::Request { slot: 2, sel: Sel::Grant }, "empty slot 1 is skipped");
+        assert_eq!(
+            c,
+            Cursor::Request {
+                slot: 2,
+                sel: Sel::Grant
+            },
+            "empty slot 1 is skipped"
+        );
         let c = cursor_down(&slots, c, &Default::default());
         assert_eq!(c, Cursor::All { grant: true });
         let c = cursor_down(&slots, c, &Default::default());
-        assert_eq!(c, Cursor::Request { slot: 0, sel: Sel::Grant }, "wraps to the top");
+        assert_eq!(
+            c,
+            Cursor::Request {
+                slot: 0,
+                sel: Sel::Grant
+            },
+            "wraps to the top"
+        );
         assert_eq!(
             cursor_up(&slots, c, &Default::default()),
             Cursor::All { grant: true },
@@ -1514,7 +1700,10 @@ mod tests {
         assert!(hint.starts_with("use 'pending'"), "hint: {hint}");
         assert!(hint.contains("'grant'"), "hint: {hint}");
         assert!(hint.contains("'deny'"), "hint: {hint}");
-        assert!(hint.ends_with("to deal with pending requests"), "hint: {hint}");
+        assert!(
+            hint.ends_with("to deal with pending requests"),
+            "hint: {hint}"
+        );
         for spec in fuse_protocol::COMMAND_TABLE {
             if matches!(spec.complete, fuse_protocol::Completer::PendingIds) {
                 assert!(
@@ -1545,7 +1734,10 @@ mod tests {
         assert!(display.route_event(&key(KeyCode::Enter)), "swallowed");
         let conversations = seen.lock().unwrap().clone();
         let grants = conversations.iter().filter(|(n, _)| n == "grant").count();
-        assert_eq!(grants, 1, "duplicate dispatch must be blocked: {conversations:?}");
+        assert_eq!(
+            grants, 1,
+            "duplicate dispatch must be blocked: {conversations:?}"
+        );
     }
 
     /// The row renders gray while its decision is in flight, and the
@@ -1559,11 +1751,14 @@ mod tests {
             true,
         );
         assert!(
-            line.spans.iter().any(|s| s.style.add_modifier.contains(Modifier::DIM)),
+            line.spans
+                .iter()
+                .any(|s| s.style.add_modifier.contains(Modifier::DIM)),
             "dimmed buttons expected: {line:?}"
         );
         assert!(
-            !line.spans
+            !line
+                .spans
                 .iter()
                 .any(|s| s.style.add_modifier.contains(Modifier::REVERSED)),
             "no selection highlight on a grayed row"
@@ -1616,20 +1811,28 @@ mod tests {
         let dimmed = |entry: &servyi_servatui::WidgetEntry| {
             let mut buf = ratatui::buffer::Buffer::empty(entry.area);
             entry.widget.render_ref(entry.area, &mut buf);
-            buf.content().iter().any(|c| c.modifier.contains(Modifier::DIM))
+            buf.content()
+                .iter()
+                .any(|c| c.modifier.contains(Modifier::DIM))
         };
 
         // One of two in flight: all-row still live.
         layer_obj.in_flight.borrow_mut().insert(31, Instant::now());
         let mut widgets = Vec::new();
         layer_obj.on_overlay(&mut ctx, &mut widgets);
-        assert!(!dimmed(widgets.last().unwrap()), "one live request keeps the all-row live");
+        assert!(
+            !dimmed(widgets.last().unwrap()),
+            "one live request keeps the all-row live"
+        );
 
         // Both in flight: all-row dims.
         layer_obj.in_flight.borrow_mut().insert(37, Instant::now());
         let mut widgets = Vec::new();
         layer_obj.on_overlay(&mut ctx, &mut widgets);
-        assert!(dimmed(widgets.last().unwrap()), "all in flight dims the all-row");
+        assert!(
+            dimmed(widgets.last().unwrap()),
+            "all in flight dims the all-row"
+        );
     }
 
     /// Disabled buttons are CLICK noops: after a decision is
@@ -1671,10 +1874,22 @@ mod tests {
                 .filter(|(n, p)| n == name && p.contains(id))
                 .count()
         };
-        assert_eq!(count("grant", "31"), 1, "no second dispatch for in-flight 31");
+        assert_eq!(
+            count("grant", "31"),
+            1,
+            "no second dispatch for in-flight 31"
+        );
         assert_eq!(count("deny", "31"), 0, "deny on an in-flight row is a noop");
-        assert_eq!(count("grant-forever", "31"), 0, "forever on an in-flight row is a noop");
-        assert_eq!(count("grant", "37"), 1, "all-row still serves the LIVE request");
+        assert_eq!(
+            count("grant-forever", "31"),
+            0,
+            "forever on an in-flight row is a noop"
+        );
+        assert_eq!(
+            count("grant", "37"),
+            1,
+            "all-row still serves the LIVE request"
+        );
     }
 
     /// Neither hover nor the keyboard cursor may highlight a disabled
@@ -1697,7 +1912,10 @@ mod tests {
 
         // 31 in flight; cursor ON it; mouse hovering its [deny].
         layer_obj.in_flight.borrow_mut().insert(31, Instant::now());
-        layer_obj.cursor = Cursor::Request { slot: 0, sel: Sel::Grant };
+        layer_obj.cursor = Cursor::Request {
+            slot: 0,
+            sel: Sel::Grant,
+        };
         let panel = panel_rect(ctx.terminal_area);
         let (deny, _) = button_pair(row_rect(panel, 0), false);
         layer_obj.hover.set(Some((deny.x + 1, deny.y)));
@@ -1709,7 +1927,9 @@ mod tests {
         let mut buf = ratatui::buffer::Buffer::empty(entry.area);
         entry.widget.render_ref(entry.area, &mut buf);
         assert!(
-            !buf.content().iter().any(|c| c.modifier.contains(Modifier::REVERSED)),
+            !buf.content()
+                .iter()
+                .any(|c| c.modifier.contains(Modifier::REVERSED)),
             "a disabled row must not highlight for hover or cursor"
         );
     }
@@ -1747,12 +1967,15 @@ mod tests {
             my_widgets: &[],
         };
         layer_obj.on_overlay(&mut ctx, &mut widgets);
-        layer_obj
-            .in_flight
-            .borrow_mut()
-            .insert(31, Instant::now() - IN_FLIGHT_TIMEOUT - Duration::from_secs(1));
+        layer_obj.in_flight.borrow_mut().insert(
+            31,
+            Instant::now() - IN_FLIGHT_TIMEOUT - Duration::from_secs(1),
+        );
         layer_obj.on_overlay(&mut ctx, &mut widgets);
-        assert!(layer_obj.in_flight.borrow().is_empty(), "stale in-flight must expire");
+        assert!(
+            layer_obj.in_flight.borrow().is_empty(),
+            "stale in-flight must expire"
+        );
     }
 
     /// The too-small warning reaches the shell's LOG WINDOW via the
@@ -1885,7 +2108,11 @@ mod tests {
         for span in &line.spans {
             assert!(span.style.fg.is_none(), "no fg: {:?}", span.style);
             assert!(span.style.bg.is_none(), "no bg: {:?}", span.style);
-            assert!(span.style.add_modifier.is_empty(), "no modifiers: {:?}", span.style);
+            assert!(
+                span.style.add_modifier.is_empty(),
+                "no modifiers: {:?}",
+                span.style
+            );
         }
     }
 
@@ -1910,8 +2137,14 @@ mod tests {
         }
         let line = grid_row_line(GridRow::Request(&pending_info(31)), PANEL_WIDTH, None);
         let colors: Vec<Option<Color>> = line.spans.iter().map(|s| s.style.fg).collect();
-        assert!(colors.contains(&Some(Color::Red),), "deny brackets red: {colors:?}");
-        assert!(colors.contains(&Some(Color::Green)), "grant brackets green: {colors:?}");
+        assert!(
+            colors.contains(&Some(Color::Red),),
+            "deny brackets red: {colors:?}"
+        );
+        assert!(
+            colors.contains(&Some(Color::Green)),
+            "grant brackets green: {colors:?}"
+        );
         assert!(
             colors.iter().filter(|c| c.is_none()).count() >= 2,
             "id/name/words stay uncolored: {colors:?}"
@@ -1924,7 +2157,11 @@ mod tests {
     fn request_line_id_is_uncolored() {
         let line = grid_row_line(GridRow::Request(&pending_info(31)), PANEL_WIDTH, None);
         let id_span = &line.spans[0];
-        assert!(id_span.style.fg.is_none(), "id must be normal-colored: {:?}", id_span.style);
+        assert!(
+            id_span.style.fg.is_none(),
+            "id must be normal-colored: {:?}",
+            id_span.style
+        );
         assert_eq!(id_span.content.trim(), "31", "first span is the id");
     }
 
@@ -1968,7 +2205,11 @@ mod tests {
             .with_collapsed_names(Arc::clone(&shared));
         // part 1: the panel consults the shared snapshot
         assert_eq!(
-            panel.collapsed.lock().unwrap().get("var/home/jonas/secrets/agent/github.netrc"),
+            panel
+                .collapsed
+                .lock()
+                .unwrap()
+                .get("var/home/jonas/secrets/agent/github.netrc"),
             Some(&".../agent/github.netrc".to_string()),
             "shared map holds exactly the status rendering"
         );
@@ -1979,10 +2220,18 @@ mod tests {
             90,
             None,
             false,
-            panel.collapsed.lock().unwrap().get(&req.secret_name).map(String::as_str),
+            panel
+                .collapsed
+                .lock()
+                .unwrap()
+                .get(&req.secret_name)
+                .map(String::as_str),
         );
         let text: String = line.spans.iter().map(|s| s.content.clone()).collect();
-        assert!(text.contains(".../agent/github.netrc"), "status form: {text:?}");
+        assert!(
+            text.contains(".../agent/github.netrc"),
+            "status form: {text:?}"
+        );
         assert!(!text.contains("var/home"), "no raw path leak: {text:?}");
     }
 
@@ -1993,7 +2242,10 @@ mod tests {
         let req = pending_for("var/home/jonas/secrets/agent/github.netrc");
         let secret = ".../agent/github.netrc";
         let fitted = fit_requester_and_secret(&req, Some(secret), 28);
-        assert!(fitted.ends_with("github.netrc"), "suffix survives: {fitted:?}");
+        assert!(
+            fitted.ends_with("github.netrc"),
+            "suffix survives: {fitted:?}"
+        );
         assert!(fitted.contains('…'), "elided front is marked: {fitted:?}");
     }
 
@@ -2005,7 +2257,10 @@ mod tests {
         // Truncation cuts by display width and pads to exactly `max`.
         let out = truncate_pad("日本語テキスト", 6);
         assert_eq!(out.width(), 6, "must be exactly max columns: {out:?}");
-        assert!(out.starts_with("日本") && out.contains('…'), "truncated with an ellipsis: {out:?}");
+        assert!(
+            out.starts_with("日本") && out.contains('…'),
+            "truncated with an ellipsis: {out:?}"
+        );
         // ASCII behavior unchanged.
         assert_eq!(truncate_pad("goose", 8), "goose   ");
         assert_eq!(truncate_pad("abcdefg", 4), "abc…");
@@ -2017,8 +2272,16 @@ mod tests {
         let row = Rect::new(38, 1, 42, 1);
         let (deny, grant) = button_pair(row, false);
         // Grant on the LEFT, deny on the RIGHT.
-        assert_eq!((deny.x, deny.width), (38 + 42 - 6, 6), "\"[deny]\" is 6 cells");
-        assert_eq!((grant.x, grant.width), (deny.x - 8, 7), "\"[grant]\" is 7 cells, left of deny");
+        assert_eq!(
+            (deny.x, deny.width),
+            (38 + 42 - 6, 6),
+            "\"[deny]\" is 6 cells"
+        );
+        assert_eq!(
+            (grant.x, grant.width),
+            (deny.x - 8, 7),
+            "\"[grant]\" is 7 cells, left of deny"
+        );
         assert_eq!(deny.y, row.y);
         let (deny, grant) = button_pair(row, true);
         assert_eq!((deny.x, deny.width), (38 + 42 - 10, 10));
@@ -2084,7 +2347,10 @@ mod tests {
                 "no panel widgets while idle"
             );
             assert_eq!(
-                widgets.iter().filter(|w| w.name == "display.taskbar").count(),
+                widgets
+                    .iter()
+                    .filter(|w| w.name == "display.taskbar")
+                    .count(),
                 1,
                 "hide_when_empty: only the builtin taskbar cell while idle"
             );
@@ -2105,7 +2371,12 @@ mod tests {
         display.add_layer(Box::new(layer(pending.clone(), &sock)));
         frame_with_pending(&mut display);
         assert_eq!(
-            pending.lock().unwrap().iter().map(|p| p.id).collect::<Vec<_>>(),
+            pending
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|p| p.id)
+                .collect::<Vec<_>>(),
             vec![31],
             "the first frame polls and fills the snapshot"
         );
@@ -2127,8 +2398,10 @@ mod tests {
     fn new_request_raises_panel_to_top() {
         let pending: PendingIds = Arc::new(Mutex::new(ids(&[31])));
         let mut display = servatui_display::Display::with_palette(Vec::new());
-        let panel = display
-            .add_layer(Box::new(layer(pending.clone(), Path::new("/nonexistent.sock"))));
+        let panel = display.add_layer(Box::new(layer(
+            pending.clone(),
+            Path::new("/nonexistent.sock"),
+        )));
         frame_with_pending(&mut display);
         assert_eq!(display.topmost(), Some(panel));
 
@@ -2147,7 +2420,11 @@ mod tests {
         // A NEW request arrives: the panel raises itself.
         *pending.lock().unwrap() = ids(&[31, 77]);
         frame_with_pending(&mut display);
-        assert_eq!(display.topmost(), Some(panel), "a new request raises the panel");
+        assert_eq!(
+            display.topmost(),
+            Some(panel),
+            "a new request raises the panel"
+        );
 
         // And stays up on subsequent frames without further Top intent.
         frame_with_pending(&mut display);
@@ -2158,10 +2435,7 @@ mod tests {
 
     /// A fake server speaking the real wire protocol: records every
     /// conversation and answers `pending` with the given ids.
-    fn fake_server(
-        sock: &Path,
-        answer: Vec<u64>,
-    ) -> Arc<Mutex<Vec<(String, String)>>> {
+    fn fake_server(sock: &Path, answer: Vec<u64>) -> Arc<Mutex<Vec<(String, String)>>> {
         use std::io::{BufRead, BufReader, Write};
         let listener = std::os::unix::net::UnixListener::bind(sock).unwrap();
         let seen: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
@@ -2178,7 +2452,10 @@ mod tests {
                 let name = serde_json::from_str::<String>(name.trim()).unwrap();
                 let mut payload = String::new();
                 reader.read_line(&mut payload).unwrap();
-                seen2.lock().unwrap().push((name.clone(), payload.trim().to_string()));
+                seen2
+                    .lock()
+                    .unwrap()
+                    .push((name.clone(), payload.trim().to_string()));
                 let resp = if name == "grant" || name == "deny" || name == "grant-forever" {
                     serde_json::json!({"type": "ok"})
                 } else {
@@ -2223,7 +2500,10 @@ mod tests {
                 let name = serde_json::from_str::<String>(name.trim()).unwrap();
                 let mut payload = String::new();
                 reader.read_line(&mut payload).unwrap();
-                seen2.lock().unwrap().push((name.clone(), payload.trim().to_string()));
+                seen2
+                    .lock()
+                    .unwrap()
+                    .push((name.clone(), payload.trim().to_string()));
                 let resp = if name == "grant-forever" {
                     serde_json::json!({"__error__": "Unknown command: grant-forever"})
                 } else if name == "grant" || name == "deny" {
@@ -2274,7 +2554,10 @@ mod tests {
         frame_with_pending(&mut display);
 
         // Cursor starts on the all-row; Down reaches request 31's grant.
-        assert!(display.route_event(&key(KeyCode::Down)), "panel has focus: swallowed");
+        assert!(
+            display.route_event(&key(KeyCode::Down)),
+            "panel has focus: swallowed"
+        );
         assert!(display.route_event(&key(KeyCode::Enter)), "Enter swallowed");
 
         let conversations = seen.lock().unwrap().clone();
@@ -2285,7 +2568,12 @@ mod tests {
             "grant for request 31 must hit the wire: {conversations:?}"
         );
         assert_eq!(
-            pending.lock().unwrap().iter().map(|p| p.id).collect::<Vec<_>>(),
+            pending
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|p| p.id)
+                .collect::<Vec<_>>(),
             vec![31, 37],
             "snapshot refreshed from the server's answer"
         );
@@ -2339,7 +2627,10 @@ mod tests {
         assert!(display.route_event(&key(KeyCode::Enter)), "Enter swallowed");
 
         let conversations = seen.lock().unwrap().clone();
-        let denies = conversations.iter().filter(|(name, _)| name == "deny").count();
+        let denies = conversations
+            .iter()
+            .filter(|(name, _)| name == "deny")
+            .count();
         assert_eq!(denies, 2, "both requests denied: {conversations:?}");
     }
 
@@ -2380,7 +2671,14 @@ mod tests {
 
         let pending: PendingIds = Arc::new(Mutex::new(Vec::new()));
         let secrets: SecretNames = Arc::new(Mutex::new(Vec::new()));
-        let talk = spawn_worker(sock.clone(), pending.clone(), secrets.clone(), Default::default(), no_error(), empty_sink());
+        let talk = spawn_worker(
+            sock.clone(),
+            pending.clone(),
+            secrets.clone(),
+            Default::default(),
+            no_error(),
+            empty_sink(),
+        );
         talk.request(
             &pending,
             PanelRequest::Action {
@@ -2439,7 +2737,13 @@ mod tests {
             );
             let _ = sel;
         }
-        let line = grid_row_line_hover(GridRow::All, PANEL_WIDTH, None, Some(&Button::GrantAll), None);
+        let line = grid_row_line_hover(
+            GridRow::All,
+            PANEL_WIDTH,
+            None,
+            Some(&Button::GrantAll),
+            None,
+        );
         assert!(
             line.spans
                 .iter()
@@ -2451,10 +2755,16 @@ mod tests {
     /// No hover -> no highlight change (pure renderer pass-through).
     #[test]
     fn hover_absent_leaves_selection_untouched() {
-        let line =
-            grid_row_line_hover(GridRow::Request(&pending_info(31)), PANEL_WIDTH, None, None, None);
+        let line = grid_row_line_hover(
+            GridRow::Request(&pending_info(31)),
+            PANEL_WIDTH,
+            None,
+            None,
+            None,
+        );
         assert!(
-            !line.spans
+            !line
+                .spans
                 .iter()
                 .any(|s| s.style.add_modifier.contains(Modifier::REVERSED)),
             "no hover and no selection: no highlight"
@@ -2495,10 +2805,15 @@ mod tests {
         let reversed = |entry: &servyi_servatui::WidgetEntry| {
             let mut buf = ratatui::buffer::Buffer::empty(entry.area);
             entry.widget.render_ref(entry.area, &mut buf);
-            buf.content().iter().any(|c| c.modifier.contains(Modifier::REVERSED))
+            buf.content()
+                .iter()
+                .any(|c| c.modifier.contains(Modifier::REVERSED))
         };
         let all = widgets.last().expect("all-row widget");
-        assert!(!reversed(all), "cursor highlight must not keep [grant all] lit under hover");
+        assert!(
+            !reversed(all),
+            "cursor highlight must not keep [grant all] lit under hover"
+        );
         assert!(
             widgets.iter().take(widgets.len() - 1).any(reversed),
             "the hovered request button highlights instead"
@@ -2541,7 +2856,10 @@ mod tests {
         ));
         assert_eq!(
             layer_obj.cursor,
-            Cursor::Request { slot: 0, sel: Sel::Grant },
+            Cursor::Request {
+                slot: 0,
+                sel: Sel::Grant
+            },
             "arrow movement must start from the HIGHLIGHTED button, not the stale cursor"
         );
         assert_eq!(layer_obj.owner.get(), Owner::Keyboard);
@@ -2551,7 +2869,9 @@ mod tests {
         let reversed = |entry: &servyi_servatui::WidgetEntry| {
             let mut buf = ratatui::buffer::Buffer::empty(entry.area);
             entry.widget.render_ref(entry.area, &mut buf);
-            buf.content().iter().any(|c| c.modifier.contains(Modifier::REVERSED))
+            buf.content()
+                .iter()
+                .any(|c| c.modifier.contains(Modifier::REVERSED))
         };
         // Keyboard owns now: its highlight is visible again.
         assert!(
@@ -2603,7 +2923,9 @@ mod tests {
         let reversed = |entry: &servyi_servatui::WidgetEntry| {
             let mut buf = ratatui::buffer::Buffer::empty(entry.area);
             entry.widget.render_ref(entry.area, &mut buf);
-            buf.content().iter().any(|c| c.modifier.contains(Modifier::REVERSED))
+            buf.content()
+                .iter()
+                .any(|c| c.modifier.contains(Modifier::REVERSED))
         };
         // Hover gone; the DEFAULT All{grant} cursor lights again.
         assert!(reversed(widgets.last().expect("all-row widget")));
@@ -2638,7 +2960,10 @@ mod tests {
             row: row0.y,
             modifiers: KeyModifiers::NONE,
         });
-        assert!(matches!(layer_obj.on_event(&moved, &ctx), EventResult::Swallow));
+        assert!(matches!(
+            layer_obj.on_event(&moved, &ctx),
+            EventResult::Swallow
+        ));
         assert_eq!(
             layer_obj.owner.get(),
             Owner::Keyboard,
@@ -2650,7 +2975,9 @@ mod tests {
         let reversed = |entry: &servyi_servatui::WidgetEntry| {
             let mut buf = ratatui::buffer::Buffer::empty(entry.area);
             entry.widget.render_ref(entry.area, &mut buf);
-            buf.content().iter().any(|c| c.modifier.contains(Modifier::REVERSED))
+            buf.content()
+                .iter()
+                .any(|c| c.modifier.contains(Modifier::REVERSED))
         };
         // Default All{grant} cursor visible.
         assert!(reversed(widgets.last().expect("all-row widget")));
@@ -2690,7 +3017,10 @@ mod tests {
         ));
         assert_eq!(
             layer_obj.cursor,
-            Cursor::Request { slot: 1, sel: Sel::Deny },
+            Cursor::Request {
+                slot: 1,
+                sel: Sel::Deny
+            },
             "cursor must land on the LIVE row below, not the grayed one"
         );
         assert_eq!(layer_obj.owner.get(), Owner::Keyboard);
@@ -2709,7 +3039,10 @@ mod tests {
         let mut layer_obj = layer(Arc::new(Mutex::new(ids(&[31]))), &sock);
         // Neutral keyboard cursor: the default All{grant} would highlight
         // [grant all] regardless of hover and mask the regression.
-        layer_obj.cursor = Cursor::Request { slot: 0, sel: Sel::Forever };
+        layer_obj.cursor = Cursor::Request {
+            slot: 0,
+            sel: Sel::Forever,
+        };
         let mut ctx = servatui_display::LayerCtx {
             id: servatui_display::LayerId::BUILTIN,
             color: Color::Reset,
@@ -2733,11 +3066,17 @@ mod tests {
         let mut widgets = Vec::new();
         layer_obj.on_overlay(&mut ctx, &mut widgets);
         let entry = widgets.last().expect("all-row widget");
-        assert_eq!(entry.area, all_row_rect(panel), "last widget is the all-row");
+        assert_eq!(
+            entry.area,
+            all_row_rect(panel),
+            "last widget is the all-row"
+        );
         let mut buf = ratatui::buffer::Buffer::empty(entry.area);
         entry.widget.render_ref(entry.area, &mut buf);
         assert!(
-            buf.content().iter().any(|c| c.modifier.contains(Modifier::REVERSED)),
+            buf.content()
+                .iter()
+                .any(|c| c.modifier.contains(Modifier::REVERSED)),
             "deny-all must render highlighted under hover"
         );
     }
@@ -2773,10 +3112,18 @@ mod tests {
     fn left_right_step_through_forever() {
         assert_eq!(Sel::Forever.step(false), Sel::Grant);
         assert_eq!(Sel::Grant.step(false), Sel::Deny);
-        assert_eq!(Sel::Deny.step(false), Sel::Deny, "clamped at the right edge");
+        assert_eq!(
+            Sel::Deny.step(false),
+            Sel::Deny,
+            "clamped at the right edge"
+        );
         assert_eq!(Sel::Deny.step(true), Sel::Grant);
         assert_eq!(Sel::Grant.step(true), Sel::Forever);
-        assert_eq!(Sel::Forever.step(true), Sel::Forever, "clamped at the left edge");
+        assert_eq!(
+            Sel::Forever.step(true),
+            Sel::Forever,
+            "clamped at the left edge"
+        );
     }
 
     /// Pressing `f` grants the cursor-selected request permanently.
@@ -2791,7 +3138,10 @@ mod tests {
         display.add_layer(Box::new(layer(pending.clone(), &sock)));
         frame_with_pending(&mut display);
 
-        assert!(display.route_event(&key(KeyCode::Down)), "panel has focus: swallowed");
+        assert!(
+            display.route_event(&key(KeyCode::Down)),
+            "panel has focus: swallowed"
+        );
         assert!(display.route_event(&key(KeyCode::Char('f'))), "f swallowed");
 
         let conversations = seen.lock().unwrap().clone();
@@ -2871,7 +3221,11 @@ mod tests {
         let mut display = servatui_display::Display::with_palette(Vec::new());
         display.add_layer(Box::new(PendingPanelLayer::new(
             pending,
-            Box::new(DirectTalk::new(&sock, Arc::new(Mutex::new(Vec::new())), error.clone())),
+            Box::new(DirectTalk::new(
+                &sock,
+                Arc::new(Mutex::new(Vec::new())),
+                error.clone(),
+            )),
             error.clone(),
         )));
         frame_with_pending(&mut display);
@@ -2901,7 +3255,14 @@ mod tests {
         let secrets: SecretNames = Arc::new(Mutex::new(Vec::new()));
         let error: LastError = no_error();
         let log: LogSink = empty_sink();
-        let talk = spawn_worker(sock.clone(), pending.clone(), secrets.clone(), Default::default(), error.clone(), log.clone());
+        let talk = spawn_worker(
+            sock.clone(),
+            pending.clone(),
+            secrets.clone(),
+            Default::default(),
+            error.clone(),
+            log.clone(),
+        );
         talk.request(
             &pending,
             PanelRequest::Action {

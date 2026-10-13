@@ -81,8 +81,8 @@ pub(crate) fn wait_connect_pub(path: &std::path::Path, what: &str, root: &std::p
 }
 pub use mock_fuse::{mock_fuse_available, MockFuseStack};
 mod real_mount;
-pub use real_mount::{bin, real_mount_available, Driver, RealMountStack};
 use real_mount::dump_logs_under;
+pub use real_mount::{bin, real_mount_available, Driver, RealMountStack};
 
 /// Default pending window for kit stacks: short (tests want fast
 /// pend-outs), long enough for grant flows.
@@ -285,10 +285,7 @@ impl Stack {
     /// the default dead seam private BY CONSTRUCTION rather than by
     /// a "nothing ever binds this fixed path" hope (review on #82).
     #[must_use]
-    pub fn state_from(
-        mut self,
-        build: impl FnOnce(&Path) -> ServerState + Send + 'static,
-    ) -> Self {
+    pub fn state_from(mut self, build: impl FnOnce(&Path) -> ServerState + Send + 'static) -> Self {
         self.custom_state = Some(Box::new(build));
         self
     }
@@ -422,7 +419,10 @@ pub fn spawn_hashd_stub(reply: HashdReply) -> HashdStub {
     let root = tempfile::tempdir().expect("testkit: mint hashd stub root");
     let path = root.path().join("hashd.sock");
     bind_hashd_wire(&path, reply);
-    HashdStub { _root: Some(root), path }
+    HashdStub {
+        _root: Some(root),
+        path,
+    }
 }
 
 /// A kit-minted RAW rendezvous: the kit binds, the test's own accept
@@ -445,7 +445,11 @@ impl StubSocket {
         let root = tempfile::tempdir().expect("testkit: mint stub-socket root");
         let path = root.path().join(format!("{label}.sock"));
         let listener = UnixListener::bind(&path).expect("testkit: bind stub socket");
-        Self { _root: root, path, listener }
+        Self {
+            _root: root,
+            path,
+            listener,
+        }
     }
 
     /// The bound socket path.
@@ -479,7 +483,9 @@ pub(crate) fn bind_hashd_wire(path: &Path, reply: HashdReply) {
 /// owned it: one `hash {pid}` line in, one reply line out.
 fn serve_hashd_wire(listener: UnixListener, reply: HashdReply) {
     for conn in listener.incoming().flatten() {
-        let Ok(clone) = conn.try_clone() else { continue };
+        let Ok(clone) = conn.try_clone() else {
+            continue;
+        };
         let mut reader = BufReader::new(clone);
         let mut stream = conn;
         let mut line = String::new();
@@ -506,8 +512,9 @@ fn serve_hashd_wire(listener: UnixListener, reply: HashdReply) {
                     ),
                 }
             }
-            (_, _, _) => "{\"error\":{\"kind\":\"generic\",\"message\":\"malformed request\"}}\n"
-                .to_string(),
+            (_, _, _) => {
+                "{\"error\":{\"kind\":\"generic\",\"message\":\"malformed request\"}}\n".to_string()
+            }
         };
         let _ = stream.write_all(out.as_bytes());
         let _ = stream.flush();
@@ -636,9 +643,7 @@ mod tests {
 
     #[test]
     fn stack_serves_the_real_oracle_wire() {
-        let stack = Stack::new()
-            .secret("s", b"CONTENT", "*")
-            .spawn_in_process();
+        let stack = Stack::new().secret("s", b"CONTENT", "*").spawn_in_process();
         let reply = fuse_server::oracle_service::ask(stack.oracle_socket(), "s", 4242, 0, 7)
             .expect("ask over the real wire");
         assert_eq!(reply, OracleReply::Allow);
@@ -688,7 +693,10 @@ mod tests {
 
     #[test]
     fn store_option_arms_persistence_under_the_root() {
-        let stack = Stack::new().store().secret("s", b"X", "*").spawn_in_process();
+        let stack = Stack::new()
+            .store()
+            .secret("s", b"X", "*")
+            .spawn_in_process();
         let path = stack.state().policy_path.clone();
         let path = path.expect("store() arms the policy path");
         assert!(path.ends_with("policy.json"));
@@ -700,10 +708,15 @@ mod tests {
             .live_hashd_stub(HashdReply::Canned("b".repeat(64)))
             .spawn_in_process();
         let seam = &stack.state().hashd_sock;
-        let stub_path =
-            stack.hashd_socket().expect("live stub socket exposed").to_path_buf();
-        assert_eq!(seam, &stub_path.display().to_string(),
-            "the seam points at the kit-bound stub");
+        let stub_path = stack
+            .hashd_socket()
+            .expect("live stub socket exposed")
+            .to_path_buf();
+        assert_eq!(
+            seam,
+            &stub_path.display().to_string(),
+            "the seam points at the kit-bound stub"
+        );
         assert!(stub_path.ends_with("hashd.sock"));
         assert_eq!(
             ask_hashd(&stub_path, 7),
@@ -736,7 +749,9 @@ mod tests {
         let server = std::thread::spawn(move || {
             let (mut conn, _) = listener.accept().expect("accept");
             let mut line = String::new();
-            let _n = BufReader::new(&mut conn).read_line(&mut line).expect("read");
+            let _n = BufReader::new(&mut conn)
+                .read_line(&mut line)
+                .expect("read");
             let _ = conn.write_all(b"hostile\n");
         });
         let mut c = UnixStream::connect(&path).expect("connect");

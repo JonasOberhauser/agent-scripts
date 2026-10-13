@@ -56,7 +56,6 @@ struct Cli {
     #[arg(long, default_value = DEFAULT_MOUNT_POINT)]
     mount_point: PathBuf,
 
-
     /// Pass --pidns=host to the container so its processes are visible in
     /// the host's PID namespace.  This allows the FUSE server to read
     /// /proc/{pid}/exe and verify the binary hash.  Without this flag,
@@ -128,7 +127,9 @@ fn main() -> ExitCode {
 
     let no_hash = cli.hash.is_none();
     let mut config = AgentConfig::from_args(
-        cli.hash.as_deref().unwrap_or(fuse_protocol::PENDING_ONLY_HASH),
+        cli.hash
+            .as_deref()
+            .unwrap_or(fuse_protocol::PENDING_ONLY_HASH),
         secrets,
         &cli.agent_subfolder,
         &cli.container_args,
