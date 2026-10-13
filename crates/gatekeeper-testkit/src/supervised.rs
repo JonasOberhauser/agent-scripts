@@ -91,11 +91,39 @@ impl SupervisedStack {
         String::from_utf8_lossy(&out.stdout)
             .split_whitespace()
             .filter_map(|p| p.parse().ok())
+            // ZOMBIES ARE DEAD (#97's lesson): kill(0) succeeds and
+            // pgrep lists unreaped corpses — a zombie daemon is not a
+            // survivor. The scheduler state is the honest answer.
+            .filter(|&pid| {
+                std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                    .ok()
+                    .and_then(|s| {
+                        s.rsplit(')')
+                            .next()
+                            .and_then(|rest| rest.split_whitespace().next().map(str::to_string))
+                    })
+                    .is_some_and(|state| state != "Z" && state != "X")
+            })
             .collect()
     }
 
-    /// SIGTERM the policy daemon — the #93 F2 move: what happens to
-    /// the supervised child is the assertion's business.
+    /// SIGTERM the policy daemon and reap it — the CLIENT's fallback
+    /// signal (#106), the catchable one whose handler runs (the
+    /// #93 F2 contract: the supervised child dies with it).
+    ///
+    /// # Panics
+    /// Panics only if the wait itself fails (never on the exit code).
+    pub fn terminate_policy(&mut self) -> std::process::ExitStatus {
+        let pid_t = self.policy.id() as libc::pid_t;
+        let sig = libc::SIGTERM;
+        // SAFETY: one verified pid, this stack's own child.
+        let _signaled = unsafe { libc::kill(pid_t, sig) };
+        self.policy.wait().expect("testkit: wait policy after TERM")
+    }
+
+    /// SIGKILL the policy daemon — the UNcatchable variant; nothing
+    /// runs (the orphan is then the restart path's business, not the
+    /// server's).
     pub fn kill_policy(&mut self) {
         let _ = self.policy.kill();
         let _ = self.policy.wait();

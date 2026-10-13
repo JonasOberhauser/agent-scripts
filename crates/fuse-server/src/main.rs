@@ -64,6 +64,20 @@ extern "C" fn shutdown_handler(_sig: libc::c_int) {
         // SAFETY: see above.
         let _unlinked = unsafe { libc::unlink(oracle_ptr) };
     }
+    // REAP the supervised data daemon (#93 F2): kill(2) is
+    // async-signal-safe; locking the Mutex that owns the Child is
+    // not. The pid is published at spawn into an atomic exactly for
+    // here — without it, every restart orphans the daemon, and on a
+    // real stack the orphan holds the FUSE mount and the successor
+    // dies on it (the second-restart failure #93 was opened for).
+    let pid = SUPERVISED_FUSED_PID.load(std::sync::atomic::Ordering::SeqCst);
+    if pid != 0 {
+        let child = pid as libc::pid_t;
+        let term = libc::SIGTERM;
+        // SAFETY: a plain SIGTERM to one recorded child pid; no
+        // pointers, no allocation; operands are bindings.
+        let _killed = unsafe { libc::kill(child, term) };
+    }
     let code = 130;
     // SAFETY: _exit(2) is the async-signal-safe way out of a handler; it
     // intentionally skips atexit/destructors to avoid non-signal-safe
@@ -76,6 +90,12 @@ extern "C" fn shutdown_handler(_sig: libc::c_int) {
 /// so we also store it to reap on shutdown).
 static SUPERVISED_FUSED: std::sync::Mutex<Option<std::process::Child>> =
     std::sync::Mutex::new(None);
+
+/// The supervised daemon's pid, published at spawn for the
+/// async-signal-safe shutdown handler — the Child handle lives
+/// behind a Mutex the handler must never lock.
+static SUPERVISED_FUSED_PID: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
 
 fn stale_socket(path: &Path) {
     if path.exists() {
@@ -120,6 +140,10 @@ fn main() {
                     .spawn();
                 match child {
                     Ok(c) => {
+                        SUPERVISED_FUSED_PID.store(
+                            c.id(),
+                            std::sync::atomic::Ordering::SeqCst,
+                        );
                         let _replaced = SUPERVISED_FUSED
                             .lock()
                             .expect("supervised-fused lock: set once at spawn")
