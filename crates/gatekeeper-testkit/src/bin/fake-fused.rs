@@ -196,5 +196,3 @@ fn surrender(oracle: &std::path::Path, custody: &Custody) -> Result<(), String> 
     let _ = (&conn).flush();
     Ok(())
 }
-
-

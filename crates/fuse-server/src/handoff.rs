@@ -37,6 +37,12 @@ use crate::OracleHub;
 const TAKE_BACK_TIMEOUT: Duration = Duration::from_secs(10);
 /// The linger/accept poll cadence.
 const HANDOFF_POLL: Duration = Duration::from_millis(50);
+/// B1-b: nobody engaged at all (no taker, no commit) for this long
+/// after the last connection ⇒ treat as a declined takeover and
+/// retire — a bare probe-and-disappear must not strand the stack for
+/// the full linger timeout.
+const HANDOFF_IDLE_ABORT: Duration = Duration::from_secs(3);
+
 /// How long the old fused gets to exit on the Retire word before the
 /// supervisor falls back to the hard kill.
 const RETIRE_GRACE: Duration = Duration::from_secs(5);
@@ -68,10 +74,14 @@ pub(crate) fn take_back(
 ) -> Result<Option<Custody>, String> {
     // The hub's control connection is one-way push; the payload comes
     // back on a FRESH oracle connection carrying SCM_RIGHTS.
-    hub.push_control_only(&OracleCommand::Surrender);
-    // The daemon needs a moment; its payload connection lands on the
-    // oracle listener this server still owns during handoff entry.
+    //
+    // The word is RE-BROADCAST until answered: the daemon's control
+    // connection may still be establishing when the restart fires
+    // (its Hello races the Surrender), and one lost push would turn
+    // every restart into the full timeout.
+    const SURRENDER_REPUSH: Duration = Duration::from_millis(200);
     let deadline = Instant::now() + TAKE_BACK_TIMEOUT;
+    let mut last_push: Option<Instant> = None;
     let mut custody_from_mailbox: Option<crate::oracle_service::Surrendered> = None;
     while custody_from_mailbox.is_none() && Instant::now() < deadline {
         // Probe via the pending-payload mailbox the oracle server
@@ -80,10 +90,22 @@ pub(crate) fn take_back(
         if let Some(s) = crate::oracle_service::take_surrender_payload() {
             custody_from_mailbox = Some(s);
             break;
+        } else if crate::oracle_service::take_surrender_refusal() {
+            // The daemon ANSWERED "cannot surrender" (the real fused
+            // until fd extraction lands): fail fast — no 10s penalty
+            // on every restart, handoff refused cleanly.
+            warn!("handoff: the supervised fused refused to surrender — no custody");
+            return Ok(None);
         } else if let Ok(Some(_)) = child.try_wait() {
             return Ok(None); // daemon died before surrendering
         } else {
-            std::thread::sleep(Duration::from_millis(20));
+            let controls_up = hub.control_len() > 0;
+            let due = last_push.is_none_or(|t| t.elapsed() >= SURRENDER_REPUSH);
+            if controls_up && due {
+                hub.push_control_only(&OracleCommand::Surrender);
+                last_push = Some(Instant::now());
+            }
+            std::thread::sleep(HANDOFF_POLL);
         }
     }
     let Some(s) = custody_from_mailbox else {
@@ -130,23 +152,52 @@ pub(crate) fn serve_handoff(
     mut child: std::process::Child,
     timeout: Duration,
 ) {
-    let deadline = Instant::now() + timeout;
+    let mut deadline = Instant::now() + timeout;
+    let mut last_activity = Instant::now();
     let _ = listener
         .set_nonblocking(true)
         .inspect_err(|e| warn!("handoff: nonblocking listener: {e}"));
     let mut committed_to: Option<u32> = None;
     let mut fd_taken_by: Option<u32> = None;
-    while Instant::now() < deadline {
+    loop {
+        // M1: a LIVE taker suspends the wall clock — evaluated EVERY
+        // iteration, not only on connections (a silent mid-takeover
+        // successor must not have the mount yanked by the timeout).
+        if committed_to.is_none() {
+            if let Some(&taker) = fd_taken_by.as_ref() {
+                if pid_alive(taker) {
+                    deadline = Instant::now() + timeout;
+                }
+            }
+        }
+        // B1-b: a probe-and-disappear with NOBODY engaged retires the
+        // old pair early instead of stranding the stack.
+        if committed_to.is_none()
+            && fd_taken_by.is_none()
+            && last_activity.elapsed() >= HANDOFF_IDLE_ABORT
+        {
+            info!("handoff: idle with no taker — treating as a declined takeover");
+            break;
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
         match listener.accept() {
             Ok((conn, _)) => {
                 // The rendezvous grants fds: never answer a stranger.
-                if !peer_is_same_uid(&conn) {
+                let Some(cred) = peer_credentials(&conn) else {
                     warn!("handoff: refused a non-same-uid peer on the rendezvous");
                     continue;
-                }
+                };
+                last_activity = Instant::now();
                 let _ = conn.set_nonblocking(false);
-                let last =
-                    serve_one_handoff_conn(conn, &custody, &mut committed_to, &mut fd_taken_by);
+                let last = serve_one_handoff_conn(
+                    conn,
+                    cred,
+                    &custody,
+                    &mut committed_to,
+                    &mut fd_taken_by,
+                );
                 if last {
                     break;
                 }
@@ -194,7 +245,7 @@ fn retire_fused(child: &mut std::process::Child) {
 /// caller, the new server verifies the old one before adopting its
 /// custody). The socket file itself is created 0600; the uid check is
 /// the load-bearing half (the default rendezvous lives in /tmp).
-pub(crate) fn peer_is_same_uid(stream: &UnixStream) -> bool {
+pub(crate) fn peer_credentials(stream: &UnixStream) -> Option<libc::ucred> {
     use std::os::unix::io::AsRawFd as _;
     let fd = stream.as_raw_fd();
     let sol = libc::SOL_SOCKET;
@@ -209,14 +260,14 @@ pub(crate) fn peer_is_same_uid(stream: &UnixStream) -> bool {
     // allocation, operands are hoisted bindings.
     let rc = unsafe { libc::getsockopt(fd, sol, opt, cred_ptr, len_ptr) };
     if rc != 0 {
-        return false;
+        return None;
     }
     // SAFETY: the getsockopt above returned 0, so the ucred out-
     // pointer was fully initialized by the kernel.
     let ucred = unsafe { ucred.assume_init() };
     // SAFETY: getuid(2) is async-signal-safe and cannot fail.
     let our_uid = unsafe { libc::getuid() };
-    ucred.uid == our_uid
+    (ucred.uid == our_uid).then_some(ucred)
 }
 
 /// #97's zombie lesson baked in: kill(0) succeeds and /proc lists
@@ -244,6 +295,7 @@ fn pid_alive(pid: u32) -> bool {
 /// end (Commit or Abort arrived).
 fn serve_one_handoff_conn(
     conn: UnixStream,
+    cred: libc::ucred,
     custody: &SharedCustody,
     committed_to: &mut Option<u32>,
     fd_taken_by: &mut Option<u32>,
@@ -283,9 +335,21 @@ fn serve_one_handoff_conn(
             }
         }
         HandoffRequest::GetFd { requester_pid, .. } => {
-            // First live taker wins; a dead taker's slot is inherited.
-            if let Some(&first) = fd_taken_by.as_ref() {
-                if first != requester_pid && pid_alive(first) {
+            // B3: the CLAIMED pid must equal the caller's KERNEL pid
+            // (SO_PEERCRED) — claims are worthless here, and a live
+            // taker's slot must not be spoofable.
+            let kernel_pid = u32::try_from(cred.pid).unwrap_or(u32::MAX);
+            if requester_pid != kernel_pid {
+                HandoffReply::Error {
+                    message: format!(
+                        "claimed pid {requester_pid} is not the kernel pid {} — \
+                         the kernel verifies identity here",
+                        cred.pid
+                    ),
+                }
+            } else if let Some(&first) = fd_taken_by.as_ref() {
+                if first != kernel_pid && pid_alive(first) {
+                    // First live taker wins; stand down and retry.
                     HandoffReply::Error {
                         message: format!(
                             "custody in flight: server pid {first} already took it over — \
@@ -293,31 +357,17 @@ fn serve_one_handoff_conn(
                         ),
                     }
                 } else {
-                    *fd_taken_by = Some(requester_pid);
-                    let c = custody.lock().expect("custody lock");
-                    let raws: Vec<RawFd> = c.fds.iter().map(|f| f.as_raw_fd()).collect();
-                    match send_reply_with_fds(
-                        &writer,
-                        &HandoffReply::Fd {
-                            fd_count: raws.len() as u32,
-                        },
-                        &raws,
-                    ) {
+                    // Same taker re-requesting, or the first died and
+                    // the slot is inherited (the resumability contract).
+                    *fd_taken_by = Some(kernel_pid);
+                    match send_fd_batch(&writer, custody) {
                         Ok(()) => return false,
                         Err(e) => HandoffReply::Error { message: e },
                     }
                 }
             } else {
-                *fd_taken_by = Some(requester_pid);
-                let c = custody.lock().expect("custody lock");
-                let raws: Vec<RawFd> = c.fds.iter().map(|f| f.as_raw_fd()).collect();
-                match send_reply_with_fds(
-                    &writer,
-                    &HandoffReply::Fd {
-                        fd_count: raws.len() as u32,
-                    },
-                    &raws,
-                ) {
+                *fd_taken_by = Some(kernel_pid);
+                match send_fd_batch(&writer, custody) {
                     Ok(()) => return false,
                     Err(e) => HandoffReply::Error { message: e },
                 }
@@ -335,9 +385,20 @@ fn serve_one_handoff_conn(
             }
         }
         HandoffRequest::Commit { new_server_pid } => {
+            // B3: only the taker of record may commit — a naked Commit
+            // from any other same-uid process must never retire the
+            // old pair out from under a live mid-resume successor.
+            let committer_pid = u32::try_from(cred.pid).unwrap_or(u32::MAX);
             if committed_to.is_some() {
                 HandoffReply::Error {
                     message: "already committed".into(),
+                }
+            } else if *fd_taken_by != Some(committer_pid) {
+                HandoffReply::Error {
+                    message: format!(
+                        "commit refused: kernel pid {committer_pid} never took custody (holder: {:?})",
+                        fd_taken_by
+                    ),
                 }
             } else {
                 *committed_to = Some(new_server_pid);
@@ -360,6 +421,20 @@ fn serve_one_handoff_conn(
         HandoffRequest::Commit { .. } | HandoffRequest::Abort { .. }
     );
     is_final
+}
+
+/// One custody batch out (the single GetFd send path). The batch line
+/// IS the reply — `true` means "written, no tail line needed".
+fn send_fd_batch(writer: &UnixStream, custody: &SharedCustody) -> Result<(), String> {
+    let c = custody.lock().expect("custody lock");
+    let raws: Vec<RawFd> = c.fds.iter().map(|f| f.as_raw_fd()).collect();
+    send_reply_with_fds(
+        writer,
+        &HandoffReply::Fd {
+            fd_count: raws.len() as u32,
+        },
+        &raws,
+    )
 }
 
 /// Write the reply line with `fds` attached as one SCM_RIGHTS batch.
@@ -481,6 +556,7 @@ pub fn resume_from_handoff(state_file: &Path) -> Option<Takeover> {
         }
     };
     // Status first: dialect gate + the race arbiter.
+    let status_schema;
     match handoff_roundtrip(&mut conn, &HandoffRequest::Status) {
         Ok(HandoffReply::Status {
             handoff_protocol_version,
@@ -491,6 +567,7 @@ pub fn resume_from_handoff(state_file: &Path) -> Option<Takeover> {
         }) => {
             if handoff_protocol_version != HANDOFF_PROTOCOL_VERSION {
                 warn!("handoff: dialect v{handoff_protocol_version} != v{HANDOFF_PROTOCOL_VERSION} — declining");
+                abort_handoff(&path, "dialect mismatch");
                 return None;
             }
             if let Some(pid) = committed_to {
@@ -499,11 +576,15 @@ pub fn resume_from_handoff(state_file: &Path) -> Option<Takeover> {
             }
             if !has_fd {
                 warn!("handoff: the old server holds no custody — fresh mount");
+                abort_handoff(&path, "no custody");
                 return None;
             }
+            status_schema = session_schema;
             info!("handoff: old server live, custody available (schema {session_schema})");
         }
         other => {
+            // Unreachable/failed status: nobody proved reachable to
+            // abort — nothing to send.
             warn!("handoff: status failed ({other:?}) — fresh mount");
             return None;
         }
@@ -562,10 +643,25 @@ pub fn resume_from_handoff(state_file: &Path) -> Option<Takeover> {
         custody: Custody {
             fds,
             session: state,
-            session_schema: 0,
+            session_schema: status_schema,
         },
         handoff_socket: path,
     })
+}
+
+/// B1-b: a DECLINED takeover must not strand the stack — tell the old
+/// pair to retire now instead of blocking the mount for the timeout.
+fn abort_handoff(socket: &Path, reason: &str) {
+    if let Ok(mut conn) = UnixStream::connect(socket) {
+        if let Err(e) = handoff_roundtrip(
+            &mut conn,
+            &HandoffRequest::Abort {
+                reason: reason.to_string(),
+            },
+        ) {
+            warn!("handoff: abort after decline failed ({e}) — the old server times out");
+        }
+    }
 }
 
 /// One command, one reply, one connection (the listener's contract).
@@ -620,32 +716,19 @@ pub static SUPERVISED: Mutex<Option<std::process::Child>> = Mutex::new(None);
 /// # Panics
 /// Panics only on lock poisoning (the supervised/custody locks are
 /// poison-free by contract).
-pub fn enter_handoff_mode(state_file: &Path, timeout: Duration) -> Result<(), String> {
-    if let Err(e) = enter_handoff_mode_inner(state_file, timeout) {
-        // The Ok already reached the client — it will NOT send TERM.
-        // Degrade honestly to the legacy shutdown contract: sockets
-        // unlinked, process gone; its restart spawns fresh (a fresh
-        // mount, exactly the pre-handoff behavior).
-        tracing::error!("handoff mode failed ({e}) — degrading to the legacy shutdown");
-        if let Some((cmd_sock, oracle_sock)) = STACK_PATHS.get() {
-            let _ = std::fs::remove_file(cmd_sock);
-            let _ = std::fs::remove_file(oracle_sock);
-        }
-        std::process::exit(0);
-    }
-    Ok(())
-}
-
-fn enter_handoff_mode_inner(state_file: &Path, timeout: Duration) -> Result<(), String> {
-    std::thread::sleep(Duration::from_millis(250));
+pub fn engage_handoff(state_file: &Path, timeout: Duration) -> Result<(), String> {
+    // B1: custody FIRST, synchronously, BEFORE the Ok — a fused that
+    // cannot surrender (the real fused until fd extraction lands)
+    // means handoff mode is REFUSED and the client takes the legacy
+    // TERM flow, byte for byte today's behavior. Entering handoff
+    // mode with empty custody unlinked the stack sockets under a
+    // live mount — the production regression the review caught.
     let Some((cmd_sock, oracle_sock)) = STACK_PATHS.get() else {
         return Err("stack paths not recorded (no handoff for this boot)".into());
     };
     let handoff_sock = fuse_protocol::handoff::handoff_socket_path(oracle_sock);
 
-    // 2. take-back (before anything stops: the payload connection
-    //    lands on the oracle listener this server still owns).
-    let custody: SharedCustody = Arc::new(Mutex::new(Custody::default()));
+    let mut custody = Custody::default();
     let fused_pid;
     {
         let mut guard = SUPERVISED.lock().expect("supervised lock");
@@ -655,49 +738,55 @@ fn enter_handoff_mode_inner(state_file: &Path, timeout: Duration) -> Result<(), 
                 let hub = OracleHub::clone(&crate::ORACLE_HUB);
                 match take_back(oracle_sock, &hub, child)? {
                     Some(c) => {
-                        let mut slot = custody.lock().expect("custody lock");
-                        slot.fds = c.fds;
-                        slot.session = c.session;
-                        slot.session_schema = c.session_schema;
+                        custody.fds = c.fds;
+                        custody.session = c.session;
+                        custody.session_schema = c.session_schema;
                     }
-                    None => warn!(
-                        "handoff: no custody (fused did not surrender) — linger will report empty"
-                    ),
+                    None => {
+                        return Err(
+                            "handoff unavailable: the supervised fused did not surrender \
+                             (no custody — refusing rather than degrading the restart)"
+                                .into(),
+                        );
+                    }
                 }
             }
             None => return Err("no supervised fused — handoff mode is meaningless".into()),
         }
     }
 
-    // 3. record the rendezvous (additive fields; pre-field files parse).
+    // Record the rendezvous BEFORE the Ok reaches the client.
     record_in_state_file(state_file, &handoff_sock, fused_pid)?;
 
-    // 4. stop presenting the stack sockets.
-    let _ = std::fs::remove_file(cmd_sock);
-    let _ = std::fs::remove_file(oracle_sock);
-
-    // 5. linger.
+    // Bind the rendezvous BEFORE the Ok too — the successor may race
+    // the reply.
     let _ = std::fs::remove_file(&handoff_sock);
     let listener = UnixListener::bind(&handoff_sock)
         .map_err(|e| format!("bind {}: {e}", handoff_sock.display()))?;
-    // The rendezvous grants fds: owner-only on the socket file (the
-    // uid check on accept is the load-bearing half — the default
-    // rendezvous path lives in world-writable /tmp).
     {
         use std::os::unix::fs::PermissionsExt as _;
         let mode = 0o600;
         let _ = std::fs::set_permissions(&handoff_sock, std::fs::Permissions::from_mode(mode));
     }
-    info!(
-        "handoff: lingering at {} (timeout {timeout:?})",
-        handoff_sock.display()
-    );
-    let child = SUPERVISED.lock().expect("supervised lock").take();
-    match child {
-        Some(c) => serve_handoff(listener, custody, c, timeout),
-        None => unreachable!("the supervised child was present above"),
-    }
-    // 6. exit — the stack belongs to the new pair (or nobody came and
-    // today's behavior already ran its course in serve_handoff).
-    std::process::exit(0);
+
+    // The conductor: grace for the reply, then stop presenting the
+    // stack sockets and linger. It owns the rest of the process.
+    let custody: SharedCustody = std::sync::Arc::new(std::sync::Mutex::new(custody));
+    let cmd_sock = cmd_sock.clone();
+    let oracle_sock = oracle_sock.clone();
+    // The conductor owns the rest of the process life; the handle
+    // is deliberately discarded.
+    let _conductor = std::thread::spawn(move || {
+        std::thread::sleep(HANDOFF_POLL);
+        let _ = std::fs::remove_file(&cmd_sock);
+        let _ = std::fs::remove_file(&oracle_sock);
+        info!("handoff: lingering (timeout {timeout:?})");
+        let child = SUPERVISED.lock().expect("supervised lock").take();
+        match child {
+            Some(c) => serve_handoff(listener, custody, c, timeout),
+            None => unreachable!("the supervised child was present above"),
+        }
+        std::process::exit(0);
+    });
+    Ok(())
 }

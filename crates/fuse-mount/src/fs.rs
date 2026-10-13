@@ -922,7 +922,19 @@ impl Filesystem for FusedFs {
 /// them produced the PR #37 field report: an old fuse-server upserting
 /// to a newer fused left an alive-but-empty mount with no diagnostic
 /// anywhere.
-fn apply_control_line(store: &Store, line: &str) -> bool {
+/// The fast "cannot surrender" answer (same-version wire): the
+/// server's take-back fails in milliseconds and the restart takes the
+/// legacy TERM flow — no timeout penalty on every restart.
+fn refuse_surrender(oracle_socket: &str) {
+    use std::io::Write as _;
+    if let Ok(mut conn) = std::os::unix::net::UnixStream::connect(oracle_socket) {
+        let refusal = "{\"type\":\"surrender_refused\"}";
+        let _ = writeln!(conn, "{refusal}");
+        let _ = conn.flush();
+    }
+}
+
+fn apply_control_line(store: &Store, line: &str, oracle_for_replies: &str) -> bool {
     // The Hello ack ({"type":"ok"}) shares the control stream with
     // commands — replies are not commands; consuming silently is
     // correct; flagging it as a parse failure would cry "version
@@ -941,14 +953,16 @@ fn apply_control_line(store: &Store, line: &str) -> bool {
         }
         // #93 F2 handoff: the REAL daemon cannot surrender its mount
         // session yet — extracting the live fuser connection fd is
-        // the follow-up (design: PR #97 thread). Answering nothing
-        // makes the server's take-back time out into the honest
-        // no-custody fallback; a WRONG answer would be worse.
+        // the follow-up (issue #103). The fast refusal answer makes
+        // the server's take-back fail in milliseconds: the restart
+        // takes the legacy TERM flow cleanly instead of timing out.
         Ok(OracleCommand::Surrender) => {
             warn!(
                 "surrender requested but this daemon build cannot hand off its \
-                 mount session — the restart will use a fresh mount"
+                 mount session — answering the refusal so the restart falls \
+                 back cleanly instead of timing out"
             );
+            refuse_surrender(oracle_for_replies);
             true
         }
         // The successor is serving: exit cleanly (fd copies close
@@ -1002,7 +1016,7 @@ pub fn run_control_loop(store: Store, oracle_socket: String) {
                 match reader.read_line(&mut line) {
                     Ok(0) | Err(_) => break,
                     Ok(_) => {
-                        let _applied = apply_control_line(&store, &line);
+                        let _applied = apply_control_line(&store, &line, &oracle_socket);
                     }
                 }
             }
@@ -1138,7 +1152,7 @@ mod tests {
                         _ => String::from_utf8_lossy(&[(rng.next() % 256) as u8; 6]).into_owned(),
                     },
                 };
-                let _ = apply_control_line(&s, &line);
+                let _ = apply_control_line(&s, &line, "");
             }
             assert_tree_invariants(&s, seed);
         }
@@ -1279,7 +1293,7 @@ mod tests {
         // parse failure would cry "version skew" on every healthy
         // connection (seen live while reproducing #39).
         let s = Store::default();
-        assert!(!apply_control_line(&s, r#"{"type":"ok"}"#));
+        assert!(!apply_control_line(&s, r#"{"type":"ok"}"#, ""));
     }
 
     #[test]

@@ -12,24 +12,26 @@ pub fn handle_command(
             state_file,
             timeout_secs,
         } => {
-            // #93 F2 seamless restart: enter handoff mode. The Ok goes
-            // out on THIS thread; the conductor waits a grace period
-            // so the client receives it before the stack sockets stop
-            // being presented.
+            // #93 F2 seamless restart. B1: engage SYNCHRONOUSLY — the
+            // Ok is a PROMISE that custody was taken and the
+            // rendezvous is live (a fused that cannot surrender means
+            // the client takes the legacy TERM flow, exactly the
+            // pre-handoff behavior — never a degraded linger).
             let sf = std::path::PathBuf::from(state_file);
             let timeout = timeout_secs
                 .as_deref()
                 .and_then(|t| t.parse().ok())
                 .map(std::time::Duration::from_secs)
                 .unwrap_or(fuse_protocol::handoff::HANDOFF_TIMEOUT);
-            // The conductor exits the process itself; the handle is
-            // deliberately discarded.
-            let _conductor = std::thread::spawn(move || {
-                if let Err(e) = crate::handoff::enter_handoff_mode(&sf, timeout) {
-                    tracing::error!("handoff mode failed to start: {e} — continuing to serve");
+            match crate::handoff::engage_handoff(&sf, timeout) {
+                Ok(()) => Response::Ok,
+                Err(e) => {
+                    tracing::info!("handoff refused: {e}");
+                    Response::Error {
+                        message: format!("handoff unavailable: {e}"),
+                    }
                 }
-            });
-            Response::Ok
+            }
         }
         Command::Reset { name } => {
             let n = state.reset(name.as_deref());

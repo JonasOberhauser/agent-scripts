@@ -260,7 +260,11 @@ impl SupervisedStack {
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
-        assert!(served, "successor never served — {}", self.dump_server_log());
+        assert!(
+            served,
+            "successor never served — {}",
+            self.dump_server_log()
+        );
     }
 
     /// The server log tail (failure diagnostics).

@@ -226,6 +226,26 @@ pub(crate) fn take_surrender_payload() -> Option<Surrendered> {
         .pop()
 }
 
+/// A daemon's explicit "cannot surrender" answer (the real fused
+/// until fd extraction lands): take-back fails in milliseconds
+/// instead of timing out.
+pub(crate) fn stash_surrender_refusal() {
+    SURRENDER_REFUSED
+        .lock()
+        .expect("surrender mailbox: no panics under the lock by contract")
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+pub(crate) fn take_surrender_refusal() -> bool {
+    SURRENDER_REFUSED
+        .lock()
+        .expect("surrender mailbox: no panics under the lock by contract")
+        .swap(false, std::sync::atomic::Ordering::SeqCst)
+}
+
+static SURRENDER_REFUSED: std::sync::LazyLock<std::sync::Mutex<std::sync::atomic::AtomicBool>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::sync::atomic::AtomicBool::new(false)));
+
 /// Package hash for the reader, ALWAYS via the hashd helper: this
 /// daemon is deliberately unprivileged and must never touch
 /// `/proc/<pid>/map_files` itself (that is hashd's one job). Failures
@@ -494,6 +514,11 @@ fn handle_conn(state: &Arc<ServerState>, hub: &OracleHub, conn: UnixStream) {
         Err(_) => return,
     };
     let first = String::from_utf8_lossy(&first_raw).to_string();
+    // A daemon's explicit refusal: answer the take-back fast.
+    if first.trim() == "\"type\":\"surrender_refused\"" || first.contains("surrender_refused") {
+        stash_surrender_refusal();
+        return;
+    }
     // The surrender payload: stash the batch, connection's job is done.
     if !fds.is_empty() {
         match serde_json::from_str::<OracleRequest>(first.trim()) {
