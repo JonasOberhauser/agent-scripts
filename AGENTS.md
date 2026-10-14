@@ -103,6 +103,16 @@ and one-read access state live in the daemon-owned policy store
 write-through on every mutation (never a shutdown flush — `kill -9`
 has no hook). Operational consequences:
 
+- **Restarts adopt the surviving data daemon (#93)**: the daemon's
+  control loop reconnects to any server that binds the oracle path, so
+  `fuse-client restart` (whose respawn passes `--adopt-window 3`) lets
+  the NEW server ADOPT the surviving daemon when the Hello version
+  matches and its argv names this stack's mountpoint — no fresh fused,
+  no remount, the served set resyncs through the snapshot replay. The
+  mount-cleanup moved from the client to the server's fresh-spawn
+  branch (the decision point); an incompatible survivor is refused
+  adoption (mixed vintage, #37) and a fresh daemon spawns — the stale
+  one stays parked, not reaped (trusted host).
 - **Killing the daemons no longer resets approvals** — what used to be
   an implicit reset (kill the gatekeeper, budgets come back) is gone;
   access state persists. Treat "restart to clear a grant" as dead.

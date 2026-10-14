@@ -566,6 +566,11 @@ fn respawn_argv(state: &ServerStateFile) -> Vec<String> {
     argv.push(state.log_level.clone());
     argv.push("--pending-timeout".to_string());
     argv.push(state.pending_timeout.to_string());
+    // #93 adopt-the-survivor: give a surviving daemon 3s to reconnect
+    // to the respawned server (its control loop retries every 1s)
+    // before it spawns a fresh one.
+    argv.push("--adopt-window".to_string());
+    argv.push("3".to_string());
     argv
 }
 
@@ -601,19 +606,15 @@ fn start_server_from_state(app: &App, state: &ServerStateFile, log_path: Option<
         eprintln!("  WARNING: cannot execute '{spawn_prog}' — check PATH");
     }
 
-    eprintln!("  Cleaning up stale mount/socket...");
-    if let Some(w) = &state.runtime_wrapper {
-        let wparts: Vec<&str> = w.split_whitespace().collect();
-        let mut umount_args: Vec<&str> = wparts[1..].to_vec();
-        umount_args.extend(&["fusermount", "-uz", &state.mount_point]);
-        let _ = std::process::Command::new(wparts[0]).args(&umount_args).output();
-    } else {
-        let _ = std::process::Command::new("fusermount").arg("-uz").arg(&state.mount_point).output();
-    }
+    eprintln!("  Cleaning up stale socket...");
+    // NO mount teardown here (#93 adopt-the-survivor): the respawned
+    // server ADOPTS the surviving daemon when it can, and clears a
+    // stale mount itself when it cannot — the cleanup moved to the
+    // decision point (spawn_fresh in the server). Destroying the
+    // mount here would detach the live one and strand the surviving
+    // daemon as an unreachable orphan.
     let _ = std::fs::remove_file(&state.socket);
-    let _ = std::fs::remove_dir_all(&state.mount_point);
     std::thread::sleep(std::time::Duration::from_millis(500));
-    let _ = std::fs::create_dir_all(&state.mount_point);
 
     eprintln!("Starting server (v{})...", CLIENT_VERSION);
     let effective_log = log_path.unwrap_or(fuse_protocol::DEFAULT_LOG_PATH);
@@ -776,16 +777,12 @@ fn restart_server(app: &App, log_path: Option<&str>) {
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
 
-    if let Some(w) = &state.runtime_wrapper {
-        let wparts: Vec<&str> = w.split_whitespace().collect();
-        let mut umount_args: Vec<&str> = wparts[1..].to_vec();
-        umount_args.extend(&["fusermount", "-uz", &state.mount_point]);
-        let _ = std::process::Command::new(wparts[0]).args(&umount_args).output();
-    } else {
-        let _ = std::process::Command::new("fusermount").arg("-uz").arg(&state.mount_point).output();
-    }
+    // The mount survives the kill on purpose (#93 adopt-the-survivor):
+    // the new server ADOPTS the still-connected daemon when versions
+    // allow, and only its fresh-spawn branch clears a stale mount.
+    // Pre-emptive fusermount -uz here would detach the live mount and
+    // strand the surviving daemon as an unreachable orphan.
     let _ = std::fs::remove_file(&state.socket);
-    let _ = std::fs::remove_dir_all(&state.mount_point);
     std::thread::sleep(std::time::Duration::from_millis(500));
 
     start_server_from_state(app, &state, log_path);
