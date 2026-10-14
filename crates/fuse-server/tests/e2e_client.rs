@@ -879,4 +879,95 @@ fn restart_appends_to_the_server_log_instead_of_truncating() {
     let _ = server.wait();
 }
 
+// ── #93 adopt-the-survivor: the REAL client flow ────────────────
 
+/// THE user-visible pin: `fuse-client restart` does not replace the
+/// data daemon. A supervision stack (speaker fake daemon), a state
+/// file naming it, a real `fuse-client restart` — the SAME daemon
+/// pid serves before and after; the respawned server ADOPTED it.
+#[test]
+fn restart_adopts_the_surviving_daemon_end_to_end() {
+    let dir = test_tempdir();
+    let cmd_sock = dir.path().join("cmd.sock");
+    let oracle_sock = dir.path().join("oracle.sock");
+    let mnt = dir.path().join("mnt");
+    std::fs::create_dir_all(&mnt).unwrap();
+    let fake = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/debug/fake-fused");
+    assert!(fake.exists(), "fake-fused not built: {}", fake.display());
+
+    let mut server = Command::new(env!("CARGO_BIN_EXE_fuse-server"))
+        .arg("--socket").arg(&cmd_sock)
+        .arg("--oracle-socket").arg(&oracle_sock)
+        .arg("--mount-point").arg(&mnt)
+        .arg("--fused-binary").arg(&fake)
+        .arg("--adopt-window").arg("3")
+        .env("RUST_LOG", "fuse_server=info")
+        .spawn().expect("spawn server");
+    wait_for_socket(&cmd_sock, "server");
+
+    // the daemon appears when the gate's window expires (fresh boot)
+    let daemon_of = |pid: u32| -> bool { std::path::Path::new(&format!("/proc/{pid}/cmdline")).exists() };
+    let find_daemon = || -> Option<u32> {
+        let out = Command::new("pgrep")
+            .arg("-f")
+            .arg(format!("{}.*{}", fake.display(), mnt.display()))
+            .output()
+            .expect("pgrep");
+        String::from_utf8_lossy(&out.stdout)
+            .split_whitespace()
+            .filter_map(|p| p.parse().ok())
+            .find(|&pid| daemon_of(pid))
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let before = loop {
+        if let Some(pid) = find_daemon() {
+            break pid;
+        }
+        assert!(std::time::Instant::now() < deadline, "daemon never spawned");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+
+    let state = serde_json::json!({
+        "version": VERSION,
+        "server_pid": server.id(),
+        "server_binary": env!("CARGO_BIN_EXE_fuse-server"),
+        "mount_point": mnt.to_string_lossy(),
+        "socket": cmd_sock.to_string_lossy(),
+        "log_level": "info",
+        "pending_timeout": 10,
+        "runtime_wrapper": null,
+        "oracle_socket": oracle_sock.to_string_lossy(),
+        "secrets": [],
+    });
+    std::fs::write(dir.path().join("state.json"), state.to_string()).unwrap();
+
+    let state_os: std::ffi::OsString = dir.path().join("state.json").to_string_lossy().into_owned().into();
+    let _guard = STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _reset = EnvReset::new(fuse_protocol::ENV_STATE_FILE, Some(&state_os));
+    let (stdout, stderr, code) = run_client(&cmd_sock, &["restart"]);
+    assert_eq!(code, 0, "restart failed: {stderr}\n{stdout}");
+
+    // THE assertion: same daemon, still alive, no second one.
+    std::thread::sleep(std::time::Duration::from_secs(4));
+    let after = find_daemon();
+    assert_eq!(
+        after,
+        Some(before),
+        "the restart must ADOPT the surviving daemon (pid {before}); \
+         found {after:?} — new process spawned instead: {stderr}"
+    );
+
+    // cleanup: the respawned server (pid from stdout) + leftovers
+    if let Some(pid) = stdout
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("Spawned pid ").and_then(|p| p.parse::<i32>().ok()))
+    {
+        let _ = Command::new("kill").arg(pid.to_string()).output();
+    }
+    if let Some(pid) = after {
+        let _ = Command::new("kill").arg(pid.to_string()).output();
+    }
+    let _ = server.kill();
+    let _ = server.wait();
+}

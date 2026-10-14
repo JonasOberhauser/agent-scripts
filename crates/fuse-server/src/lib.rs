@@ -1,6 +1,8 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::panic, unused_results))]
 pub mod handler;
 pub mod oracle_service;
+
+pub use oracle_service::{AdoptionOffer, ADOPTION_OFFER};
 pub mod policy_store;
 pub mod protocols;
 pub mod socket;

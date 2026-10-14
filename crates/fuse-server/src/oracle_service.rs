@@ -362,6 +362,18 @@ fn handle_conn(state: &Arc<ServerState>, hub: &OracleHub, conn: UnixStream) {
             }
             _ => {}
         }
+        // Offer ourselves to the adoption gate (#93): the startup
+        // window polls this slot; a surviving daemon's reconnect IS
+        // the adoption handshake — no new protocol.
+        if let Some(pid) = peer_pid(&stream) {
+            let mut slot = ADOPTION_OFFER
+                .lock()
+                .expect("adoption slot: no panics under the lock by contract");
+            *slot = Some(AdoptionOffer {
+                pid,
+                version: version.clone(),
+            });
+        }
         let _ = writeln!(stream, "{}", serde_json::to_string(&OracleReply::Ok)
                 .expect("serializing Ok ack: internal enum, infallible"));
         // Replay the content snapshot: late joiners get every secret.
@@ -424,6 +436,39 @@ fn handle_conn(state: &Arc<ServerState>, hub: &OracleHub, conn: UnixStream) {
 /// Process-wide hub the protocol closures use to forward content
 /// changes (the servatui protocols close over `&ServerState` only).
 pub static ORACLE_HUB: std::sync::LazyLock<OracleHub> = std::sync::LazyLock::new(OracleHub::new);
+
+/// A daemon's Hello, offered to the adoption gate (#93 adopt-the-
+/// survivor): filled by every control connection, consumed by the
+/// startup gate that decides adopt-vs-spawn.
+#[derive(Debug, Clone)]
+pub struct AdoptionOffer {
+    pub pid: u32,
+    pub version: Option<String>,
+}
+
+pub static ADOPTION_OFFER: std::sync::Mutex<Option<AdoptionOffer>> =
+    std::sync::Mutex::new(None);
+
+/// The kernel-verified pid of the connected peer (SO_PEERCRED).
+pub(crate) fn peer_pid(stream: &UnixStream) -> Option<u32> {
+    use std::os::unix::io::AsRawFd as _;
+    let fd = stream.as_raw_fd();
+    let sol = libc::SOL_SOCKET;
+    let opt = libc::SO_PEERCRED;
+    let len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let mut len_out = len;
+    let mut ucred: std::mem::MaybeUninit<libc::ucred> = std::mem::MaybeUninit::uninit();
+    let cred_ptr = ucred.as_mut_ptr().cast();
+    let len_ptr = &mut len_out as *mut libc::socklen_t;
+    // SAFETY: getsockopt(2) with a valid fd, SOL_SOCKET/SO_PEERCRED,
+    // properly sized out-pointers — pure kernel query, no allocation.
+    let rc = unsafe { libc::getsockopt(fd, sol, opt, cred_ptr, len_ptr) };
+    if rc != 0 {
+        return None;
+    }
+    // SAFETY: rc == 0, so the kernel fully initialized the ucred.
+    Some(unsafe { ucred.assume_init() }.pid as u32)
+}
 
 /// Run the oracle listener. Blocks.
 pub fn run_oracle_server(socket_path: &std::path::Path, state: Arc<ServerState>, hub: OracleHub) -> Result<(), String> {

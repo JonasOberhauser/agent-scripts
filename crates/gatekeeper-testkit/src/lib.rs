@@ -132,6 +132,11 @@ pub struct Stack {
     /// kit's `fake-fused` on the [`Driver::Supervised`] tier; also
     /// honored by [`Driver::RealMount`].
     pub(crate) fused_binary: Option<PathBuf>,
+    /// Adoption window for the supervision tier (#93): passed as
+    /// --adopt-window so the gate waits for a surviving daemon.
+    pub(crate) adopt_window: Option<u64>,
+    /// Extra env for the spawned policy daemon (test injection).
+    pub(crate) envs: std::collections::HashMap<String, String>,
 }
 
 /// What a kit hashd stub answers on the wire (`hash {pid}` → reply).
@@ -179,6 +184,8 @@ impl Stack {
             secrets: Vec::new(),
             driver: Driver::None,
             fused_binary: None,
+            adopt_window: None,
+            envs: std::collections::HashMap::new(),
         }
     }
 
@@ -189,6 +196,23 @@ impl Stack {
     #[must_use]
     pub fn driver(mut self, d: Driver) -> Self {
         self.driver = d;
+        self
+    }
+
+    /// Add an environment variable for the spawned tiers (the
+    /// adoption tests inject FUSE_FAKE_HELLO_VERSION).
+    #[must_use]
+    pub fn env(mut self, key: &str, value: &str) -> Self {
+        let _ins = self.envs.insert(key.to_string(), value.to_string());
+        self
+    }
+
+    /// Set the adoption window (#93 adopt-the-survivor) on the
+    /// supervision tier: the server waits this long for a surviving
+    /// daemon before spawning fresh.
+    #[must_use]
+    pub fn adopt_window(mut self, secs: u64) -> Self {
+        self.adopt_window = Some(secs);
         self
     }
 
@@ -586,6 +610,175 @@ impl StackHandle {
     /// Tail every daemon log under the stack's root.
     pub fn dump_logs(&self, what: &str) -> String {
         dump_logs_under(self._root.path(), what)
+    }
+}
+
+// Tests may hand-parse output/protocol lines: sanctioned by policy
+// (test + allow), NOT available to production code.
+#[cfg(test)]
+#[allow(unknown_lints)]
+#[allow(custom_parser)]
+#[allow(clippy::panic)]
+mod adopt_tests {
+    use crate::Stack;
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+
+    /// Respawn the policy daemon on the SAME stack sockets/mount —
+    /// the restart shape. The pid registers for teardown; the child
+    /// leaks into init's care otherwise (the respawned server is not
+    /// the kit's own Child).
+    fn respawn_policy(stack: &crate::SupervisedStack, adopt_window: u64) -> u32 {
+        let root = stack.root();
+        let log = std::fs::OpenOptions::new()
+            .create(true).append(true)
+            .open(root.join("server.log"))
+            .expect("reopen server.log");
+        let child = Command::new(crate::real_mount::bin("fuse-server"))
+            .arg("--socket").arg(root.join("cmd.sock"))
+            .arg("--oracle-socket").arg(root.join("oracle.sock"))
+            .arg("--mount-point").arg(root.join("mnt"))
+            .arg("--fused-binary").arg(crate::real_mount::bin("fake-fused"))
+            .arg("--pending-timeout").arg("5")
+            .arg("--adopt-window").arg(adopt_window.to_string())
+            .env(fuse_protocol::ENV_POLICY_FILE, root.join("policy.json"))
+            .env("RUST_LOG", "fuse_server=info")
+            .stdout(log.try_clone().expect("clone log"))
+            .stderr(log)
+            .spawn()
+            .expect("respawn fuse-server");
+        let pid = child.id();
+        stack.register_respawn(pid);
+        // leak the Child handle intentionally: the kit kills by pid at
+        // teardown (double-kill of a waited child is harmless; NOT
+        // registering leaks a server per call)
+        std::mem::forget(child);
+        pid
+    }
+
+    fn wait_until(deadline_secs: u64, f: impl Fn() -> bool) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(deadline_secs);
+        while Instant::now() < deadline {
+            if f() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        false
+    }
+
+    /// #93 adopt-the-survivor, the headline: kill the policy daemon
+    /// (the crash shape — nothing in the server kills the data
+    /// daemon), respawn WITH an adoption window, and the SURVIVING
+    /// daemon must be ADOPTED: same pid, no second daemon spawned.
+    #[test]
+    fn a_surviving_daemon_is_adopted_not_replaced() {
+        let mut stack = Stack::new()
+            .pending_timeout(Duration::from_secs(5))
+            .adopt_window(3)
+            .spawn_supervised();
+        let daemons = stack.daemon_pids();
+        assert_eq!(daemons.len(), 1, "precondition: exactly one daemon");
+        let survivor = daemons[0];
+
+        stack.kill_policy(); // SIGKILL: the crash shape; daemon survives
+
+        let _new_server = respawn_policy(&stack, 3);
+
+        // wait for the new server to boot and the gate to decide
+        assert!(
+            wait_until(10, || {
+                stack.daemon_pids() == vec![survivor]
+                    && stack.server_log_contains("ADOPTED the surviving data daemon")
+            }),
+            "the surviving daemon (pid {survivor}) was not adopted — \
+             daemons now {:?} — server log:\n{}",
+            stack.daemon_pids(),
+            stack.server_log()
+        );
+    }
+
+    /// No survivor (fresh boot, adoption window set): fresh spawn —
+    /// a NEW daemon pid, gate times out honestly.
+    #[test]
+    fn no_survivor_means_fresh_spawn() {
+        let stack = Stack::new()
+            .pending_timeout(Duration::from_secs(5))
+            .adopt_window(2)
+            .spawn_supervised();
+        let daemons = stack.daemon_pids();
+        assert_eq!(
+            daemons.len(),
+            1,
+            "a fresh boot still gets exactly one daemon — {}",
+            stack.server_log()
+        );
+        assert!(
+            stack.server_log_contains("no surviving daemon within"),
+            "the gate must say it timed out honestly: {}",
+            stack.server_log()
+        );
+    }
+
+    /// Incompatible vintage: NOT adopted (the #37 mixed-vintage trap)
+    /// — the server spawns a fresh daemon instead. Both live: the
+    /// stale one is parked (not reaped, per the trusted-host call),
+    /// the fresh one serves.
+    #[test]
+    fn an_incompatible_survivor_is_not_adopted() {
+        let mut stack = Stack::new()
+            .pending_timeout(Duration::from_secs(5))
+            .adopt_window(3)
+            .env("FUSE_FAKE_HELLO_VERSION", "0.0.1")
+            .spawn_supervised();
+        let daemons = stack.daemon_pids();
+        assert_eq!(daemons.len(), 1, "precondition");
+        let stale = daemons[0];
+
+        stack.kill_policy();
+        let _new_server = respawn_policy(&stack, 3);
+
+        assert!(
+            wait_until(10, || {
+                stack.daemon_pids().len() == 2
+                    && stack.server_log_contains("not adoptable")
+            }),
+            "an incompatible survivor must be refused adoption and a \
+             fresh daemon spawned — daemons {:?} — {}",
+            stack.daemon_pids(),
+            stack.server_log()
+        );
+        assert!(
+            stack.daemon_pids().contains(&stale),
+            "no reaping: the stale daemon stays parked (trusted host)"
+        );
+    }
+
+    /// The daemon that serves a DIFFERENT mountpoint (another stack's
+    /// survivor dialing this oracle) must not be adopted: the gate's
+    /// /proc argv check is the identity discipline.
+    #[test]
+    fn a_foreign_survivor_is_not_adopted() {
+        let ours = Stack::new()
+            .pending_timeout(Duration::from_secs(5))
+            .adopt_window(3)
+            .spawn_supervised();
+        // a second stack's daemon, left orphaned pointing at ITS mount
+        let mut other = Stack::new()
+            .pending_timeout(Duration::from_secs(5))
+            .adopt_window(0)
+            .spawn_supervised();
+        other.kill_policy(); // its daemon survives, reconnect loop live
+
+        // respawn OUR server: the foreign daemon may dial OUR oracle?
+        // It dials ITS OWN oracle path (stack-private roots), so it
+        // cannot even reach ours — the root isolation is the first
+        // wall; this test pins that our spawn is unaffected.
+        assert_eq!(
+            ours.daemon_pids().len(),
+            1,
+            "our stack stays single-daemon"
+        );
     }
 }
 

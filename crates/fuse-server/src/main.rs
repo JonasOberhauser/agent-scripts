@@ -32,6 +32,13 @@ struct Cli {
     secret: Vec<String>,
     #[arg(long)]
     allow_other: bool,
+    /// Adoption window (#93 adopt-the-survivor): how long to wait for
+    /// a surviving data daemon to reconnect before spawning a fresh
+    /// one. 0 (default) = spawn immediately — adoption is a RESTART-
+    /// path feature; the client's respawn passes a nonzero window so
+    /// cold starts pay nothing.
+    #[arg(long, default_value_t = 0)]
+    adopt_window: u64,
     /// Substitute the supervised data-daemon binary (issue #94): the
     /// supervision seam — tests drive the lifecycle with a fake fused
     /// that needs no kernel FUSE mount. Same argv otherwise.
@@ -102,46 +109,9 @@ fn main() {
     info!("  socket:          {}", cli.socket.display());
     info!("  oracle-socket:   {}", cli.oracle_socket.display());
     info!("  pending-timeout: {}s", cli.pending_timeout);
-    // --mount-point means SUPERVISE a data daemon at that mount point
-    // (the one-command contract of the old monolith): spawn fused next
-    // to this binary and keep it as a child; on our exit it dies too.
-    if let Some(mp) = &cli.mount_point {
-        let exe = std::env::current_exe().expect("current exe");
-        let sibling = exe.parent().map(|d| d.join(fuse_protocol::FUSED_BIN)).filter(|p| p.exists());
-        // The seam (#94): an explicit --fused-binary wins over the
-        // exe-sibling default; without either, the loud #37 failure.
-        let fused = cli.fused_binary.clone().or(sibling);
-        match fused {
-            Some(fused) => {
-                info!("  mount-point:     {} (spawning supervised data daemon)", mp.display());
-                let child = std::process::Command::new(&fused)
-                    .arg("--mount-point").arg(mp)
-                    .arg(fuse_protocol::ORACLE_SOCKET_FLAG).arg(&cli.oracle_socket)
-                    .spawn();
-                match child {
-                    Ok(c) => {
-                        let _replaced = SUPERVISED_FUSED
-                            .lock()
-                            .expect("supervised-fused lock: set once at spawn")
-                            .replace(c);
-                    }
-                    Err(e) => error!("cannot spawn data daemon {}: {e}", fused.display()),
-                }
-            }
-            None => {
-                // Serving adds with no data daemon looks "healthy" to
-                // every client while nothing ever reaches a mount —
-                // the PR #37 field-report trap.  Fail loudly instead.
-                error!(
-                    "--mount-point given but no data daemon found next to {} — build it \\
-                     (cargo build --workspace) or start `fused` manually; refusing to run \\
-                     mount-less",
-                    exe.display()
-                );
-                std::process::exit(1);
-            }
-        }
-    }
+    // --mount-point handling lives AFTER the oracle endpoint comes
+    // up: the ADOPTION GATE (#93) may take the surviving daemon
+    // instead of spawning. See the tail of main().
 
     stale_socket(&cli.socket);
     stale_socket(&cli.oracle_socket);
@@ -232,12 +202,190 @@ fn main() {
     });
 
     // ── Oracle endpoint (fused: adjudication + content) ───────────
-    // Blocks the main thread for the daemon's lifetime.
-    if let Err(e) = fuse_server::run_oracle_server(&cli.oracle_socket, state, hub) {
-        error!("Oracle server error: {e}");
-        let _ = std::fs::remove_file(&cli.socket);
+    // On its own thread: the ADOPTION GATE must run after the oracle
+    // is listening, and the gate belongs on the main thread.
+    let oracle_path = cli.oracle_socket.clone();
+    let oracle = std::thread::spawn(move || {
+        if let Err(e) = fuse_server::run_oracle_server(&oracle_path, state, hub) {
+            error!("Oracle server error: {e}");
+            std::process::exit(1);
+        }
+    });
+
+    // ── Adoption gate (#93: adopt the surviving daemon) ───────────
+    // --mount-point now means ENSURE a daemon serves that mountpoint:
+    // a surviving fused from the previous server reconnects to this
+    // oracle within ~1s (its control loop), the Hello carries its
+    // version, and SO_PEERCRED names its pid. Compatible + serving OUR
+    // mountpoint => ADOPT: no spawn, no mount touch — the snapshot
+    // replay in the Hello handler resyncs the served set (the
+    // kill-9-respawn flow, generalized). Otherwise fall through to a
+    // fresh spawn, clearing any stale mount first.
+    if let Some(mp) = &cli.mount_point {
+        let window = std::time::Duration::from_secs(cli.adopt_window);
+        if cli.adopt_window == 0 {
+            info!(
+                "  mount-point:     {} (no adoption window; spawning supervised data daemon)",
+                mp.display()
+            );
+            spawn_fresh(&cli, mp);
+        } else if let Some(offer) = wait_for_adoption_offer(window) {
+            let version_ok = offer
+                .version
+                .as_deref()
+                .is_some_and(|v| fuse_protocol::versions_compatible(v, fuse_protocol::VERSION));
+            let mp_ok = daemon_serves_mountpoint(offer.pid, mp);
+            if version_ok && mp_ok {
+                info!(
+                    "  mount-point:     {} — ADOPTED the surviving data daemon \
+                     (pid {}, {})",
+                    mp.display(),
+                    offer.pid,
+                    offer.version.as_deref().unwrap_or("?")
+                );
+                ADOPTED_DAEMON_PID.store(offer.pid, std::sync::atomic::Ordering::SeqCst);
+            } else {
+                warn!(
+                    "  mount-point:     {} — surviving daemon pid {} not adoptable \
+                     (version {:?} compatible={}, serves mountpoint={}); spawning fresh",
+                    mp.display(),
+                    offer.pid,
+                    offer.version,
+                    version_ok,
+                    mp_ok
+                );
+                spawn_fresh(&cli, mp);
+            }
+        } else {
+            info!(
+                "  mount-point:     {} — no surviving daemon within {:?}; spawning fresh",
+                mp.display(),
+                window
+            );
+            spawn_fresh(&cli, mp);
+        }
+    }
+
+    // Park for the daemon's lifetime (the oracle thread owns exit).
+    let _ = oracle.join();
+}
+
+/// The adopted daemon's pid (0 = none). An adopted daemon is NOT a
+/// child: it survives this server's death by design and reconnects to
+/// the NEXT one — that is the adopt flow's whole point.
+static ADOPTED_DAEMON_PID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+fn wait_for_adoption_offer(window: std::time::Duration) -> Option<fuse_server::AdoptionOffer> {
+    let deadline = std::time::Instant::now() + window;
+    loop {
+        {
+            let mut slot = fuse_server::ADOPTION_OFFER
+                .lock()
+                .expect("adoption slot: no panics under the lock by contract");
+            if let Some(offer) = slot.take() {
+                return Some(offer);
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// Verify the daemon is OURS for this stack: its argv carries this
+/// mount point. Kernel-stable, works across every daemon vintage —
+/// no protocol involved (#65's exact-pid discipline, mountpoint form).
+fn daemon_serves_mountpoint(pid: u32, mp: &Path) -> bool {
+    let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+        return false;
+    };
+    let args: Vec<&str> = raw
+        .split(|&b| b == 0)
+        .map(|b| std::str::from_utf8(b).unwrap_or(""))
+        .collect();
+    let mp_str = mp.to_string_lossy();
+    args.windows(2).any(|w| w[0] == "--mount-point" && w[1] == mp_str)
+}
+
+/// The fresh-spawn branch: clear a stale mount (the #54-validated
+/// world: ENOTCONN corpse) and spawn a supervised child, exactly the
+/// pre-adoption behavior. The mountpoint cleanup lives HERE — with
+/// the decision — not in the client, which can no longer know
+/// whether adoption will succeed.
+fn spawn_fresh(cli: &Cli, mp: &Path) {
+    clear_stale_mount(mp);
+    let exe = std::env::current_exe().expect("current exe");
+    let sibling = exe
+        .parent()
+        .map(|d| d.join(fuse_protocol::FUSED_BIN))
+        .filter(|p| p.exists());
+    // The seam (#94): an explicit --fused-binary wins over the
+    // exe-sibling default; without either, the loud #37 failure.
+    let fused = cli.fused_binary.clone().or(sibling);
+    match fused {
+        Some(fused) => {
+            info!("  mount-point:     {} (spawning supervised data daemon)", mp.display());
+            let child = std::process::Command::new(&fused)
+                .arg("--mount-point")
+                .arg(mp)
+                .arg(fuse_protocol::ORACLE_SOCKET_FLAG)
+                .arg(&cli.oracle_socket)
+                .spawn();
+            match child {
+                Ok(c) => {
+                    let _replaced = SUPERVISED_FUSED
+                        .lock()
+                        .expect("supervised-fused lock: set once at spawn")
+                        .replace(c);
+                }
+                Err(e) => error!("cannot spawn data daemon {}: {e}", fused.display()),
+            }
+        }
+        None => {
+            // Serving adds with no data daemon looks "healthy" to
+            // every client while nothing ever reaches a mount —
+            // the PR #37 field-report trap.  Fail loudly instead.
+            error!(
+                "--mount-point given but no data daemon found next to {} — build it \
+                 (cargo build --workspace) or start `fused` manually; refusing to run \
+                 mount-less",
+                exe.display()
+            );
+            std::process::exit(1);
+        }
+    }
+}
+
+/// A dead FUSE mount occupies the path (ENOTCONN corpse — the #54
+/// world): lazy-unmount it and recreate the directory so the fresh
+/// daemon can mount. Best-effort with the manual remediation spelled
+/// out, the #37 discipline.
+fn clear_stale_mount(mp: &Path) {
+    let enotconn = |r: std::io::Result<std::fs::Metadata>| match r {
+        Err(e) => e.raw_os_error() == Some(libc::ENOTCONN),
+        Ok(_) => false,
+    };
+    if !enotconn(std::fs::metadata(mp)) {
+        return;
+    }
+    info!("  stale mount at {} — lazy unmounting", mp.display());
+    for tool in ["fusermount3", "fusermount"] {
+        let _clear = std::process::Command::new(tool).arg("-uz").arg(mp).output();
+        if !enotconn(std::fs::metadata(mp)) {
+            break;
+        }
+    }
+    if enotconn(std::fs::metadata(mp)) {
+        error!(
+            "cannot clear the stale mount at {} — run: fusermount3 -uz {}",
+            mp.display(),
+            mp.display()
+        );
         std::process::exit(1);
     }
+    let _rm = std::fs::remove_dir_all(mp);
+    let _mk = std::fs::create_dir_all(mp);
 }
 
 /// Three WORDS (clap's num_args = 3 delivers them as a triple) — no
