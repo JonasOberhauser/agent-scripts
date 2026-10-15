@@ -1,4 +1,4 @@
-#![cfg_attr(test, allow(inline_literal))]
+#![cfg_attr(test, allow(unknown_lints, inline_literal))]
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};

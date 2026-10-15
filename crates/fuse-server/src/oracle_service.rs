@@ -14,7 +14,7 @@
 //! package-hash lookup → one-read semantics → pending + wait until
 //! grant/expiry → Allow/Deny. The data daemon serves bytes only on
 //! Allow.
-#![cfg_attr(test, allow(inline_literal))]
+#![cfg_attr(test, allow(unknown_lints, inline_literal))]
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};

@@ -1,4 +1,4 @@
-#![cfg_attr(test, allow(inline_literal))]
+#![cfg_attr(test, allow(unknown_lints, inline_literal))]
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 

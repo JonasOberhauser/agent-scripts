@@ -1,4 +1,4 @@
-#![cfg_attr(test, allow(inline_literal))]
+#![cfg_attr(test, allow(unknown_lints, inline_literal))]
 use fuse_protocol::{Command, Response};
 
 use crate::state::ServerState;

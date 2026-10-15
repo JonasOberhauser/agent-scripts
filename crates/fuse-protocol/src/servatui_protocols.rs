@@ -1,4 +1,4 @@
-#![cfg_attr(test, allow(inline_literal))]
+#![cfg_attr(test, allow(unknown_lints, inline_literal))]
 use servyi_servatui::{Console, Plugin, Protocol, ShellAction};
 
 /// The message positions this crate uses (servyi/lints #7/#16

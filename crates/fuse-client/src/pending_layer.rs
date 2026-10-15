@@ -14,7 +14,7 @@
 //! All server I/O goes through [`ServerTalk`] so the render/event path
 //! never blocks on the socket: production queues requests to a worker
 //! thread ([`spawn_worker`]), tests run them inline ([`DirectTalk`]).
-#![cfg_attr(test, allow(inline_literal))]
+#![cfg_attr(test, allow(unknown_lints, inline_literal))]
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};

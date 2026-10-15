@@ -15,7 +15,7 @@
 //! `~/.local/state/gatekeeper/policy.json` — state, not config
 //! (never hand-edited concurrently, not portable), and never /tmp
 //! (tmpfiles/tmpfs wipe on reboot would defeat the point).
-#![cfg_attr(test, allow(inline_literal))]
+#![cfg_attr(test, allow(unknown_lints, inline_literal))]
 
 use std::io::Write as _;
 use std::path::PathBuf;

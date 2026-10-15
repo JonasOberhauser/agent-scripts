@@ -3,7 +3,7 @@
 //! fix each failure, so pendings shown to a human are actionable.
 //!
 //! See the `hashd` binary crate for the protocol and deployment modes.
-#![cfg_attr(test, allow(inline_literal))]
+#![cfg_attr(test, allow(unknown_lints, inline_literal))]
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;

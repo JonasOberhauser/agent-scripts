@@ -1,4 +1,4 @@
-#![cfg_attr(test, allow(inline_literal))]
+#![cfg_attr(test, allow(unknown_lints, inline_literal))]
 use serde::{Deserialize, Serialize};
 
 /// Read-only status snapshot for a secret.
