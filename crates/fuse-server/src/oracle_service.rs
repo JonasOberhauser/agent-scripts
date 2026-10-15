@@ -334,15 +334,57 @@ fn adjudicate(state: &ServerState, name: &str, pid: u32, offset: usize, size: us
 
 /// One accepted connection: control (`hello` first) or asks.
 fn handle_conn(state: &Arc<ServerState>, hub: &OracleHub, conn: UnixStream) {
+    // #103: a SurrenderPayload connection carries its fd batch as
+    // SCM_RIGHTS on the FIRST line — ancillary data cannot pass
+    // through a buffered reader (it would be swallowed), so peek the
+    // first line with recvmsg BEFORE any BufReader exists.
+    {
+        let (line, fds) = match recv_first_line_with_fds(&conn) {
+            Ok(x) => x,
+            Err(e) => {
+                warn!("oracle: first-line recv failed ({e}) — closing");
+                return;
+            }
+        };
+        if let Ok(OracleRequest::SurrenderPayload {
+            session_schema,
+            state: payload,
+        }) = serde_json::from_str::<OracleRequest>(line.trim())
+        {
+            info!(
+                "oracle: takeover payload received (schema {session_schema}, {} fds)",
+                fds.len()
+            );
+            let mut mbox = TAKEOVER_MAILBOX
+                .lock()
+                .expect("takeover lock: no panics under it by contract");
+            *mbox = Some(TakeoverPayload {
+                fds,
+                session_schema,
+                state: payload,
+            });
+            return;
+        }
+        // Not a payload: continue with the buffered handling of the
+        // same first line (recvmsg consumed it raw).
+        handle_conn_first(state, hub, conn, line);
+    }
+}
+
+/// The buffered path, with the first line already consumed raw.
+fn handle_conn_first(
+    state: &Arc<ServerState>,
+    hub: &OracleHub,
+    conn: UnixStream,
+    first: String,
+) {
     let mut reader = BufReader::new(match conn.try_clone() {
         Ok(c) => c,
         Err(_) => return,
     });
     let mut stream = conn;
-    let mut first = String::new();
-    if reader.read_line(&mut first).is_err() {
-        return;
-    }
+    let mut first = first;
+    let _ = &mut first;
     // Control connection: hello — register and hold the stream open;
     // the hub writes commands into it.
     if let Ok(OracleRequest::Hello { version }) = serde_json::from_str(first.trim()) {
@@ -355,13 +397,48 @@ fn handle_conn(state: &Arc<ServerState>, hub: &OracleHub, conn: UnixStream) {
             Some(v) if !fuse_protocol::versions_compatible(v, fuse_protocol::VERSION) => {
                 warn!(
                     "data daemon reports protocol v{} vs server v{} — mixed vintages; \
-                     its mount may silently miss content. Rebuild (cargo build \
-                     --workspace) and restart the data daemon (fused).",
+                     requesting the mount session (Surrender, #103)",
                     v, fuse_protocol::VERSION
                 );
+                // #103 fd handover: ask the incompatible daemon for its
+                // mount session instead of parking it. A daemon that
+                // knows the word answers with a SurrenderPayload
+                // connection; one that doesn't ignores it (logged as an
+                // unrecognized line on its side) and the gate times out
+                // into the fresh-mount fallback. Either way it is NOT
+                // registered into the hub — an incompatible daemon must
+                // not receive this-vintage Serve pushes.
+                let line = serde_json::to_string(&OracleCommand::Surrender)
+                    .expect("internal enum: infallible");
+                let _w = writeln!(stream, "{line}");
+                let _f = stream.flush();
+                let pid = peer_pid(&stream);
+                let mut pending = TAKEOVER_PENDING
+                    .lock()
+                    .expect("takeover lock: no panics under it by contract");
+                *pending = Some(TakeoverPending {
+                    daemon_pid: pid,
+                    control: stream.try_clone().ok(),
+                });
+                // The gate must still LEARN about the incompatible
+                // daemon (its offer carries the version) so the
+                // takeover branch can run — mismatch ≠ invisible.
+                if let Some(pid) = pid {
+                    let mut slot = ADOPTION_OFFER
+                        .lock()
+                        .expect("adoption slot: no panics under the lock by contract");
+                    *slot = Some(AdoptionOffer {
+                        pid,
+                        version: version.clone(),
+                    });
+                }
+                return; // hold nothing further on THIS thread's borrow
             }
             _ => {}
         }
+        // #103: a compatible Hello from a takeover-successor wakes
+        // the transplant loop (its Retire step waits for this).
+        RESUMED_HELLO.store(true, std::sync::atomic::Ordering::SeqCst);
         // Offer ourselves to the adoption gate (#93): the startup
         // window polls this slot; a surviving daemon's reconnect IS
         // the adoption handshake — no new protocol.
@@ -449,7 +526,87 @@ pub struct AdoptionOffer {
 pub static ADOPTION_OFFER: std::sync::Mutex<Option<AdoptionOffer>> =
     std::sync::Mutex::new(None);
 
+/// #103 fd handover: the incompatible daemon's CONTROL connection
+/// (kept for the Retire word once the successor serves), plus its pid.
+pub struct TakeoverPending {
+    pub daemon_pid: Option<u32>,
+    pub control: Option<UnixStream>,
+}
+
+pub static TAKEOVER_PENDING: std::sync::Mutex<Option<TakeoverPending>> =
+    std::sync::Mutex::new(None);
+
+/// A received takeover payload: the fd batch (fd\[0\] = the live
+/// /dev/fuse connection, fd\[1..\] = open host fds) and the
+/// session-state envelope (schema + opaque JSON).
+pub struct TakeoverPayload {
+    pub fds: Vec<std::os::fd::OwnedFd>,
+    pub session_schema: u32,
+    pub state: serde_json::Value,
+}
+
+pub static TAKEOVER_MAILBOX: std::sync::Mutex<Option<TakeoverPayload>> =
+    std::sync::Mutex::new(None);
+
+/// #103: set on every COMPATIBLE Hello — the takeover transplant
+/// loop watches it to learn its successor is serving (then Retires
+/// the old daemon). The adoption gate consumed its own offer first,
+/// so a regular adopted daemon's Hello cannot false-wake a transplant
+/// (transplant only runs on the incompatible path).
+pub static RESUMED_HELLO: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// The kernel-verified pid of the connected peer (SO_PEERCRED).
+/// Read the first line WITH any SCM_RIGHTS batch attached to it
+/// (#103 takeover payloads). Stream sockets deliver ancillary data
+/// with some byte range — recvmsg until the newline, collecting fds
+/// from every cmsg that arrives.
+fn recv_first_line_with_fds(
+    conn: &UnixStream,
+) -> Result<(String, Vec<std::os::fd::OwnedFd>), String> {
+    use std::os::fd::AsRawFd as _;
+    use std::os::fd::FromRawFd as _;
+    let mut line = Vec::new();
+    let mut owned_fds: Vec<std::os::fd::OwnedFd> = Vec::new();
+    let fd = conn.as_raw_fd();
+    let mut buf = [0u8; 4096];
+    let mut cmsg_space = nix::cmsg_space!(libc::cmsghdr, std::os::unix::io::RawFd);
+    loop {
+        let n = {
+            let mut iov = [std::io::IoSliceMut::new(&mut buf)];
+            let msg = nix::sys::socket::recvmsg::<()>(
+                fd,
+                &mut iov,
+                Some(&mut cmsg_space),
+                nix::sys::socket::MsgFlags::empty(),
+            )
+            .map_err(|e| format!("recvmsg: {e}"))?;
+            let mut collected: Vec<std::os::fd::OwnedFd> = Vec::new();
+            let cmsgs: Vec<_> = msg.cmsgs().map(|it| it.collect()).unwrap_or_default();
+            for c in cmsgs {
+                if let nix::sys::socket::ControlMessageOwned::ScmRights(fds) = c {
+                    for raw in fds {
+                        // SAFETY: the kernel placed this fd in our table.
+                        collected.push(unsafe {
+                            std::os::fd::OwnedFd::from_raw_fd(raw)
+                        });
+                    }
+                }
+            }
+            owned_fds.extend(collected);
+            msg.bytes
+        };
+        if n == 0 {
+            return Err("connection closed before a full line".into());
+        }
+        line.extend_from_slice(&buf[..n]);
+        if let Some(nl) = line.iter().position(|&b| b == b'\n') {
+            line.truncate(nl);
+            return Ok((String::from_utf8_lossy(&line).into_owned(), owned_fds));
+        }
+    }
+}
+
 pub(crate) fn peer_pid(stream: &UnixStream) -> Option<u32> {
     use std::os::unix::io::AsRawFd as _;
     let fd = stream.as_raw_fd();
@@ -519,3 +676,45 @@ pub fn ask(socket_path: &std::path::Path, name: &str, pid: u32, offset: u64, siz
 #[allow(dead_code)]
 fn _pending_type_witness(_: Option<PendingAccessInfo>) {}
 
+
+#[cfg(test)]
+mod takeover_wire_tests {
+    use super::*;
+    use std::os::fd::AsRawFd as _;
+
+    /// The payload path end to end in-process: a fake daemon sends
+    /// the SurrenderPayload line with an SCM_RIGHTS batch; the
+    /// receiver must yield the line AND the fds.
+    #[test]
+    fn recv_first_line_with_fds_gets_line_and_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let f = tempfile::tempfile().unwrap();
+        let fd = f.as_raw_fd();
+        let payload = serde_json::json!({
+            "type": "surrender_payload",
+            "session_schema": 1,
+            "state": {"next_fino": 1, "tree": [], "labels": [], "identities": [], "open_fds": [], "proto_major": 7, "proto_minor": 9}
+        });
+        std::thread::spawn(move || {
+            let c = UnixStream::connect(&path).unwrap();
+            let bytes = format!("{payload}\n");
+            let iov = [std::io::IoSlice::new(bytes.as_bytes())];
+            let cmsg = nix::sys::socket::ControlMessage::ScmRights(&[fd]);
+            let _sent = nix::sys::socket::sendmsg::<()>(
+                c.as_raw_fd(), &iov, &[cmsg],
+                nix::sys::socket::MsgFlags::empty(), None,
+            ).unwrap();
+        });
+        let (conn, _) = listener.accept().unwrap();
+        let (line, fds) = recv_first_line_with_fds(&conn)
+            .unwrap_or_else(|e| panic!("recv failed: {e}"));
+        assert!(line.contains("surrender_payload"), "{line}");
+        assert_eq!(fds.len(), 1);
+        use std::io::Read as _;
+        let mut probe = std::fs::File::from(fds.into_iter().next().unwrap());
+        let mut buf = [0u8; 1];
+        let _ = probe.read(&mut buf);
+    }
+}

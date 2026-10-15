@@ -7,6 +7,7 @@ edition = "2021"
 fuse-protocol = { path = "../fuse-protocol" }
 fuse-server = { path = "../fuse-server" }
 tempfile = "3"
+nix = { workspace = true }
 serde_json = "1"
 libc = "0.2"
 

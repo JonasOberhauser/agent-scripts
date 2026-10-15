@@ -2,7 +2,7 @@
 pub mod handler;
 pub mod oracle_service;
 
-pub use oracle_service::{AdoptionOffer, ADOPTION_OFFER};
+pub use oracle_service::{AdoptionOffer, ADOPTION_OFFER, TakeoverPending, TakeoverPayload, TAKEOVER_MAILBOX, TAKEOVER_PENDING};
 pub mod policy_store;
 pub mod protocols;
 pub mod socket;

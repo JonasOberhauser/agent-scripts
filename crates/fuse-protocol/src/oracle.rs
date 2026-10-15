@@ -76,6 +76,13 @@ pub enum OracleRequest {
         #[serde(default)]
         version: Option<String>,
     },
+    /// The takeover payload — see the struct-level docs above; a
+    /// member here so the oracle's one parse surface covers every
+    /// first line a daemon may send.
+    SurrenderPayload {
+        session_schema: u32,
+        state: serde_json::Value,
+    },
 }
 
 /// Policy daemon → fused.
@@ -108,6 +115,19 @@ pub enum OracleCommand {
     },
     /// Stop serving this secret (readers get ENOENT).
     Remove { name: String },
+    /// FROZEN TAKEOVER WORD (#103): a newer policy daemon asks an
+    /// incompatible-vintage daemon to hand its mount connection over.
+    /// The daemon answers on a FRESH connection with
+    /// [`OracleRequest::SurrenderPayload`] (the /dev/fuse fd + open
+    /// host fds as SCM_RIGHTS), then serves until `Retire`. Daemons
+    /// that predate the word log it as unrecognized and keep serving —
+    /// the caller times out into the fresh-mount fallback. Additive
+    /// forever: never repurpose, never remove.
+    Surrender,
+    /// FROZEN TAKEOVER WORD (#103): the successor is serving; exit
+    /// cleanly (its fd copies are its own to close — the kernel
+    /// connection lives on the successor's dups).
+    Retire,
 }
 
 /// Replies, both directions.
