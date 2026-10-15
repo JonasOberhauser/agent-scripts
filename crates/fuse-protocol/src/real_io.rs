@@ -26,7 +26,7 @@ use crate::IoError;
 /// each cause has a different remediation, and the pending panel shows
 /// this text to the human deciding the grant.
 /// Error prose (user-facing diagnostics).
-#[allow(inline_literal)]
+#[allow(unknown_lints)] #[allow(inline_literal)]
 fn inspect_hint(e: &std::io::Error) -> &'static str {
     use std::io::ErrorKind::*;
     match e.kind() {
@@ -44,7 +44,7 @@ fn inspect_hint(e: &std::io::Error) -> &'static str {
 /// permission above, or the mapped path does not resolve in the server's
 /// mount namespace (paths from a container guest rootfs).
 /// Error prose (user-facing diagnostics).
-#[allow(inline_literal)]
+#[allow(unknown_lints)] #[allow(inline_literal)]
 fn map_files_hint(e: &std::io::Error) -> &'static str {
     use std::io::ErrorKind::*;
     match e.kind() {

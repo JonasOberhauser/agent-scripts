@@ -266,7 +266,7 @@ fn parse_reset(args: &str) -> Result<Command, String> {
 }
 fn parse_reset_all(_: &str) -> Result<Command, String> { Ok(Command::Reset { name: None }) }
 // Necessity: split-indexed argv parsing (parts[0..2] are positional protocol words)
-#[allow(inline_literal)]
+#[allow(unknown_lints)] #[allow(inline_literal)]
 fn parse_add(args: &str) -> Result<Command, String> {
     let parts: Vec<&str> = args.split_whitespace().collect();
     if parts.len() < 3 {
@@ -299,7 +299,7 @@ fn parse_remove(args: &str) -> Result<Command, String> {
     Ok(Command::RemoveSecret { name: name.to_string() })
 }
 // Necessity: positional argv parsing
-#[allow(inline_literal)]
+#[allow(unknown_lints)] #[allow(inline_literal)]
 fn parse_rotate(args: &str) -> Result<Command, String> {
     let parts: Vec<&str> = args.split_whitespace().collect();
     if parts.len() < 2 {
@@ -401,7 +401,7 @@ const CONFIRM_SEP: char = ' ';
 /// The wire's error marker field.
 const WIRE_ERROR_FIELD: &str = "__error__";
 
-#[allow(inline_literal)] // help strings are user-facing prose by
+#[allow(unknown_lints)] #[allow(inline_literal)] // help strings are user-facing prose by
                          // definition; fixture literals below likewise
 pub const COMMAND_TABLE: &[CommandSpec] = &[
     CommandSpec { name: cmd::STATUS, help: "Show all secrets and access counts", parse: parse_status, complete: NO_COMPLETE, offline: None, cli_args: no_cli_args },
