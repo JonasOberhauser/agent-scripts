@@ -1,4 +1,28 @@
+#![cfg_attr(test, allow(unknown_lints, inline_literal))]
 use servyi_servatui::{Console, Plugin, Protocol, ShellAction};
+
+/// The message positions this crate uses (servyi/lints #7/#16
+/// protocol): prose constructors whose string arguments are messages
+/// by definition, not constants to name.
+macro_rules! register_message {
+    ($m:ident) => {
+        #[allow(dead_code)]
+        const _: &[(&str, &str)] = &[("servyi::message", stringify!($m))];
+    };
+}
+register_message!(print_line);
+register_message!(help);
+register_message!(about);
+
+/// Usage prose shared by the id-parsing commands.
+macro_rules! usage {
+    ($cmd:expr) => {
+        concat!("Usage: ", $cmd, " ID (ID must be a number)")
+    };
+}
+
+
+
 
 use crate::protocol::{Command, PendingAccessInfo, Response};
 
@@ -241,6 +265,8 @@ fn parse_reset(args: &str) -> Result<Command, String> {
     Ok(Command::Reset { name: args.split_whitespace().next().map(|s| s.to_string()) })
 }
 fn parse_reset_all(_: &str) -> Result<Command, String> { Ok(Command::Reset { name: None }) }
+// Necessity: split-indexed argv parsing (parts[0..2] are positional protocol words)
+#[allow(unknown_lints)] #[allow(inline_literal)]
 fn parse_add(args: &str) -> Result<Command, String> {
     let parts: Vec<&str> = args.split_whitespace().collect();
     if parts.len() < 3 {
@@ -272,6 +298,8 @@ fn parse_remove(args: &str) -> Result<Command, String> {
     }
     Ok(Command::RemoveSecret { name: name.to_string() })
 }
+// Necessity: positional argv parsing
+#[allow(unknown_lints)] #[allow(inline_literal)]
 fn parse_rotate(args: &str) -> Result<Command, String> {
     let parts: Vec<&str> = args.split_whitespace().collect();
     if parts.len() < 2 {
@@ -282,18 +310,18 @@ fn parse_rotate(args: &str) -> Result<Command, String> {
 fn parse_pending(_: &str) -> Result<Command, String> { Ok(Command::ListPending) }
 fn parse_grant(args: &str) -> Result<Command, String> {
     args.trim().parse::<u64>().map(|id| Command::Grant { id })
-        .map_err(|_| "Usage: grant ID (ID must be a number)".into())
+        .map_err(|_| usage!("grant").into())
 }
 fn parse_grant_forever(args: &str) -> Result<Command, String> {
     args.trim().parse::<u64>().map(|id| Command::GrantForever { id })
-        .map_err(|_| "Usage: grant-forever ID (ID must be a number)".into())
+        .map_err(|_| usage!("grant-forever").into())
 }
 fn parse_lockdown(_: &str) -> Result<Command, String> {
     Ok(Command::LockDown)
 }
 fn parse_deny(args: &str) -> Result<Command, String> {
     args.trim().parse::<u64>().map(|id| Command::Deny { id })
-        .map_err(|_| "Usage: deny ID (ID must be a number)".into())
+        .map_err(|_| usage!("deny").into())
 }
 fn parse_version(_: &str) -> Result<Command, String> { Ok(Command::GetVersion) }
 fn parse_show_map(_: &str) -> Result<Command, String> { Ok(Command::ShowMap) }
@@ -368,6 +396,13 @@ pub mod cmd {
 }
 
 /// The complete wire command set, in protocol order.
+/// Confirmation sentinel (the shell-side prompt marker).
+const CONFIRM_SEP: char = ' ';
+/// The wire's error marker field.
+const WIRE_ERROR_FIELD: &str = "__error__";
+
+#[allow(unknown_lints)] #[allow(inline_literal)] // help strings are user-facing prose by
+                         // definition; fixture literals below likewise
 pub const COMMAND_TABLE: &[CommandSpec] = &[
     CommandSpec { name: cmd::STATUS, help: "Show all secrets and access counts", parse: parse_status, complete: NO_COMPLETE, offline: None, cli_args: no_cli_args },
     CommandSpec { name: cmd::MOUNTS, help: "List mounted secret files", parse: parse_mounts, complete: NO_COMPLETE, offline: None, cli_args: no_cli_args },
@@ -435,7 +470,7 @@ pub(crate) fn complete_first_secret(
         return Vec::new();
     };
     // The argument must have been started (a space after the command).
-    if !confirmed.contains(' ') {
+    if !confirmed.contains(CONFIRM_SEP) {
         return Vec::new();
     }
     let arg = tokens.next().unwrap_or("");
@@ -497,7 +532,7 @@ pub(crate) fn pending_completions(ids: &[u64], confirmed: &str) -> Vec<String> {
     let Some(cmd) = tokens.next() else {
         return Vec::new();
     };
-    if !confirmed.contains(' ') {
+    if !confirmed.contains(CONFIRM_SEP) {
         return Vec::new();
     }
     let arg = tokens.next().unwrap_or("");
@@ -526,7 +561,7 @@ pub fn run_command_once(
     // server-side failures travel as the {"__error__": msg} envelope and
     // must surface as Err(msg) — not die in Response parsing.
     if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&raw) {
-        if let Some(err) = val.get("__error__").and_then(|v| v.as_str()) {
+        if let Some(err) = val.get(WIRE_ERROR_FIELD).and_then(|v| v.as_str()) {
             return Err(err.to_string());
         }
     }

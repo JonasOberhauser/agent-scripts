@@ -6,6 +6,7 @@
 //! connects to. It holds NO secret bytes in split mode: content goes to
 //! the data daemon through the oracle hub, metadata stays here.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::panic, unused_results))]
+#![cfg_attr(test, allow(unknown_lints, inline_literal))]
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
@@ -56,6 +57,23 @@ struct Cli {
     oracle_socket: PathBuf,
 }
 
+/// Exit status for signal-caused shutdowns (128+SIGINT/TERM).
+const EXIT_SIGNALLED: i32 = 130;
+/// Generic startup/config failure exit.
+const EXIT_FAILURE: i32 = 1;
+/// The conservative secret mode for boot-time secrets (read-only).
+const BOOT_SECRET_MODE: u32 = 0o400;
+/// Poll cadence while waiting on spawned children/sockets.
+const SPAWN_POLL: Duration = Duration::from_millis(50);
+/// The mount-point flag (argv contract with fused).
+const MOUNT_POINT_FLAG: &str = "--mount-point";
+/// The unmount tool pair, most-specific first.
+const UNMOUNT_TOOLS: [&str; 2] = ["fusermount3", "fusermount"];
+/// The lazy-unmount flag.
+const LAZY_UNMOUNT_FLAG: &str = "-uz";
+/// Secrets arrive as flat triples.
+const SECRET_WORDS: usize = 3;
+
 /// Pre-computed CStrings for async-signal-safe unlink in the handler.
 static CLEANUP_SOCKETS: OnceLock<(std::ffi::CString, std::ffi::CString)> = OnceLock::new();
 
@@ -71,7 +89,7 @@ extern "C" fn shutdown_handler(_sig: libc::c_int) {
         // SAFETY: see above.
         let _unlinked = unsafe { libc::unlink(oracle_ptr) };
     }
-    let code = 130;
+    let code = EXIT_SIGNALLED;
     // SAFETY: _exit(2) is the async-signal-safe way out of a handler; it
     // intentionally skips atexit/destructors to avoid non-signal-safe
     // cleanup in this context.
@@ -88,7 +106,7 @@ fn stale_socket(path: &Path) {
     if path.exists() {
         if std::os::unix::net::UnixStream::connect(path).is_ok() {
             error!("Another server is running at {}. Kill it first.", path.display());
-            std::process::exit(1);
+            std::process::exit(EXIT_FAILURE);
         }
         warn!("Removing stale socket at {}", path.display());
         let _ = std::fs::remove_file(path);
@@ -162,7 +180,7 @@ fn main() {
 
     let hub = OracleHub::clone(&fuse_server::ORACLE_HUB);
     // num_args = 3: flat [name, file, hash, ...] triples; chunk them.
-    for spec in cli.secret.chunks(3) {
+    for spec in cli.secret.chunks(SECRET_WORDS) {
         match parse_secret(&spec[0], &spec[1], &spec[2]) {
             Ok((name, host, hash)) => {
                 // MR4: register by stat — identity + size, never bytes.
@@ -170,7 +188,7 @@ fn main() {
                     Ok(md) => md,
                     Err(e) => {
                         error!("cannot stat {}: {e}", host.display());
-                        std::process::exit(1);
+                        std::process::exit(EXIT_FAILURE);
                     }
                 };
                 use std::os::unix::fs::MetadataExt;
@@ -179,13 +197,13 @@ fn main() {
                     md.len(),
                     md.ino()
                 );
-                state.add_with_mode(&name, host.clone(), md.len() as usize, &hash, 0o400);
+                state.add_with_mode(&name, host.clone(), md.len() as usize, &hash, BOOT_SECRET_MODE);
                 let inner = fuse_protocol::anonymize_path(&state.anon_salt, &name);
-                hub.serve(&name, &inner, 0o400);
+                hub.serve(&name, &inner, BOOT_SECRET_MODE);
             }
             Err(e) => {
                 error!("Bad --secret {:?}: {e}", spec);
-                std::process::exit(1);
+                std::process::exit(EXIT_FAILURE);
             }
         }
     }
@@ -197,7 +215,7 @@ fn main() {
     let _socket_server = std::thread::spawn(move || {
         if let Err(e) = fuse_server::run_socket_server(&socket_path, socket_state) {
             error!("Socket server error: {e}");
-            std::process::exit(1);
+            std::process::exit(EXIT_FAILURE);
         }
     });
 
@@ -208,7 +226,7 @@ fn main() {
     let oracle = std::thread::spawn(move || {
         if let Err(e) = fuse_server::run_oracle_server(&oracle_path, state, hub) {
             error!("Oracle server error: {e}");
-            std::process::exit(1);
+            std::process::exit(EXIT_FAILURE);
         }
     });
 
@@ -289,7 +307,7 @@ fn wait_for_adoption_offer(window: std::time::Duration) -> Option<fuse_server::A
         if std::time::Instant::now() >= deadline {
             return None;
         }
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::thread::sleep(SPAWN_POLL);
     }
 }
 
@@ -305,7 +323,7 @@ fn daemon_serves_mountpoint(pid: u32, mp: &Path) -> bool {
         .map(|b| std::str::from_utf8(b).unwrap_or(""))
         .collect();
     let mp_str = mp.to_string_lossy();
-    args.windows(2).any(|w| w[0] == "--mount-point" && w[1] == mp_str)
+    args.windows(2).any(|w| w[0] == MOUNT_POINT_FLAG && w[1] == mp_str)
 }
 
 /// The fresh-spawn branch: clear a stale mount (the #54-validated
@@ -327,7 +345,7 @@ fn spawn_fresh(cli: &Cli, mp: &Path) {
         Some(fused) => {
             info!("  mount-point:     {} (spawning supervised data daemon)", mp.display());
             let child = std::process::Command::new(&fused)
-                .arg("--mount-point")
+                .arg(MOUNT_POINT_FLAG)
                 .arg(mp)
                 .arg(fuse_protocol::ORACLE_SOCKET_FLAG)
                 .arg(&cli.oracle_socket)
@@ -352,7 +370,7 @@ fn spawn_fresh(cli: &Cli, mp: &Path) {
                  mount-less",
                 exe.display()
             );
-            std::process::exit(1);
+            std::process::exit(EXIT_FAILURE);
         }
     }
 }
@@ -370,8 +388,8 @@ fn clear_stale_mount(mp: &Path) {
         return;
     }
     info!("  stale mount at {} — lazy unmounting", mp.display());
-    for tool in ["fusermount3", "fusermount"] {
-        let _clear = std::process::Command::new(tool).arg("-uz").arg(mp).output();
+    for tool in UNMOUNT_TOOLS {
+        let _clear = std::process::Command::new(tool).arg(LAZY_UNMOUNT_FLAG).arg(mp).output();
         if !enotconn(std::fs::metadata(mp)) {
             break;
         }
@@ -382,7 +400,7 @@ fn clear_stale_mount(mp: &Path) {
             mp.display(),
             mp.display()
         );
-        std::process::exit(1);
+        std::process::exit(EXIT_FAILURE);
     }
     let _rm = std::fs::remove_dir_all(mp);
     let _mk = std::fs::create_dir_all(mp);

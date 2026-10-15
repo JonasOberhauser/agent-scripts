@@ -1,5 +1,18 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::panic, unused_results))]
 pub mod error;
+
+/// The message positions this crate uses (servyi/lints #7/#16
+/// protocol): prose constructors whose string arguments are messages
+/// by definition, not constants to name.
+macro_rules! register_message {
+    ($m:ident) => {
+        #[allow(dead_code)]
+        const _: &[(&str, &str)] = &[("servyi::message", stringify!($m))];
+    };
+}
+register_message!(IoError);
+
+
 pub mod hashd;
 pub mod io;
 pub mod oracle;
@@ -23,9 +36,12 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// patch releases never change the wire protocol and must not force a
 /// restart of the long-running shared server.  Unparseable versions
 /// (e.g. an old server's placeholder) count as incompatible.
+/// Version-component separator.
+const SEP_VERSION: char = '.';
+
 pub fn protocol_compatible(a: &str, b: &str) -> bool {
     fn major_minor(s: &str) -> Option<(&str, &str)> {
-        let mut it = s.split('.');
+        let mut it = s.split(SEP_VERSION);
         let maj = it.next()?;
         let min = it.next()?;
         let digits = |x: &str| !x.is_empty() && x.bytes().all(|b| b.is_ascii_digit());

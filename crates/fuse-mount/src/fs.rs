@@ -16,6 +16,7 @@
 //!                                        SCM_RIGHTS, reads pread it,
 //!                                        release closes it. No
 //!                                        snapshot bytes anywhere.
+#![cfg_attr(test, allow(unknown_lints, inline_literal))]
 
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsStr;

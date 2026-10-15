@@ -1,3 +1,4 @@
+#![cfg_attr(test, allow(unknown_lints, inline_literal))]
 use fuse_protocol::{Command, Response};
 
 use crate::state::ServerState;
@@ -7,7 +8,7 @@ pub fn handle_command(cmd: Command, state: &ServerState, hub: &crate::oracle_ser
         Command::Reset { name } => {
             let n = state.reset(name.as_deref());
             if name.is_some() && n == 0 {
-                Response::Error { message: "secret not found".into() }
+                Response::Error { message: crate::oracle_service::REASON_NOT_FOUND.into() }
             } else {
                 Response::Ok
             }
@@ -47,7 +48,7 @@ pub fn handle_command(cmd: Command, state: &ServerState, hub: &crate::oracle_ser
                 hub.remove(&name);
                 Response::Ok
             } else {
-                Response::Error { message: "secret not found".into() }
+                Response::Error { message: crate::oracle_service::REASON_NOT_FOUND.into() }
             }
         }
 
@@ -55,7 +56,7 @@ pub fn handle_command(cmd: Command, state: &ServerState, hub: &crate::oracle_ser
             if state.rotate_hash(&name, &new_hash) {
                 Response::Ok
             } else {
-                Response::Error { message: "secret not found".into() }
+                Response::Error { message: crate::oracle_service::REASON_NOT_FOUND.into() }
             }
         }
 
@@ -129,12 +130,12 @@ fn register_secret(
     if !md.is_file() {
         return Err(format!("{} is not a regular file", host.display()));
     }
-    state.add_with_mode(name, host, md.len() as usize, hash, mode & 0o777);
+    state.add_with_mode(name, host, md.len() as usize, hash, mode & crate::oracle_service::MODE_MASK_PLAIN);
     // Serve carries structure only — the identity's wire crossings
     // are StatOk (down) and Open (up), each with a job — plus the
     // anonymized container-view path (issue #47).
     let inner = fuse_protocol::anonymize_path(&state.anon_salt, name);
-    hub.serve(name, &inner, mode & 0o777);
+    hub.serve(name, &inner, mode & crate::oracle_service::MODE_MASK_PLAIN);
     Ok(inner)
 }
 #[cfg(test)]

@@ -1,3 +1,4 @@
+#![cfg_attr(test, allow(unknown_lints, inline_literal))]
 use std::path::{Path, PathBuf};
 
 use fuse_protocol::SystemIo;

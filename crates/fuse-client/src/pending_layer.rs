@@ -14,6 +14,7 @@
 //! All server I/O goes through [`ServerTalk`] so the render/event path
 //! never blocks on the socket: production queues requests to a worker
 //! thread ([`spawn_worker`]), tests run them inline ([`DirectTalk`]).
+#![cfg_attr(test, allow(unknown_lints, inline_literal))]
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -35,6 +36,13 @@ use unicode_width::UnicodeWidthStr;
 
 /// Widget-name of the panel rows (ownership/hit-testing key).
 const PANEL_NAME: &str = "fuse.pending_panel";
+
+/// The button labels (one source for render AND width math).
+pub(crate) const LABEL_DENY: &str = "[deny]";
+pub(crate) const LABEL_GRANT: &str = "[grant]";
+pub(crate) const LABEL_FOREVER: &str = "[forever]";
+pub(crate) const LABEL_DENY_ALL: &str = "[deny all]";
+pub(crate) const LABEL_GRANT_ALL: &str = "[grant all]";
 
 /// How many request lines the panel shows at once.
 const MAX_SHOWN: usize = 5;
@@ -90,11 +98,11 @@ impl Button {
     /// The rendered label, brackets included.
     fn label(&self) -> &'static str {
         match self {
-            Button::Deny { .. } => "[deny]",
-            Button::Grant { .. } => "[grant]",
-            Button::GrantForever { .. } => "[forever]",
-            Button::DenyAll => "[deny all]",
-            Button::GrantAll => "[grant all]",
+            Button::Deny { .. } => LABEL_DENY,
+            Button::Grant { .. } => LABEL_GRANT,
+            Button::GrantForever { .. } => LABEL_FOREVER,
+            Button::DenyAll => LABEL_DENY_ALL,
+            Button::GrantAll => LABEL_GRANT_ALL,
         }
     }
 
@@ -335,7 +343,7 @@ fn all_row_rect(panel: Rect) -> Rect {
 /// (grant on the left, deny on the right). Shared by request rows and
 /// the all-row (only the labels differ).
 fn button_pair(row: Rect, all: bool) -> (Rect, Rect) {
-    let (deny_l, grant_l) = if all { ("[deny all]", "[grant all]") } else { ("[deny]", "[grant]") };
+    let (deny_l, grant_l) = if all { (LABEL_DENY_ALL, LABEL_GRANT_ALL) } else { (LABEL_DENY, LABEL_GRANT) };
     let deny = Rect {
         x: row.x + row.width.saturating_sub(deny_l.len() as u16),
         y: row.y,
@@ -355,9 +363,9 @@ fn button_pair(row: Rect, all: bool) -> (Rect, Rect) {
 fn forever_rect(row: Rect) -> Rect {
     let (_, grant) = button_pair(row, false);
     Rect {
-        x: grant.x.saturating_sub("[forever]".len() as u16 + 1),
+        x: grant.x.saturating_sub(LABEL_FOREVER.len() as u16 + 1),
         y: row.y,
-        width: "[forever]".len() as u16,
+        width: LABEL_FOREVER.len() as u16,
         height: 1,
     }
 }
@@ -578,8 +586,8 @@ fn grid_row_line_styled_collapsed(
     collapsed: Option<&str>,
 ) -> Line<'static> {
     let all = matches!(row, GridRow::All);
-    let (deny_l, grant_l) = if all { ("[deny all]", "[grant all]") } else { ("[deny]", "[grant]") };
-    let forever_w = if all { 0 } else { "[forever]".len() + 1 };
+    let (deny_l, grant_l) = if all { (LABEL_DENY_ALL, LABEL_GRANT_ALL) } else { (LABEL_DENY, LABEL_GRANT) };
+    let forever_w = if all { 0 } else { LABEL_FOREVER.len() + 1 };
     let buttons_w = deny_l.len() + 1 + grant_l.len() + forever_w;
     let mut spans: Vec<Span<'static>> = Vec::new();
     match row {

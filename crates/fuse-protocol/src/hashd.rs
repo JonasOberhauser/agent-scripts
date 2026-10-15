@@ -3,6 +3,7 @@
 //! fix each failure, so pendings shown to a human are actionable.
 //!
 //! See the `hashd` binary crate for the protocol and deployment modes.
+#![cfg_attr(test, allow(unknown_lints, inline_literal))]
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -10,6 +11,24 @@ use std::time::Duration;
 
 /// Where the socket-activated (or manually started) hashd listens.
 pub const DEFAULT_SOCK: &str = "/run/fuse-hashd.sock";
+
+/// How many times a Busy hashd is retried before surfacing (#38).
+const BUSY_RETRY_LIMIT: u32 = 3;
+/// The wire's error-kind vocabulary.
+const KIND_UNPRIVILEGED: &str = "unprivileged";
+const KIND_GONE: &str = "gone";
+/// Placeholder binary name in remediation text.
+const HASHD_BIN_PLACEHOLDER: &str = "<hashd-binary>";
+
+/// The retry cadence for a Busy hashd (#38): the ask retries while a
+/// slot frees.
+const BUSY_RETRY_PAUSE: Duration = Duration::from_millis(250);
+/// The connect-attempt deadline before falling back to a sibling.
+const CONNECT_DEADLINE: Duration = Duration::from_millis(400);
+/// The poll slice while watching a nonblocking connect.
+const CONNECT_POLL: Duration = Duration::from_millis(25);
+/// An ascii sha256 hex digest's length.
+const SHA256_HEX_LEN: usize = 64;
 
 /// Reply classification.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,9 +94,9 @@ pub fn ask_with_answer_timeout(
         attempts += 1;
         match ask_once(socket, pid, answer_timeout) {
             Ok(h) => return Ok(h),
-            Err(HashdError::Busy(why)) if attempts < 3 => {
+            Err(HashdError::Busy(why)) if attempts < BUSY_RETRY_LIMIT => {
                 // the promised "retry in a moment will succeed"
-                std::thread::sleep(Duration::from_millis(250));
+                std::thread::sleep(BUSY_RETRY_PAUSE);
                 let _ = why;
             }
             Err(e) => return Err(e),
@@ -123,7 +142,7 @@ fn ask_once(socket: &str, pid: u32, answer_timeout: Duration) -> Result<String, 
 /// step may classify EAGAIN this way — on the read path the same
 /// errno comes from our own 500ms timeout and means "no answer".
 fn connect_with_retry(socket: &str) -> Result<UnixStream, HashdError> {
-    let deadline = std::time::Instant::now() + Duration::from_millis(400);
+    let deadline = std::time::Instant::now() + CONNECT_DEADLINE;
     loop {
         match connect_bounded(socket, deadline) {
             Ok(s) => return Ok(s),
@@ -136,7 +155,7 @@ fn connect_with_retry(socket: &str) -> Result<UnixStream, HashdError> {
                         HashdError::Unreachable(e.to_string())
                     });
                 }
-                std::thread::sleep(Duration::from_millis(25));
+                std::thread::sleep(CONNECT_POLL);
             }
         }
     }
@@ -202,7 +221,7 @@ fn connect_bounded(socket: &str, deadline: std::time::Instant) -> Result<UnixStr
             }
             let mut pfd = libc::pollfd { fd, events: libc::POLLOUT, revents: 0 };
             let n_fds = 1;
-            let slice_ms = 25;
+            let slice_ms = CONNECT_POLL.as_millis() as i32;
             let poll_ptr = &mut pfd as *mut libc::pollfd;
             // SAFETY: poll_ptr/n_fds describe exactly pfd above.
             let prc = unsafe { libc::poll(poll_ptr, n_fds, slice_ms) };
@@ -267,14 +286,14 @@ pub fn parse_reply(line: &str) -> Result<String, HashdError> {
     let r: Reply = serde_json::from_str(line.trim())
         .map_err(|e| HashdError::Other(format!("malformed reply: {e} (line {line:?})")))?;
     if let Some(hash) = r.ok {
-        if hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        if hash.len() == SHA256_HEX_LEN && hash.chars().all(|c| c.is_ascii_hexdigit()) {
             return Ok(hash);
         }
         return Err(HashdError::Other(format!("malformed hash in reply: {line:?}")));
     }
     match r.error {
-        Some(e) if e.kind == "unprivileged" => Err(HashdError::Unprivileged(e.message)),
-        Some(e) if e.kind == "gone" => Err(HashdError::Gone(e.message)),
+        Some(e) if e.kind == KIND_UNPRIVILEGED => Err(HashdError::Unprivileged(e.message)),
+        Some(e) if e.kind == KIND_GONE => Err(HashdError::Gone(e.message)),
         Some(e) => Err(HashdError::Other(e.message)),
         None => Err(HashdError::Other(format!("malformed reply: {line:?}"))),
     }
@@ -296,7 +315,7 @@ pub const SYSTEM_PATH: &str = "/usr/local/bin/hashd";
 pub fn start_commands(socket: &str, hashd_binary: Option<&str>) -> String {
     let source = match hashd_binary {
         Some(bin) if bin != SYSTEM_PATH => bin.to_string(),
-        _ => "<hashd-binary>".to_string(),
+        _ => HASHD_BIN_PLACEHOLDER.to_string(),
     };
     format!(
         "sudo install -m 755 {source} {SYSTEM_PATH}\n  \
@@ -497,7 +516,7 @@ mod tests {
                     seen.store(1, std::sync::atomic::Ordering::SeqCst);
                     // hold without answering: the small injected budget
                     // classifies this ask Busy; the client disconnects
-                    std::thread::sleep(Duration::from_millis(400));
+                    std::thread::sleep(CONNECT_DEADLINE);
                     continue;
                 }
                 let _ = conn.write_all(format!("{{\"ok\":\"{}\"}}\n", "a".repeat(64)).as_bytes());

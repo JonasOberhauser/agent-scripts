@@ -1,8 +1,22 @@
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::panic, unused_results))]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::panic, unused_results, unknown_lints, inline_literal))]
 use std::path::{Path, PathBuf};
 
 use fuse_protocol::{client_protocols, ServerStateFile, VERSION as CLIENT_VERSION};
 use servyi_servatui::App;
+
+/// The message positions this crate uses (servyi/lints #7/#16
+/// protocol): prose constructors whose string arguments are messages
+/// by definition, not constants to name.
+macro_rules! register_message {
+    ($m:ident) => {
+        #[allow(dead_code)]
+        const _: &[(&str, &str)] = &[("servyi::message", stringify!($m))];
+    };
+}
+register_message!(help);
+register_message!(about);
+
+
 
 mod pending_layer;
 

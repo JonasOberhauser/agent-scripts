@@ -1,8 +1,22 @@
+#![cfg_attr(test, allow(unknown_lints, inline_literal))]
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
+
+/// The plain rwx mask for served modes.
+const MODE_MASK_PLAIN: u32 = 0o777;
+/// The wildcard hash sentinel (any reader).
+const WILDCARD_HASH: &str = "*";
+
+/// The deny reason when the one-read budget is spent.
+const REASON_EXCEEDED: &str = "exceeded access limit";
+/// The deny reason while lockdown is armed (#66).
+pub(crate) const REASON_LOCKDOWN: &str =
+    "lockdown armed: new unauthorized access is refused";
+/// The first pending id minted (ids only grow from here).
+const FIRST_PENDING_ID: u64 = 1;
 use tracing::error;
 
 /// One permitted reader hash, with provenance (issue #34 MR3): the
@@ -86,12 +100,12 @@ impl ReadOutcome {
     /// pending flow, without a reason string).
     pub fn denial_reason(&self) -> Option<String> {
         match self {
-            ReadOutcome::AlreadyAccessed => Some("exceeded access limit".to_string()),
+            ReadOutcome::AlreadyAccessed => Some(REASON_EXCEEDED.to_string()),
             ReadOutcome::HashMismatch { got, expected } => {
                 Some(format!("hash mismatch: got {got}, expected {expected}"))
             }
             ReadOutcome::DeniedLocked => {
-                Some("lockdown armed: new unauthorized access is refused".to_string())
+                Some(REASON_LOCKDOWN.to_string())
             }
             ReadOutcome::Granted | ReadOutcome::NotFound => None,
         }
@@ -106,7 +120,7 @@ pub fn lock_secret<'a>(rec: &'a Mutex<SecretRecord>, name: &str) -> MutexGuard<'
         Ok(guard) => guard,
         Err(poisoned) => {
             let mut guard = poisoned.into_inner();
-            guard.access_count = 1;
+            guard.access_count = FIRST_ACCESS;
             guard.reading_pid = None;
             guard.read_progress = 0;
             error!("Secret '{name}' mutex poisoned — access revoked. Use 'reset {name}' to re-enable.");
@@ -117,6 +131,17 @@ pub fn lock_secret<'a>(rec: &'a Mutex<SecretRecord>, name: &str) -> MutexGuard<'
 
 /// Shared state behind the FUSE filesystem and the socket server.
 /// No global Mutex — each secret has its own Mutex for fine-grained locking.
+/// The one-read budget's first tick (a granted open sets it).
+const FIRST_ACCESS: u64 = 1;
+/// Default pending window when none is configured.
+pub(crate) const DEFAULT_PENDING_TIMEOUT: Duration = Duration::from_secs(10);
+/// Display width of a truncated package hash.
+const HASH_DISPLAY_CHARS: usize = 12;
+/// The display form of an unobserved package hash.
+const UNKNOWN_HASH: &str = "<unknown>";
+/// How pending hashes join for display.
+const HASH_JOIN_SEP: &str = " | ";
+
 #[derive(Debug)]
 pub struct ServerState {
     pub secrets: DashMap<String, Arc<Mutex<SecretRecord>>>,
@@ -161,8 +186,8 @@ impl Default for ServerState {
         Self {
             secrets: DashMap::new(),
             pending: DashMap::new(),
-            next_pending_id: AtomicU64::new(1),
-            pending_timeout: Mutex::new(Duration::from_secs(10)),
+            next_pending_id: AtomicU64::new(FIRST_PENDING_ID),
+            pending_timeout: Mutex::new(DEFAULT_PENDING_TIMEOUT),
             lockdown: AtomicBool::new(false),
             hashd_sock: std::env::var(fuse_protocol::ENV_HASHD_SOCK)
                 .unwrap_or_else(|_| fuse_protocol::hashd::DEFAULT_SOCK.to_string()),
@@ -187,7 +212,7 @@ impl ServerState {
         size: usize,
         allowed_hash: impl Into<String>,
     ) {
-        self.add_with_mode(name, host_path, size, allowed_hash, 0o400);
+        self.add_with_mode(name, host_path, size, allowed_hash, fuse_protocol::protocol::default_secret_mode());
     }
 
     /// The host file behind a name (MR4 open path).
@@ -254,7 +279,7 @@ impl ServerState {
             // review blocker on #57: it used to return without
             // write-through, so a joined hash died with the process.
             rec.size = size;
-            rec.mode = mode & 0o777;
+            rec.mode = mode & MODE_MASK_PLAIN;
             rec.host_path = host_path.into();
             drop(rec);
             drop(existing);
@@ -270,7 +295,7 @@ impl ServerState {
                 access_count: 0,
                 reading_pid: None,
                 read_progress: 0,
-                mode: mode & 0o777,
+                mode: mode & MODE_MASK_PLAIN,
                 unlimited_reads: false,
             })),
         );
@@ -337,8 +362,8 @@ impl ServerState {
             Some(h) => rec
                 .allowed_hashes
                 .iter()
-                .any(|ph| ph.hash == "*" || ph.hash == h),
-            None => rec.allowed_hashes.iter().any(|ph| ph.hash == "*"),
+                .any(|ph| ph.hash == WILDCARD_HASH || ph.hash == h),
+            None => rec.allowed_hashes.iter().any(|ph| ph.hash == WILDCARD_HASH),
         };
 
         if !hash_ok && self.lockdown() {
@@ -357,13 +382,13 @@ impl ServerState {
             ReadOutcome::Granted
         } else {
             ReadOutcome::HashMismatch {
-                got: pid_hash.unwrap_or("<unknown>").to_string(),
+                got: pid_hash.unwrap_or(UNKNOWN_HASH).to_string(),
                 expected: rec
                     .allowed_hashes
                     .iter()
                     .map(|ph| ph.render())
                     .collect::<Vec<_>>()
-                    .join(" | "),
+                    .join(HASH_JOIN_SEP),
             }
         }
     }
@@ -600,7 +625,7 @@ impl ServerState {
             let mut rec = lock_secret(&rec_arc, &secret_name);
             tracing::info!(
                 "grant-forever {id}: whitelisting package {} for '{secret_name}' (unlimited reads)",
-                &package_hash[..package_hash.len().min(12)]
+                &package_hash[..package_hash.len().min(HASH_DISPLAY_CHARS)]
             );
             match rec
                 .allowed_hashes

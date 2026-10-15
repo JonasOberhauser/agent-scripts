@@ -1,7 +1,15 @@
+#![cfg_attr(test, allow(unknown_lints, inline_literal))]
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::io::{CommandOutput, PathState, SystemIo};
+
+/// The stty reset verb (terminal heal after a crash).
+const STTY_RESET: &str = "sane";
+/// The NUL seed byte of the package hasher.
+const HASH_SEED_BYTE: &[u8] = b"\0";
+/// The line terminator on the hashd wire.
+const WIRE_NEWLINE: &[u8] = b"\n";
 use crate::IoError;
 
 
@@ -17,6 +25,8 @@ use crate::IoError;
 /// Disambiguate why a `/proc/<pid>` inspection step failed, from the errno:
 /// each cause has a different remediation, and the pending panel shows
 /// this text to the human deciding the grant.
+/// Error prose (user-facing diagnostics).
+#[allow(unknown_lints)] #[allow(inline_literal)]
 fn inspect_hint(e: &std::io::Error) -> &'static str {
     use std::io::ErrorKind::*;
     match e.kind() {
@@ -33,6 +43,8 @@ fn inspect_hint(e: &std::io::Error) -> &'static str {
 /// The map_files read (and its fallbacks) both failed: either the ptrace
 /// permission above, or the mapped path does not resolve in the server's
 /// mount namespace (paths from a container guest rootfs).
+/// Error prose (user-facing diagnostics).
+#[allow(unknown_lints)] #[allow(inline_literal)]
 fn map_files_hint(e: &std::io::Error) -> &'static str {
     use std::io::ErrorKind::*;
     match e.kind() {
@@ -257,7 +269,7 @@ impl SystemIo for RealSystemIo {
         }
         // Raw mode first: stty sane restores line discipline and default
         // special chars on our stdin (the tty the child borrowed).
-        let _ = std::process::Command::new("stty").arg("sane").status();
+        let _ = std::process::Command::new("stty").arg(STTY_RESET).status();
         // Then the escape-level modes stty knows nothing about: mouse
         // capture (incl. SGR 1006 — the dead-scroll-wheel culprit),
         // alternate screen, hidden cursor. Mirrors servatui's restore
@@ -300,7 +312,7 @@ impl SystemIo for RealSystemIo {
         let mut hasher = Sha256::new();
         for (range, path) in &entries {
             hasher.update(path.to_string_lossy().as_bytes());
-            hasher.update(b"\0");
+            hasher.update(HASH_SEED_BYTE);
             // Read the actually-mapped inode (works after the on-disk
             // path was replaced or unlinked); fall back to the path.
             // FAIL CLOSED on unreadable mappings: a marker would make
@@ -351,7 +363,7 @@ impl SystemIo for RealSystemIo {
         let mut stream = std::os::unix::net::UnixStream::connect(path)
             .map_err(|e| IoError(format!("connect {}: {e}", path.display())))?;
         stream.write_all(data)?;
-        stream.write_all(b"\n")?;
+        stream.write_all(WIRE_NEWLINE)?;
         stream.flush()?;
         let mut reader = BufReader::new(&stream);
         let mut line = String::new();
