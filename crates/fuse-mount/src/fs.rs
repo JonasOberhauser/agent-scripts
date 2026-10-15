@@ -1205,6 +1205,8 @@ fn surrender(store: &Store, oracle: &std::path::Path) -> Result<(), String> {
     let mut owned: Vec<std::os::fd::OwnedFd> = Vec::with_capacity(1 + host_fds.len());
     for fd in std::iter::once(fuse_fd).chain(host_fds.iter().copied()) {
         let dup = nix_dup(fd)?;
+        // SAFETY: dup is a live descriptor returned by the clone
+        // above; ownership transfers to the OwnedFd.
         owned.push(unsafe { std::os::fd::OwnedFd::from_raw_fd(dup) });
     }
 
