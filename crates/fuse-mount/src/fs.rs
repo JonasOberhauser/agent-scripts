@@ -872,15 +872,6 @@ fn apply_control_line(store: &Store, line: &str) -> bool {
     }
 }
 
-/// Maintain the CONTROL connection to the policy daemon: say hello,
-/// then apply every Serve/Remove it pushes. Reconnects on loss.
-/// Content sync no longer exists — Serve only shapes the frozen tree;
-/// bytes reach readers as fds at open time.
-///
-/// # Panics
-/// Never in operation: the `expect`s clone a live connection and
-/// serialize internal enums — both infallible on a healthy loop
-/// iteration; transport errors return through `Result` paths instead.
 /// statvfs traditional values (the frozen-tree convention).
 const STATFS_BLOCKS: u64 = 1_000_000;
 const STATFS_BSIZE: u32 = 512;
@@ -898,6 +889,15 @@ const IO_BUFFER: usize = 4096;
 /// The control socket's connect timeout.
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Maintain the CONTROL connection to the policy daemon: say hello,
+/// then apply every Serve/Remove it pushes. Reconnects on loss.
+/// Content sync no longer exists — Serve only shapes the frozen tree;
+/// bytes reach readers as fds at open time.
+///
+/// # Panics
+/// Never in operation: the `expect`s clone a live connection and
+/// serialize internal enums — both infallible on a healthy loop
+/// iteration; transport errors return through `Result` paths instead.
 pub fn run_control_loop(store: Store, oracle_socket: String) {
     loop {
         if let Ok(conn) = UnixStream::connect(&oracle_socket) {
