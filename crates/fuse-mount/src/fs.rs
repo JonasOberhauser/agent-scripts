@@ -522,7 +522,7 @@ impl FusedFs {
         FileAttr {
             ino,
             size,
-            blocks: size.div_ceil(BLOCK_SIZE),
+            blocks: size.div_ceil(u64::from(BLOCK_SIZE)),
             atime: now,
             mtime: now,
             ctime: now,
@@ -533,7 +533,7 @@ impl FusedFs {
             uid,
             gid,
             rdev: 0,
-            blksize: STATFS_BSIZE,
+            blksize: BLOCK_SIZE,
             flags: 0,
         }
     }
@@ -555,7 +555,7 @@ impl FusedFs {
             uid,
             gid,
             rdev: 0,
-            blksize: STATFS_BSIZE,
+            blksize: BLOCK_SIZE,
             flags: 0,
         }
     }
@@ -810,7 +810,7 @@ impl Filesystem for FusedFs {
         // Content sizes are live at open (no snapshots); only the
         // served-file count is known statically.
         let files = self.store.file_count() as u64 + 1;
-        reply.statfs(STATFS_BLOCKS, STATFS_BLOCKS, STATFS_BLOCKS, files, STATFS_BLOCKS, STATFS_BSIZE, STATFS_NAME_MAX, STATFS_BSIZE);
+        reply.statfs(STATFS_BLOCKS, STATFS_BLOCKS, STATFS_BLOCKS, files, STATFS_BLOCKS, BLOCK_SIZE, STATFS_NAME_MAX, BLOCK_SIZE);
     }
 
     fn setattr(
@@ -872,12 +872,12 @@ fn apply_control_line(store: &Store, line: &str) -> bool {
     }
 }
 
-/// statvfs traditional values (the frozen-tree convention).
+/// statvfs traditional values (the frozen-tree convention). The
+/// block size is one thing: what `blocks` counts in AND what
+/// `f_bsize`/`blksize` report — one constant, not two.
+const BLOCK_SIZE: u32 = 512;
 const STATFS_BLOCKS: u64 = 1_000_000;
-const STATFS_BSIZE: u32 = 512;
 const STATFS_NAME_MAX: u32 = 255;
-/// stat blocks per byte-unit.
-const BLOCK_SIZE: u64 = 512;
 /// Regular-file read-only mask for the served view.
 const MODE_READ_MASK: u32 = 0o444;
 /// The plain rwx mask.
