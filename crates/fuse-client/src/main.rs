@@ -1,4 +1,4 @@
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::panic, unused_results), inline_literal)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::panic, unused_results, unknown_lints, inline_literal))]
 use std::path::{Path, PathBuf};
 
 use fuse_protocol::{client_protocols, ServerStateFile, VERSION as CLIENT_VERSION};
