@@ -12,6 +12,7 @@
 //! 2. `fuse-mount`  — the FUSE mount answers a `stat` of the hosted file
 //!    within a bounded time (run via `timeout(1)` so a dead mount cannot
 //!    wedge the orchestrator itself).
+#![cfg_attr(test, allow(inline_literal))]
 
 use std::fmt;
 use std::path::Path;

@@ -15,6 +15,7 @@
 //! `~/.local/state/gatekeeper/policy.json` — state, not config
 //! (never hand-edited concurrently, not portable), and never /tmp
 //! (tmpfiles/tmpfs wipe on reboot would defeat the point).
+#![cfg_attr(test, allow(inline_literal))]
 
 use std::io::Write as _;
 use std::path::PathBuf;
@@ -64,16 +65,23 @@ struct PolicyHash {
 
 /// Resolved persistence location (see module docs).
 pub fn policy_path() -> PathBuf {
+    /// The XDG state home override key.
+const ENV_XDG_STATE: &str = "XDG_STATE_HOME";
+/// The fallback home key.
+const ENV_HOME: &str = "HOME";
+/// The store's directory and file names under the state root.
+const STORE_DIR: &str = "gatekeeper";
+const STORE_FILE: &str = "policy.json";
     if let Some(p) = std::env::var_os(fuse_protocol::ENV_POLICY_FILE) {
         return PathBuf::from(p);
     }
-    let base = std::env::var_os("XDG_STATE_HOME")
+    let base = std::env::var_os(ENV_XDG_STATE)
         .map(PathBuf::from)
         .unwrap_or_else(|| {
-            let home = std::env::var_os("HOME").unwrap_or_default();
+            let home = std::env::var_os(ENV_HOME).unwrap_or_default();
             PathBuf::from(home).join(".local").join("state")
         });
-    base.join("gatekeeper").join("policy.json")
+    base.join(STORE_DIR).join(STORE_FILE)
 }
 
 /// Load policy into `state` (and announce the tree to a connected
