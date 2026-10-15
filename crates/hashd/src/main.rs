@@ -51,7 +51,7 @@ use fuse_protocol::{RealSystemIo, SystemIo};
 /// Default socket path: `/run` when we can (root / socket activation),
 /// `$TMPDIR`-style fallback for unprivileged manual runs.
 fn default_socket() -> String {
-    if std::path::Path::new("/run").is_dir() && can_write_run() {
+    if std::path::Path::new(RUN_DIR).is_dir() && can_write_run() {
         fuse_protocol::hashd::DEFAULT_SOCK.to_string()
     } else {
         format!("{HASHD_SOCK_PREFIX}{}.sock", nix_uid())
@@ -61,7 +61,7 @@ fn default_socket() -> String {
 fn can_write_run() -> bool {
     std::fs::metadata(fuse_protocol::hashd::DEFAULT_SOCK)
         .map(|_| true) // exists: socket-activated, the fd arrives later
-        .or_else(|_| std::fs::metadata("/run").map(|m| !m.permissions().readonly()))
+        .or_else(|_| std::fs::metadata(RUN_DIR).map(|m| !m.permissions().readonly()))
         .is_ok_and(|ok| ok)
 }
 
@@ -80,7 +80,7 @@ fn nix_uid() -> u32 {
 /// Does THIS process hold the capability the kernel demands (can it
 /// follow one of its own child's map_files links)?
 fn privileges_ok() -> bool {
-    let Ok(mut child) = std::process::Command::new("sleep").arg("2").spawn() else {
+    let Ok(mut child) = std::process::Command::new("sleep").arg(CHECK_DELAY_SECS).spawn() else {
         return false;
     };
     let ok = (|| {
@@ -113,8 +113,8 @@ fn handle(conn: std::os::unix::net::UnixStream) {
         return;
     }
     let trimmed = line.trim();
-    let reply = if trimmed == "status" {
-        let state = if privileges_ok() { "privileged" } else { "unprivileged" };
+    let reply = if trimmed == REQ_STATUS {
+        let state = if privileges_ok() { STATE_PRIVILEGED } else { STATE_UNPRIVILEGED };
         format!("{{\"status\":\"{state}\"}}\n")
     } else {
         // request grammar: WORD pid — plain split, the exempt idiom
@@ -128,16 +128,16 @@ fn handle(conn: std::os::unix::net::UnixStream) {
                         || msg.contains("Permission denied")
                     {
                         if privileges_ok() {
-                            "generic"
+                            KIND_GENERIC
                         } else {
                             // The helper itself lacks the init-ns capability:
                             // the actionable case for client-side remediation.
-                            "unprivileged"
+                            KIND_UNPRIVILEGED
                         }
                     } else if msg.contains("No such file") {
-                        "gone"
+                        KIND_GONE
                     } else {
-                        "generic"
+                        KIND_GENERIC
                     };
                     format!(
                         "{{\"error\":{{\"kind\":\"{kind}\",\"message\":{}}}}}\n",
@@ -156,14 +156,32 @@ fn handle(conn: std::os::unix::net::UnixStream) {
     let _ = stream.flush();
 }
 
+/// The well-known runtime dir (socket home).
+const RUN_DIR: &str = "/run";
+/// The status request word.
+const REQ_STATUS: &str = "status";
+/// Wire kinds.
+const KIND_GENERIC: &str = "generic";
+const KIND_UNPRIVILEGED: &str = "unprivileged";
+const KIND_GONE: &str = "gone";
+/// Status words.
+const STATE_PRIVILEGED: &str = "privileged";
+const STATE_UNPRIVILEGED: &str = "unprivileged";
+/// The privilege self-check delay.
+const CHECK_DELAY_SECS: &str = "2";
+/// The socket flag.
+const SOCKET_FLAG: &str = "--socket";
+/// The daemon socket's mode (hashd is a shared helper).
+const SOCKET_MODE: u32 = 0o666;
+
 fn main() {
     let socket = std::env::args()
         .nth(1)
-        .filter(|a| a != "--socket")
+        .filter(|a| a != SOCKET_FLAG)
         .or_else(|| {
             let mut it = std::env::args();
             while let Some(a) = it.next() {
-                if a == "--socket" {
+                if a == SOCKET_FLAG {
                     return it.next();
                 }
             }
@@ -186,7 +204,7 @@ fn main() {
     {
         use std::os::unix::fs::PermissionsExt as _;
         if let Err(e) =
-            std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o666))
+            std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(SOCKET_MODE))
         {
             eprintln!("hashd: cannot open {socket} to unprivileged clients: {e}");
             std::process::exit(1);
@@ -194,7 +212,7 @@ fn main() {
     }
     eprintln!(
         "hashd: listening on {socket} ({})",
-        if privileges_ok() { "privileged" } else { "unprivileged" }
+        if privileges_ok() { STATE_PRIVILEGED } else { STATE_UNPRIVILEGED }
     );
     serve_conns(listener, std::sync::Arc::new(handle));
 }

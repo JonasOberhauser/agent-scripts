@@ -429,7 +429,7 @@ pub fn stat_secret(socket: &str, name: &str) -> Result<OracleReply, String> {
             .expect("serializing Stat: internal enum, infallible"),
     )?;
     // Metadata has no pending machinery to wait out — bound it tight.
-    s.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+    s.set_read_timeout(Some(CONTROL_TIMEOUT))
         .map_err(|e| e.to_string())?;
     let mut line = String::new();
     let mut r = BufReader::new(s);
@@ -477,7 +477,7 @@ fn open_secret_timeout(
     )?;
     s.set_read_timeout(Some(timeout)).map_err(|e| e.to_string())?;
 
-    let mut buf = vec![0u8; 4096];
+    let mut buf = vec![0u8; IO_BUFFER];
     let mut cmsg_buf = nix::cmsg_space!(libc::cmsghdr, std::os::unix::io::RawFd);
     let mut iov = [std::io::IoSliceMut::new(&mut buf)];
     // SAFETY: recvmsg writes into the provided buffers only; the
@@ -516,13 +516,13 @@ impl FusedFs {
 
     fn file_attr(&self, ino: u64, size: u64, uid: u32, gid: u32, mode: u32) -> FileAttr {
         // Read-only view: strip every write bit, whatever the source had.
-        let ro = mode & 0o444;
+        let ro = mode & MODE_READ_MASK;
         let now = std::time::SystemTime::now();
         #[allow(deprecated)]
         FileAttr {
             ino,
             size,
-            blocks: size.div_ceil(512),
+            blocks: size.div_ceil(BLOCK_SIZE),
             atime: now,
             mtime: now,
             ctime: now,
@@ -533,7 +533,7 @@ impl FusedFs {
             uid,
             gid,
             rdev: 0,
-            blksize: 512,
+            blksize: STATFS_BSIZE,
             flags: 0,
         }
     }
@@ -550,12 +550,12 @@ impl FusedFs {
             ctime: now,
             crtime: now,
             kind: FileType::Directory,
-            perm: 0o555,
+            perm: MODE_DIR,
             nlink: 2,
             uid,
             gid,
             rdev: 0,
-            blksize: 512,
+            blksize: STATFS_BSIZE,
             flags: 0,
         }
     }
@@ -639,7 +639,7 @@ impl Filesystem for FusedFs {
                         st.st_size as u64,
                         req.uid(),
                         req.gid(),
-                        (st.st_mode & 0o777) as u32,
+                        (st.st_mode & MODE_RWX) as u32,
                     );
                     reply.attr(&TTL, &attr);
                     return;
@@ -810,7 +810,7 @@ impl Filesystem for FusedFs {
         // Content sizes are live at open (no snapshots); only the
         // served-file count is known statically.
         let files = self.store.file_count() as u64 + 1;
-        reply.statfs(1_000_000, 1_000_000, 1_000_000, files, 1_000_000, 512, 255, 512);
+        reply.statfs(STATFS_BLOCKS, STATFS_BLOCKS, STATFS_BLOCKS, files, STATFS_BLOCKS, STATFS_BSIZE, STATFS_NAME_MAX, STATFS_BSIZE);
     }
 
     fn setattr(
@@ -881,6 +881,23 @@ fn apply_control_line(store: &Store, line: &str) -> bool {
 /// Never in operation: the `expect`s clone a live connection and
 /// serialize internal enums — both infallible on a healthy loop
 /// iteration; transport errors return through `Result` paths instead.
+/// statvfs traditional values (the frozen-tree convention).
+const STATFS_BLOCKS: u64 = 1_000_000;
+const STATFS_BSIZE: u32 = 512;
+const STATFS_NAME_MAX: u32 = 255;
+/// stat blocks per byte-unit.
+const BLOCK_SIZE: u64 = 512;
+/// Regular-file read-only mask for the served view.
+const MODE_READ_MASK: u32 = 0o444;
+/// The plain rwx mask.
+const MODE_RWX: u32 = 0o777;
+/// Directory mode (r-x).
+const MODE_DIR: u16 = 0o555;
+/// The control-wire read buffer size.
+const IO_BUFFER: usize = 4096;
+/// The control socket's connect timeout.
+const CONTROL_TIMEOUT: Duration = Duration::from_secs(10);
+
 pub fn run_control_loop(store: Store, oracle_socket: String) {
     loop {
         if let Ok(conn) = UnixStream::connect(&oracle_socket) {

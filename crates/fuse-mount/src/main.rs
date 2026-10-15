@@ -32,6 +32,9 @@ struct Cli {
     log_level: String,
 }
 
+/// The FUSE filesystem name.
+const FS_NAME: &str = "gatekeeper";
+
 fn main() {
     let cli = Cli::parse();
 
@@ -72,7 +75,7 @@ fn main() {
         fuse_mount::mock_fuser::serve(fuser_fs, &control);
         return;
     }
-    let options = vec![fuser::MountOption::FSName("gatekeeper".into())];
+    let options = vec![fuser::MountOption::FSName(FS_NAME.into())];
     match fuser::mount2(fuser_fs, &cli.mount_point, &options) {
         Ok(()) => info!("FUSE unmounted cleanly."),
         Err(e) => {
