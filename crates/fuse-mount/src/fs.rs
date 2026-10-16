@@ -32,7 +32,6 @@ const NLINK_FILE: u32 = 1;
 const NLINK_DIR: u32 = 2;
 const DOT_ENTRY: &str = ".";
 const DOTDOT_ENTRY: &str = "..";
-const INIT_FILLED: usize = 0;
 /// Control-loop retry pacing.
 const RETRY_PACE: Duration = Duration::from_secs(1);
 
@@ -744,7 +743,7 @@ impl Filesystem for FusedFs {
         // fh IS the host fd: pread it. Fills exactly `size` bytes
         // except at EOF (the kernel substitutes zeroes otherwise).
         let mut out = vec![0u8; size as usize];
-        let mut filled = INIT_FILLED;
+        let mut filled = 0usize;
         while filled < size as usize {
             let fd = fh as i32;
             let dst = out[filled..].as_mut_ptr() as *mut libc::c_void;

@@ -26,9 +26,6 @@ const ADOPT_MARGIN: u64 = 10;
 const ADOPT_POLL: std::time::Duration = std::time::Duration::from_millis(100);
 /// Adoption log marker.
 const MARK_ADOPTED: &str = "ADOPTED the surviving";
-/// No configured adopt window.
-const NO_WINDOW: u64 = 0;
-
 /// A live supervision stack: the policy daemon child plus everything
 /// needed to observe and drive the supervision lifecycle. Dropping it
 /// kills the policy daemon and any surviving substituted daemon.
@@ -129,7 +126,7 @@ impl SupervisedStack {
         // see the steady state, not the gate mid-flight.
         if stack.adopt_window.is_some() {
             let deadline = std::time::Instant::now()
-                + std::time::Duration::from_secs(stack.adopt_window.unwrap_or(NO_WINDOW) + ADOPT_MARGIN);
+                + std::time::Duration::from_secs(stack.adopt_window.unwrap_or(0) + ADOPT_MARGIN);
             let this_mount = mount.clone();
             while std::time::Instant::now() < deadline {
                 let _ = &this_mount;

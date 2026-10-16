@@ -89,7 +89,7 @@ pub fn ask_with_answer_timeout(
     pid: u32,
     answer_timeout: Duration,
 ) -> Result<String, HashdError> {
-    let mut attempts = INIT_ATTEMPTS;
+    let mut attempts = 0;
     loop {
         attempts += 1;
         match ask_once(socket, pid, answer_timeout) {
@@ -234,7 +234,7 @@ fn connect_bounded(socket: &str, deadline: std::time::Instant) -> Result<UnixStr
             if prc == 0 {
                 continue; // 25ms slice, re-check the deadline
             }
-            let mut so_err: libc::c_int = ERR_CLEAR;
+            let mut so_err: libc::c_int = 0;
             let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
             let opt_val = &mut so_err as *mut libc::c_int as *mut libc::c_void;
             let (sol, soerr, fd_arg, len_ptr) = (libc::SOL_SOCKET, libc::SO_ERROR, fd, &mut len);
@@ -378,10 +378,8 @@ const HASHD_INSTALL_HINT: &str = "sudo install -m 755 target/{debug,release}/has
      sudo install -m 644 crates/hashd/fuse-hashd.socket crates/hashd/fuse-hashd.service /etc/systemd/system/\n  \
      sudo systemctl daemon-reload && sudo systemctl enable --now fuse-hashd.socket";
 /// Retry/socket plumbing inits.
-const INIT_ATTEMPTS: u32 = 0;
 const PROTO_DEFAULT: libc::c_int = 0;
 const ONE_FD: libc::nfds_t = 1;
-const ERR_CLEAR: libc::c_int = 0;
 /// Unprivileged signature marker.
 const MARK_INSUFFICIENT: &str = "hashd: insufficient privileges";
 

@@ -19,7 +19,6 @@ const LAZY_UMOUNT_LAZY: &str = "-l";
 const FAKE_PID_DETACHED: u32 = 12345;
 const FAKE_PID_INDEPENDENT: u32 = 54321;
 const SEP_PATH: char = '/';
-const EMPTY_STR: &str = "";
 /// The NUL seed byte of the package hasher.
 const HASH_SEED_BYTE: &[u8] = b"\0";
 /// The line terminator on the hashd wire.
@@ -846,7 +845,7 @@ impl SystemIo for MockSystemIo {
             // directory its own entry and any walker loop forever.
             if let Some(rest) = Path::new(key).strip_prefix(path).ok().filter(|r| !r.as_os_str().is_empty()) {
                 // the first component below `path` — plain split idiom
-                let component = rest.to_string_lossy().split(SEP_PATH).next().unwrap_or(EMPTY_STR).to_string();
+                let component = rest.to_string_lossy().split(SEP_PATH).next().unwrap_or("").to_string();
                 let full = path.join(&component);
                 if seen.insert(full.clone()) {
                     entries.push(full);

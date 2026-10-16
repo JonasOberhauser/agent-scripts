@@ -28,7 +28,6 @@ const OUT_HEADER_SIZE: usize = 16;
 /// FUSE ABI alignment + walk start.
 const ABI_ALIGN: usize = 8;
 const START_OFF: usize = 0;
-const PROTO_DEFAULT: libc::c_int = 0;
 
 
 const FRAME_BUF: usize = 1 << 20;
@@ -75,7 +74,7 @@ impl MockDriver {
         // is wrapped in UnixStream on success and closed by it.
         let af_unix = libc::AF_UNIX;
         let seqpacket = libc::SOCK_SEQPACKET;
-        let zero = PROTO_DEFAULT;
+        let zero = 0;
         // SAFETY: socket(2) returns a fresh fd (or -1, checked).
         let fd = unsafe { libc::socket(af_unix, seqpacket, zero) };
         if fd < 0 {

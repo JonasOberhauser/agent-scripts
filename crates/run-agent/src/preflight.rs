@@ -43,10 +43,7 @@ const SPACE_SEP: &str = " ";
 const EXIT_TIMEOUT: i32 = 124;
 const EXIT_NOT_FOUND: i32 = 1;
 const PLURAL_S: &str = "s";
-const EMPTY_STR: &str = "";
 /// Retry/init counters.
-const FIRST_ATTEMPT: usize = 0;
-const ONE_MORE: usize = 1;
 pub const DEFAULT_TIMEOUT_SECS: u64 = 3;
 
 /// A freshly spawned data daemon can take a moment to mount — adds land
@@ -143,9 +140,9 @@ fn check_mount<S: SystemIo>(
     let mount_side_str = mount_side.display().to_string();
 
     let mut last_stderr;
-    let mut attempts = FIRST_ATTEMPT;
+    let mut attempts = 0;
     let (ok, detail) = loop {
-        attempts += ONE_MORE;
+        attempts += 1;
         let res = io.run_command(
             TIMEOUT_BIN,
             &[&secs, STAT_CMD, STAT_FMT, STAT_SIZE_TPL, &mount_side_str],
@@ -280,7 +277,7 @@ pub fn failure_summary(results: &[CheckResult]) -> Option<String> {
     let mut msg = format!(
         "pre-flight checks failed — aborting before container start ({} failure{}):\n",
         failures.len(),
-        if failures.len() == 1 { EMPTY_STR } else { PLURAL_S }
+        if failures.len() == 1 { "" } else { PLURAL_S }
     );
     for f in failures {
         msg.push_str(&format!("  {f}\n"));
