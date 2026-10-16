@@ -80,7 +80,6 @@ pub(crate) const SOCK_CMD: &str = "cmd.sock";
 pub(crate) const SOCK_HASHD: &str = "hashd.sock";
 pub(crate) const FILE_POLICY: &str = "policy.json";
 pub(crate) const FILE_SERVER_LOG: &str = "server.log";
-pub(crate) const FILE_STATE: &str = "state.json";
 pub(crate) const DIR_MOUNT: &str = "mnt";
 pub(crate) const DIR_SECRETS: &str = "secrets";
 /// argv flags the tiers pass to the daemons.
