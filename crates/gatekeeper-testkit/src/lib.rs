@@ -56,6 +56,7 @@
 //! rendezvous for tests whose SUT speaks the other end (the hostile
 //! fake-daemon fuzz tier).
 #![cfg_attr(test, allow(clippy::unwrap_used))]
+#![cfg_attr(test, allow(unknown_lints, inline_literal))]
 
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::os::unix::net::UnixListener;
@@ -87,6 +88,16 @@ pub(crate) const FLAG_MOUNT_POINT: &str = "--mount-point";
 pub(crate) const FLAG_ORACLE: &str = "--oracle-socket";
 pub(crate) const FLAG_SOCKET: &str = "--socket";
 pub(crate) const FLAG_FUSED_BINARY: &str = "--fused-binary";
+
+/// Supervision-tier hashd stub socket name.
+const SOCK_HASHD_DEAD: &str = "hashd-dead.sock";
+/// Short readiness waits for in-process tiers.
+const WAIT_DEADLINE_SHORT: std::time::Duration = std::time::Duration::from_secs(5);
+const POLL_SLEEP_FAST: std::time::Duration = std::time::Duration::from_millis(10);
+/// hashd stub reply for unparseable requests.
+#[allow(unknown_lints)]
+#[allow(inline_literal)]
+const MALFORMED_REPLY: &str = "{\"error\":{\"kind\":\"generic\",\"message\":\"malformed request\"}}\n";
 pub(crate) const FLAG_PENDING_TIMEOUT: &str = "--pending-timeout";
 pub(crate) const FLAG_ADOPT_WINDOW: &str = "--adopt-window";
 pub(crate) const FLAG_SECRET: &str = "--secret";
@@ -367,7 +378,7 @@ impl Stack {
     pub fn spawn_in_process(self) -> StackHandle {
         let root = self.root;
         let oracle = root.path().join(SOCK_ORACLE);
-        let dead_hashd = root.path().join("hashd-dead.sock").display().to_string();
+        let dead_hashd = root.path().join(SOCK_HASHD_DEAD).display().to_string();
         let hashd = self.live_hashd.map(|reply| {
             let path = root.path().join(SOCK_HASHD);
             bind_hashd_wire(&path, reply);
@@ -415,14 +426,14 @@ impl Stack {
         let _server_thread = std::thread::spawn(move || {
             let _ = run_oracle_server(&p2, s2, hub2);
         });
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + WAIT_DEADLINE_SHORT;
         while !oracle.exists() {
             assert!(
                 std::time::Instant::now() < deadline,
                 "testkit: oracle server never bound at {}",
                 oracle.display()
             );
-            std::thread::sleep(Duration::from_millis(10));
+            std::thread::sleep(POLL_SLEEP_FAST);
         }
 
         StackHandle {
@@ -523,6 +534,10 @@ pub(crate) fn bind_hashd_wire(path: &Path, reply: HashdReply) {
 
 /// The one hashd wire shape every stub spoke by hand before the kit
 /// owned it: one `hash {pid}` line in, one reply line out.
+// Necessity: hashd stub wire grammar (WORD pid split, serde-shaped
+// one-line JSON replies — a stub protocol, not constants to name).
+#[allow(unknown_lints)]
+#[allow(inline_literal)]
 fn serve_hashd_wire(listener: UnixListener, reply: HashdReply) {
     for conn in listener.incoming().flatten() {
         let Ok(clone) = conn.try_clone() else { continue };
@@ -552,8 +567,7 @@ fn serve_hashd_wire(listener: UnixListener, reply: HashdReply) {
                     ),
                 }
             }
-            (_, _, _) => "{\"error\":{\"kind\":\"generic\",\"message\":\"malformed request\"}}\n"
-                .to_string(),
+            (_, _, _) => MALFORMED_REPLY.to_string(),
         };
         let _ = stream.write_all(out.as_bytes());
         let _ = stream.flush();

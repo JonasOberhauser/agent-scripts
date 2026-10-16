@@ -32,6 +32,7 @@
 //! one-read adjudication. This is the e2e substrate for environments
 //! without a FUSE device (CI containers, the sandbox, fuzz hosts).
 
+#![cfg_attr(test, allow(unknown_lints, inline_literal))]
 use std::io::Read as _;
 use std::io::Write;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -204,6 +205,9 @@ fn request_opcode(frame: &[u8]) -> Option<u32> {
 /// `fuser::mount2`).
 /// Bind a SOCK_SEQPACKET listener at `path` — std's UnixListener is
 /// stream-only, and frames must survive the driver hop whole.
+// Necessity: raw socket plumbing (sockaddr zero-fill, protocol 0).
+#[allow(unknown_lints)]
+#[allow(inline_literal)]
 fn bind_seqpacket_listener(path: &Path) -> std::io::Result<OwnedFd> {
     let af_unix = libc::AF_UNIX;
     let seqpacket = libc::SOCK_SEQPACKET;
@@ -248,6 +252,10 @@ fn bind_seqpacket_listener(path: &Path) -> std::io::Result<OwnedFd> {
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
+// Necessity: session plumbing (listen backlog, socketpair fds[0]/[1],
+// stdio handoff, exit codes, one-off lifecycle prose).
+#[allow(unknown_lints)]
+#[allow(inline_literal)]
 pub fn serve(fs: FusedFs, control: &Path) {
     let _ = std::fs::remove_file(control);
     let listener = match bind_seqpacket_listener(control) {

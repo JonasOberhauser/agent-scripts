@@ -14,9 +14,18 @@
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 
+/// Env var overriding the advertised HELLO version.
+const ENV_HELLO_VERSION: &str = "FUSE_FAKE_HELLO_VERSION";
+/// Idle park + pacing between oracle lines.
+const IDLE_FOREVER: std::time::Duration = std::time::Duration::from_secs(3600);
+const PACE: std::time::Duration = std::time::Duration::from_secs(1);
+
+// Necessity: argv walking (skip(1), flag matching loop).
+#[allow(unknown_lints)]
+#[allow(inline_literal)]
 fn main() {
     let mut oracle: Option<String> = None;
-    let mut version = std::env::var("FUSE_FAKE_HELLO_VERSION")
+    let mut version = std::env::var(ENV_HELLO_VERSION)
         .unwrap_or_else(|_| fuse_protocol::VERSION.to_string());
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -29,7 +38,7 @@ fn main() {
     match oracle {
         Some(path) => speak(&path, &version),
         None => loop {
-            std::thread::sleep(std::time::Duration::from_secs(3600));
+            std::thread::sleep(IDLE_FOREVER);
         },
     }
 }
@@ -41,7 +50,7 @@ fn speak(oracle: &str, version: &str) {
             let mut reader = BufReader::new(match conn.try_clone() {
                 Ok(c) => c,
                 Err(_) => {
-                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    std::thread::sleep(PACE);
                     continue;
                 }
             });
@@ -50,7 +59,7 @@ fn speak(oracle: &str, version: &str) {
                 "{{\"type\":\"hello\",\"version\":\"{version}\"}}\n"
             );
             if w.write_all(hello.as_bytes()).and_then(|_| w.flush()).is_err() {
-                std::thread::sleep(std::time::Duration::from_secs(1));
+                std::thread::sleep(PACE);
                 continue;
             }
             let mut line = String::new();
@@ -62,6 +71,6 @@ fn speak(oracle: &str, version: &str) {
                 }
             }
         }
-        std::thread::sleep(std::time::Duration::from_secs(1));
+        std::thread::sleep(PACE);
     }
 }

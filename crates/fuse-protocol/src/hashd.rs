@@ -89,7 +89,7 @@ pub fn ask_with_answer_timeout(
     pid: u32,
     answer_timeout: Duration,
 ) -> Result<String, HashdError> {
-    let mut attempts = 0;
+    let mut attempts = INIT_ATTEMPTS;
     loop {
         attempts += 1;
         match ask_once(socket, pid, answer_timeout) {
@@ -167,7 +167,7 @@ fn connect_with_retry(socket: &str) -> Result<UnixStream, HashdError> {
 /// timeout surfaces as EAGAIN (busy: the #38 backlog semantics).
 fn connect_bounded(socket: &str, deadline: std::time::Instant) -> Result<UnixStream, std::io::Error> {
     use std::os::unix::io::FromRawFd;
-    let (af_unix, sock_stream, zero) = (libc::AF_UNIX, libc::SOCK_STREAM, 0);
+    let (af_unix, sock_stream, zero) = (libc::AF_UNIX, libc::SOCK_STREAM, PROTO_DEFAULT);
     // SAFETY: socket(2) with plain constants has no preconditions.
     let fd = unsafe { libc::socket(af_unix, sock_stream, zero) };
     if fd < 0 {
@@ -220,7 +220,7 @@ fn connect_bounded(socket: &str, deadline: std::time::Instant) -> Result<UnixStr
                 return Err(std::io::Error::from_raw_os_error(libc::EAGAIN));
             }
             let mut pfd = libc::pollfd { fd, events: libc::POLLOUT, revents: 0 };
-            let n_fds = 1;
+            let n_fds = ONE_FD;
             let slice_ms = CONNECT_POLL.as_millis() as i32;
             let poll_ptr = &mut pfd as *mut libc::pollfd;
             // SAFETY: poll_ptr/n_fds describe exactly pfd above.
@@ -234,7 +234,7 @@ fn connect_bounded(socket: &str, deadline: std::time::Instant) -> Result<UnixStr
             if prc == 0 {
                 continue; // 25ms slice, re-check the deadline
             }
-            let mut so_err: libc::c_int = 0;
+            let mut so_err: libc::c_int = ERR_CLEAR;
             let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
             let opt_val = &mut so_err as *mut libc::c_int as *mut libc::c_void;
             let (sol, soerr, fd_arg, len_ptr) = (libc::SOL_SOCKET, libc::SO_ERROR, fd, &mut len);
@@ -328,10 +328,7 @@ pub fn start_commands(socket: &str, hashd_binary: Option<&str>) -> String {
 /// The permanent install commands (one-time, root), run from the
 /// repository directory that contains the hashd crate.
 pub fn install_commands() -> String {
-    "sudo install -m 755 target/{debug,release}/hashd /usr/local/bin/hashd\n  \
-     sudo install -m 644 crates/hashd/fuse-hashd.socket crates/hashd/fuse-hashd.service /etc/systemd/system/\n  \
-     sudo systemctl daemon-reload && sudo systemctl enable --now fuse-hashd.socket"
-        .to_string()
+    HASHD_INSTALL_HINT.to_string()
 }
 
 /// Error text fit for a pending shown to a human: unlike plain
@@ -376,9 +373,21 @@ pub fn actionable_error(err: &HashdError, socket: &str, hashd_binary: Option<&st
     }
 }
 
+/// One-time root install commands (from the repo dir).
+const HASHD_INSTALL_HINT: &str = "sudo install -m 755 target/{debug,release}/hashd /usr/local/bin/hashd\n  \
+     sudo install -m 644 crates/hashd/fuse-hashd.socket crates/hashd/fuse-hashd.service /etc/systemd/system/\n  \
+     sudo systemctl daemon-reload && sudo systemctl enable --now fuse-hashd.socket";
+/// Retry/socket plumbing inits.
+const INIT_ATTEMPTS: u32 = 0;
+const PROTO_DEFAULT: libc::c_int = 0;
+const ONE_FD: libc::nfds_t = 1;
+const ERR_CLEAR: libc::c_int = 0;
+/// Unprivileged signature marker.
+const MARK_INSUFFICIENT: &str = "hashd: insufficient privileges";
+
 /// Does an error message carry the unprivileged-hashd signature?
 pub fn is_unprivileged_error(msg: &str) -> bool {
-    msg.contains("hashd: insufficient privileges")
+    msg.contains(MARK_INSUFFICIENT)
 }
 
 

@@ -15,7 +15,7 @@ use tracing::{error, info};
 
 
 #[derive(Parser)]
-#[command(name = fuse_protocol::FUSED_BIN, about = "FUSE gatekeeper DATA daemon: secret bytes + mount; access decided by the policy daemon")]
+#[command(name = fuse_protocol::FUSED_BIN, about = FUSED_ABOUT)]
 struct Cli {
     #[arg(short, long)]
     mount_point: PathBuf,
@@ -28,12 +28,16 @@ struct Cli {
     /// without /dev/fuse — every layer above the kernel stays real.
     #[arg(long)]
     mock_fuse: Option<PathBuf>,
-    #[arg(long, default_value = "info")]
+    #[arg(long, default_value = DEFAULT_LOG_LEVEL)]
     log_level: String,
 }
 
 /// The FUSE filesystem name.
 const FS_NAME: &str = "gatekeeper";
+/// CLI defaults.
+const DEFAULT_LOG_LEVEL: &str = "info";
+const FUSED_ABOUT: &str = "FUSE gatekeeper DATA daemon: secret bytes + mount; access decided by the policy daemon";
+const EXIT_FAILURE: i32 = 1;
 
 fn main() {
     let cli = Cli::parse();
@@ -47,7 +51,7 @@ fn main() {
     if !cli.mount_point.exists() {
         if let Err(e) = std::fs::create_dir_all(&cli.mount_point) {
             error!("Failed to create mount point {}: {e}", cli.mount_point.display());
-            std::process::exit(1);
+            std::process::exit(EXIT_FAILURE);
         }
     }
 
@@ -80,7 +84,7 @@ fn main() {
         Ok(()) => info!("FUSE unmounted cleanly."),
         Err(e) => {
             error!("FUSE mount error: {e}");
-            std::process::exit(1);
+            std::process::exit(EXIT_FAILURE);
         }
     }
 }

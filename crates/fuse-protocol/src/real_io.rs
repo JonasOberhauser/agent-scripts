@@ -6,6 +6,20 @@ use crate::io::{CommandOutput, PathState, SystemIo};
 
 /// The stty reset verb (terminal heal after a crash).
 const STTY_RESET: &str = "sane";
+const STTY_BIN: &str = "stty";
+/// Hex digest capacity (sha-256 = 64 chars).
+const HEX_SHA256_LEN: usize = 64;
+/// ENOTCONN probe reply.
+const MSG_ENOTCONN: &str = "Transport endpoint is not connected (os error 107)";
+/// Lazy-unmount success detection.
+const EXIT_OK: i32 = 0;
+const LAZY_UMOUNT_FLAG: &str = "-uz";
+const LAZY_UMOUNT_LAZY: &str = "-l";
+/// Mock spawn PIDs.
+const FAKE_PID_DETACHED: u32 = 12345;
+const FAKE_PID_INDEPENDENT: u32 = 54321;
+const SEP_PATH: char = '/';
+const EMPTY_STR: &str = "";
 /// The NUL seed byte of the package hasher.
 const HASH_SEED_BYTE: &[u8] = b"\0";
 /// The line terminator on the hashd wire.
@@ -102,7 +116,7 @@ fn proc_err(e: procfs::ProcError) -> IoError {
 fn hex_sha256(data: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(data);
-    let mut s = String::with_capacity(64);
+    let mut s = String::with_capacity(HEX_SHA256_LEN);
     for b in digest {
         s.push_str(&format!("{b:02x}"));
     }
@@ -269,7 +283,7 @@ impl SystemIo for RealSystemIo {
         }
         // Raw mode first: stty sane restores line discipline and default
         // special chars on our stdin (the tty the child borrowed).
-        let _ = std::process::Command::new("stty").arg(STTY_RESET).status();
+        let _ = std::process::Command::new(STTY_BIN).arg(STTY_RESET).status();
         // Then the escape-level modes stty knows nothing about: mouse
         // capture (incl. SGR 1006 — the dead-scroll-wheel culprit),
         // alternate screen, hidden cursor. Mirrors servatui's restore
@@ -630,7 +644,7 @@ impl SystemIo for MockSystemIo {
         // Dead FUSE mount: the kernel holds the name, stat fails.
         // ENOTCONN is what a killed data daemon's mountpoint answers.
         if self.stale_mounts.borrow().contains(&key) {
-            return PathState::Unreachable("Transport endpoint is not connected (os error 107)".into());
+            return PathState::Unreachable(MSG_ENOTCONN.into());
         }
         if self.dirs.contains(&key) || self.created_dirs.borrow().contains(&key) {
             return PathState::Dir;
@@ -720,7 +734,7 @@ impl SystemIo for MockSystemIo {
         });
         // Simulate: a successful unmount clears the busy state, just as
         // `fusermount -uz` frees the mount point in the real world.
-        if status == Some(0) && args.iter().any(|a| *a == "-uz" || *a == "-l") {
+        if status == Some(EXIT_OK) && args.iter().any(|a| *a == LAZY_UMOUNT_FLAG || *a == LAZY_UMOUNT_LAZY) {
             self.busy_paths.borrow_mut().clear();
             // A successful lazy unmount of a dead mount leaves the
             // mountpoint behind as a plain (empty) directory — record
@@ -746,7 +760,7 @@ impl SystemIo for MockSystemIo {
 
     fn spawn_detached(&mut self, program: &str, args: &[&str]) -> Result<u32, IoError> {
         self.record_spawn(program, args);
-        Ok(12345)
+        Ok(FAKE_PID_DETACHED)
     }
 
     fn spawn_independent(
@@ -760,7 +774,7 @@ impl SystemIo for MockSystemIo {
         }
         self.record_spawn(program, args);
         self.unix_connected = true;
-        Ok(54321)
+        Ok(FAKE_PID_INDEPENDENT)
     }
 
     fn run_interactive(&self, program: &str, args: &[&str]) -> Result<i32, IoError> {
@@ -832,7 +846,7 @@ impl SystemIo for MockSystemIo {
             // directory its own entry and any walker loop forever.
             if let Some(rest) = Path::new(key).strip_prefix(path).ok().filter(|r| !r.as_os_str().is_empty()) {
                 // the first component below `path` — plain split idiom
-                let component = rest.to_string_lossy().split('/').next().unwrap_or("").to_string();
+                let component = rest.to_string_lossy().split(SEP_PATH).next().unwrap_or(EMPTY_STR).to_string();
                 let full = path.join(&component);
                 if seen.insert(full.clone()) {
                     entries.push(full);

@@ -26,6 +26,16 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+/// Readdir/stat vocabulary.
+const SEP_PATH_STR: &str = "/";
+const NLINK_FILE: u32 = 1;
+const NLINK_DIR: u32 = 2;
+const DOT_ENTRY: &str = ".";
+const DOTDOT_ENTRY: &str = "..";
+const INIT_FILLED: usize = 0;
+/// Control-loop retry pacing.
+const RETRY_PACE: Duration = Duration::from_secs(1);
+
 use fuse_protocol::oracle::{OracleCommand, OracleReply, OracleRequest};
 use fuser::{
     FileAttr, FileType, Filesystem, KernelConfig, Request, ReplyAttr, ReplyData, ReplyDirectory,
@@ -235,7 +245,7 @@ impl Store {
         }
         {
             let labels = &mut s.root_labels;
-            let outer_full = comps.join("/");
+            let outer_full = comps.join(SEP_PATH_STR);
             // A bimap is bijective by construction: insert removes the
             // previous pairing on BOTH sides (relabel is a rename),
             // and a conflicting inner label would evict the old
@@ -529,7 +539,7 @@ impl FusedFs {
             crtime: now,
             kind: FileType::RegularFile,
             perm: ro as u16,
-            nlink: 1,
+            nlink: NLINK_FILE,
             uid,
             gid,
             rdev: 0,
@@ -551,7 +561,7 @@ impl FusedFs {
             crtime: now,
             kind: FileType::Directory,
             perm: MODE_DIR,
-            nlink: 2,
+            nlink: NLINK_DIR,
             uid,
             gid,
             rdev: 0,
@@ -734,7 +744,7 @@ impl Filesystem for FusedFs {
         // fh IS the host fd: pread it. Fills exactly `size` bytes
         // except at EOF (the kernel substitutes zeroes otherwise).
         let mut out = vec![0u8; size as usize];
-        let mut filled = 0usize;
+        let mut filled = INIT_FILLED;
         while filled < size as usize {
             let fd = fh as i32;
             let dst = out[filled..].as_mut_ptr() as *mut libc::c_void;
@@ -786,8 +796,8 @@ impl Filesystem for FusedFs {
         };
         let parent = self.store.parent_of(FuseIno(ino)).unwrap_or(FuseIno::ROOT);
         let all: Vec<(u64, FileType, String)> = vec![
-            (ino, FileType::Directory, ".".into()),
-            (parent.0, FileType::Directory, "..".into()),
+            (ino, FileType::Directory, DOT_ENTRY.into()),
+            (parent.0, FileType::Directory, DOTDOT_ENTRY.into()),
         ]
         .into_iter()
         .chain(children.into_iter().map(|(i, d, n)| {
@@ -913,7 +923,7 @@ pub fn run_control_loop(store: Store, oracle_socket: String) {
             )
             .is_err()
             {
-                std::thread::sleep(Duration::from_secs(1));
+                std::thread::sleep(RETRY_PACE);
                 continue;
             }
             let _ = w.flush();
@@ -929,7 +939,7 @@ pub fn run_control_loop(store: Store, oracle_socket: String) {
                 }
             }
         }
-        std::thread::sleep(Duration::from_secs(1));
+        std::thread::sleep(RETRY_PACE);
     }
 }
 

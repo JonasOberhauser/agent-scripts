@@ -65,7 +65,7 @@ pub fn print_response(resp: &Response, out: &mut dyn Console) {
                     }
                     for (i, h) in s.allowed_hashes.iter().enumerate() {
                         let rendered = if h.hash == crate::PENDING_ONLY_HASH {
-                            "(manual approval only)".to_string()
+                            LABEL_MANUAL_ONLY.to_string()
                         } else {
                             match &h.by {
                                 Some(by) => format!("{by} -- {}", h.hash),
@@ -169,6 +169,9 @@ pub type PendingIds = std::sync::Arc<std::sync::Mutex<Vec<PendingAccessInfo>>>;
 pub type SecretNames = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
 
 /// Test/constructor helper: a pending request with the given id.
+/// Fixture-shaped constructor helper (test/constructor vocabulary).
+#[allow(unknown_lints)]
+#[allow(inline_literal)]
 pub fn pending_info(id: u64) -> PendingAccessInfo {
     PendingAccessInfo {
         id,
@@ -339,38 +342,47 @@ fn no_cli_args() -> Vec<clap::Arg> {
     Vec::new()
 }
 
+/// clap arg ids/flags shared by the CLI builders below.
+const ARG_ID: &str = "id";
+const ARG_NAME: &str = "name";
+const ARG_HASH: &str = "hash";
+const ARG_FILE: &str = "file";
+const LONG_NAME: &str = "name";
+/// Pending-approval rendering.
+const LABEL_MANUAL_ONLY: &str = "(manual approval only)";
+
 /// `grant`/`grant-forever`/`deny`: the pending id.
 fn id_cli() -> Vec<clap::Arg> {
-    vec![clap::Arg::new("id").required(true).value_parser(clap::value_parser!(u64))]
+    vec![clap::Arg::new(ARG_ID).required(true).value_parser(clap::value_parser!(u64))]
 }
 
 /// `remove`: the secret name.
 fn name_cli() -> Vec<clap::Arg> {
-    vec![clap::Arg::new("name").required(true)]
+    vec![clap::Arg::new(ARG_NAME).required(true)]
 }
 
 /// `reset [--name NAME]`.
 fn reset_cli() -> Vec<clap::Arg> {
-    vec![clap::Arg::new("name").long("name").required(false)]
+    vec![clap::Arg::new(ARG_NAME).long(LONG_NAME).required(false)]
 }
 
 /// `rotate NAME --hash HASH`.
 fn name_hash_cli() -> Vec<clap::Arg> {
     vec![
-        clap::Arg::new("name").required(true),
-        clap::Arg::new("hash").long("hash").required(true),
+        clap::Arg::new(ARG_NAME).required(true),
+        clap::Arg::new(ARG_HASH).long(ARG_HASH).required(true),
     ]
 }
 
 /// `add NAME --file PATH --hash HASH`.
 fn add_cli() -> Vec<clap::Arg> {
     vec![
-        clap::Arg::new("name").required(true),
-        clap::Arg::new("file")
-            .long("file")
+        clap::Arg::new(ARG_NAME).required(true),
+        clap::Arg::new(ARG_FILE)
+            .long(ARG_FILE)
             .required(true)
             .value_parser(clap::value_parser!(std::path::PathBuf)),
-        clap::Arg::new("hash").long("hash").required(true),
+        clap::Arg::new(ARG_HASH).long(ARG_HASH).required(true),
     ]
 }
 

@@ -18,7 +18,7 @@ use tracing::{error, info, warn};
 use fuse_server::{OracleHub, ServerState};
 
 #[derive(Parser)]
-#[command(name = fuse_protocol::SERVER_BIN, about = "FUSE gatekeeper POLICY daemon (decisions + command socket; data lives in fused)")]
+#[command(name = fuse_protocol::SERVER_BIN, about = SERVER_ABOUT)]
 struct Cli {
     /// Accepted for backward compatibility with older orchestrators;
     /// mounting is the data daemon's job now.
@@ -29,7 +29,7 @@ struct Cli {
     /// Boot-time secret: NAME, FILE, HASH as three words — no
     /// delimiter grammar, nothing to escape (colons are ordinary
     /// path characters). Repeatable.
-    #[arg(long, num_args = 3, value_names = ["NAME", "FILE", "HASH"])]
+    #[arg(long, num_args = SECRET_SPEC_ARGS, value_names = SECRET_SPEC_NAMES)]
     secret: Vec<String>,
     #[arg(long)]
     allow_other: bool,
@@ -38,16 +38,16 @@ struct Cli {
     /// one. 0 (default) = spawn immediately — adoption is a RESTART-
     /// path feature; the client's respawn passes a nonzero window so
     /// cold starts pay nothing.
-    #[arg(long, default_value_t = 0)]
+    #[arg(long, default_value_t = ZERO_SECS)]
     adopt_window: u64,
     /// Substitute the supervised data-daemon binary (issue #94): the
     /// supervision seam — tests drive the lifecycle with a fake fused
     /// that needs no kernel FUSE mount. Same argv otherwise.
     #[arg(long)]
     fused_binary: Option<std::path::PathBuf>,
-    #[arg(long, default_value = "info")]
+    #[arg(long, default_value = DEFAULT_LOG_LEVEL)]
     log_level: String,
-    #[arg(long, default_value_t = 300)]
+    #[arg(long, default_value_t = DEFAULT_PENDING_SECS)]
     pending_timeout: u64,
     #[arg(long, default_value = fuse_protocol::DEFAULT_LOG_PATH)]
     log_path: PathBuf,
@@ -59,6 +59,16 @@ struct Cli {
 
 /// Exit status for signal-caused shutdowns (128+SIGINT/TERM).
 const EXIT_SIGNALLED: i32 = 130;
+/// CLI defaults + --secret spec arity.
+const SECRET_SPEC_ARGS: usize = 3;
+const SERVER_ABOUT: &str = "FUSE gatekeeper POLICY daemon (decisions + command socket; data lives in fused)";
+// Necessity: table form (the strings ARE the spec field names).
+#[allow(unknown_lints)]
+#[allow(inline_literal)]
+const SECRET_SPEC_NAMES: [&str; 3] = ["NAME", "FILE", "HASH"];
+const ZERO_SECS: u64 = 0;
+const DEFAULT_LOG_LEVEL: &str = "info";
+const DEFAULT_PENDING_SECS: u64 = 300;
 /// Generic startup/config failure exit.
 const EXIT_FAILURE: i32 = 1;
 /// The conservative secret mode for boot-time secrets (read-only).
@@ -68,6 +78,9 @@ const SPAWN_POLL: Duration = Duration::from_millis(50);
 /// The mount-point flag (argv contract with fused).
 const MOUNT_POINT_FLAG: &str = "--mount-point";
 /// The unmount tool pair, most-specific first.
+// Necessity: table form (the strings ARE the unmount tool names).
+#[allow(unknown_lints)]
+#[allow(inline_literal)]
 const UNMOUNT_TOOLS: [&str; 2] = ["fusermount3", "fusermount"];
 /// The lazy-unmount flag.
 const LAZY_UNMOUNT_FLAG: &str = "-uz";
@@ -180,6 +193,9 @@ fn main() {
 
     let hub = OracleHub::clone(&fuse_server::ORACLE_HUB);
     // num_args = 3: flat [name, file, hash, ...] triples; chunk them.
+    // Necessity: triple-chunked CLI values (chunks(3), spec[0..2]).
+    #[allow(unknown_lints)]
+    #[allow(inline_literal)]
     for spec in cli.secret.chunks(SECRET_WORDS) {
         match parse_secret(&spec[0], &spec[1], &spec[2]) {
             Ok((name, host, hash)) => {
@@ -314,6 +330,9 @@ fn wait_for_adoption_offer(window: std::time::Duration) -> Option<fuse_server::A
 /// Verify the daemon is OURS for this stack: its argv carries this
 /// mount point. Kernel-stable, works across every daemon vintage —
 /// no protocol involved (#65's exact-pid discipline, mountpoint form).
+// Necessity: /proc cmdline argv walking (windows(2), w[0]/w[1]).
+#[allow(unknown_lints)]
+#[allow(inline_literal)]
 fn daemon_serves_mountpoint(pid: u32, mp: &Path) -> bool {
     let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
         return false;

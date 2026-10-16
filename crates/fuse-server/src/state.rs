@@ -12,6 +12,12 @@ const WILDCARD_HASH: &str = "*";
 
 /// The deny reason when the one-read budget is spent.
 const REASON_EXCEEDED: &str = "exceeded access limit";
+/// Fresh-record initializers.
+const FRESH_COUNT: u64 = 0;
+const START_PROGRESS: usize = 0;
+/// Grant-arm count returns.
+const GRANT_ONE: usize = 1;
+const GRANT_NONE: usize = 0;
 /// The deny reason while lockdown is armed (#66).
 pub(crate) const REASON_LOCKDOWN: &str =
     "lockdown armed: new unauthorized access is refused";
@@ -122,7 +128,7 @@ pub fn lock_secret<'a>(rec: &'a Mutex<SecretRecord>, name: &str) -> MutexGuard<'
             let mut guard = poisoned.into_inner();
             guard.access_count = FIRST_ACCESS;
             guard.reading_pid = None;
-            guard.read_progress = 0;
+            guard.read_progress = START_PROGRESS;
             error!("Secret '{name}' mutex poisoned — access revoked. Use 'reset {name}' to re-enable.");
             guard
         }
@@ -434,12 +440,12 @@ impl ServerState {
                     let rec_arc = Arc::clone(entry.value());
                     drop(entry);
                     let mut rec = lock_secret(&rec_arc, n);
-                    rec.access_count = 0;
+                    rec.access_count = FRESH_COUNT;
                     rec.reading_pid = None;
-                    rec.read_progress = 0;
-                    1
+                    rec.read_progress = START_PROGRESS;
+                    GRANT_ONE
                 } else {
-                    0
+                    GRANT_NONE
                 }
             }
             None => {
@@ -450,9 +456,9 @@ impl ServerState {
                 let count = entries.len();
                 for (name, rec_arc) in &entries {
                     let mut rec = lock_secret(rec_arc, name);
-                    rec.access_count = 0;
+                    rec.access_count = FRESH_COUNT;
                     rec.reading_pid = None;
-                    rec.read_progress = 0;
+                    rec.read_progress = START_PROGRESS;
                 }
                 count
             }

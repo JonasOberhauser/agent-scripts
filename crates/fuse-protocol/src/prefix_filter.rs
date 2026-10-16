@@ -1,3 +1,4 @@
+#![cfg_attr(test, allow(unknown_lints, inline_literal))]
 /// WARNING: CUSTOM PARSER — APPROVED BY: <https://github.com/JonasOberhauser/agent-scripts/pull/92#issuecomment-6059228895>
 ///
 /// (Approved use: "filtering among a list of options by a specified

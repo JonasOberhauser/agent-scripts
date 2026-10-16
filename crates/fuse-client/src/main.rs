@@ -56,6 +56,7 @@ const ADOPT_WINDOW_SECS: &str = "3";
 const STATE_TMP_EXT: &str = "pid.tmp";
 /// The clap arg ids (referenced by both the builder and get_one).
 const ARG_SOCKET: &str = "socket";
+const SHORT_SOCKET: char = 's';
 const ARG_SHELL: &str = "shell";
 const ARG_COMPLETE: &str = "complete";
 /// The orphan-sweep signal and pattern flags.
@@ -91,7 +92,7 @@ fn build_cli(protocols: &[servyi_servatui::Protocol]) -> clap::Command {
         .about("Send CRUD commands to the fuse-server")
         .arg(
             clap::Arg::new(ARG_SOCKET)
-                .short('s')
+                .short(SHORT_SOCKET)
                 .long(ARG_SOCKET)
                 .env(fuse_protocol::ENV_CMD_SOCKET)
                 .default_value(fuse_protocol::DEFAULT_CMD_SOCKET)
@@ -758,6 +759,10 @@ fn start_server_from_state(app: &App, state: &ServerStateFile, log_path: Option<
     eprintln!("Server ready (v{}).", CLIENT_VERSION);
 }
 
+// Necessity: wrapper argv splitting (wparts[0], wparts[1..]) in the
+// privileged kill path.
+#[allow(unknown_lints)]
+#[allow(inline_literal)]
 fn restart_server(app: &App, log_path: Option<&str>) {
     use fuse_protocol::Response;
 
