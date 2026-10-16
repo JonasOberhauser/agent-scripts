@@ -3,6 +3,9 @@ use fuse_protocol::{Command, Response};
 
 use crate::state::ServerState;
 
+/// One-off lockdown prose (issue #66 reference).
+const MSG_LOCKDOWN_ARMED: &str = "lockdown armed (issue #66): current grants keep working; new unauthorized access is refused";
+
 pub fn handle_command(cmd: Command, state: &ServerState, hub: &crate::oracle_service::OracleHub) -> Response {
     match cmd {
         Command::Reset { name } => {
@@ -16,7 +19,7 @@ pub fn handle_command(cmd: Command, state: &ServerState, hub: &crate::oracle_ser
 
         Command::LockDown => {
             state.arm_lockdown();
-            tracing::info!("lockdown armed (issue #66): current grants keep working; new unauthorized access is refused");
+            tracing::info!("{MSG_LOCKDOWN_ARMED}");
             Response::Ok
         }
         Command::Status => {

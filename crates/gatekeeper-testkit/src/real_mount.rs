@@ -14,10 +14,74 @@
 //! it (MR4: source files must outlive the stack — transparent reads
 //! open them at read time).
 
+#![cfg_attr(test, allow(unknown_lints, inline_literal))]
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
+
+/// Daemon binaries spawned by this tier.
+const BIN_SERVER: &str = "fuse-server";
+const BIN_DATA: &str = "fused";
+const BIN_CLIENT: &str = "fuse-client";
+/// Log file names inside the run root.
+const LOG_FUSED: &str = "fused.log";
+const TAG_SERVER_RESPAWN: &str = "server-respawn";
+const TAG_DATA_RESPAWN: &str = "fused-respawn";
+/// Readiness/poll timings.
+const WAIT_DEADLINE: Duration = Duration::from_secs(10);
+const POLL_SLEEP: Duration = Duration::from_millis(50);
+/// Unmount sweep binaries + lazy flag.
+const FUSERMOUNT3: &str = "fusermount3";
+const FUSERMOUNT: &str = "fusermount";
+const LAZY_UMOUNT: &str = "-uz";
+// Necessity: table form (the pairs ARE the named constants above).
+#[allow(unknown_lints)]
+#[allow(inline_literal)]
+const UNMOUNT_SWEEP: [(&str, &str); 2] = [(FUSERMOUNT3, LAZY_UMOUNT), (FUSERMOUNT, LAZY_UMOUNT)];
+/// Log tail size.
+const LOG_TAIL_LINES: usize = 25;
+/// Environment probes.
+const DEV_FUSE: &str = "/dev/fuse";
+const FUSERMOUNT3_PATH: &str = "/usr/bin/fusermount3";
+const SETUID_BIT: u32 = 0o400;
+const HEX_RADIX: u32 = 16;
+/// Salt policy file.
+const POLICY_JSON: &str = "policy.json";
+/// Capability probe (sh -c 'grep ^Cap /proc/self/status').
+const SHELL_CMD_FLAG: &str = "-c";
+const CAP_GREP: &str = "grep '^Cap' /proc/self/status";
+/// Build-layout binary dir (repo target/debug).
+const TARGET_DEBUG_REL: &str = "../../target/debug";
+/// Env var key for tracing filters.
+const RUST_LOG_ENV: &str = "RUST_LOG";
+/// Socket labels for readiness waits.
+const ORACLE_SOCKET_LABEL: &str = "oracle socket";
+const CMD_SOCKET_LABEL: &str = "command socket";
+/// Process-table indices (policy first, data second — spawn order).
+const POLICY_PROC: usize = 0;
+const DATA_PROC: usize = 1;
+/// Log-file extension + newline join.
+const LOG_EXT: &str = "log";
+const NL: &str = "\n";
+/// Probe binaries.
+const ID_BIN: &str = "id";
+const SH_BIN: &str = "sh";
+/// Policy JSON key for the salt.
+const SALT_KEY: &str = "salt";
+/// Stale-artifact loader trap (observed live, twice).
+const LOADER_ERR_MARKER: &str = "error while loading shared libraries";
+const LOADER_ERR_HINT: &str = "\nHINT: fused.log shows a shared-library loader error — the target/debug/fused artifact is STALE (cargo test does not rebuild other crates' binaries). Run `cargo build -p fuse-mount` and re-run.";
+const NO_HINT: &str = "";
+/// Probe report words.
+const PROBE_ABSENT: &str = "absent";
+const NO_LOG_PLACEHOLDER: &str = "(no log)\n";
+/// Readiness labels.
+const LABEL_POLICY_RESPAWN: &str = "respawned policy daemon";
+const LABEL_POLICY_RESPAWN_SECRETS: &str = "respawned policy daemon (secrets)";
+/// Duration floor for the pending flag (never zero).
+const MIN_PENDING_SECS: u64 = 1;
+const NL_CHAR: char = '\n';
 
 use crate::{HashdStub, Stack};
 
@@ -68,7 +132,7 @@ pub struct RealMountStack {
 /// every hand-rolled harness used; `CARGO_BIN_EXE_` only reaches
 /// same-package bins).
 pub fn bin(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/debug").join(name)
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(TARGET_DEBUG_REL).join(name)
 }
 
 impl RealMountStack {
@@ -84,7 +148,7 @@ impl RealMountStack {
         let oracle = root.path().join(crate::SOCK_ORACLE);
         let server_log = std::fs::File::create(root.path().join(crate::FILE_SERVER_LOG))
             .expect("testkit: create server.log");
-        let fused_log = std::fs::File::create(root.path().join("fused.log"))
+        let fused_log = std::fs::File::create(root.path().join(LOG_FUSED))
             .expect("testkit: create fused.log");
 
         let hashd = stack.live_hashd.map(|reply| {
@@ -94,17 +158,17 @@ impl RealMountStack {
         });
 
         // The policy daemon loads secrets from files (--secret N:F:H).
-        let mut policy = Command::new(bin("fuse-server"));
+        let mut policy = Command::new(bin(BIN_SERVER));
         let _ = policy
             .arg(crate::FLAG_SOCKET).arg(&socket)
             .arg(crate::FLAG_ORACLE).arg(&oracle)
-            .arg(crate::FLAG_PENDING_TIMEOUT).arg(stack.pending_timeout.as_secs().max(1).to_string())
+            .arg(crate::FLAG_PENDING_TIMEOUT).arg(stack.pending_timeout.as_secs().max(MIN_PENDING_SECS).to_string())
             // The store is ALWAYS armed for real-mount stacks: the
             // container view's salt lands in it at first registration
             // (inner names are derived from it), and the kill-point
             // respawns load through it.
             .env(fuse_protocol::ENV_POLICY_FILE, root.path().join(crate::FILE_POLICY))
-            .env("RUST_LOG", crate::RUST_LOG_STACK);
+            .env(RUST_LOG_ENV, crate::RUST_LOG_STACK);
         if let Some(stub) = &hashd {
             let _ = policy.env(fuse_protocol::ENV_HASHD_SOCK, stub.path());
         }
@@ -129,13 +193,13 @@ impl RealMountStack {
             .spawn()
             .expect("testkit: spawn fuse-server (policy) — is target/debug built?");
 
-        wait_connect(&oracle, "oracle socket", root.path());
-        wait_connect(&socket, "command socket", root.path());
+        wait_connect(&oracle, ORACLE_SOCKET_LABEL, root.path());
+        wait_connect(&socket, CMD_SOCKET_LABEL, root.path());
 
-        let data = Command::new(bin("fused"))
+        let data = Command::new(bin(BIN_DATA))
             .arg(crate::FLAG_MOUNT_POINT).arg(&mount)
             .arg(crate::FLAG_ORACLE).arg(&oracle)
-            .env("RUST_LOG", crate::LOG_INFO)
+            .env(RUST_LOG_ENV, crate::LOG_INFO)
             .stdout(fused_log.try_clone().expect("testkit: clone log")).stderr(fused_log)
             .spawn()
             .expect("testkit: spawn fused (data) — is target/debug built?");
@@ -146,19 +210,19 @@ impl RealMountStack {
         // salt lands in the policy store at the server's first
         // registration persist — poll for it, then wait on the INNER
         // name the mount actually serves.
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + WAIT_DEADLINE;
         while !root.path().join(crate::FILE_POLICY).exists() {
             assert!(Instant::now() < deadline, "testkit: policy store never written");
-            std::thread::sleep(Duration::from_millis(50));
+            std::thread::sleep(POLL_SLEEP);
         }
         for (name, _, _) in &secrets {
             let target = mount.join(inner_name_of(root.path(), name));
-            let deadline = Instant::now() + Duration::from_secs(10);
+            let deadline = Instant::now() + WAIT_DEADLINE;
             while Instant::now() < deadline {
                 if target.exists() {
                     break;
                 }
-                std::thread::sleep(Duration::from_millis(50));
+                std::thread::sleep(POLL_SLEEP);
             }
             assert!(
                 target.exists(),
@@ -167,7 +231,7 @@ impl RealMountStack {
             );
         }
 
-        Self { mount, socket, oracle, procs: vec![policy, data], root, secrets, pending_secs: stack.pending_timeout.as_secs().max(1), _hashd: hashd }
+        Self { mount, socket, oracle, procs: vec![policy, data], root, secrets, pending_secs: stack.pending_timeout.as_secs().max(MIN_PENDING_SECS), _hashd: hashd }
     }
 
     /// The mount point (a real kernel FUSE mount while the data
@@ -214,10 +278,10 @@ impl RealMountStack {
     /// # Panics
     /// Panics if the client binary cannot be spawned.
     pub fn client(&self, args: &[&str]) -> Output {
-        Command::new(bin("fuse-client"))
+        Command::new(bin(BIN_CLIENT))
             .arg(crate::FLAG_SOCKET).arg(&self.socket)
             .args(args)
-            .env("RUST_LOG", crate::RUST_LOG_STACK)
+            .env(RUST_LOG_ENV, crate::RUST_LOG_STACK)
             .output()
             .expect("testkit: run fuse-client")
     }
@@ -241,12 +305,12 @@ impl RealMountStack {
     }
 
     fn policy_cmd(&self, log: std::fs::File) -> Command {
-        let mut cmd = Command::new(bin("fuse-server"));
+        let mut cmd = Command::new(bin(BIN_SERVER));
         let _ = cmd.arg(crate::FLAG_SOCKET).arg(&self.socket)
             .arg(crate::FLAG_ORACLE).arg(&self.oracle)
             .arg(crate::FLAG_PENDING_TIMEOUT).arg(self.pending_secs.to_string())
             .env(fuse_protocol::ENV_POLICY_FILE, self.root.path().join(crate::FILE_POLICY))
-            .env("RUST_LOG", crate::RUST_LOG_STACK)
+            .env(RUST_LOG_ENV, crate::RUST_LOG_STACK)
             .stdout(Stdio::from(log.try_clone().expect("testkit: clone log")))
             .stderr(log);
         cmd
@@ -256,13 +320,13 @@ impl RealMountStack {
     /// it. No cleanup hooks run — stale sockets are exactly what the
     /// survivors see.
     pub fn kill_policy(&mut self) {
-        kill9(&mut self.procs[0]);
+        kill9(&mut self.procs[POLICY_PROC]);
     }
 
     /// ── kill point: SIGKILL the DATA daemon and reap it. The kernel
     /// keeps the (now dead) mount until a lazy unmount.
     pub fn kill_data(&mut self) {
-        kill9(&mut self.procs[1]);
+        kill9(&mut self.procs[DATA_PROC]);
     }
 
     /// Respawn the POLICY daemon on the same sockets and policy
@@ -272,13 +336,13 @@ impl RealMountStack {
     /// # Panics
     /// Panics if the daemon never accepts within 10s (logs attached).
     pub fn respawn_policy_store_only(&mut self, tag: &str) {
-        let log = self.respawn_log(tag, "server-respawn");
+        let log = self.respawn_log(tag, TAG_SERVER_RESPAWN);
         let mut cmd = self.policy_cmd(log);
         if let Some(stub) = &self._hashd {
             let _ = cmd.env(fuse_protocol::ENV_HASHD_SOCK, stub.path());
         }
-        self.procs[0] = cmd.spawn().expect("testkit: respawn fuse-server");
-        self.wait_live_accept("respawned policy daemon");
+        self.procs[POLICY_PROC] = cmd.spawn().expect("testkit: respawn fuse-server");
+        self.wait_live_accept(LABEL_POLICY_RESPAWN);
     }
 
     /// Respawn the POLICY daemon WITH `--secret` re-registration (the
@@ -288,7 +352,7 @@ impl RealMountStack {
     /// # Panics
     /// Panics if the daemon never accepts within 10s (logs attached).
     pub fn respawn_policy_with_secrets(&mut self, tag: &str) {
-        let log = self.respawn_log(tag, "server-respawn");
+        let log = self.respawn_log(tag, TAG_SERVER_RESPAWN);
         let mut cmd = self.policy_cmd(log);
         if let Some(stub) = &self._hashd {
             let _ = cmd.env(fuse_protocol::ENV_HASHD_SOCK, stub.path());
@@ -300,8 +364,8 @@ impl RealMountStack {
                 .arg(path)
                 .arg(hash);
         }
-        self.procs[0] = cmd.spawn().expect("testkit: respawn fuse-server (secrets)");
-        self.wait_live_accept("respawned policy daemon (secrets)");
+        self.procs[POLICY_PROC] = cmd.spawn().expect("testkit: respawn fuse-server (secrets)");
+        self.wait_live_accept(LABEL_POLICY_RESPAWN_SECRETS);
     }
 
     /// Spawn a FRESH data daemon on the same mountpoint + oracle —
@@ -312,24 +376,24 @@ impl RealMountStack {
     /// Panics if the remount never comes up within 10s (logs
     /// attached).
     pub fn respawn_data(&mut self, tag: &str) {
-        for b in ["fusermount3", "fusermount"] {
-            let _ = Command::new(b).arg("-uz").arg(&self.mount).status();
+        for (b, flag) in UNMOUNT_SWEEP {
+            let _ = Command::new(b).arg(flag).arg(&self.mount).status();
         }
-        let log = self.respawn_log(tag, "fused-respawn");
-        let mut cmd = Command::new(bin("fused"));
+        let log = self.respawn_log(tag, TAG_DATA_RESPAWN);
+        let mut cmd = Command::new(bin(BIN_DATA));
         let _ = cmd.arg(crate::FLAG_MOUNT_POINT).arg(&self.mount)
             .arg(crate::FLAG_ORACLE).arg(&self.oracle)
-            .env("RUST_LOG", crate::LOG_INFO)
+            .env(RUST_LOG_ENV, crate::LOG_INFO)
             .stdout(Stdio::from(log.try_clone().expect("testkit: clone log")))
             .stderr(log);
-        self.procs[1] = cmd.spawn().expect("testkit: respawn fused");
+        self.procs[DATA_PROC] = cmd.spawn().expect("testkit: respawn fused");
         wait_mount(&self.mount, self.root.path());
     }
 
     /// The stale socket file of a killed server still exists — wait
     /// for a LIVE accept.
     fn wait_live_accept(&self, what: &str) {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + WAIT_DEADLINE;
         let live = loop {
             if UnixStream::connect(&self.socket).is_ok() {
                 break true;
@@ -337,7 +401,7 @@ impl RealMountStack {
             if Instant::now() > deadline {
                 break false;
             }
-            std::thread::sleep(Duration::from_millis(50));
+            std::thread::sleep(POLL_SLEEP);
         };
         assert!(live, "testkit: {what} never accepted: {}", self.dump_logs(what));
     }
@@ -352,10 +416,10 @@ pub(crate) fn dump_logs_under(root: &Path, what: &str) -> String {
         .unwrap_or_default();
     logs.sort();
     for p in logs {
-        if p.extension().is_some_and(|e| e == "log") {
+        if p.extension().is_some_and(|e| e == LOG_EXT) {
             if let Ok(t) = std::fs::read_to_string(&p) {
                 let lines: Vec<&str> = t.lines().collect();
-                let start = lines.len().saturating_sub(25);
+                let start = lines.len().saturating_sub(LOG_TAIL_LINES);
                 s.push_str(&format!("== {} ==\n{}\n", p.display(), lines[start..].join("\n")));
             }
         }
@@ -369,8 +433,8 @@ impl Drop for RealMountStack {
             let _ = p.kill();
             let _ = p.wait();
         }
-        for bin_ in ["fusermount3", "fusermount"] {
-            let _ = Command::new(bin_).arg("-uz").arg(&self.mount).status();
+        for (bin_, flag) in UNMOUNT_SWEEP {
+            let _ = Command::new(bin_).arg(flag).arg(&self.mount).status();
         }
         let _ = std::fs::remove_file(&self.socket);
         let _ = std::fs::remove_file(&self.oracle);
@@ -393,7 +457,7 @@ pub(crate) fn wait_connect_pub(path: &Path, what: &str, root: &Path) {
 }
 
 fn wait_connect(path: &Path, what: &str, root: &Path) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + WAIT_DEADLINE;
     let up = loop {
         if UnixStream::connect(path).is_ok() {
             break true;
@@ -401,7 +465,7 @@ fn wait_connect(path: &Path, what: &str, root: &Path) {
         if Instant::now() > deadline {
             break false;
         }
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(POLL_SLEEP);
     };
     assert!(
         up,
@@ -416,7 +480,7 @@ fn wait_mount(mount: &Path, root: &Path) {
     // read_dir() would pass trivially with no mount at all and later
     // surface as a misleading "content sync broken" (#39). Verify the
     // kernel actually has a FUSE mount on the path.
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + WAIT_DEADLINE;
     let up = loop {
         if mounted_fuse(mount) {
             break true;
@@ -424,24 +488,24 @@ fn wait_mount(mount: &Path, root: &Path) {
         if Instant::now() > deadline {
             break false;
         }
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(POLL_SLEEP);
     };
-    let fused_log = log_tail(&root.join("fused.log"));
+    let fused_log = log_tail(&root.join(LOG_FUSED));
     // The cross-crate stale-binary trap, named: cargo test -p fuse-server
     // does NOT rebuild fuse-mount's fused binary — the harness runs
     // whatever artifact sits in target/debug. A loader error in
     // fused.log means that artifact was built against a different
     // libfuse than the host provides (observed live, twice).
-    let loader_hint = if fused_log.contains("error while loading shared libraries") {
-        "\nHINT: fused.log shows a shared-library loader error — the target/debug/fused artifact is STALE (cargo test does not rebuild other crates' binaries). Run `cargo build -p fuse-mount` and re-run."
+    let loader_hint = if fused_log.contains(LOADER_ERR_MARKER) {
+        LOADER_ERR_HINT
     } else {
-        ""
+        NO_HINT
     };
     assert!(
         up,
         "testkit: FUSE mount never came up at {} — /dev/fuse present: {}, fusermount3: {}\n--- env ---\n{}{}{loader_hint}",
         mount.display(),
-        Path::new("/dev/fuse").exists(),
+        Path::new(DEV_FUSE).exists(),
         fusermount3_state(),
         probe_env(),
         dump_logs_under(root, "mount timeout"),
@@ -453,21 +517,21 @@ fn wait_mount(mount: &Path, root: &Path) {
 /// CAP_SYS_ADMIN). A stripped setuid bit is a classic silent killer.
 fn fusermount3_state() -> String {
     use std::os::unix::fs::MetadataExt;
-    match std::fs::metadata("/usr/bin/fusermount3") {
+    match std::fs::metadata(FUSERMOUNT3_PATH) {
         Ok(m) => {
             let mode = m.mode();
-            format!("present, mode {:o}, uid {} (setuid: {})", mode, m.uid(), mode & 0o4000 != 0)
+            format!("present, mode {:o}, uid {} (setuid: {})", mode, m.uid(), mode & SETUID_BIT != 0)
         }
-        Err(_) => String::from("absent"),
+        Err(_) => String::from(PROBE_ABSENT),
     }
 }
 
 fn probe_env() -> String {
-    let id = Command::new("id").output()
+    let id = Command::new(ID_BIN).output()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_else(|e| format!("id failed: {e}"));
-    let caps = Command::new("sh")
-        .args(["-c", "grep '^Cap' /proc/self/status"])
+    let caps = Command::new(SH_BIN)
+        .args([SHELL_CMD_FLAG, CAP_GREP])
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_default();
@@ -477,13 +541,16 @@ fn probe_env() -> String {
 // Resolve a secret's container-view (anonymized) name from the
 // stack's policy store — the salt lands there at the server's first
 // registration persist.
+// Necessity: hex-pair walking (i*2, i*2+2, len/2) — pair indexing.
+#[allow(unknown_lints)]
+#[allow(inline_literal)]
 fn inner_name_of(root: &Path, name: &str) -> String {
-    let txt = std::fs::read_to_string(root.join("policy.json"))
+    let txt = std::fs::read_to_string(root.join(POLICY_JSON))
         .expect("testkit: policy store written at first registration");
     let v: serde_json::Value = serde_json::from_str(&txt).expect("testkit: parse policy store");
-    let hex = v["salt"].as_str().unwrap_or_default();
+    let hex = v[SALT_KEY].as_str().unwrap_or_default();
     let bytes: Vec<u8> = (0..hex.len() / 2)
-        .filter_map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok())
+                .filter_map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], HEX_RADIX).ok())
         .collect();
     let salt = fuse_protocol::Salt::from_bytes(bytes)
         .expect("testkit: salt persisted before the mount serves");
@@ -513,12 +580,12 @@ fn log_tail(path: &Path) -> String {
     match std::fs::read_to_string(path) {
         Ok(s) => {
             let lines: Vec<&str> = s.lines().collect();
-            let start = lines.len().saturating_sub(25);
-            let mut out = lines[start..].join("\n");
-            out.push('\n');
+            let start = lines.len().saturating_sub(LOG_TAIL_LINES);
+            let mut out = lines[start..].join(NL);
+            out.push(NL_CHAR);
             out
         }
-        Err(_) => String::from("(no log)\n"),
+        Err(_) => String::from(NO_LOG_PLACEHOLDER),
     }
 }
 
@@ -526,11 +593,11 @@ fn log_tail(path: &Path) -> String {
 /// built binaries. Kit real-mount tests skip (with a note) where any
 /// leg is missing; CI's build-then-test job provides all three.
 pub fn real_mount_available() -> bool {
-    Path::new("/dev/fuse").exists()
-        && std::fs::metadata("/usr/bin/fusermount3").is_ok()
-        && bin("fuse-server").exists()
-        && bin("fused").exists()
-        && bin("fuse-client").exists()
+    Path::new(DEV_FUSE).exists()
+        && std::fs::metadata(FUSERMOUNT3_PATH).is_ok()
+        && bin(BIN_SERVER).exists()
+        && bin(BIN_DATA).exists()
+        && bin(BIN_CLIENT).exists()
 }
 
 #[cfg(test)]

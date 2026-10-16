@@ -1061,6 +1061,9 @@ impl PendingPanelLayer {
 }
 
 impl DisplayLayer for PendingPanelLayer {
+    // Necessity: grid assembly (row indexing, cell-width space fill).
+    #[allow(unknown_lints)]
+    #[allow(inline_literal)]
     fn on_overlay(&mut self, ctx: &mut LayerCtx<'_>, widgets: &mut Vec<WidgetEntry>) -> StackIntent {
         // Self-polling: the panel owns the 1s poll cadence (the frame
         // loop ticks every ~100ms, so a fresh request appears within one

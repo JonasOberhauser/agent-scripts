@@ -222,7 +222,7 @@ impl Salt {
     /// Panics if `/dev/urandom` cannot be opened or short-reads:
     /// anonymization must not quietly degrade.
     pub fn generate() -> Salt {
-        let mut buf = [0u8; SALT_BYTES];
+        let mut buf = [ZERO_BYTE; SALT_BYTES];
         let mut f = std::fs::File::open(URANDOM)
             .expect("/dev/urandom for the anonymization salt");
         use std::io::Read as _;
@@ -240,6 +240,9 @@ impl Salt {
 const ELLIPSIS: &str = "...";
 /// Path separator on the wire and in displays.
 const PATH_SEP: char = '/';
+const ZERO_BYTE: u8 = 0;
+const SEP_VERSION: char = '.';
+const MODE_OWNER_READ: u32 = 0o400;
 /// Bytes of entropy in a freshly minted salt.
 const SALT_BYTES: usize = 32;
 /// Hex characters per salt byte shown.
@@ -278,7 +281,7 @@ pub fn anonymize_path(salt: &Salt, name: &str) -> String {
 /// server restart.  Malformed versions are incompatible — fail closed.
 pub fn versions_compatible(server: &str, client: &str) -> bool {
     fn parts(v: &str) -> Option<(u32, u32)> {
-        let mut it = v.split('.');
+        let mut it = v.split(SEP_VERSION);
         let maj = it.next()?.parse().ok()?;
         let min = it.next()?.parse().ok()?;
         Some((maj, min))
@@ -293,7 +296,7 @@ pub fn versions_compatible(server: &str, client: &str) -> bool {
 /// mode field (conservative read-only).  Shared by the client-facing
 /// `AddSecret` and the oracle `Upsert` wire formats.
 pub fn default_secret_mode() -> u32 {
-    0o400
+    MODE_OWNER_READ
 }
 
 /// Allowed-hash sentinel for secrets hosted without a binary hash
