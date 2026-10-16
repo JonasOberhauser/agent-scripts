@@ -41,24 +41,24 @@ impl Runtime {
     ) -> Option<&'static str> {
         match self {
             Runtime::Podman => {
-                if runtime_available(io, wrapper, "podman") {
-                    Some("podman")
+                if runtime_available(io, wrapper, RUNTIME_PODMAN) {
+                    Some(RUNTIME_PODMAN)
                 } else {
                     None
                 }
             }
             Runtime::Docker => {
-                if runtime_available(io, wrapper, "docker") {
-                    Some("docker")
+                if runtime_available(io, wrapper, RUNTIME_DOCKER) {
+                    Some(RUNTIME_DOCKER)
                 } else {
                     None
                 }
             }
             Runtime::Auto => {
-                if runtime_available(io, wrapper, "podman") {
-                    Some("podman")
-                } else if runtime_available(io, wrapper, "docker") {
-                    Some("docker")
+                if runtime_available(io, wrapper, RUNTIME_PODMAN) {
+                    Some(RUNTIME_PODMAN)
+                } else if runtime_available(io, wrapper, RUNTIME_DOCKER) {
+                    Some(RUNTIME_DOCKER)
                 } else {
                     None
                 }
@@ -88,7 +88,7 @@ fn runtime_available<S: SystemIo>(
         }
         None => {
             // Podman: just check the binary. Docker: require rootless socket.
-            if runtime == "docker" {
+            if runtime == RUNTIME_DOCKER {
                 let sock = rootless_docker_socket();
                 io.try_unix_connect(Path::new(&sock))
             } else {
@@ -115,6 +115,21 @@ pub fn split_wrapper(wrapper: &str) -> (String, Vec<String>) {
 /// path) and reads are redirected to `/fuse/<name>`.
 ///
 /// If `host` is a directory, it is mapped recursively (`cp -r` style).
+/// Container runtime names.
+pub(crate) const RUNTIME_PODMAN: &str = "podman";
+pub(crate) const RUNTIME_DOCKER: &str = "docker";
+/// Default resource budget for the agent box.
+const DEFAULT_IMAGE: &str = "agentbox";
+const DEFAULT_MEMORY: &str = "224G";
+const DEFAULT_CPUS: &str = "90";
+/// Container-side workspace path.
+pub(crate) const CONTAINER_WORKDIR: &str = "/workspace";
+/// Local config/workspace dir names under agent_path.
+const CONFIG_DIR: &str = "config";
+const WORKSPACE_DIR: &str = "workspace";
+/// Short-hash prefix length in container names.
+const NAME_HASH_CHARS: usize = 8;
+
 #[derive(Debug, Clone)]
 pub struct SecretMapping {
     /// Host-side path to the real secret file or directory.
@@ -161,6 +176,7 @@ pub fn seccomp_profile_path() -> PathBuf {
 }
 
 #[derive(Debug, Clone)]
+/// Container runtime names.
 pub struct AgentConfig {
     /// SHA-256 of the binary allowed to read the secret.
     pub binary_hash: String,
@@ -227,10 +243,10 @@ impl AgentConfig {
             agent_path: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             fuse_server_path: PathBuf::from(fuse_protocol::SERVER_BIN),
             oracle_socket: None,
-            image_name: "agentbox".to_string(),
+            image_name: DEFAULT_IMAGE.to_string(),
             seccomp_profile: seccomp_profile_path(),
-            memory: "224G".to_string(),
-            cpus: "90".to_string(),
+            memory: DEFAULT_MEMORY.to_string(),
+            cpus: DEFAULT_CPUS.to_string(),
             auto_confirm: false,
             socket_path: PathBuf::from(DEFAULT_SOCKET),
             mount_point: PathBuf::from(DEFAULT_MOUNT_POINT),
@@ -245,11 +261,11 @@ impl AgentConfig {
     // ── computed paths ────────────────────────── ──────────────────────────────────────────
 
     pub fn host_config_dir(&self) -> PathBuf {
-        self.agent_path.join("config")
+        self.agent_path.join(CONFIG_DIR)
     }
 
     pub fn host_workspace(&self) -> PathBuf {
-        self.agent_path.join("workspace")
+        self.agent_path.join(WORKSPACE_DIR)
     }
 
     pub fn host_fuse(&self) -> PathBuf {
@@ -272,7 +288,7 @@ impl AgentConfig {
         let mut hasher = Sha256::new();
         hasher.update(self.agent_path.to_string_lossy().as_bytes());
         let hash = format!("{:x}", hasher.finalize());
-        format!("agentbox-{}", &hash[..8])
+        format!("{DEFAULT_IMAGE}-{}", &hash[..NAME_HASH_CHARS])
     }
 }
 
@@ -320,7 +336,7 @@ pub fn build_create_args(config: &AgentConfig, devices: &[String]) -> Vec<String
         "-v".into(),
         format!("{}:/fuse:ro,z,slave", config.host_fuse().display()),
         "--workdir".into(),
-        "/workspace".into(),
+        CONTAINER_WORKDIR.into(),
         "--security-opt".into(),
         format!("seccomp={}", config.seccomp_profile.display()),
     ]);
@@ -347,7 +363,7 @@ pub fn build_exec_args(config: &AgentConfig, setup_script: &str) -> Vec<String> 
         "exec".into(),
         "-it".into(),
         "-w".into(),
-        "/workspace".into(),
+        CONTAINER_WORKDIR.into(),
         config.container_name(),
     ];
 
@@ -550,7 +566,7 @@ mod tests {
     #[test]
     fn runtime_auto_prefers_podman() {
         let mock = MockSystemIo::new();
-        assert_eq!(Runtime::Auto.resolve(&mock, None), Some("podman"));
+        assert_eq!(Runtime::Auto.resolve(&mock, None), Some(RUNTIME_PODMAN));
     }
 
     #[test]
@@ -558,7 +574,7 @@ mod tests {
         let mut mock = MockSystemIo::new();
         mock.command_status = None;
         mock.unix_connected = true;
-        assert_eq!(Runtime::Auto.resolve(&mock, None), Some("docker"));
+        assert_eq!(Runtime::Auto.resolve(&mock, None), Some(RUNTIME_DOCKER));
     }
 
     #[test]
@@ -571,14 +587,14 @@ mod tests {
     #[test]
     fn runtime_podman_forces_podman() {
         let mock = MockSystemIo::new();
-        assert_eq!(Runtime::Podman.resolve(&mock, None), Some("podman"));
+        assert_eq!(Runtime::Podman.resolve(&mock, None), Some(RUNTIME_PODMAN));
     }
 
     #[test]
     fn runtime_docker_forces_docker() {
         let mut mock = MockSystemIo::new();
         mock.unix_connected = true;
-        assert_eq!(Runtime::Docker.resolve(&mock, None), Some("docker"));
+        assert_eq!(Runtime::Docker.resolve(&mock, None), Some(RUNTIME_DOCKER));
     }
 
     #[test]
@@ -586,7 +602,7 @@ mod tests {
         let mock = MockSystemIo::new();
         assert_eq!(
             Runtime::Podman.resolve(&mock, Some("flatpak-spawn --host")),
-            Some("podman")
+            Some(RUNTIME_PODMAN)
         );
     }
 

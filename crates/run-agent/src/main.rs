@@ -108,6 +108,9 @@ struct Cli {
     container_args: Vec<String>,
 }
 
+/// Default container runtime when resolution fails.
+const FALLBACK_RUNTIME: &str = "podman";
+
 fn main() -> ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
@@ -166,7 +169,7 @@ fn main() -> ExitCode {
     if cli.stop {
         let name = config.container_name();
         let wrapper = config.runtime_wrapper.as_deref();
-        let bin = config.runtime.resolve(&io, wrapper).unwrap_or("podman");
+        let bin = config.runtime.resolve(&io, wrapper).unwrap_or(FALLBACK_RUNTIME);
         eprintln!("Stopping container {name}...");
         match wrapper {
             Some(w) => {
