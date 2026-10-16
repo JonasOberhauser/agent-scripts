@@ -20,6 +20,12 @@ use fuse_server::ServerState;
 
 use crate::{bin, Stack, StackHandle};
 
+/// The mock tier's own scratch names.
+const SOCK_MOCK_CONTROL: &str = "mock-fuse.sock";
+const FILE_MOCK_FUSED_LOG: &str = "fused.log";
+const FLAG_MOCK_FUSE: &str = "--mock-fuse";
+
+
 /// The mock-fuse split stack: the in-process policy daemon + the real
 /// `fused` child on `--mock-fuse`, under one kit root. Dropping it
 /// kills the child and tears the policy stack down (root reclaimed,
@@ -41,21 +47,21 @@ impl MockFuseStack {
     /// socket never appears within 10s.
     pub(super) fn spawn(stack: Stack) -> Self {
         let policy = stack.spawn_in_process();
-        let control = policy.scratch("mock-fuse.sock");
+        let control = policy.scratch(SOCK_MOCK_CONTROL);
         let log = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(policy.scratch("fused.log"))
+            .open(policy.scratch(FILE_MOCK_FUSED_LOG))
             .expect("testkit: open fused.log");
         #[allow(clippy::zombie_processes)]
         let child = Command::new(bin("fused"))
-            .arg("--mount-point")
-            .arg(policy.scratch("mnt"))
-            .arg("--oracle-socket")
+            .arg(crate::FLAG_MOUNT_POINT)
+            .arg(policy.scratch(crate::DIR_MOUNT))
+            .arg(crate::FLAG_ORACLE)
             .arg(policy.oracle_socket())
-            .arg("--mock-fuse")
+            .arg(FLAG_MOCK_FUSE)
             .arg(&control)
-            .env("RUST_LOG", "info")
+            .env("RUST_LOG", crate::LOG_INFO)
             .stdout(Stdio::from(log.try_clone().expect("testkit: clone log")))
             .stderr(log)
             .spawn()

@@ -73,6 +73,28 @@ mod mock_fuse;
 pub mod supervised;
 use supervised::SupervisedStack;
 
+/// Stack-layout vocabulary shared by every tier's spawn code (the
+/// file-backed parts all live under the per-stack root).
+pub(crate) const SOCK_ORACLE: &str = "oracle.sock";
+pub(crate) const SOCK_CMD: &str = "cmd.sock";
+pub(crate) const SOCK_HASHD: &str = "hashd.sock";
+pub(crate) const FILE_POLICY: &str = "policy.json";
+pub(crate) const FILE_SERVER_LOG: &str = "server.log";
+pub(crate) const DIR_MOUNT: &str = "mnt";
+pub(crate) const DIR_SECRETS: &str = "secrets";
+/// argv flags the tiers pass to the daemons.
+pub(crate) const FLAG_MOUNT_POINT: &str = "--mount-point";
+pub(crate) const FLAG_ORACLE: &str = "--oracle-socket";
+pub(crate) const FLAG_SOCKET: &str = "--socket";
+pub(crate) const FLAG_FUSED_BINARY: &str = "--fused-binary";
+pub(crate) const FLAG_PENDING_TIMEOUT: &str = "--pending-timeout";
+pub(crate) const FLAG_ADOPT_WINDOW: &str = "--adopt-window";
+pub(crate) const FLAG_SECRET: &str = "--secret";
+/// The log-level filters the tiers use.
+pub(crate) const RUST_LOG_STACK: &str = "fuse_mount=info,fuse_server=info";
+pub(crate) const RUST_LOG_DAEMON: &str = "fuse_server=info";
+pub(crate) const LOG_INFO: &str = "info";
+
 /// Crate-internal connect-wait shared by the binary tiers (the
 /// diagnostics live in real_mount's copy; this one keeps the
 /// message minimal for the supervision tier).
@@ -344,10 +366,10 @@ impl Stack {
     /// Panics if the oracle server never binds within 5s.
     pub fn spawn_in_process(self) -> StackHandle {
         let root = self.root;
-        let oracle = root.path().join("oracle.sock");
+        let oracle = root.path().join(SOCK_ORACLE);
         let dead_hashd = root.path().join("hashd-dead.sock").display().to_string();
         let hashd = self.live_hashd.map(|reply| {
-            let path = root.path().join("hashd.sock");
+            let path = root.path().join(SOCK_HASHD);
             bind_hashd_wire(&path, reply);
             HashdStub { _root: None, path }
         });
@@ -376,7 +398,7 @@ impl Stack {
                     .unwrap_or(dead_hashd);
                 st.pending_timeout = Mutex::new(self.pending_timeout);
                 if self.store {
-                    st.policy_path = Some(root.path().join("policy.json"));
+                    st.policy_path = Some(root.path().join(FILE_POLICY));
                 }
                 st
             }
@@ -444,7 +466,7 @@ impl HashdStub {
 /// Panics if the root or the socket bind fails.
 pub fn spawn_hashd_stub(reply: HashdReply) -> HashdStub {
     let root = tempfile::tempdir().expect("testkit: mint hashd stub root");
-    let path = root.path().join("hashd.sock");
+    let path = root.path().join(SOCK_HASHD);
     bind_hashd_wire(&path, reply);
     HashdStub { _root: Some(root), path }
 }
@@ -635,14 +657,14 @@ mod adopt_tests {
             .open(root.join("server.log"))
             .expect("reopen server.log");
         let child = Command::new(crate::real_mount::bin("fuse-server"))
-            .arg("--socket").arg(root.join("cmd.sock"))
-            .arg("--oracle-socket").arg(root.join("oracle.sock"))
-            .arg("--mount-point").arg(root.join("mnt"))
-            .arg("--fused-binary").arg(crate::real_mount::bin("fake-fused"))
-            .arg("--pending-timeout").arg("5")
-            .arg("--adopt-window").arg(adopt_window.to_string())
-            .env(fuse_protocol::ENV_POLICY_FILE, root.join("policy.json"))
-            .env("RUST_LOG", "fuse_server=info")
+            .arg(crate::FLAG_SOCKET).arg(root.join(crate::SOCK_CMD))
+            .arg(crate::FLAG_ORACLE).arg(root.join(crate::SOCK_ORACLE))
+            .arg(crate::FLAG_MOUNT_POINT).arg(root.join(crate::DIR_MOUNT))
+            .arg(crate::FLAG_FUSED_BINARY).arg(crate::real_mount::bin("fake-fused"))
+            .arg(crate::FLAG_PENDING_TIMEOUT).arg("5")
+            .arg(crate::FLAG_ADOPT_WINDOW).arg(adopt_window.to_string())
+            .env(fuse_protocol::ENV_POLICY_FILE, root.join(crate::FILE_POLICY))
+            .env("RUST_LOG", crate::RUST_LOG_DAEMON)
             .stdout(log.try_clone().expect("clone log"))
             .stderr(log)
             .spawn()
