@@ -28,6 +28,49 @@ const BIN_NAME: &str = env!("CARGO_PKG_NAME");
 /// Base name of the client action log (beside the state file, or
 /// /tmp when no state file is known).
 const CLIENT_LOG_BASE: &str = "fuse-gatekeeper-client.log";
+/// Exit codes.
+const EXIT_FAILURE: i32 = 1;
+/// The interactive yes-literal.
+const CONFIRM_YES: &str = "y";
+/// Poll/wait cadences.
+const RESTART_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
+/// Socket I/O timeouts for the completion/listener probes.
+const SOCKET_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(200);
+/// The null poll reply.
+const POLL_NULL: &[u8] = b"null\n";
+/// The completion handoff word.
+const COMPLETE_FLAG: &str = "--complete";
+/// argv flags passed to respawned servers.
+const FLAG_MOUNT_POINT: &str = "--mount-point";
+const FLAG_SOCKET: &str = "--socket";
+const FLAG_LOG_LEVEL: &str = "--log-level";
+const FLAG_PENDING_TIMEOUT: &str = "--pending-timeout";
+const FLAG_ADOPT_WINDOW: &str = "--adopt-window";
+const FLAG_LOG_PATH: &str = "--log-path";
+/// Default log level + pending timeout for fresh state files.
+const DEFAULT_LOG_LEVEL: &str = "info";
+const DEFAULT_PENDING_TIMEOUT: u64 = 10;
+/// The takeover adoption window the restart path asks for (secs).
+const ADOPT_WINDOW_SECS: &str = "3";
+/// The temp suffix for atomic state rewrites.
+const STATE_TMP_EXT: &str = "pid.tmp";
+/// The clap arg ids (referenced by both the builder and get_one).
+const ARG_SOCKET: &str = "socket";
+const ARG_SHELL: &str = "shell";
+const ARG_COMPLETE: &str = "complete";
+/// The orphan-sweep signal and pattern flags.
+const SWEEP_SIGNAL: &str = "kill";
+const PKILL_FULL: &str = "-f";
+/// The orphan-sweep binary.
+const PKILL_BIN: &str = "pkill";
+/// The orphan probe's help check.
+const PROBE_HELP: &str = "--help";
+/// Placeholder when a stale state names no binary.
+const UNKNOWN_SERVER: &str = "<unknown (old server)>";
+/// Status-query failure prose.
+const COULD_NOT_QUERY: &str = "could not query current secrets";
+/// The old-server stop bound.
+const STOP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 
 
 /// The client-LOCAL commands (never on the wire): declared once,
@@ -47,17 +90,17 @@ fn build_cli(protocols: &[servyi_servatui::Protocol]) -> clap::Command {
     let extras = clap::Command::new(BIN_NAME)
         .about("Send CRUD commands to the fuse-server")
         .arg(
-            clap::Arg::new("socket")
+            clap::Arg::new(ARG_SOCKET)
                 .short('s')
-                .long("socket")
+                .long(ARG_SOCKET)
                 .env(fuse_protocol::ENV_CMD_SOCKET)
                 .default_value(fuse_protocol::DEFAULT_CMD_SOCKET)
                 .value_parser(clap::value_parser!(PathBuf))
                 .global(true),
         )
         .arg(
-            clap::Arg::new("complete")
-                .long("complete")
+            clap::Arg::new(ARG_COMPLETE)
+                .long(ARG_COMPLETE)
                 .hide(true)
                 .action(clap::ArgAction::SetTrue)
                 .help("Shell completion mode (also auto-engaged when COMP_LINE is set)"),
@@ -73,7 +116,7 @@ from the state file's host paths.",
         .subcommand(
             clap::Command::new(local::COMPLETIONS)
                 .about("Emit the delegating shell-completion scripts (bash | zsh | fish)")
-                .arg(clap::Arg::new("shell").required(true)),
+                .arg(clap::Arg::new(ARG_SHELL).required(true)),
         );
     servyi_servatui::cli::clap_tree(extras, protocols)
 }
@@ -112,19 +155,19 @@ fn main() {
     let matches = build_cli(&protocols).get_matches();
 
     let socket = matches
-        .get_one::<PathBuf>("socket")
+        .get_one::<PathBuf>(ARG_SOCKET)
         .cloned()
         .expect("default_value guarantees a socket");
 
     // Shell completion comes FIRST: it must never hit the version
     // handshake, the log, or anything slow — a Tab press waits on it.
-    if matches.get_flag("complete") || std::env::var_os(fuse_protocol::COMP_LINE).is_some() {
+    if matches.get_flag(ARG_COMPLETE) || std::env::var_os(fuse_protocol::COMP_LINE).is_some() {
         complete_mode(&socket);
         return;
     }
     if let Some((name, sub)) = matches.subcommand() {
         if name == local::COMPLETIONS {
-            print_completion_script(sub.get_one::<String>("shell").expect("required"));
+            print_completion_script(sub.get_one::<String>(ARG_SHELL).expect("required"));
             return;
         }
     }
@@ -170,7 +213,7 @@ fn main() {
                 }
                 Err(e) => {
                     eprintln!("Error: {e}");
-                    std::process::exit(1);
+                    std::process::exit(EXIT_FAILURE);
                 }
             }
         }
@@ -228,7 +271,7 @@ fn main() {
             display.set_log_sink(log_sink);
             if let Err(e) = display.run(&socket, &protocols) {
                 eprintln!("Error: {e}");
-                std::process::exit(1);
+                std::process::exit(EXIT_FAILURE);
             }
         }
     }
@@ -273,8 +316,8 @@ fn one_shot_query(
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixStream;
     let mut c = UnixStream::connect(socket).ok()?;
-    let _ = c.set_read_timeout(Some(std::time::Duration::from_millis(200)));
-    let _ = c.set_write_timeout(Some(std::time::Duration::from_millis(200)));
+    let _ = c.set_read_timeout(Some(SOCKET_IO_TIMEOUT));
+    let _ = c.set_write_timeout(Some(SOCKET_IO_TIMEOUT));
     let name_frame = serde_json::to_string(name).ok()?;
     let args_frame = serde_json::to_string(command).ok()?;
     c.write_all(format!("{name_frame}\n").as_bytes()).ok()?;
@@ -287,7 +330,7 @@ fn one_shot_query(
         }
     }
     // finalize sentinel — the daemon's step protocol expects it.
-    let _ = c.write_all(b"null\n");
+    let _ = c.write_all(POLL_NULL);
     let _ = c.flush();
     Some(line)
 }
@@ -313,6 +356,10 @@ fn live_candidates(socket: &std::path::Path, word: &str) -> Vec<String> {
 
 /// Completion entry: print one candidate per line (bare words — both
 /// bash's `complete -C` and fish's `-a` expect position candidates).
+// Necessity: shell-completion argv indexing (skip(1), prior[0],
+// join(" ")) — the positional protocol of the completion environment.
+#[allow(unknown_lints)]
+#[allow(inline_literal)]
 fn complete_mode(socket: &std::path::Path) {
     use fuse_protocol::COMMAND_TABLE;
     use std::io::Write;
@@ -332,7 +379,7 @@ fn complete_mode(socket: &std::path::Path) {
         // fish: everything AFTER --complete is the command line being
         // completed (a custom --socket sits before the flag).
         let argv: Vec<String> = std::env::args()
-            .skip_while(|a| a != "--complete")
+            .skip_while(|a| a != COMPLETE_FLAG)
             .skip(1)
             .collect();
         split_completing(&argv.join(" "))
@@ -404,7 +451,7 @@ fn print_completion_script(shell: &str) {
         Some(script) => print!("{script}"),
         None => {
             eprintln!("unsupported shell {shell:?} (bash | zsh | fish)");
-            std::process::exit(1);
+            std::process::exit(EXIT_FAILURE);
         }
     }
 }
@@ -434,7 +481,7 @@ fn check_version_or_restart(app: &App) {
                 Response::Version { version } => Some(version),
                 _ => None,
             })
-            .unwrap_or_else(|| "<unknown (old server)>".to_string()),
+            .unwrap_or_else(|| UNKNOWN_SERVER.to_string()),
         Err(e) => {
             eprintln!("Warning: cannot query server version: {e}");
             return;
@@ -452,9 +499,9 @@ fn check_version_or_restart(app: &App) {
     if std::io::stdin().read_line(&mut input).is_err() {
         return;
     }
-    if input.trim().to_lowercase() != "y" {
+    if input.trim().to_lowercase() != CONFIRM_YES {
         eprintln!("Exiting. Restart the server manually, then re-run fuse-client.");
-        std::process::exit(1);
+        std::process::exit(EXIT_FAILURE);
     }
 
     let log_path = discover_log_path(app);
@@ -537,7 +584,7 @@ fn record_successor_pid(state: &ServerStateFile, pid: u32) {
     next.server_pid = pid;
     if let Ok(bytes) = serde_json::to_vec(&next) {
         let path = fuse_protocol::state_file();
-        let tmp = path.with_extension("pid.tmp");
+        let tmp = path.with_extension(STATE_TMP_EXT);
         if std::fs::write(&tmp, &bytes).is_ok() {
             let _ = std::fs::rename(&tmp, &path);
         }
@@ -564,9 +611,9 @@ fn server_kill_spec(state: &ServerStateFile) -> ServerKillSpec {
 /// anything or touching the fixed state-file path.
 fn respawn_argv(state: &ServerStateFile) -> Vec<String> {
     let mut argv = vec![
-        "--mount-point".to_string(),
+        FLAG_MOUNT_POINT.to_string(),
         state.mount_point.clone(),
-        "--socket".to_string(),
+        FLAG_SOCKET.to_string(),
         state.socket.clone(),
     ];
     if let Some(oracle) = &state.oracle_socket {
@@ -576,15 +623,15 @@ fn respawn_argv(state: &ServerStateFile) -> Vec<String> {
         argv.push(fuse_protocol::ORACLE_SOCKET_FLAG.to_string());
         argv.push(oracle.clone());
     }
-    argv.push("--log-level".to_string());
+    argv.push(FLAG_LOG_LEVEL.to_string());
     argv.push(state.log_level.clone());
-    argv.push("--pending-timeout".to_string());
+    argv.push(FLAG_PENDING_TIMEOUT.to_string());
     argv.push(state.pending_timeout.to_string());
     // #93 adopt-the-survivor: give a surviving daemon 3s to reconnect
     // to the respawned server (its control loop retries every 1s)
     // before it spawns a fresh one.
-    argv.push("--adopt-window".to_string());
-    argv.push("3".to_string());
+    argv.push(FLAG_ADOPT_WINDOW.to_string());
+    argv.push(ADOPT_WINDOW_SECS.to_string());
     argv
 }
 
@@ -597,10 +644,13 @@ fn read_state_file() -> Option<ServerStateFile> {
 fn start_server_from_state(app: &App, state: &ServerStateFile, log_path: Option<&str>) {
     let mut cmd_args = respawn_argv(state);
     if let Some(lp) = log_path {
-        cmd_args.push("--log-path".into());
+        cmd_args.push(FLAG_LOG_PATH.into());
         cmd_args.push(lp.into());
     }
 
+    // Necessity: wrapper argv splitting (parts[0], parts[1..]).
+    #[allow(unknown_lints)]
+    #[allow(inline_literal)]
     let (spawn_prog, spawn_args): (String, Vec<String>) = if let Some(w) = &state.runtime_wrapper {
         let parts: Vec<String> = w.split_whitespace().map(|s| s.to_string()).collect();
         let mut args = parts[1..].to_vec();
@@ -616,7 +666,7 @@ fn start_server_from_state(app: &App, state: &ServerStateFile, log_path: Option<
     eprintln!("  Program:  {spawn_prog}");
     eprintln!("  Args:     {}", spawn_args.join(" "));
 
-    if std::process::Command::new(&spawn_prog).arg("--help").output().is_err() {
+    if std::process::Command::new(&spawn_prog).arg(PROBE_HELP).output().is_err() {
         eprintln!("  WARNING: cannot execute '{spawn_prog}' — check PATH");
     }
 
@@ -628,7 +678,7 @@ fn start_server_from_state(app: &App, state: &ServerStateFile, log_path: Option<
     // mount here would detach the live one and strand the surviving
     // daemon as an unreachable orphan.
     let _ = std::fs::remove_file(&state.socket);
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    std::thread::sleep(RESTART_GRACE);
 
     eprintln!("Starting server (v{})...", CLIENT_VERSION);
     let effective_log = log_path.unwrap_or(fuse_protocol::DEFAULT_LOG_PATH);
@@ -638,8 +688,8 @@ fn start_server_from_state(app: &App, state: &ServerStateFile, log_path: Option<
     let log_file = std::fs::OpenOptions::new()
         .create(true).append(true)
         .open(&log_path_buf)
-        .unwrap_or_else(|e| { eprintln!("open log file: {e}"); std::process::exit(1); });
-    let log_file2 = log_file.try_clone().unwrap_or_else(|e| { eprintln!("dup log fd: {e}"); std::process::exit(1); });
+        .unwrap_or_else(|e| { eprintln!("open log file: {e}"); std::process::exit(EXIT_FAILURE); });
+    let log_file2 = log_file.try_clone().unwrap_or_else(|e| { eprintln!("dup log fd: {e}"); std::process::exit(EXIT_FAILURE); });
     eprintln!("  Log:       {}", log_path_buf.display());
 
     use std::os::unix::process::CommandExt;
@@ -682,19 +732,19 @@ fn start_server_from_state(app: &App, state: &ServerStateFile, log_path: Option<
         Err(e) => {
             eprintln!("Failed to start server: {e}");
             eprintln!("Start it manually with: run-agent ...");
-            std::process::exit(1);
+            std::process::exit(EXIT_FAILURE);
         }
     }
 
     eprintln!("Waiting for server...");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + STOP_DEADLINE;
     loop {
         if app.server_running() { break; }
         if std::time::Instant::now() > deadline {
             eprintln!("Server did not start within 10s. Start it manually.");
-            std::process::exit(1);
+            std::process::exit(EXIT_FAILURE);
         }
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        std::thread::sleep(SOCKET_IO_TIMEOUT);
     }
 
     eprintln!("Restoring {} secret(s)...", state.secrets.len());
@@ -729,8 +779,8 @@ fn restart_server(app: &App, log_path: Option<&str>) {
                 }
                 _ => None,
             })
-            .unwrap_or_else(|| "could not query current secrets".to_string()),
-        Err(_) => "could not query current secrets".to_string(),
+            .unwrap_or_else(|| COULD_NOT_QUERY.to_string()),
+        Err(_) => COULD_NOT_QUERY.to_string(),
     };
     eprintln!("Current server state: {status_info}");
 
@@ -761,7 +811,7 @@ fn restart_server(app: &App, log_path: Option<&str>) {
                     let wparts: Vec<&str> = w.split_whitespace().collect();
                     let mut kill_args: Vec<&str> = wparts[1..].to_vec();
                     let pid_str = pid.to_string();
-                    kill_args.extend(&["kill", &pid_str]);
+                    kill_args.extend(&[SWEEP_SIGNAL, &pid_str]);
                     let _ = std::process::Command::new(wparts[0])
                         .args(&kill_args)
                         .output();
@@ -782,13 +832,13 @@ fn restart_server(app: &App, log_path: Option<&str>) {
     // "Server did not start within 10s". A signal returning has never
     // meant the target died; refusing to stop is a loud failure, not
     // something to walk the successor into.
-    let stop_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let stop_deadline = std::time::Instant::now() + STOP_DEADLINE;
     while app.server_running() {
         if std::time::Instant::now() > stop_deadline {
             eprintln!("Old server did not stop within 10s. Kill it manually and re-run.");
-            std::process::exit(1);
+            std::process::exit(EXIT_FAILURE);
         }
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        std::thread::sleep(SOCKET_IO_TIMEOUT);
     }
 
     // The mount survives the kill on purpose (#93 adopt-the-survivor):
@@ -797,7 +847,7 @@ fn restart_server(app: &App, log_path: Option<&str>) {
     // Pre-emptive fusermount -uz here would detach the live mount and
     // strand the surviving daemon as an unreachable orphan.
     let _ = std::fs::remove_file(&state.socket);
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    std::thread::sleep(RESTART_GRACE);
 
     start_server_from_state(app, &state, log_path);
 }
@@ -807,7 +857,7 @@ fn check_start_server(app: &App) {
     let _flushed = std::io::Write::flush(&mut std::io::stdout()).ok();
     let mut input = String::new();
     if std::io::stdin().read_line(&mut input).is_err() { return; }
-    if input.trim().to_lowercase() != "y" { return; }
+    if input.trim().to_lowercase() != CONFIRM_YES { return; }
 
     match read_state_file() {
         Some(state) => start_server_from_state(app, &state, None),
@@ -826,7 +876,7 @@ fn ask_reset_anyway() {
     let _flushed = std::io::Write::flush(&mut std::io::stdout()).ok();
     let mut input = String::new();
     let _ = std::io::stdin().read_line(&mut input);
-    if input.trim().to_lowercase() == "y" {
+    if input.trim().to_lowercase() == CONFIRM_YES {
         // #62 discipline here too: the reset kills through the same
         // precise spec as restart — a raw `pkill -f fuse-server` here
         // was the last bare sweep in the client, with the same blast
@@ -840,8 +890,8 @@ fn ask_reset_anyway() {
             server_binary: String::new(),
             mount_point: String::new(),
             socket: fuse_protocol::DEFAULT_CMD_SOCKET.into(),
-            log_level: "info".into(),
-            pending_timeout: 10,
+            log_level: DEFAULT_LOG_LEVEL.into(),
+            pending_timeout: DEFAULT_PENDING_TIMEOUT,
             runtime_wrapper: None,
             oracle_socket: None,
             secrets: vec![],
@@ -855,8 +905,8 @@ fn ask_reset_anyway() {
             }
             ServerKillSpec::OrphanBySocket { socket } => {
                 let pat = format!("--socket {socket}");
-                let _ = std::process::Command::new("pkill")
-                    .arg("-f")
+                let _ = std::process::Command::new(PKILL_BIN)
+                    .arg(PKILL_FULL)
                     .arg(&pat)
                     .output();
             }
@@ -865,7 +915,7 @@ fn ask_reset_anyway() {
         std::process::exit(0);
     } else {
         eprintln!("Exiting without restarting.");
-        std::process::exit(1);
+        std::process::exit(EXIT_FAILURE);
     }
 }
 
@@ -1029,8 +1079,8 @@ mod tests {
             server_binary: "/x/fuse-server".into(),
             mount_point: "/m".into(),
             socket: "/s".into(),
-            log_level: "info".into(),
-            pending_timeout: 10,
+            log_level: DEFAULT_LOG_LEVEL.into(),
+            pending_timeout: DEFAULT_PENDING_TIMEOUT,
             runtime_wrapper: None,
             oracle_socket: Some("/tmp/.tmpABC/oracle.sock".into()),
             secrets: vec![],
