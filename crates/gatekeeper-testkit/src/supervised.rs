@@ -52,9 +52,9 @@ pub struct SupervisedStack {
 impl SupervisedStack {
     pub(crate) fn spawn(stack: Stack) -> Self {
         let root = stack.root;
-        let socket = root.path().join("cmd.sock");
-        let oracle = root.path().join("oracle.sock");
-        let mount = root.path().join("mnt");
+        let socket = root.path().join(crate::SOCK_CMD);
+        let oracle = root.path().join(crate::SOCK_ORACLE);
+        let mount = root.path().join(crate::DIR_MOUNT);
         std::fs::create_dir_all(&mount).expect("testkit: mount dir");
 
         let daemon_binary = stack
@@ -67,25 +67,25 @@ impl SupervisedStack {
             daemon_binary.display()
         );
 
-        let log = std::fs::File::create(root.path().join("server.log"))
+        let log = std::fs::File::create(root.path().join(crate::FILE_SERVER_LOG))
             .expect("testkit: create server.log");
         let mut policy = Command::new(bin("fuse-server"));
         {
             let _a = policy
-                .arg("--socket").arg(&socket)
-                .arg("--oracle-socket").arg(&oracle)
-                .arg("--mount-point").arg(&mount)
-                .arg("--fused-binary").arg(&daemon_binary)
-                .arg("--pending-timeout")
+                .arg(crate::FLAG_SOCKET).arg(&socket)
+                .arg(crate::FLAG_ORACLE).arg(&oracle)
+                .arg(crate::FLAG_MOUNT_POINT).arg(&mount)
+                .arg(crate::FLAG_FUSED_BINARY).arg(&daemon_binary)
+                .arg(crate::FLAG_PENDING_TIMEOUT)
                 .arg(stack.pending_timeout.as_secs().max(1).to_string());
         }
         if let Some(w) = stack.adopt_window {
-            let _win = policy.arg("--adopt-window").arg(w.to_string());
+            let _win = policy.arg(crate::FLAG_ADOPT_WINDOW).arg(w.to_string());
         }
         {
             let _b = policy
-                .env(fuse_protocol::ENV_POLICY_FILE, root.path().join("policy.json"))
-                .env("RUST_LOG", "fuse_server=info")
+                .env(fuse_protocol::ENV_POLICY_FILE, root.path().join(crate::FILE_POLICY))
+                .env("RUST_LOG", crate::RUST_LOG_DAEMON)
                 .envs(&stack.envs)
                 .stdout(log.try_clone().expect("testkit: clone log"))
                 .stderr(log);
@@ -108,7 +108,7 @@ impl SupervisedStack {
             while std::time::Instant::now() < deadline {
                 let _ = &this_mount;
                 let has_daemon = pgrep_daemons(&daemon_binary, &mount).len() == 1;
-                let log = std::fs::read_to_string(root.path().join("server.log"))
+                let log = std::fs::read_to_string(root.path().join(crate::FILE_SERVER_LOG))
                     .unwrap_or_default();
                 let decided = log.contains("ADOPTED the surviving") || has_daemon;
                 if decided {
@@ -140,7 +140,7 @@ impl SupervisedStack {
 
     /// The raw server log (adoption-gate assertions).
     pub fn server_log(&self) -> String {
-        std::fs::read_to_string(self._root.path().join("server.log"))
+        std::fs::read_to_string(self._root.path().join(crate::FILE_SERVER_LOG))
             .unwrap_or_default()
     }
 

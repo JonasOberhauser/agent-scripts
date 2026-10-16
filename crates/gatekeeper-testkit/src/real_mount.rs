@@ -78,17 +78,17 @@ impl RealMountStack {
     /// must be DIAGNOSABLE from the failure, not guessed at (#39).
     pub(super) fn spawn(stack: Stack) -> Self {
         let root = stack.root;
-        let mount = root.path().join("mnt");
+        let mount = root.path().join(crate::DIR_MOUNT);
         std::fs::create_dir_all(&mount).expect("testkit: create mountpoint");
-        let socket = root.path().join("cmd.sock");
-        let oracle = root.path().join("oracle.sock");
-        let server_log = std::fs::File::create(root.path().join("server.log"))
+        let socket = root.path().join(crate::SOCK_CMD);
+        let oracle = root.path().join(crate::SOCK_ORACLE);
+        let server_log = std::fs::File::create(root.path().join(crate::FILE_SERVER_LOG))
             .expect("testkit: create server.log");
         let fused_log = std::fs::File::create(root.path().join("fused.log"))
             .expect("testkit: create fused.log");
 
         let hashd = stack.live_hashd.map(|reply| {
-            let path = root.path().join("hashd.sock");
+            let path = root.path().join(crate::SOCK_HASHD);
             crate::bind_hashd_wire(&path, reply);
             HashdStub { _root: None, path }
         });
@@ -96,21 +96,21 @@ impl RealMountStack {
         // The policy daemon loads secrets from files (--secret N:F:H).
         let mut policy = Command::new(bin("fuse-server"));
         let _ = policy
-            .arg("--socket").arg(&socket)
-            .arg("--oracle-socket").arg(&oracle)
-            .arg("--pending-timeout").arg(stack.pending_timeout.as_secs().max(1).to_string())
+            .arg(crate::FLAG_SOCKET).arg(&socket)
+            .arg(crate::FLAG_ORACLE).arg(&oracle)
+            .arg(crate::FLAG_PENDING_TIMEOUT).arg(stack.pending_timeout.as_secs().max(1).to_string())
             // The store is ALWAYS armed for real-mount stacks: the
             // container view's salt lands in it at first registration
             // (inner names are derived from it), and the kill-point
             // respawns load through it.
-            .env(fuse_protocol::ENV_POLICY_FILE, root.path().join("policy.json"))
-            .env("RUST_LOG", "fuse_mount=info,fuse_server=info");
+            .env(fuse_protocol::ENV_POLICY_FILE, root.path().join(crate::FILE_POLICY))
+            .env("RUST_LOG", crate::RUST_LOG_STACK);
         if let Some(stub) = &hashd {
             let _ = policy.env(fuse_protocol::ENV_HASHD_SOCK, stub.path());
         }
         let mut secrets = Vec::new();
         for spec in &stack.secrets {
-            let f = root.path().join("secrets").join(&spec.name);
+            let f = root.path().join(crate::DIR_SECRETS).join(&spec.name);
             // Path-shaped names (issue #34) carry directories — the
             // source tree must exist before the write.
             if let Some(parent) = f.parent() {
@@ -118,7 +118,7 @@ impl RealMountStack {
             }
             std::fs::write(&f, &spec.content).expect("testkit: write host file");
             let _ = policy
-                .arg("--secret")
+                .arg(crate::FLAG_SECRET)
                 .arg(&spec.name)
                 .arg(&f)
                 .arg(&spec.hash);
@@ -133,9 +133,9 @@ impl RealMountStack {
         wait_connect(&socket, "command socket", root.path());
 
         let data = Command::new(bin("fused"))
-            .arg("--mount-point").arg(&mount)
-            .arg("--oracle-socket").arg(&oracle)
-            .env("RUST_LOG", "info")
+            .arg(crate::FLAG_MOUNT_POINT).arg(&mount)
+            .arg(crate::FLAG_ORACLE).arg(&oracle)
+            .env("RUST_LOG", crate::LOG_INFO)
             .stdout(fused_log.try_clone().expect("testkit: clone log")).stderr(fused_log)
             .spawn()
             .expect("testkit: spawn fused (data) — is target/debug built?");
@@ -147,7 +147,7 @@ impl RealMountStack {
         // registration persist — poll for it, then wait on the INNER
         // name the mount actually serves.
         let deadline = Instant::now() + Duration::from_secs(10);
-        while !root.path().join("policy.json").exists() {
+        while !root.path().join(crate::FILE_POLICY).exists() {
             assert!(Instant::now() < deadline, "testkit: policy store never written");
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -201,7 +201,7 @@ impl RealMountStack {
     /// The host-side source file behind a served name (MR4 tests:
     /// transparent reads observe it live).
     pub fn source_path(&self, name: &str) -> PathBuf {
-        self.root.path().join("secrets").join(name)
+        self.root.path().join(crate::DIR_SECRETS).join(name)
     }
 
     /// `std::fs::read` through the mount.
@@ -215,9 +215,9 @@ impl RealMountStack {
     /// Panics if the client binary cannot be spawned.
     pub fn client(&self, args: &[&str]) -> Output {
         Command::new(bin("fuse-client"))
-            .arg("--socket").arg(&self.socket)
+            .arg(crate::FLAG_SOCKET).arg(&self.socket)
             .args(args)
-            .env("RUST_LOG", "fuse_mount=info,fuse_server=info")
+            .env("RUST_LOG", crate::RUST_LOG_STACK)
             .output()
             .expect("testkit: run fuse-client")
     }
@@ -242,11 +242,11 @@ impl RealMountStack {
 
     fn policy_cmd(&self, log: std::fs::File) -> Command {
         let mut cmd = Command::new(bin("fuse-server"));
-        let _ = cmd.arg("--socket").arg(&self.socket)
-            .arg("--oracle-socket").arg(&self.oracle)
-            .arg("--pending-timeout").arg(self.pending_secs.to_string())
-            .env(fuse_protocol::ENV_POLICY_FILE, self.root.path().join("policy.json"))
-            .env("RUST_LOG", "fuse_mount=info,fuse_server=info")
+        let _ = cmd.arg(crate::FLAG_SOCKET).arg(&self.socket)
+            .arg(crate::FLAG_ORACLE).arg(&self.oracle)
+            .arg(crate::FLAG_PENDING_TIMEOUT).arg(self.pending_secs.to_string())
+            .env(fuse_protocol::ENV_POLICY_FILE, self.root.path().join(crate::FILE_POLICY))
+            .env("RUST_LOG", crate::RUST_LOG_STACK)
             .stdout(Stdio::from(log.try_clone().expect("testkit: clone log")))
             .stderr(log);
         cmd
@@ -295,7 +295,7 @@ impl RealMountStack {
         }
         for (name, path, hash) in &self.secrets {
             let _ = cmd
-                .arg("--secret")
+                .arg(crate::FLAG_SECRET)
                 .arg(name)
                 .arg(path)
                 .arg(hash);
@@ -317,9 +317,9 @@ impl RealMountStack {
         }
         let log = self.respawn_log(tag, "fused-respawn");
         let mut cmd = Command::new(bin("fused"));
-        let _ = cmd.arg("--mount-point").arg(&self.mount)
-            .arg("--oracle-socket").arg(&self.oracle)
-            .env("RUST_LOG", "info")
+        let _ = cmd.arg(crate::FLAG_MOUNT_POINT).arg(&self.mount)
+            .arg(crate::FLAG_ORACLE).arg(&self.oracle)
+            .env("RUST_LOG", crate::LOG_INFO)
             .stdout(Stdio::from(log.try_clone().expect("testkit: clone log")))
             .stderr(log);
         self.procs[1] = cmd.spawn().expect("testkit: respawn fused");
