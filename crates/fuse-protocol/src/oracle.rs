@@ -7,6 +7,7 @@
 //! One JSON line per message, LF-terminated — the same framing as the
 //! client-facing protocol.
 
+#![cfg_attr(test, allow(unknown_lints, inline_literal))]
 use serde::{Deserialize, Serialize};
 
 /// Host filesystem identity halves (MR4): a device number and an

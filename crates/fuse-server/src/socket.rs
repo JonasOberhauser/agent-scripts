@@ -1,3 +1,4 @@
+#![cfg_attr(test, allow(unknown_lints, inline_literal))]
 use std::path::Path;
 use std::sync::Arc;
 
@@ -27,6 +28,7 @@ pub fn run_socket_server(
 #[cfg(test)]
 #[allow(unknown_lints)]
 #[allow(custom_parser)]
+#[cfg(test)]
 mod tests {
     use super::*;
     use fuse_protocol::client_protocols;
