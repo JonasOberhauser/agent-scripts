@@ -99,8 +99,16 @@ pub const DEFAULT_CMD_SOCKET: &str = "/tmp/fuse-gatekeeper.sock";
 pub const ENV_HASHD_SOCK: &str = "FUSE_HASHD_SOCK";
 /// bash's `complete -C` protocol: the completing line. Shared by the
 /// client binary (reads it) and the e2e tests (sets it).
+// Necessity: external identifiers (names restate their values —
+// review on servyi/lints#16).
+#[allow(unknown_lints)]
+#[allow(inline_literal)]
 pub const COMP_LINE: &str = "COMP_LINE";
 /// bash's `complete -C` protocol: the cursor offset into COMP_LINE.
+// Necessity: external identifiers (names restate their values —
+// review on servyi/lints#16).
+#[allow(unknown_lints)]
+#[allow(inline_literal)]
 pub const COMP_POINT: &str = "COMP_POINT";
 
 /// State file path, overridable via [`ENV_STATE_FILE`] (e.g. for

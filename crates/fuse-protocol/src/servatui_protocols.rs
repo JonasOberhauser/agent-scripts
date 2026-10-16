@@ -389,6 +389,10 @@ fn add_cli() -> Vec<clap::Arg> {
 /// The single source of every command word. The table rows below are
 /// BUILT from these constants, and every other reference in the code
 /// base imports them — no command string is ever retyped.
+// Necessity: the wire words ARE the vocabulary (each name restates
+// its external protocol value — review on servyi/lints#16).
+#[allow(unknown_lints)]
+#[allow(inline_literal)]
 pub mod cmd {
     pub const STATUS: &str = "status";
     pub const MOUNTS: &str = "mounts";

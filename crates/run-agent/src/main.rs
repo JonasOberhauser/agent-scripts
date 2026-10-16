@@ -28,6 +28,10 @@ const VALUE_CONTAINER: &str = "CONTAINER";
 /// Pair arity of --secret values.
 const SECRET_PAIR: usize = 2;
 /// Plans-dir convention (relative to cwd).
+// Necessity: external identifiers (names restate their values —
+// review on servyi/lints#16).
+#[allow(unknown_lints)]
+#[allow(inline_literal)]
 const PLANS_SHARED: &str = "./plans/shared";
 const YES_SHORT: char = 'y';
 /// Container lifecycle verbs.

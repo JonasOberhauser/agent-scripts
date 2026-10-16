@@ -32,7 +32,15 @@ const TAG_DATA_RESPAWN: &str = "fused-respawn";
 const WAIT_DEADLINE: Duration = Duration::from_secs(10);
 const POLL_SLEEP: Duration = Duration::from_millis(50);
 /// Unmount sweep binaries + lazy flag.
+// Necessity: external identifiers (names restate their values —
+// review on servyi/lints#16).
+#[allow(unknown_lints)]
+#[allow(inline_literal)]
 const FUSERMOUNT3: &str = "fusermount3";
+// Necessity: external identifiers (names restate their values —
+// review on servyi/lints#16).
+#[allow(unknown_lints)]
+#[allow(inline_literal)]
 const FUSERMOUNT: &str = "fusermount";
 const LAZY_UMOUNT: &str = "-uz";
 // Necessity: table form (the pairs ARE the named constants above).
@@ -42,11 +50,19 @@ const UNMOUNT_SWEEP: [(&str, &str); 2] = [(FUSERMOUNT3, LAZY_UMOUNT), (FUSERMOUN
 /// Log tail size.
 const LOG_TAIL_LINES: usize = 25;
 /// Environment probes.
+// Necessity: external identifiers (names restate their values —
+// review on servyi/lints#16).
+#[allow(unknown_lints)]
+#[allow(inline_literal)]
 const DEV_FUSE: &str = "/dev/fuse";
 const FUSERMOUNT3_PATH: &str = "/usr/bin/fusermount3";
 const SETUID_BIT: u32 = 0o400;
 const HEX_RADIX: u32 = 16;
 /// Salt policy file.
+// Necessity: external identifiers (names restate their values —
+// review on servyi/lints#16).
+#[allow(unknown_lints)]
+#[allow(inline_literal)]
 const POLICY_JSON: &str = "policy.json";
 /// Capability probe (sh -c 'grep ^Cap /proc/self/status').
 const SHELL_CMD_FLAG: &str = "-c";

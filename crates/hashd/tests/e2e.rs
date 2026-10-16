@@ -10,12 +10,11 @@
 //! root hashd was connectable by root only — every unprivileged
 //! fuse-server got EACCES. It needs root to drop privileges, so it is
 //! #[ignore]-gated like the other environment-dependent suites.
-
 // Tests may hand-parse output/protocol lines: sanctioned by policy
 // (test + allow), NOT available to production code. unknown_lints:
 // the custom_parser lint exists only under the servyi driver.
 #![allow(unknown_lints)]
-#![allow(custom_parser)]
+#![allow(custom_parser, inline_literal)]
 #![allow(clippy::unwrap_used, clippy::panic, unused_results)]
 
 

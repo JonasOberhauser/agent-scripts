@@ -20,8 +20,20 @@ const EMBEDDED_DOCKERFILE: &str = include_str!("../../../Dockerfile");
 /// Env var naming a substitute Dockerfile (debug/test builds only).
 const ENV_TEST_DOCKERFILE: &str = "RUN_AGENT_TEST_DOCKERFILE";
 /// The unmount helpers tried in turn: (binary, flag).
+// Necessity: external identifiers (names restate their values —
+// review on servyi/lints#16).
+#[allow(unknown_lints)]
+#[allow(inline_literal)]
 const FUSERMOUNT: &str = "fusermount";
+// Necessity: external identifiers (names restate their values —
+// review on servyi/lints#16).
+#[allow(unknown_lints)]
+#[allow(inline_literal)]
 const FUSERMOUNT3: &str = "fusermount3";
+// Necessity: external identifiers (names restate their values —
+// review on servyi/lints#16).
+#[allow(unknown_lints)]
+#[allow(inline_literal)]
 const UMOUNT: &str = "umount";
 const LAZY_UMOUNT_FLAG: &str = "-uz";
 const LAZY_UMOUNT_FLAG3: &str = "-uz";
@@ -48,7 +60,15 @@ const CHECK_SOURCE_FILE: &str = "source-file";
 const MOUNT_BIN: &str = "mount";
 const FLAG_MAKE_SHARED: &str = "--make-shared";
 /// Nested-container char-device passthroughs.
+// Necessity: external identifiers (names restate their values —
+// review on servyi/lints#16).
+#[allow(unknown_lints)]
+#[allow(inline_literal)]
 const DEV_FUSE: &str = "/dev/fuse";
+// Necessity: external identifiers (names restate their values —
+// review on servyi/lints#16).
+#[allow(unknown_lints)]
+#[allow(inline_literal)]
 const DEV_NET_TUN: &str = "/dev/net/tun";
 /// Nested container engine names.
 const RM_CMD: &str = "rm";
