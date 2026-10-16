@@ -76,6 +76,9 @@ const STOP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// The client-LOCAL commands (never on the wire): declared once,
 /// referenced everywhere.
+// Necessity: subcommand words (names restate values — servyi/lints#16).
+#[allow(unknown_lints)]
+#[allow(inline_literal)]
 mod local {
     pub const RESTART: &str = "restart";
     pub const COMPLETIONS: &str = "completions";

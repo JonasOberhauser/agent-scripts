@@ -23,7 +23,7 @@
 // (test + allow), NOT available to production code. unknown_lints:
 // the custom_parser lint exists only under the servyi driver.
 #![allow(unknown_lints)]
-#![allow(custom_parser)]
+#![allow(custom_parser, inline_literal)]
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 

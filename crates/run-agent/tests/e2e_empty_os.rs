@@ -35,12 +35,11 @@
 //! ```sh
 //! podman run --device /dev/fuse --cap-add SYS_ADMIN ...
 //! ```
-
 // Tests may hand-parse output/protocol lines: sanctioned by policy
 // (test + allow), NOT available to production code. unknown_lints:
 // the custom_parser lint exists only under the servyi driver.
 #![allow(unknown_lints)]
-#![allow(custom_parser)]
+#![allow(custom_parser, inline_literal)]
 
 #![allow(clippy::unwrap_used, clippy::panic, unused_results)]
 
