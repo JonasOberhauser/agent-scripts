@@ -1228,6 +1228,8 @@ fn surrender(store: &Store, oracle: &std::path::Path) -> Result<(), String> {
 /// dup(2) with hoisted operands (the unsafe_scope lint's one-op rule).
 fn nix_dup(fd: i32) -> Result<i32, String> {
     use std::os::fd::{BorrowedFd, IntoRawFd as _};
+    // SAFETY: fd is a live descriptor owned by the caller for the
+    // duration of this call; the borrow ends before return.
     let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
     let dup = borrowed
         .try_clone_to_owned()
