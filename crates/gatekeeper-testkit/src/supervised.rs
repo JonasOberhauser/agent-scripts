@@ -9,14 +9,34 @@ use std::process::{Child, Command};
 
 use crate::{Stack, bin};
 
+/// Process probes.
+const PGREP_BIN: &str = "pgrep";
+const PGREP_FULL: &str = "-f";
+const KILL_BIN: &str = "kill";
+/// Zombie/dead ps states (zombie, killed).
+const STATE_ZOMBIE: &str = "Z";
+const STATE_KILLED: &str = "X";
+/// Daemon binaries.
+const BIN_SERVER: &str = "fuse-server";
+const BIN_FAKE_DATA: &str = "fake-fused";
+/// Env key + timings.
+const RUST_LOG_ENV: &str = "RUST_LOG";
+const MIN_PENDING_SECS: u64 = 1;
+const ADOPT_MARGIN: u64 = 10;
+const ADOPT_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+/// Adoption log marker.
+const MARK_ADOPTED: &str = "ADOPTED the surviving";
 /// A live supervision stack: the policy daemon child plus everything
 /// needed to observe and drive the supervision lifecycle. Dropping it
 /// kills the policy daemon and any surviving substituted daemon.
 /// The live daemons for this binary+mountpoint (root-scoped pattern;
 /// zombies count as dead — #97's lesson in kit form).
+// Necessity: ps/pgrep output parsing (rsplit(')'), state chars).
+#[allow(unknown_lints)]
+#[allow(inline_literal)]
 fn pgrep_daemons(daemon_binary: &std::path::Path, mount: &std::path::Path) -> Vec<u32> {
-    let out = Command::new("pgrep")
-        .arg("-f")
+    let out = Command::new(PGREP_BIN)
+        .arg(PGREP_FULL)
         .arg(format!("{}.*{}", daemon_binary.display(), mount.display()))
         .output()
         .expect("testkit: pgrep");
@@ -33,7 +53,7 @@ fn pgrep_daemons(daemon_binary: &std::path::Path, mount: &std::path::Path) -> Ve
                         .next()
                         .and_then(|rest| rest.split_whitespace().next().map(|f| f.to_string()))
                 })
-                .is_some_and(|state| state != "Z" && state != "X")
+                .is_some_and(|state| state != STATE_ZOMBIE && state != STATE_KILLED)
         })
         .collect()
 }
@@ -50,42 +70,45 @@ pub struct SupervisedStack {
 }
 
 impl SupervisedStack {
+    // Necessity: spawn wiring + one-off expect prose.
+    #[allow(unknown_lints)]
+    #[allow(inline_literal)]
     pub(crate) fn spawn(stack: Stack) -> Self {
         let root = stack.root;
-        let socket = root.path().join("cmd.sock");
-        let oracle = root.path().join("oracle.sock");
-        let mount = root.path().join("mnt");
+        let socket = root.path().join(crate::SOCK_CMD);
+        let oracle = root.path().join(crate::SOCK_ORACLE);
+        let mount = root.path().join(crate::DIR_MOUNT);
         std::fs::create_dir_all(&mount).expect("testkit: mount dir");
 
         let daemon_binary = stack
             .fused_binary
             .clone()
-            .unwrap_or_else(|| bin("fake-fused"));
+            .unwrap_or_else(|| bin(BIN_FAKE_DATA));
         assert!(
             daemon_binary.exists(),
             "testkit: substituted daemon {} not built (cargo build --workspace)",
             daemon_binary.display()
         );
 
-        let log = std::fs::File::create(root.path().join("server.log"))
+        let log = std::fs::File::create(root.path().join(crate::FILE_SERVER_LOG))
             .expect("testkit: create server.log");
-        let mut policy = Command::new(bin("fuse-server"));
+        let mut policy = Command::new(bin(BIN_SERVER));
         {
             let _a = policy
-                .arg("--socket").arg(&socket)
-                .arg("--oracle-socket").arg(&oracle)
-                .arg("--mount-point").arg(&mount)
-                .arg("--fused-binary").arg(&daemon_binary)
-                .arg("--pending-timeout")
-                .arg(stack.pending_timeout.as_secs().max(1).to_string());
+                .arg(crate::FLAG_SOCKET).arg(&socket)
+                .arg(crate::FLAG_ORACLE).arg(&oracle)
+                .arg(crate::FLAG_MOUNT_POINT).arg(&mount)
+                .arg(crate::FLAG_FUSED_BINARY).arg(&daemon_binary)
+                .arg(crate::FLAG_PENDING_TIMEOUT)
+                .arg(stack.pending_timeout.as_secs().max(MIN_PENDING_SECS).to_string());
         }
         if let Some(w) = stack.adopt_window {
-            let _win = policy.arg("--adopt-window").arg(w.to_string());
+            let _win = policy.arg(crate::FLAG_ADOPT_WINDOW).arg(w.to_string());
         }
         {
             let _b = policy
-                .env(fuse_protocol::ENV_POLICY_FILE, root.path().join("policy.json"))
-                .env("RUST_LOG", "fuse_server=info")
+                .env(fuse_protocol::ENV_POLICY_FILE, root.path().join(crate::FILE_POLICY))
+                .env(RUST_LOG_ENV, crate::RUST_LOG_DAEMON)
                 .envs(&stack.envs)
                 .stdout(log.try_clone().expect("testkit: clone log"))
                 .stderr(log);
@@ -103,18 +126,18 @@ impl SupervisedStack {
         // see the steady state, not the gate mid-flight.
         if stack.adopt_window.is_some() {
             let deadline = std::time::Instant::now()
-                + std::time::Duration::from_secs(stack.adopt_window.unwrap_or(0) + 10);
+                + std::time::Duration::from_secs(stack.adopt_window.unwrap_or(0) + ADOPT_MARGIN);
             let this_mount = mount.clone();
             while std::time::Instant::now() < deadline {
                 let _ = &this_mount;
                 let has_daemon = pgrep_daemons(&daemon_binary, &mount).len() == 1;
-                let log = std::fs::read_to_string(root.path().join("server.log"))
+                let log = std::fs::read_to_string(root.path().join(crate::FILE_SERVER_LOG))
                     .unwrap_or_default();
-                let decided = log.contains("ADOPTED the surviving") || has_daemon;
+                let decided = log.contains(MARK_ADOPTED) || has_daemon;
                 if decided {
                     break;
                 }
-                std::thread::sleep(std::time::Duration::from_millis(100));
+                std::thread::sleep(ADOPT_POLL);
             }
         }
 
@@ -145,7 +168,7 @@ impl SupervisedStack {
 
     /// The raw server log (adoption-gate assertions).
     pub fn server_log(&self) -> String {
-        std::fs::read_to_string(self._root.path().join("server.log"))
+        std::fs::read_to_string(self._root.path().join(crate::FILE_SERVER_LOG))
             .unwrap_or_default()
     }
 
@@ -187,10 +210,10 @@ impl Drop for SupervisedStack {
     fn drop(&mut self) {
         self.kill_policy();
         for pid in self.respawns.borrow().iter() {
-            let _ = Command::new("kill").arg(pid.to_string()).output();
+            let _ = Command::new(KILL_BIN).arg(pid.to_string()).output();
         }
         for pid in self.daemon_pids() {
-            let _ = Command::new("kill").arg(pid.to_string()).output();
+            let _ = Command::new(KILL_BIN).arg(pid.to_string()).output();
         }
     }
 }

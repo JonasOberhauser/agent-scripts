@@ -10,6 +10,7 @@
 //! whose mock control socket tests drive through their typed driver
 //! (`fuse_mount::mock_driver::MockDriver::connect`).
 
+#![cfg_attr(test, allow(unknown_lints, inline_literal))]
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -17,8 +18,20 @@ use std::time::{Duration, Instant};
 
 use fuse_server::oracle_service::OracleHub;
 use fuse_server::ServerState;
+/// Daemon binary + env key for spawn wiring.
+const BIN_DATA: &str = "fused";
+const RUST_LOG_ENV: &str = "RUST_LOG";
+/// Readiness timings.
+const WAIT_DEADLINE: Duration = Duration::from_secs(10);
+const POLL_SLEEP: Duration = Duration::from_millis(20);
 
 use crate::{bin, Stack, StackHandle};
+
+/// The mock tier's own scratch names.
+const SOCK_MOCK_CONTROL: &str = "mock-fuse.sock";
+const FILE_MOCK_FUSED_LOG: &str = "fused.log";
+const FLAG_MOCK_FUSE: &str = "--mock-fuse";
+
 
 /// The mock-fuse split stack: the in-process policy daemon + the real
 /// `fused` child on `--mock-fuse`, under one kit root. Dropping it
@@ -41,26 +54,26 @@ impl MockFuseStack {
     /// socket never appears within 10s.
     pub(super) fn spawn(stack: Stack) -> Self {
         let policy = stack.spawn_in_process();
-        let control = policy.scratch("mock-fuse.sock");
+        let control = policy.scratch(SOCK_MOCK_CONTROL);
         let log = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(policy.scratch("fused.log"))
+            .open(policy.scratch(FILE_MOCK_FUSED_LOG))
             .expect("testkit: open fused.log");
         #[allow(clippy::zombie_processes)]
-        let child = Command::new(bin("fused"))
-            .arg("--mount-point")
-            .arg(policy.scratch("mnt"))
-            .arg("--oracle-socket")
+        let child = Command::new(bin(BIN_DATA))
+            .arg(crate::FLAG_MOUNT_POINT)
+            .arg(policy.scratch(crate::DIR_MOUNT))
+            .arg(crate::FLAG_ORACLE)
             .arg(policy.oracle_socket())
-            .arg("--mock-fuse")
+            .arg(FLAG_MOCK_FUSE)
             .arg(&control)
-            .env("RUST_LOG", "info")
+            .env(RUST_LOG_ENV, crate::LOG_INFO)
             .stdout(Stdio::from(log.try_clone().expect("testkit: clone log")))
             .stderr(log)
             .spawn()
             .expect("testkit: spawn fused --mock-fuse — is target/debug built?");
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + WAIT_DEADLINE;
         let up = loop {
             if control.exists() {
                 break true;
@@ -68,7 +81,7 @@ impl MockFuseStack {
             if Instant::now() > deadline {
                 break false;
             }
-            std::thread::sleep(Duration::from_millis(20));
+            std::thread::sleep(POLL_SLEEP);
         };
         assert!(
             up,
@@ -123,7 +136,7 @@ impl Drop for MockFuseStack {
 /// binary is built (no `/dev/fuse` or `fusermount3` needed — this is
 /// the everywhere-tier).
 pub fn mock_fuse_available() -> bool {
-    bin("fused").exists()
+    bin(BIN_DATA).exists()
 }
 
 #[cfg(test)]
@@ -148,7 +161,7 @@ mod tests {
 
         let mut d = MockDriver::connect(stack.control_socket()).expect("connect driver");
         let _init = d.init().expect("init handshake");
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + WAIT_DEADLINE;
         let entry = loop {
             let dh = d.opendir(fuser::FUSE_ROOT_ID).expect("opendir");
             let entries = d.readdir(dh.fh, 4096).expect("readdir");

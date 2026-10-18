@@ -9,7 +9,7 @@
 // pinned, not authored, here. Delta vs crates.io 0.15.1:
 // Session::from_fd_resumed (see README-GATEKEEPER.md).
 #![allow(unknown_lints)]
-#![allow(unsafe_scope, custom_parser, non_test_panic_allow, unsound_constructor)]
+#![allow(unsafe_scope, custom_parser, non_test_panic_allow, unsound_constructor, inline_literal)]
 
 #![warn(missing_docs, missing_debug_implementations, rust_2018_idioms)]
 

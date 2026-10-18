@@ -1,3 +1,9 @@
+// VENDORED (gatekeeper #103): third-party code — the servyi lints
+// govern first-party crates only; upstream fuser predates them and is
+// pinned, not authored, here (same exemption as src/lib.rs).
+#![allow(unknown_lints)]
+#![allow(unsafe_scope, custom_parser, non_test_panic_allow, unsound_constructor, inline_literal)]
+
 fn main() {
     // Register rustc cfg for switching between mount implementations.
     // When fuser MSRV is updated to v1.77 or above, we should switch from 'cargo:' to 'cargo::' syntax.

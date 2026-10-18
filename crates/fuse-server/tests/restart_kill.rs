@@ -15,6 +15,7 @@
 //!
 //! Both rounds must now complete: honest kill, waited-out death,
 //! successor serving, state file naming the successor.
+#![allow(unknown_lints, inline_literal)]
 
 #![allow(clippy::unwrap_used, clippy::panic, unused_results)]
 

@@ -1,4 +1,4 @@
-#![allow(clippy::unwrap_used, clippy::panic, unused_results)]
+#![allow(clippy::unwrap_used, clippy::panic, unused_results, unknown_lints, inline_literal)]
 
 #[cfg(test)]
 mod tests {

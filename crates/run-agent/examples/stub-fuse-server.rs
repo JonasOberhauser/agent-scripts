@@ -15,24 +15,37 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 
+/// argv/wire vocabulary of the stub.
+const FLAG_SOCKET: &str = "--socket";
+const CMD_ADD: &str = "add";
+#[allow(unknown_lints)]
+#[allow(inline_literal)]
+const REPLY_OK: &str = "{\"type\":\"ok\"}\n";
+const EXIT_USAGE: i32 = 2;
+const EXIT_BIND: i32 = 3;
+
+// Necessity: argv walking (skip(1), flag matching) and the WORD reply
+// grammar (split(' ')) — a hand-rolled wire stub, not constants to name.
+#[allow(unknown_lints)]
+#[allow(inline_literal)]
 fn main() {
     let mut path: Option<PathBuf> = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
-        if a == "--socket" {
+        if a == FLAG_SOCKET {
             path = args.next().map(PathBuf::from);
         }
     }
     let Some(path) = path else {
         eprintln!("stub: --socket required");
-        std::process::exit(2);
+        std::process::exit(EXIT_USAGE);
     };
     let _ = std::fs::remove_file(&path);
     let listener = match UnixListener::bind(&path) {
         Ok(l) => l,
         Err(e) => {
             eprintln!("stub: bind {}: {e}", path.display());
-            std::process::exit(3);
+            std::process::exit(EXIT_BIND);
         }
     };
     eprintln!("stub-fuse-server: listening at {}", path.display());
@@ -47,10 +60,10 @@ fn main() {
             // request grammar: WORD args — plain split
             let mut words = line.split(' ');
             let reply = match (words.next(), words.next()) {
-                (Some("add"), Some(name)) => {
+                (Some(CMD_ADD), Some(name)) => {
                     format!("{{\"type\":\"added\",\"inner\":\"stub-{name}\"}}\n")
                 }
-                _ => "{\"type\":\"ok\"}\n".to_string(),
+                _ => REPLY_OK.to_string(),
             };
         let _ = w.write_all(reply.as_bytes());
         let _ = w.flush();

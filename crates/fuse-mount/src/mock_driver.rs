@@ -9,6 +9,7 @@
 //! review asked for, expressed as one method per op instead of a
 //! runtime-paired decoder.
 
+#![cfg_attr(test, allow(unknown_lints, inline_literal))]
 use std::io::{Read, Write};
 use std::os::fd::FromRawFd;
 use std::os::unix::net::UnixStream;
@@ -17,6 +18,17 @@ use std::path::Path;
 use fuse_backend_rs::abi::fuse_abi as abi;
 
 use crate::mock_fuser::{pod_bytes, pod_decode};
+
+/// Kernel ABI negotiation facts (stable since 7.1).
+const KERNEL_MAJOR: u32 = 7;
+const KERNEL_MINOR: u32 = 8;
+const MAX_READAHEAD: u32 = 128 * 1024;
+const NO_FLAGS: u32 = 0;
+const OUT_HEADER_SIZE: usize = 16;
+/// FUSE ABI alignment + walk start.
+const ABI_ALIGN: usize = 8;
+const START_OFF: usize = 0;
+
 
 const FRAME_BUF: usize = 1 << 20;
 
@@ -148,6 +160,10 @@ impl MockDriver {
     }
 
     /// FUSE_INIT — the handshake every session expects first.
+    /// Necessity: fixed-field u32 LE reads (g(0)/g(4)/g(8)) — the
+    /// init reply's frozen wire layout.
+    #[allow(unknown_lints)]
+    #[allow(inline_literal)]
     pub fn init(&mut self) -> Result<abi::InitOut, Errno> {
         // The init reply's layout is feature-dependent on the SERVING
         // side (fuser compiles a subset); the prefix
@@ -156,23 +172,27 @@ impl MockDriver {
             abi::Opcode::Init,
             0,
             &pod_bytes(&abi::InitIn {
-                major: 7,
-                minor: 8,
-                max_readahead: 128 * 1024,
-                flags: 0,
+                major: KERNEL_MAJOR,
+                minor: KERNEL_MINOR,
+                max_readahead: MAX_READAHEAD,
+                flags: NO_FLAGS,
             }),
         )?;
-        if reply.len() < 16 {
+        if reply.len() < OUT_HEADER_SIZE {
             return Err(Errno(libc::EIO));
         }
-        let g = |off: usize| u32::from_le_bytes(reply[off..off + 4].try_into().unwrap_or([0; 4]));
+        // Necessity: fixed-field u32 LE layout reads (off..off+4).
+        #[allow(unknown_lints)]
+        #[allow(inline_literal)]
+        let g =
+            |off: usize| u32::from_le_bytes(reply[off..off + 4].try_into().unwrap_or([0; 4]));
         Ok(abi::InitOut { major: g(0), minor: g(4), flags: g(8), ..Default::default() })
     }
 
     pub fn lookup(&mut self, name: &str) -> Result<abi::EntryOut, Errno> {
         let mut p = name.as_bytes().to_vec();
         p.push(0);
-        while !p.len().is_multiple_of(8) {
+        while !p.len().is_multiple_of(ABI_ALIGN) {
             p.push(0);
         }
         let reply = self.roundtrip(abi::Opcode::Lookup, fuser::FUSE_ROOT_ID, &p)?;
@@ -239,7 +259,7 @@ impl MockDriver {
         )?;
         let hdr = std::mem::size_of::<abi::Dirent>();
         let mut out = Vec::new();
-        let mut off = 0usize;
+        let mut off = START_OFF;
         while off + hdr <= data.len() {
             let Some(d) = pod_decode::<abi::Dirent>(&data[off..off + hdr]) else {
                 break;
@@ -251,7 +271,7 @@ impl MockDriver {
             let name =
                 String::from_utf8_lossy(&data[off + hdr..off + hdr + namelen]).into_owned();
             out.push((d, name));
-            off += (hdr + namelen).div_ceil(8) * 8;
+            off += (hdr + namelen).div_ceil(ABI_ALIGN) * ABI_ALIGN;
         }
         Ok(out)
     }

@@ -7,6 +7,7 @@
 //! One JSON line per message, LF-terminated — the same framing as the
 //! client-facing protocol.
 
+#![cfg_attr(test, allow(unknown_lints, inline_literal))]
 use serde::{Deserialize, Serialize};
 
 /// Host filesystem identity halves (MR4): a device number and an
@@ -86,6 +87,12 @@ pub enum OracleRequest {
 }
 
 /// Policy daemon → fused.
+/// The takeover envelope's schema field (server → successor state
+/// file, #103).
+pub const TAKEOVER_KEY_SCHEMA: &str = "session_schema";
+/// The takeover envelope's state field.
+pub const TAKEOVER_KEY_STATE: &str = "state";
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum OracleCommand {

@@ -11,12 +11,28 @@
 //! `--advertise-version` overrides the Hello version (the
 //! incompatible-vintage pin).
 
+
+// Test-stub binary (the #116 convention): fixtures and wire stubs
+// are the sanctioned test-code shape — inline literals carry no
+// naming burden here.
+#![allow(unknown_lints)]
+#![allow(inline_literal)]
+
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 
+/// Env var overriding the advertised HELLO version.
+const ENV_HELLO_VERSION: &str = "FUSE_FAKE_HELLO_VERSION";
+/// Idle park + pacing between oracle lines.
+const IDLE_FOREVER: std::time::Duration = std::time::Duration::from_secs(3600);
+const PACE: std::time::Duration = std::time::Duration::from_secs(1);
+
+// Necessity: argv walking (skip(1), flag matching loop).
+#[allow(unknown_lints)]
+#[allow(inline_literal)]
 fn main() {
     let mut oracle: Option<String> = None;
-    let mut version = std::env::var("FUSE_FAKE_HELLO_VERSION")
+    let mut version = std::env::var(ENV_HELLO_VERSION)
         .unwrap_or_else(|_| fuse_protocol::VERSION.to_string());
     let mut args = std::env::args().skip(1);
     let mut resumed = false;
@@ -43,10 +59,16 @@ fn main() {
     match oracle {
         Some(path) => speak(&path, &version),
         None => loop {
-            std::thread::sleep(std::time::Duration::from_secs(3600));
+            std::thread::sleep(IDLE_FOREVER);
         },
     }
 }
+
+/// First fuse inode number of a fresh session.
+const NEXT_FINO_START: u64 = 1;
+/// Kernel ABI a stand-in session claims.
+const FUSE_PROTO_MAJOR: u32 = 7;
+const FUSE_PROTO_MINOR: u32 = 9;
 
 /// Surrender like the real daemon, with a STAND-IN fd (a temp file):
 /// the transplant path on the server is fd-agnostic — this exercises
@@ -55,19 +77,19 @@ fn surrender(oracle: &str) -> Result<(), String> {
     use std::os::fd::AsRawFd as _;
     let f = tempfile::tempfile().map_err(|e| e.to_string())?;
     let fd = f.as_raw_fd();
-    let payload = serde_json::json!({
-        "type": "surrender_payload",
-        "session_schema": 1,
-        "state": {
-            "next_fino": 1,
-            "tree": [],
-            "labels": [],
-            "identities": [],
-            "open_fds": [],
-            "proto_major": 7,
-            "proto_minor": 9
-        }
-    });
+    let state = fuse_mount::fs::TakeoverState {
+        next_fino: NEXT_FINO_START,
+        tree: Vec::new(),
+        labels: Vec::new(),
+        identities: Vec::new(),
+        open_fds: Vec::new(),
+        proto_major: FUSE_PROTO_MAJOR,
+        proto_minor: FUSE_PROTO_MINOR,
+    };
+    let payload = fuse_protocol::oracle::OracleRequest::SurrenderPayload {
+        session_schema: fuse_mount::fs::TAKEOVER_SESSION_SCHEMA,
+        state: serde_json::to_value(&state).map_err(|e| e.to_string())?,
+    };
     let line = serde_json::to_string(&payload).map_err(|e| e.to_string())?;
     let conn = UnixStream::connect(oracle).map_err(|e| format!("connect: {e}"))?;
     let payload_bytes = format!("{line}\n");
@@ -93,16 +115,21 @@ fn speak(oracle: &str, version: &str) {
             let mut reader = BufReader::new(match conn.try_clone() {
                 Ok(c) => c,
                 Err(_) => {
-                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    std::thread::sleep(PACE);
                     continue;
                 }
             });
             let mut w = conn;
-            let hello = format!(
-                "{{\"type\":\"hello\",\"version\":\"{version}\"}}\n"
-            );
-            if w.write_all(hello.as_bytes()).and_then(|_| w.flush()).is_err() {
-                std::thread::sleep(std::time::Duration::from_secs(1));
+            let hello = serde_json::to_string(&fuse_protocol::oracle::OracleRequest::Hello {
+                version: Some(version.to_string()),
+            })
+            .unwrap_or_default();
+            if w
+                .write_all(format!("{hello}\n").as_bytes())
+                .and_then(|_| w.flush())
+                .is_err()
+            {
+                std::thread::sleep(PACE);
                 continue;
             }
             let mut line = String::new();
@@ -111,19 +138,26 @@ fn speak(oracle: &str, version: &str) {
                 match reader.read_line(&mut line) {
                     Ok(0) | Err(_) => break,
                     Ok(_) => {
-                        if line.contains("\"surrender\"") && !line.contains("payload") {
-                            if let Err(e) = surrender(oracle) {
-                                eprintln!("fake-fused: surrender failed: {e}");
+                        // the typed wire: OracleCommand covers every
+                        // line the policy daemon may push (the
+                        // string-grep this replaces could not see
+                        // shapes, only substrings).
+                        match serde_json::from_str::<fuse_protocol::oracle::OracleCommand>(&line) {
+                            Ok(fuse_protocol::oracle::OracleCommand::Surrender) => {
+                                if let Err(e) = surrender(oracle) {
+                                    eprintln!("fake-fused: surrender failed: {e}");
+                                }
                             }
-                        }
-                        if line.contains("\"retire\"") {
-                            eprintln!("fake-fused: retired — exiting 0");
-                            std::process::exit(0);
+                            Ok(fuse_protocol::oracle::OracleCommand::Retire) => {
+                                eprintln!("fake-fused: retired — exiting 0");
+                                std::process::exit(0);
+                            }
+                            _ => {}
                         }
                     }
                 }
             }
         }
-        std::thread::sleep(std::time::Duration::from_secs(1));
+        std::thread::sleep(PACE);
     }
 }

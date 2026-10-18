@@ -16,6 +16,7 @@
 //!                                        SCM_RIGHTS, reads pread it,
 //!                                        release closes it. No
 //!                                        snapshot bytes anywhere.
+#![cfg_attr(test, allow(unknown_lints, inline_literal))]
 
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsStr;
@@ -25,12 +26,21 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+/// Readdir/stat vocabulary.
+const SEP_PATH_STR: &str = "/";
+const NLINK_FILE: u32 = 1;
+const NLINK_DIR: u32 = 2;
+const DOT_ENTRY: &str = ".";
+const DOTDOT_ENTRY: &str = "..";
+/// Control-loop retry pacing.
+const RETRY_PACE: Duration = Duration::from_secs(1);
+
 use fuse_protocol::oracle::{OracleCommand, OracleReply, OracleRequest};
 use fuser::{
     FileAttr, FileType, Filesystem, KernelConfig, Request, ReplyAttr, ReplyData, ReplyDirectory,
     ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs,
 };
-use tracing::warn;
+use tracing::{info, warn};
 
 /// The fuse inode number (review: newtype pattern). Opaque to the
 /// kernel and to the container — only ever minted here.
@@ -234,7 +244,7 @@ impl Store {
         }
         {
             let labels = &mut s.root_labels;
-            let outer_full = comps.join("/");
+            let outer_full = comps.join(SEP_PATH_STR);
             // A bimap is bijective by construction: insert removes the
             // previous pairing on BOTH sides (relabel is a rename),
             // and a conflicting inner label would evict the old
@@ -428,7 +438,7 @@ pub fn stat_secret(socket: &str, name: &str) -> Result<OracleReply, String> {
             .expect("serializing Stat: internal enum, infallible"),
     )?;
     // Metadata has no pending machinery to wait out — bound it tight.
-    s.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+    s.set_read_timeout(Some(CONTROL_TIMEOUT))
         .map_err(|e| e.to_string())?;
     let mut line = String::new();
     let mut r = BufReader::new(s);
@@ -476,7 +486,7 @@ fn open_secret_timeout(
     )?;
     s.set_read_timeout(Some(timeout)).map_err(|e| e.to_string())?;
 
-    let mut buf = vec![0u8; 4096];
+    let mut buf = vec![0u8; IO_BUFFER];
     let mut cmsg_buf = nix::cmsg_space!(libc::cmsghdr, std::os::unix::io::RawFd);
     let mut iov = [std::io::IoSliceMut::new(&mut buf)];
     // SAFETY: recvmsg writes into the provided buffers only; the
@@ -543,24 +553,24 @@ impl FusedFs {
 
     fn file_attr(&self, ino: u64, size: u64, uid: u32, gid: u32, mode: u32) -> FileAttr {
         // Read-only view: strip every write bit, whatever the source had.
-        let ro = mode & 0o444;
+        let ro = mode & MODE_READ_MASK;
         let now = std::time::SystemTime::now();
         #[allow(deprecated)]
         FileAttr {
             ino,
             size,
-            blocks: size.div_ceil(512),
+            blocks: size.div_ceil(u64::from(BLOCK_SIZE)),
             atime: now,
             mtime: now,
             ctime: now,
             crtime: now,
             kind: FileType::RegularFile,
             perm: ro as u16,
-            nlink: 1,
+            nlink: NLINK_FILE,
             uid,
             gid,
             rdev: 0,
-            blksize: 512,
+            blksize: BLOCK_SIZE,
             flags: 0,
         }
     }
@@ -577,12 +587,12 @@ impl FusedFs {
             ctime: now,
             crtime: now,
             kind: FileType::Directory,
-            perm: 0o555,
-            nlink: 2,
+            perm: MODE_DIR,
+            nlink: NLINK_DIR,
             uid,
             gid,
             rdev: 0,
-            blksize: 512,
+            blksize: BLOCK_SIZE,
             flags: 0,
         }
     }
@@ -666,7 +676,7 @@ impl Filesystem for FusedFs {
                         st.st_size as u64,
                         req.uid(),
                         req.gid(),
-                        (st.st_mode & 0o777) as u32,
+                        (st.st_mode & MODE_RWX) as u32,
                     );
                     reply.attr(&TTL, &attr);
                     return;
@@ -835,8 +845,8 @@ impl Filesystem for FusedFs {
         };
         let parent = self.store.parent_of(FuseIno(ino)).unwrap_or(FuseIno::ROOT);
         let all: Vec<(u64, FileType, String)> = vec![
-            (ino, FileType::Directory, ".".into()),
-            (parent.0, FileType::Directory, "..".into()),
+            (ino, FileType::Directory, DOT_ENTRY.into()),
+            (parent.0, FileType::Directory, DOTDOT_ENTRY.into()),
         ]
         .into_iter()
         .chain(children.into_iter().map(|(i, d, n)| {
@@ -859,7 +869,7 @@ impl Filesystem for FusedFs {
         // Content sizes are live at open (no snapshots); only the
         // served-file count is known statically.
         let files = self.store.file_count() as u64 + 1;
-        reply.statfs(1_000_000, 1_000_000, 1_000_000, files, 1_000_000, 512, 255, 512);
+        reply.statfs(STATFS_BLOCKS, STATFS_BLOCKS, STATFS_BLOCKS, files, STATFS_BLOCKS, BLOCK_SIZE, STATFS_NAME_MAX, BLOCK_SIZE);
     }
 
     fn setattr(
@@ -992,20 +1002,20 @@ pub fn takeover_snapshot(
     // open host fds: /proc/self/fd minus the known set. fd numbers =
     // fh values (open's contract: the forgotten OwnedFd's number).
     let mut host_fds: Vec<i32> = Vec::new();
-    if let Ok(entries) = std::fs::read_dir("/proc/self/fd") {
+    if let Ok(entries) = std::fs::read_dir(PROC_SELF_FD) {
         for e in entries.flatten() {
             let name = e.file_name().to_string_lossy().into_owned();
             let Ok(fd) = name.parse::<i32>() else { continue };
-            if fd <= 2 || exclude_fds.contains(&fd) {
+            if fd < STDIO_FD_LIMIT || exclude_fds.contains(&fd) {
                 continue;
             }
             // only REAL files (host secrets); sockets/pipes/eve are
             // not transferable state (sockets cannot cross SCM_RIGHTS
             // meaningfully and belong to live connections of ours).
-            let target = std::fs::read_link(format!("/proc/self/fd/{fd}"))
+            let target = std::fs::read_link(format!("{PROC_SELF_FD}/{fd}"))
                 .unwrap_or_default();
             let target_str = target.to_string_lossy();
-            if ["socket:", "pipe:", "anon_inode:"]
+            if ANON_LINK_PREFIXES
                 .iter()
                 .any(|pfx| fuse_protocol::prefix_filter::has_prefix(&target_str, pfx))
             {
@@ -1134,7 +1144,7 @@ fn apply_control_line(store: &Store, oracle: &std::path::Path, line: &str) -> bo
         // the swap. We keep serving until Retire.
         Ok(OracleCommand::Surrender) => {
             match surrender(store, oracle) {
-                Ok(()) => tracing::info!(
+                Ok(()) => info!(
                     "surrendered the mount session (fds + state) — serving until retire"
                 ),
                 Err(e) => warn!(
@@ -1147,7 +1157,7 @@ fn apply_control_line(store: &Store, oracle: &std::path::Path, line: &str) -> bo
         // fd copies close with us; the kernel connection survives on
         // the successor's).
         Ok(OracleCommand::Retire) => {
-            tracing::info!("retired by the policy daemon — exiting 0");
+            info!("retired by the policy daemon — exiting 0");
             std::process::exit(0);
         }
         Err(e) => {
@@ -1167,19 +1177,19 @@ fn surrender(store: &Store, oracle: &std::path::Path) -> Result<(), String> {
     use std::os::fd::AsRawFd as _;
     // 1. find the live /dev/fuse fd (a REAL file, in our fd table).
     let mut fuse_fd: Option<i32> = None;
-    if let Ok(entries) = std::fs::read_dir("/proc/self/fd") {
+    if let Ok(entries) = std::fs::read_dir(PROC_SELF_FD) {
         for e in entries.flatten() {
             let name = e.file_name().to_string_lossy().into_owned();
             let Ok(fd) = name.parse::<i32>() else { continue };
-            if let Ok(target) = std::fs::read_link(format!("/proc/self/fd/{fd}")) {
-                if target == std::path::Path::new("/dev/fuse") {
+            if let Ok(target) = std::fs::read_link(format!("{PROC_SELF_FD}/{fd}")) {
+                if target == std::path::Path::new(DEV_FUSE) {
                     fuse_fd = Some(fd);
                     break;
                 }
             }
         }
     }
-    let fuse_fd = fuse_fd.ok_or("no live /dev/fuse fd (not a real mount)")?;
+    let fuse_fd = fuse_fd.ok_or_else(|| format!("no live {DEV_FUSE} fd (not a real mount)"))?;
     let exclude = [fuse_fd];
 
     // 2. snapshot (state + discovered open host fds).
@@ -1195,8 +1205,8 @@ fn surrender(store: &Store, oracle: &std::path::Path) -> Result<(), String> {
         takeover_snapshot(
             &inner,
             &exclude,
-            7,
-            9,
+            KERNEL_ABI_MAJOR,
+            KERNEL_ABI_MINOR,
         )
     };
 
@@ -1264,6 +1274,41 @@ fn send_line_with_fds(
     Ok(())
 }
 
+/// statvfs traditional values (the frozen-tree convention). The
+/// block size is one thing: what `blocks` counts in AND what
+/// `f_bsize`/`blksize` report — one constant, not two.
+const BLOCK_SIZE: u32 = 512;
+const STATFS_BLOCKS: u64 = 1_000_000;
+const STATFS_NAME_MAX: u32 = 255;
+/// Regular-file read-only mask for the served view.
+const MODE_READ_MASK: u32 = 0o444;
+/// The plain rwx mask.
+const MODE_RWX: u32 = 0o777;
+/// Directory mode (r-x).
+const MODE_DIR: u16 = 0o555;
+/// The control-wire read buffer size.
+const IO_BUFFER: usize = 4096;
+/// The control socket's connect timeout.
+const CONTROL_TIMEOUT: Duration = Duration::from_secs(10);
+// Necessity: the path IS the kernel's stable name (not a choice).
+#[allow(unknown_lints)]
+#[allow(inline_literal)]
+const PROC_SELF_FD: &str = "/proc/self/fd";
+// Necessity: the device path IS its stable name (not a choice).
+#[allow(unknown_lints)]
+#[allow(inline_literal)]
+const DEV_FUSE: &str = "/dev/fuse";
+/// fds below this are std streams, never host secrets.
+const STDIO_FD_LIMIT: i32 = 3;
+// Necessity: table form (the strings ARE the kernel's link prefixes).
+#[allow(unknown_lints)]
+#[allow(inline_literal)]
+const ANON_LINK_PREFIXES: [&str; 3] = ["socket:", "pipe:", "anon_inode:"];
+/// The kernel ABI this build offers on resume (mounts negotiate
+/// abi-7-9; the kernel never negotiates above the daemon's offer).
+const KERNEL_ABI_MAJOR: u32 = 7;
+const KERNEL_ABI_MINOR: u32 = 9;
+
 /// Maintain the CONTROL connection to the policy daemon: say hello,
 /// then apply every Serve/Remove it pushes. Reconnects on loss.
 /// Content sync no longer exists — Serve only shapes the frozen tree;
@@ -1288,7 +1333,7 @@ pub fn run_control_loop(store: Store, oracle_socket: String) {
             )
             .is_err()
             {
-                std::thread::sleep(Duration::from_secs(1));
+                std::thread::sleep(RETRY_PACE);
                 continue;
             }
             let _ = w.flush();
@@ -1305,7 +1350,7 @@ pub fn run_control_loop(store: Store, oracle_socket: String) {
                 }
             }
         }
-        std::thread::sleep(Duration::from_secs(1));
+        std::thread::sleep(RETRY_PACE);
     }
 }
 

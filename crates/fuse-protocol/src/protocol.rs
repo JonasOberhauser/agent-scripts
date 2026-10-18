@@ -1,3 +1,4 @@
+#![cfg_attr(test, allow(unknown_lints, inline_literal))]
 use serde::{Deserialize, Serialize};
 
 /// Read-only status snapshot for a secret.
@@ -150,7 +151,7 @@ impl CollapseTrie {
             let write = i == comps.len() - 1 || parent_branches;
             if write {
                 if elided {
-                    pieces.push("...".into());
+                    pieces.push(ELLIPSIS.into());
                     elided = false;
                 }
                 pieces.push((*c).to_string());
@@ -162,9 +163,9 @@ impl CollapseTrie {
             // The sequence ended on an elided chain — cannot happen
             // for rendered names (the last component is always
             // written), kept for completeness.
-            pieces.push("...".into());
+            pieces.push(ELLIPSIS.into());
         }
-        pieces.join("/")
+        pieces.join(PATH_SEP.to_string().as_str())
     }
 }
 
@@ -176,7 +177,7 @@ pub fn collapse_paths(paths: &[String]) -> Vec<String> {
             set.push(p.clone());
         }
     }
-    let comps: Vec<Vec<&str>> = set.iter().map(|p| p.split('/').collect()).collect();
+    let comps: Vec<Vec<&str>> = set.iter().map(|p| p.split(SEP_PATH).collect()).collect();
 
     let mut trie = CollapseTrie::default();
     for c in &comps {
@@ -221,8 +222,8 @@ impl Salt {
     /// Panics if `/dev/urandom` cannot be opened or short-reads:
     /// anonymization must not quietly degrade.
     pub fn generate() -> Salt {
-        let mut buf = [0u8; 32];
-        let mut f = std::fs::File::open("/dev/urandom")
+        let mut buf = [ZERO_BYTE; SALT_BYTES];
+        let mut f = std::fs::File::open(URANDOM)
             .expect("/dev/urandom for the anonymization salt");
         use std::io::Read as _;
         f.read_exact(&mut buf)
@@ -235,13 +236,25 @@ impl Salt {
     }
 }
 
+/// The elision marker for long paths in panel display.
+const ELLIPSIS: &str = "...";
+/// Path separator on the wire and in displays.
+const PATH_SEP: char = '/';
+const ZERO_BYTE: u8 = 0;
+const SEP_VERSION: char = '.';
+const MODE_OWNER_READ: u32 = 0o400;
+/// Bytes of entropy in a freshly minted salt.
+const SALT_BYTES: usize = 32;
+/// Hex characters per salt byte shown.
+const SALT_HEX_CHARS: usize = 6;
+
 pub fn anonymize(salt: &Salt, component: &str) -> String {
     use sha2::{Digest as _, Sha256};
     let mut h = Sha256::new();
     h.update(salt.as_bytes());
     h.update(component.as_bytes());
     let d = h.finalize();
-    d.iter().take(6).map(|b| format!("{b:02x}")).collect()
+    d.iter().take(SALT_HEX_CHARS).map(|b| format!("{b:02x}")).collect()
 }
 
 
@@ -252,6 +265,12 @@ pub fn anonymize(salt: &Salt, component: &str) -> String {
 /// mount, and no depth/fan-out structure leaking into the
 /// container. The hash input is the full path with separators, so
 /// distinct paths are unambiguous.
+/// Path-component separator.
+const SEP_PATH: char = '/';
+
+/// The kernel's entropy source for salt minting.
+const URANDOM: &str = "/dev/urandom";
+
 pub fn anonymize_path(salt: &Salt, name: &str) -> String {
     anonymize(salt, name)
 }
@@ -262,7 +281,7 @@ pub fn anonymize_path(salt: &Salt, name: &str) -> String {
 /// server restart.  Malformed versions are incompatible — fail closed.
 pub fn versions_compatible(server: &str, client: &str) -> bool {
     fn parts(v: &str) -> Option<(u32, u32)> {
-        let mut it = v.split('.');
+        let mut it = v.split(SEP_VERSION);
         let maj = it.next()?.parse().ok()?;
         let min = it.next()?.parse().ok()?;
         Some((maj, min))
@@ -277,7 +296,7 @@ pub fn versions_compatible(server: &str, client: &str) -> bool {
 /// mode field (conservative read-only).  Shared by the client-facing
 /// `AddSecret` and the oracle `Upsert` wire formats.
 pub fn default_secret_mode() -> u32 {
-    0o400
+    MODE_OWNER_READ
 }
 
 /// Allowed-hash sentinel for secrets hosted without a binary hash

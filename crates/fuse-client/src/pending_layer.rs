@@ -14,6 +14,7 @@
 //! All server I/O goes through [`ServerTalk`] so the render/event path
 //! never blocks on the socket: production queues requests to a worker
 //! thread ([`spawn_worker`]), tests run them inline ([`DirectTalk`]).
+#![cfg_attr(test, allow(unknown_lints, inline_literal))]
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -35,6 +36,13 @@ use unicode_width::UnicodeWidthStr;
 
 /// Widget-name of the panel rows (ownership/hit-testing key).
 const PANEL_NAME: &str = "fuse.pending_panel";
+
+/// The button labels (one source for render AND width math).
+pub(crate) const LABEL_DENY: &str = "[deny]";
+pub(crate) const LABEL_GRANT: &str = "[grant]";
+pub(crate) const LABEL_FOREVER: &str = "[forever]";
+pub(crate) const LABEL_DENY_ALL: &str = "[deny all]";
+pub(crate) const LABEL_GRANT_ALL: &str = "[grant all]";
 
 /// How many request lines the panel shows at once.
 const MAX_SHOWN: usize = 5;
@@ -90,11 +98,11 @@ impl Button {
     /// The rendered label, brackets included.
     fn label(&self) -> &'static str {
         match self {
-            Button::Deny { .. } => "[deny]",
-            Button::Grant { .. } => "[grant]",
-            Button::GrantForever { .. } => "[forever]",
-            Button::DenyAll => "[deny all]",
-            Button::GrantAll => "[grant all]",
+            Button::Deny { .. } => LABEL_DENY,
+            Button::Grant { .. } => LABEL_GRANT,
+            Button::GrantForever { .. } => LABEL_FOREVER,
+            Button::DenyAll => LABEL_DENY_ALL,
+            Button::GrantAll => LABEL_GRANT_ALL,
         }
     }
 
@@ -251,6 +259,10 @@ pub(crate) fn cursor_after_action(slots: &Slots, slot: usize) -> Cursor {
 
 /// Move the cursor one line up (requests, then the all-row, wrapping;
 /// freed slots are skipped).
+    // Necessity: TUI layout arithmetic (height:1, occ[0], bracket
+    // spans, space-fill) — pixel-adjacent geometry, not constants.
+    #[allow(unknown_lints)]
+    #[allow(inline_literal)]
 pub(crate) fn cursor_up(slots: &Slots, cur: Cursor, disabled: &std::collections::HashSet<u64>) -> Cursor {
     let occ = occupied_live(slots, disabled);
     if occ.is_empty() {
@@ -281,6 +293,10 @@ pub(crate) fn cursor_up(slots: &Slots, cur: Cursor, disabled: &std::collections:
 
 /// Move the cursor one line down (requests, then the all-row, wrapping;
 /// freed slots are skipped).
+    // Necessity: TUI layout arithmetic (height:1, occ[0], bracket
+    // spans, space-fill) — pixel-adjacent geometry, not constants.
+    #[allow(unknown_lints)]
+    #[allow(inline_literal)]
 pub(crate) fn cursor_down(slots: &Slots, cur: Cursor, disabled: &std::collections::HashSet<u64>) -> Cursor {
     let occ = occupied_live(slots, disabled);
     if occ.is_empty() {
@@ -305,6 +321,10 @@ pub(crate) fn cursor_down(slots: &Slots, cur: Cursor, disabled: &std::collection
 // ── Layout ────────────────────────────────────────────────────────
 
 /// The panel's area: fixed width against the right terminal edge.
+    // Necessity: TUI layout arithmetic (height:1, occ[0], bracket
+    // spans, space-fill) — pixel-adjacent geometry, not constants.
+    #[allow(unknown_lints)]
+    #[allow(inline_literal)]
 fn panel_rect(terminal: Rect) -> Rect {
     let w = PANEL_WIDTH.min(terminal.width);
     let h = (1 + MAX_SHOWN as u16 + 1).min(terminal.height);
@@ -312,6 +332,10 @@ fn panel_rect(terminal: Rect) -> Rect {
 }
 
 /// The area of request line `i` inside the panel.
+    // Necessity: TUI layout arithmetic (height:1, occ[0], bracket
+    // spans, space-fill) — pixel-adjacent geometry, not constants.
+    #[allow(unknown_lints)]
+    #[allow(inline_literal)]
 fn row_rect(panel: Rect, i: usize) -> Rect {
     Rect {
         x: panel.x,
@@ -322,6 +346,10 @@ fn row_rect(panel: Rect, i: usize) -> Rect {
 }
 
 /// The all-row area at the panel bottom.
+    // Necessity: TUI layout arithmetic (height:1, occ[0], bracket
+    // spans, space-fill) — pixel-adjacent geometry, not constants.
+    #[allow(unknown_lints)]
+    #[allow(inline_literal)]
 fn all_row_rect(panel: Rect) -> Rect {
     Rect {
         x: panel.x,
@@ -334,8 +362,12 @@ fn all_row_rect(panel: Rect) -> Rect {
 /// A row's two button children, right-aligned as a grant|deny pair
 /// (grant on the left, deny on the right). Shared by request rows and
 /// the all-row (only the labels differ).
+    // Necessity: TUI layout arithmetic (height:1, occ[0], bracket
+    // spans, space-fill) — pixel-adjacent geometry, not constants.
+    #[allow(unknown_lints)]
+    #[allow(inline_literal)]
 fn button_pair(row: Rect, all: bool) -> (Rect, Rect) {
-    let (deny_l, grant_l) = if all { ("[deny all]", "[grant all]") } else { ("[deny]", "[grant]") };
+    let (deny_l, grant_l) = if all { (LABEL_DENY_ALL, LABEL_GRANT_ALL) } else { (LABEL_DENY, LABEL_GRANT) };
     let deny = Rect {
         x: row.x + row.width.saturating_sub(deny_l.len() as u16),
         y: row.y,
@@ -352,12 +384,16 @@ fn button_pair(row: Rect, all: bool) -> (Rect, Rect) {
 }
 
 /// The per-request `[forever]` button sits one cell left of `[grant]`.
+    // Necessity: TUI layout arithmetic (height:1, occ[0], bracket
+    // spans, space-fill) — pixel-adjacent geometry, not constants.
+    #[allow(unknown_lints)]
+    #[allow(inline_literal)]
 fn forever_rect(row: Rect) -> Rect {
     let (_, grant) = button_pair(row, false);
     Rect {
-        x: grant.x.saturating_sub("[forever]".len() as u16 + 1),
+        x: grant.x.saturating_sub(LABEL_FOREVER.len() as u16 + 1),
         y: row.y,
-        width: "[forever]".len() as u16,
+        width: LABEL_FOREVER.len() as u16,
         height: 1,
     }
 }
@@ -367,6 +403,10 @@ fn forever_rect(row: Rect) -> Rect {
 /// The panel title: completely unstyled text — no modifiers, no
 /// colors, no background override. It sits directly on the layer's
 /// servatui-assigned backdrop like every other row.
+    // Necessity: TUI layout arithmetic (height:1, occ[0], bracket
+    // spans, space-fill) — pixel-adjacent geometry, not constants.
+    #[allow(unknown_lints)]
+    #[allow(inline_literal)]
 fn title_line(shown: usize, total: usize, error: Option<&str>, width: u16) -> Line<'static> {
     let prefix = format!(" pending requests: {shown}/{total} ");
     let mut t = prefix.clone();
@@ -390,6 +430,9 @@ fn requester(req: &PendingAccessInfo) -> String {
 /// multi-byte character), truncating with an ellipsis; non-ASCII names
 /// are as wide as the terminal renders them, not as many bytes or chars
 /// they contain.
+    // Necessity: width/ellipsis/truncation math — terminal cells.
+    #[allow(unknown_lints)]
+    #[allow(inline_literal)]
 fn truncate_pad(s: &str, max: usize) -> String {
     let mut out = truncate_fit(s, max);
     let total = unicode_width::UnicodeWidthStr::width(out.as_str());
@@ -401,6 +444,9 @@ fn truncate_pad(s: &str, max: usize) -> String {
 
 /// Truncate to `max` display columns, unpadded — the caller that
 /// used to `trim_end()` a padded result wants exactly this.
+    // Necessity: width/ellipsis/truncation math — terminal cells.
+    #[allow(unknown_lints)]
+    #[allow(inline_literal)]
 fn truncate_fit(s: &str, max: usize) -> String {
     let total = s.width();
     if total <= max {
@@ -429,6 +475,10 @@ fn truncate_fit(s: &str, max: usize) -> String {
 /// `disabled`: the request's decision is in flight — render the
 /// button dimmed (normal colors, `DIM`, never reverse-highlighted);
 /// plain DarkGray was unreadable against the panel backdrop.
+    // Necessity: TUI span/layout math (bracket spans, width budget,
+    // space-fill) — terminal-cell geometry, not constants to name.
+    #[allow(unknown_lints)]
+    #[allow(inline_literal)]
 fn button_spans_styled(button: Button, selected: bool, disabled: bool) -> Vec<Span<'static>> {
     if disabled {
         let label = button.label();
@@ -469,6 +519,10 @@ enum GridRow<'a> {
 /// The too-small fallback text, derived from the single command table
 /// (never a hardcoded duplicate): the pending list command plus every
 /// command that completes pending-request ids.
+    // Necessity: TUI span/layout math (bracket spans, width budget,
+    // space-fill) — terminal-cell geometry, not constants to name.
+    #[allow(unknown_lints)]
+    #[allow(inline_literal)]
 fn small_shell_hint() -> String {
     let mut names: Vec<&str> = Vec::new();
     for spec in fuse_protocol::COMMAND_TABLE {
@@ -491,6 +545,9 @@ fn small_shell_hint() -> String {
 /// secret renders COLLAPSED to its first point of difference against
 /// the other served names (issue #34) — the SAME rendering the
 /// status table prints (same function, same name set).
+    // Necessity: width/ellipsis/truncation math — terminal cells.
+    #[allow(unknown_lints)]
+    #[allow(inline_literal)]
 fn requester_and_secret(req: &PendingAccessInfo, collapsed: Option<&str>) -> String {
     let secret = collapsed.unwrap_or(&req.secret_name);
     format!("{} → {}", requester(req), secret)
@@ -501,6 +558,10 @@ fn requester_and_secret(req: &PendingAccessInfo, collapsed: Option<&str>) -> Str
 /// identity lives in its suffix (`.../x/x1/bar.txt`), so a tail-cut
 /// (what plain truncation does) would eat the basename and make the
 /// row disagree with the status table even further.
+    // Necessity: TUI span/layout math (bracket spans, width budget,
+    // space-fill) — terminal-cell geometry, not constants to name.
+    #[allow(unknown_lints)]
+    #[allow(inline_literal)]
 fn fit_requester_and_secret(req: &PendingAccessInfo, collapsed: Option<&str>, max: usize) -> String {
     let whole = requester_and_secret(req, collapsed);
     if whole.width() <= max {
@@ -540,6 +601,10 @@ fn fit_requester_and_secret(req: &PendingAccessInfo, collapsed: Option<&str>, ma
 
 /// Hover (#25): the button under the mouse renders with the same
 /// reverse-video highlight as the keyboard selection.
+    // Necessity: TUI span/layout math (bracket spans, width budget,
+    // space-fill) — terminal-cell geometry, not constants to name.
+    #[allow(unknown_lints)]
+    #[allow(inline_literal)]
 fn grid_row_line_hover(
     row: GridRow<'_>,
     width: u16,
@@ -557,10 +622,18 @@ fn grid_row_line_hover(
 }
 
 #[cfg(test)]
+    // Necessity: TUI span/layout math (bracket spans, width budget,
+    // space-fill) — terminal-cell geometry, not constants to name.
+    #[allow(unknown_lints)]
+    #[allow(inline_literal)]
 fn grid_row_line(row: GridRow<'_>, width: u16, sel_here: Option<Sel>) -> Line<'static> {
     grid_row_line_styled(row, width, sel_here, false)
 }
 
+    // Necessity: TUI span/layout math (bracket spans, width budget,
+    // space-fill) — terminal-cell geometry, not constants to name.
+    #[allow(unknown_lints)]
+    #[allow(inline_literal)]
 fn grid_row_line_styled(
     row: GridRow<'_>,
     width: u16,
@@ -570,6 +643,10 @@ fn grid_row_line_styled(
     grid_row_line_styled_collapsed(row, width, sel_here, disabled, None)
 }
 
+    // Necessity: TUI span/layout math (bracket spans, width budget,
+    // space-fill) — terminal-cell geometry, not constants to name.
+    #[allow(unknown_lints)]
+    #[allow(inline_literal)]
 fn grid_row_line_styled_collapsed(
     row: GridRow<'_>,
     width: u16,
@@ -578,8 +655,8 @@ fn grid_row_line_styled_collapsed(
     collapsed: Option<&str>,
 ) -> Line<'static> {
     let all = matches!(row, GridRow::All);
-    let (deny_l, grant_l) = if all { ("[deny all]", "[grant all]") } else { ("[deny]", "[grant]") };
-    let forever_w = if all { 0 } else { "[forever]".len() + 1 };
+    let (deny_l, grant_l) = if all { (LABEL_DENY_ALL, LABEL_GRANT_ALL) } else { (LABEL_DENY, LABEL_GRANT) };
+    let forever_w = if all { 0 } else { LABEL_FOREVER.len() + 1 };
     let buttons_w = deny_l.len() + 1 + grant_l.len() + forever_w;
     let mut spans: Vec<Span<'static>> = Vec::new();
     match row {
@@ -984,6 +1061,9 @@ impl PendingPanelLayer {
 }
 
 impl DisplayLayer for PendingPanelLayer {
+    // Necessity: grid assembly (row indexing, cell-width space fill).
+    #[allow(unknown_lints)]
+    #[allow(inline_literal)]
     fn on_overlay(&mut self, ctx: &mut LayerCtx<'_>, widgets: &mut Vec<WidgetEntry>) -> StackIntent {
         // Self-polling: the panel owns the 1s poll cadence (the frame
         // loop ticks every ~100ms, so a fresh request appears within one
@@ -1320,6 +1400,9 @@ impl DisplayLayer for PendingPanelLayer {
         }
     }
 
+    // Necessity: the panel's single-char tab label.
+    #[allow(unknown_lints)]
+    #[allow(inline_literal)]
     fn tab_label(&self) -> char {
         'p'
     }
@@ -1363,6 +1446,9 @@ mod tests {
         )
     }
 
+    // Necessity: width/ellipsis/truncation math — terminal cells.
+    #[allow(unknown_lints)]
+    #[allow(inline_literal)]
     fn key(code: KeyCode) -> Event {
         Event::Key(crossterm::event::KeyEvent::from(code))
     }

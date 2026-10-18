@@ -1,5 +1,18 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::panic, unused_results))]
 pub mod error;
+
+/// The message positions this crate uses (servyi/lints #7/#16
+/// protocol): prose constructors whose string arguments are messages
+/// by definition, not constants to name.
+macro_rules! register_message {
+    ($m:ident) => {
+        #[allow(dead_code)]
+        const _: &[(&str, &str)] = &[("servyi::message", stringify!($m))];
+    };
+}
+register_message!(IoError);
+
+
 pub mod hashd;
 pub mod io;
 pub mod oracle;
@@ -23,9 +36,12 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// patch releases never change the wire protocol and must not force a
 /// restart of the long-running shared server.  Unparseable versions
 /// (e.g. an old server's placeholder) count as incompatible.
+/// Version-component separator.
+const SEP_VERSION: char = '.';
+
 pub fn protocol_compatible(a: &str, b: &str) -> bool {
     fn major_minor(s: &str) -> Option<(&str, &str)> {
-        let mut it = s.split('.');
+        let mut it = s.split(SEP_VERSION);
         let maj = it.next()?;
         let min = it.next()?;
         let digits = |x: &str| !x.is_empty() && x.bytes().all(|b| b.is_ascii_digit());
@@ -59,6 +75,12 @@ pub const DEFAULT_ORACLE_SOCKET: &str = "/tmp/fuse-gatekeeper-oracle.sock";
 /// (typed by fuse-server, fused, run-agent, and fuse-client's
 /// respawn argv — one spelling).
 pub const ORACLE_SOCKET_FLAG: &str = "--oracle-socket";
+/// The fused mount-point flag.
+pub const MOUNT_POINT_FLAG: &str = "--mount-point";
+/// The takeover-resume flags (server → successor argv, #103).
+pub const RESUME_FD_FLAG: &str = "--resume-fd";
+pub const RESUME_FDS_BASE_FLAG: &str = "--resume-fds-base";
+pub const RESUME_STATE_FLAG: &str = "--resume-state";
 /// The policy daemon's binary name (clap name, orchestrator default).
 pub const SERVER_BIN: &str = "fuse-server";
 /// The data daemon's binary name (clap name, policy-daemon spawn).
@@ -83,8 +105,16 @@ pub const DEFAULT_CMD_SOCKET: &str = "/tmp/fuse-gatekeeper.sock";
 pub const ENV_HASHD_SOCK: &str = "FUSE_HASHD_SOCK";
 /// bash's `complete -C` protocol: the completing line. Shared by the
 /// client binary (reads it) and the e2e tests (sets it).
+// Necessity: external identifiers (names restate their values —
+// review on servyi/lints#16).
+#[allow(unknown_lints)]
+#[allow(inline_literal)]
 pub const COMP_LINE: &str = "COMP_LINE";
 /// bash's `complete -C` protocol: the cursor offset into COMP_LINE.
+// Necessity: external identifiers (names restate their values —
+// review on servyi/lints#16).
+#[allow(unknown_lints)]
+#[allow(inline_literal)]
 pub const COMP_POINT: &str = "COMP_POINT";
 
 /// State file path, overridable via [`ENV_STATE_FILE`] (e.g. for

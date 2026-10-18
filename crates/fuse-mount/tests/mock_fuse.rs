@@ -10,6 +10,7 @@
 //! OPEN's MR4 adjudication (the policy daemon answers with a host fd
 //! over SCM_RIGHTS), READ's preads of that fd, one-read semantics in
 //! the policy daemon, RELEASE closing the fd.
+#![allow(unknown_lints, inline_literal)]
 
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 

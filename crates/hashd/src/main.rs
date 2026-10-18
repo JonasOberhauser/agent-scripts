@@ -42,6 +42,7 @@
 //! sudo systemd-run --unit=fuse-hashd <path-to-this-binary> --socket <sock>
 //! ```
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::panic, unused_results))]
+#![cfg_attr(test, allow(unknown_lints, inline_literal))]
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
@@ -51,7 +52,7 @@ use fuse_protocol::{RealSystemIo, SystemIo};
 /// Default socket path: `/run` when we can (root / socket activation),
 /// `$TMPDIR`-style fallback for unprivileged manual runs.
 fn default_socket() -> String {
-    if std::path::Path::new("/run").is_dir() && can_write_run() {
+    if std::path::Path::new(RUN_DIR).is_dir() && can_write_run() {
         fuse_protocol::hashd::DEFAULT_SOCK.to_string()
     } else {
         format!("{HASHD_SOCK_PREFIX}{}.sock", nix_uid())
@@ -61,7 +62,7 @@ fn default_socket() -> String {
 fn can_write_run() -> bool {
     std::fs::metadata(fuse_protocol::hashd::DEFAULT_SOCK)
         .map(|_| true) // exists: socket-activated, the fd arrives later
-        .or_else(|_| std::fs::metadata("/run").map(|m| !m.permissions().readonly()))
+        .or_else(|_| std::fs::metadata(RUN_DIR).map(|m| !m.permissions().readonly()))
         .is_ok_and(|ok| ok)
 }
 
@@ -80,14 +81,14 @@ fn nix_uid() -> u32 {
 /// Does THIS process hold the capability the kernel demands (can it
 /// follow one of its own child's map_files links)?
 fn privileges_ok() -> bool {
-    let Ok(mut child) = std::process::Command::new("sleep").arg("2").spawn() else {
+    let Ok(mut child) = std::process::Command::new(SLEEP_BIN).arg(CHECK_DELAY_SECS).spawn() else {
         return false;
     };
     let ok = (|| {
         let maps = std::fs::read_to_string(format!("/proc/{}/maps", child.id())).ok()?;
         let range = maps
             .lines()
-            .find(|l| l.contains('/'))?
+            .find(|l| l.contains(SLASH))?
             .split_whitespace()
             .next()?
             .to_string();
@@ -113,57 +114,95 @@ fn handle(conn: std::os::unix::net::UnixStream) {
         return;
     }
     let trimmed = line.trim();
-    let reply = if trimmed == "status" {
-        let state = if privileges_ok() { "privileged" } else { "unprivileged" };
+    let reply = if trimmed == REQ_STATUS {
+        let state = if privileges_ok() { STATE_PRIVILEGED } else { STATE_UNPRIVILEGED };
         format!("{{\"status\":\"{state}\"}}\n")
     } else {
         // request grammar: WORD pid — plain split, the exempt idiom
-        let mut words = trimmed.split(' ');
+        let mut words = trimmed.split(WORD_SEP);
         match (words.next(), words.next().and_then(|p| p.parse::<u32>().ok())) {
             (Some("hash"), Some(pid)) => match RealSystemIo::new().sha256_process_package(pid) {
                 Ok(hash) => format!("{{\"ok\":\"{hash}\"}}\n"),
                 Err(e) => {
                     let msg = e.to_string();
-                    let kind = if msg.contains("Operation not permitted")
-                        || msg.contains("Permission denied")
+                    let kind = if msg.contains(ERR_EPERM)
+                        || msg.contains(ERR_EACCES)
                     {
                         if privileges_ok() {
-                            "generic"
+                            KIND_GENERIC
                         } else {
                             // The helper itself lacks the init-ns capability:
                             // the actionable case for client-side remediation.
-                            "unprivileged"
+                            KIND_UNPRIVILEGED
                         }
-                    } else if msg.contains("No such file") {
-                        "gone"
+                    } else if msg.contains(ERR_ENOENT) {
+                        KIND_GONE
                     } else {
-                        "generic"
+                        KIND_GENERIC
                     };
                     format!(
                         "{{\"error\":{{\"kind\":\"{kind}\",\"message\":{}}}}}\n",
-                        serde_json::to_string(&msg).unwrap_or_else(|_| "\"?\"".to_string())
+                        serde_json::to_string(&msg).unwrap_or_else(|_| JSON_UNKNOWN.to_string())
                     )
                 }
             },
             (Some("hash"), None) => {
-                "{\"error\":{\"kind\":\"generic\",\"message\":\"pid must be a number\"}}\n".to_string()
+                ERR_PID_NOT_NUMBER.to_string()
             }
-            _ => "{\"error\":{\"kind\":\"generic\",\"message\":\"unknown request (use: hash <pid> | status)\"}}\n"
-                .to_string(),
+            _ => ERR_UNKNOWN_REQUEST.to_string(),
         }
     };
     let _ = stream.write_all(reply.as_bytes());
     let _ = stream.flush();
 }
 
+/// The well-known runtime dir (socket home).
+const RUN_DIR: &str = "/run";
+/// The status request word.
+const REQ_STATUS: &str = "status";
+/// Wire kinds.
+const KIND_GENERIC: &str = "generic";
+const KIND_UNPRIVILEGED: &str = "unprivileged";
+const KIND_GONE: &str = "gone";
+/// Status words.
+const STATE_PRIVILEGED: &str = "privileged";
+const STATE_UNPRIVILEGED: &str = "unprivileged";
+/// Probe child + parsing separators.
+const SLEEP_BIN: &str = "sleep";
+const SLASH: char = '/';
+const WORD_SEP: char = ' ';
+/// strerror-shaped substrings for reply kinds.
+const ERR_EPERM: &str = "Operation not permitted";
+const ERR_EACCES: &str = "Permission denied";
+const ERR_ENOENT: &str = "No such file";
+/// JSON fallbacks + canned errors.
+#[allow(unknown_lints)]
+#[allow(inline_literal)]
+const JSON_UNKNOWN: &str = "\"?\"";
+#[allow(unknown_lints)]
+#[allow(inline_literal)]
+const ERR_PID_NOT_NUMBER: &str = "{\"error\":{\"kind\":\"generic\",\"message\":\"pid must be a number\"}}\n";
+#[allow(unknown_lints)]
+#[allow(inline_literal)]
+const ERR_UNKNOWN_REQUEST: &str = "{\"error\":{\"kind\":\"generic\",\"message\":\"unknown request (use: hash <pid> | status)\"}}\n";
+/// Positional word of the pid argument.
+const ARG_PID: usize = 1;
+const EXIT_FAILURE: i32 = 1;
+/// The privilege self-check delay.
+const CHECK_DELAY_SECS: &str = "2";
+/// The socket flag.
+const SOCKET_FLAG: &str = "--socket";
+/// The daemon socket's mode (hashd is a shared helper).
+const SOCKET_MODE: u32 = 0o666;
+
 fn main() {
     let socket = std::env::args()
-        .nth(1)
-        .filter(|a| a != "--socket")
+        .nth(ARG_PID)
+        .filter(|a| a != SOCKET_FLAG)
         .or_else(|| {
             let mut it = std::env::args();
             while let Some(a) = it.next() {
-                if a == "--socket" {
+                if a == SOCKET_FLAG {
                     return it.next();
                 }
             }
@@ -176,7 +215,7 @@ fn main() {
         Ok(l) => l,
         Err(e) => {
             eprintln!("hashd: cannot bind {socket}: {e}");
-            std::process::exit(1);
+            std::process::exit(EXIT_FAILURE);
         }
     };
     // connect(2) on a unix socket needs WRITE permission on the socket
@@ -186,15 +225,15 @@ fn main() {
     {
         use std::os::unix::fs::PermissionsExt as _;
         if let Err(e) =
-            std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o666))
+            std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(SOCKET_MODE))
         {
             eprintln!("hashd: cannot open {socket} to unprivileged clients: {e}");
-            std::process::exit(1);
+            std::process::exit(EXIT_FAILURE);
         }
     }
     eprintln!(
         "hashd: listening on {socket} ({})",
-        if privileges_ok() { "privileged" } else { "unprivileged" }
+        if privileges_ok() { STATE_PRIVILEGED } else { STATE_UNPRIVILEGED }
     );
     serve_conns(listener, std::sync::Arc::new(handle));
 }

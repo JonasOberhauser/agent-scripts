@@ -6,6 +6,7 @@
 //! half alone is useless — compromise of fused yields no authorization,
 //! compromise of the policy daemon yields no bytes.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::panic, unused_results))]
+#![cfg_attr(test, allow(unknown_lints, inline_literal))]
 
 use std::path::PathBuf;
 
@@ -14,7 +15,7 @@ use tracing::{error, info};
 
 
 #[derive(Parser)]
-#[command(name = fuse_protocol::FUSED_BIN, about = "FUSE gatekeeper DATA daemon: secret bytes + mount; access decided by the policy daemon")]
+#[command(name = fuse_protocol::FUSED_BIN, about = FUSED_ABOUT)]
 struct Cli {
     #[arg(short, long)]
     mount_point: PathBuf,
@@ -38,9 +39,19 @@ struct Cli {
     resume_fds_base: Option<i32>,
     #[arg(long)]
     resume_state: Option<PathBuf>,
-    #[arg(long, default_value = "info")]
+    #[arg(long, default_value = DEFAULT_LOG_LEVEL)]
     log_level: String,
 }
+
+/// The FUSE filesystem name.
+const FS_NAME: &str = "gatekeeper";
+/// CLI defaults.
+const DEFAULT_LOG_LEVEL: &str = "info";
+const FUSED_ABOUT: &str = "FUSE gatekeeper DATA daemon: secret bytes + mount; access decided by the policy daemon";
+const EXIT_FAILURE: i32 = 1;
+/// Resume declined (schema mismatch / unreadable state): the caller
+/// (spawn path) falls back to a fresh mount.
+const EXIT_TAKEOVER_DECLINED: i32 = 3;
 
 fn main() {
     let cli = Cli::parse();
@@ -54,7 +65,7 @@ fn main() {
     if !cli.mount_point.exists() {
         if let Err(e) = std::fs::create_dir_all(&cli.mount_point) {
             error!("Failed to create mount point {}: {e}", cli.mount_point.display());
-            std::process::exit(1);
+            std::process::exit(EXIT_FAILURE);
         }
     }
 
@@ -91,14 +102,14 @@ fn main() {
         let raw = std::fs::read_to_string(state_path)
             .unwrap_or_else(|e| {
                 eprintln!("resume state unreadable: {e}");
-                std::process::exit(3);
+                std::process::exit(EXIT_TAKEOVER_DECLINED);
             });
         let state: serde_json::Value = serde_json::from_str(&raw)
             .unwrap_or_else(|e| {
                 eprintln!("resume state unparseable: {e}");
-                std::process::exit(3);
+                std::process::exit(EXIT_TAKEOVER_DECLINED);
             });
-        let schema = state["session_schema"]
+        let schema = state[fuse_protocol::oracle::TAKEOVER_KEY_SCHEMA]
             .as_u64()
             .unwrap_or(u64::MAX) as u32;
         if schema != fuse_mount::fs::TAKEOVER_SESSION_SCHEMA {
@@ -108,17 +119,17 @@ fn main() {
                  caller's business)",
                 fuse_mount::fs::TAKEOVER_SESSION_SCHEMA
             );
-            std::process::exit(3);
+            std::process::exit(EXIT_TAKEOVER_DECLINED);
         }
-        let ts: fuse_mount::fs::TakeoverState = serde_json::from_value(state["state"].clone())
+        let ts: fuse_mount::fs::TakeoverState = serde_json::from_value(state[fuse_protocol::oracle::TAKEOVER_KEY_STATE].clone())
             .unwrap_or_else(|e| {
                 eprintln!("takeover state does not match schema 1: {e}");
-                std::process::exit(3);
+                std::process::exit(EXIT_TAKEOVER_DECLINED);
             });
         let inner = fuse_mount::fs::takeover_restore(&ts)
             .unwrap_or_else(|e| {
                 eprintln!("takeover restore failed: {e}");
-                std::process::exit(3);
+                std::process::exit(EXIT_TAKEOVER_DECLINED);
             });
 
         // rebuild the store from the restored inner state
@@ -159,18 +170,18 @@ fn main() {
             Ok(()) => info!("FUSE unmounted cleanly (resumed session)."),
             Err(e) => {
                 error!("FUSE resumed session error: {e}");
-                std::process::exit(1);
+                std::process::exit(EXIT_FAILURE);
             }
         }
         return;
     }
 
-    let options = vec![fuser::MountOption::FSName("gatekeeper".into())];
+    let options = vec![fuser::MountOption::FSName(FS_NAME.into())];
     match fuser::mount2(fuser_fs, &cli.mount_point, &options) {
         Ok(()) => info!("FUSE unmounted cleanly."),
         Err(e) => {
             error!("FUSE mount error: {e}");
-            std::process::exit(1);
+            std::process::exit(EXIT_FAILURE);
         }
     }
 }

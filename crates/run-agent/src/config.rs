@@ -1,3 +1,4 @@
+#![cfg_attr(test, allow(unknown_lints, inline_literal))]
 use std::path::{Path, PathBuf};
 
 use fuse_protocol::SystemIo;
@@ -40,24 +41,24 @@ impl Runtime {
     ) -> Option<&'static str> {
         match self {
             Runtime::Podman => {
-                if runtime_available(io, wrapper, "podman") {
-                    Some("podman")
+                if runtime_available(io, wrapper, RUNTIME_PODMAN) {
+                    Some(RUNTIME_PODMAN)
                 } else {
                     None
                 }
             }
             Runtime::Docker => {
-                if runtime_available(io, wrapper, "docker") {
-                    Some("docker")
+                if runtime_available(io, wrapper, RUNTIME_DOCKER) {
+                    Some(RUNTIME_DOCKER)
                 } else {
                     None
                 }
             }
             Runtime::Auto => {
-                if runtime_available(io, wrapper, "podman") {
-                    Some("podman")
-                } else if runtime_available(io, wrapper, "docker") {
-                    Some("docker")
+                if runtime_available(io, wrapper, RUNTIME_PODMAN) {
+                    Some(RUNTIME_PODMAN)
+                } else if runtime_available(io, wrapper, RUNTIME_DOCKER) {
+                    Some(RUNTIME_DOCKER)
                 } else {
                     None
                 }
@@ -67,6 +68,9 @@ impl Runtime {
 }
 
 /// Check whether `<wrapper>? <runtime> --version` succeeds.
+// Necessity: wrapper argv splitting (parts[0], parts[1..]).
+#[allow(unknown_lints)]
+#[allow(inline_literal)]
 fn runtime_available<S: SystemIo>(
     io: &S,
     wrapper: Option<&str>,
@@ -80,18 +84,18 @@ fn runtime_available<S: SystemIo>(
             }
             let mut args: Vec<&str> = parts[1..].to_vec();
             args.push(runtime);
-            args.push("--version");
+            args.push(VERSION_FLAG);
             io.run_command(parts[0], &args)
                 .map(|o| o.success())
                 .unwrap_or(false)
         }
         None => {
             // Podman: just check the binary. Docker: require rootless socket.
-            if runtime == "docker" {
+            if runtime == RUNTIME_DOCKER {
                 let sock = rootless_docker_socket();
                 io.try_unix_connect(Path::new(&sock))
             } else {
-                io.run_command(runtime, &["--version"])
+                io.run_command(runtime, &[VERSION_FLAG])
                     .map(|o| o.success())
                     .unwrap_or(false)
             }
@@ -101,6 +105,9 @@ fn runtime_available<S: SystemIo>(
 
 /// Split a wrapper string like `"flatpak-spawn --host"` into
 /// `("flatpak-spawn", ["--host"])`.
+// Necessity: wrapper argv splitting (parts[0], parts[1..]).
+#[allow(unknown_lints)]
+#[allow(inline_literal)]
 pub fn split_wrapper(wrapper: &str) -> (String, Vec<String>) {
     let parts: Vec<String> = wrapper.split_whitespace().map(|s| s.to_string()).collect();
     (parts[0].clone(), parts[1..].to_vec())
@@ -114,6 +121,58 @@ pub fn split_wrapper(wrapper: &str) -> (String, Vec<String>) {
 /// path) and reads are redirected to `/fuse/<name>`.
 ///
 /// If `host` is a directory, it is mapped recursively (`cp -r` style).
+/// Container runtime names.
+pub(crate) const RUNTIME_PODMAN: &str = "podman";
+pub(crate) const RUNTIME_DOCKER: &str = "docker";
+/// Default resource budget for the agent box.
+const DEFAULT_IMAGE: &str = "agentbox";
+const DEFAULT_MEMORY: &str = "224G";
+const DEFAULT_CPUS: &str = "90";
+/// Container-side workspace path.
+pub(crate) const CONTAINER_WORKDIR: &str = "/workspace";
+/// Container engine verbs + flags (podman/docker run dialect).
+pub(crate) const RUN_CMD: &str = "run";
+const DETACH_FLAG: &str = "-d";
+const NAME_FLAG: &str = "--name";
+const MEMORY_FLAG: &str = "-m";
+const CPUS_FLAG: &str = "--cpus";
+const USER_FLAG: &str = "--user";
+const ROOT_USER: &str = "root";
+const VOLUME_FLAG: &str = "-v";
+const DEVICE_FLAG: &str = "--device";
+const WORKDIR_FLAG: &str = "--workdir";
+const SECCOMP_FLAG: &str = "--security-opt";
+const PID_FLAG: &str = "--pid";
+const PID_HOST: &str = "host";
+const SLEEP_CMD: &str = "sleep";
+const SLEEP_INFINITY: &str = "infinity";
+const EXEC_CMD: &str = "exec";
+const TTY_INTERACTIVE: &str = "-it";
+const CHDIR_FLAG: &str = "-w";
+const SHELL_BIN: &str = "sh";
+const SHELL_CMD_FLAG: &str = "-c";
+/// Container-mount option suffixes.
+const OPT_SLAVE_Z: &str = "slave,Z";
+const OPT_Z: &str = ":Z";
+const OPT_RO_Z_SLAVE: &str = "ro,z,slave";
+/// Volume mount targets (container side).
+/// Version probe flag.
+const VERSION_FLAG: &str = "--version";
+/// Temp-file name for the materialized seccomp profile.
+const SECCOMP_TMP_NAME: &str = "agentbox-seccomp.json";
+/// Default log level + agent name fallback.
+const DEFAULT_LOG_LEVEL: &str = "info";
+const DEFAULT_AGENT_NAME: &str = "agent";
+/// Fallback cwd when the current dir is unreadable.
+const FALLBACK_CWD: &str = ".";
+/// The container-side fuse mount target.
+const FUSE_MOUNT_TARGET: &str = "/fuse";
+/// Local config/workspace dir names under agent_path.
+const CONFIG_DIR: &str = "config";
+const WORKSPACE_DIR: &str = "workspace";
+/// Short-hash prefix length in container names.
+const NAME_HASH_CHARS: usize = 8;
+
 #[derive(Debug, Clone)]
 pub struct SecretMapping {
     /// Host-side path to the real secret file or directory.
@@ -156,10 +215,11 @@ pub const NESTED_SECCOMP_PROFILE: &str = include_str!("seccomp_profile.json");
 /// Host-side location the profile is written to before container
 /// creation.  Fixed path is fine: content is identical every run.
 pub fn seccomp_profile_path() -> PathBuf {
-    std::env::temp_dir().join("agentbox-seccomp.json")
+    std::env::temp_dir().join(SECCOMP_TMP_NAME)
 }
 
 #[derive(Debug, Clone)]
+/// Container runtime names.
 pub struct AgentConfig {
     /// SHA-256 of the binary allowed to read the secret.
     pub binary_hash: String,
@@ -223,20 +283,20 @@ impl AgentConfig {
             secrets,
             agent_subfolder: agent_subfolder.to_string(),
             container_args: container_args.to_vec(),
-            agent_path: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            agent_path: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(FALLBACK_CWD)),
             fuse_server_path: PathBuf::from(fuse_protocol::SERVER_BIN),
             oracle_socket: None,
-            image_name: "agentbox".to_string(),
+            image_name: DEFAULT_IMAGE.to_string(),
             seccomp_profile: seccomp_profile_path(),
-            memory: "224G".to_string(),
-            cpus: "90".to_string(),
+            memory: DEFAULT_MEMORY.to_string(),
+            cpus: DEFAULT_CPUS.to_string(),
             auto_confirm: false,
             socket_path: PathBuf::from(DEFAULT_SOCKET),
             mount_point: PathBuf::from(DEFAULT_MOUNT_POINT),
             pidns_host: false,
             runtime: Runtime::Auto,
             runtime_wrapper: None,
-            log_level: "info".to_string(),
+            log_level: DEFAULT_LOG_LEVEL.to_string(),
             plans_path: None,
         }
     }
@@ -244,11 +304,11 @@ impl AgentConfig {
     // ── computed paths ────────────────────────── ──────────────────────────────────────────
 
     pub fn host_config_dir(&self) -> PathBuf {
-        self.agent_path.join("config")
+        self.agent_path.join(CONFIG_DIR)
     }
 
     pub fn host_workspace(&self) -> PathBuf {
-        self.agent_path.join("workspace")
+        self.agent_path.join(WORKSPACE_DIR)
     }
 
     pub fn host_fuse(&self) -> PathBuf {
@@ -259,7 +319,7 @@ impl AgentConfig {
         self.agent_path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "agent".to_string())
+            .unwrap_or_else(|| DEFAULT_AGENT_NAME.to_string())
     }
 
     pub fn container_config_dir(&self) -> String {
@@ -271,7 +331,7 @@ impl AgentConfig {
         let mut hasher = Sha256::new();
         hasher.update(self.agent_path.to_string_lossy().as_bytes());
         let hash = format!("{:x}", hasher.finalize());
-        format!("agentbox-{}", &hash[..8])
+        format!("{DEFAULT_IMAGE}-{}", &hash[..NAME_HASH_CHARS])
     }
 }
 
@@ -280,58 +340,64 @@ impl AgentConfig {
 /// `/dev/net/tun`) — the caller passes only those that exist.
 pub fn build_create_args(config: &AgentConfig, devices: &[String]) -> Vec<String> {
     let mut args = vec![
-        "run".into(),
-        "-d".into(),
-        "--name".into(),
+        RUN_CMD.into(),
+        DETACH_FLAG.into(),
+        NAME_FLAG.into(),
         config.container_name(),
-        "-m".into(),
+        MEMORY_FLAG.into(),
         config.memory.clone(),
-        "--cpus".into(),
+        CPUS_FLAG.into(),
         config.cpus.clone(),
-        "--user".into(),
-        "root".into(),
-        "-v".into(),
+        USER_FLAG.into(),
+        ROOT_USER.into(),
+        VOLUME_FLAG.into(),
         format!(
-            "{}:{}:slave,Z",
+            "{}:{}:{OPT_SLAVE_Z}",
             config.host_config_dir().display(),
             config.container_config_dir()
         ),
-        "-v".into(),
+        VOLUME_FLAG.into(),
         format!(
-            "{}:/workspace:slave,Z",
+            "{}:{CONTAINER_WORKDIR}:{OPT_SLAVE_Z}",
             config.host_workspace().display()
         ),
     ];
 
     if let Some(plans) = &config.plans_path {
-        args.push("-v".into());
-        args.push(format!("{}:/workspace/plans:Z", plans.display()));
+        args.push(VOLUME_FLAG.into());
+        args.push(format!(
+            "{}:{CONTAINER_WORKDIR}/plans:{OPT_Z}",
+            plans.display()
+        ));
     }
 
     for d in devices {
-        args.push("--device".into());
+        args.push(DEVICE_FLAG.into());
         args.push(d.clone());
     }
 
     args.extend_from_slice(&[
-        "-v".into(),
+        VOLUME_FLAG.into(),
         format!("{}_home:/root:z", config.agent_name()),
-        "-v".into(),
-        format!("{}:/fuse:ro,z,slave", config.host_fuse().display()),
-        "--workdir".into(),
-        "/workspace".into(),
-        "--security-opt".into(),
+        VOLUME_FLAG.into(),
+        format!(
+            "{}:{FUSE_MOUNT_TARGET}:{OPT_RO_Z_SLAVE}",
+            config.host_fuse().display()
+        ),
+        WORKDIR_FLAG.into(),
+        CONTAINER_WORKDIR.into(),
+        SECCOMP_FLAG.into(),
         format!("seccomp={}", config.seccomp_profile.display()),
     ]);
 
     if config.pidns_host {
-        args.push("--pid".into());
-        args.push("host".into());
+        args.push(PID_FLAG.into());
+        args.push(PID_HOST.into());
     }
 
     args.push(config.image_name.clone());
-    args.push("sleep".into());
-    args.push("infinity".into());
+    args.push(SLEEP_CMD.into());
+    args.push(SLEEP_INFINITY.into());
 
     args
 }
@@ -343,23 +409,23 @@ pub fn build_create_args(config: &AgentConfig, devices: &[String]) -> Vec<String
 /// the exec command is wrapped as `sh -c '<setup> && exec "$@"' sh <args>`.
 pub fn build_exec_args(config: &AgentConfig, setup_script: &str) -> Vec<String> {
     let mut args = vec![
-        "exec".into(),
-        "-it".into(),
-        "-w".into(),
-        "/workspace".into(),
+        EXEC_CMD.into(),
+        TTY_INTERACTIVE.into(),
+        CHDIR_FLAG.into(),
+        CONTAINER_WORKDIR.into(),
         config.container_name(),
     ];
 
     if setup_script.is_empty() {
         args.extend(config.container_args.iter().cloned());
     } else {
-        args.push("sh".into());
-        args.push("-c".into());
+        args.push(SHELL_BIN.into());
+        args.push(SHELL_CMD_FLAG.into());
         if config.container_args.is_empty() {
             args.push(format!("{setup_script} && exec bash"));
         } else {
             args.push(format!("{setup_script} && exec \"$@\""));
-            args.push("sh".into());
+            args.push(SHELL_BIN.into());
             args.extend(config.container_args.iter().cloned());
         }
     }
@@ -444,7 +510,7 @@ mod tests {
             pidns_host: false,
             runtime: Runtime::Auto,
             runtime_wrapper: None,
-            log_level: "info".to_string(),
+            log_level: DEFAULT_LOG_LEVEL.to_string(),
             plans_path: None,
         };
         let args = build_create_args(
@@ -497,7 +563,7 @@ mod tests {
             pidns_host: true,
             runtime: Runtime::Auto,
             runtime_wrapper: None,
-            log_level: "info".to_string(),
+            log_level: DEFAULT_LOG_LEVEL.to_string(),
             plans_path: None,
         };
         let args = build_create_args(&cfg, &[]);
@@ -531,7 +597,7 @@ mod tests {
             pidns_host: false,
             runtime: Runtime::Auto,
             runtime_wrapper: None,
-            log_level: "info".to_string(),
+            log_level: DEFAULT_LOG_LEVEL.to_string(),
             plans_path: None,
         };
         let args = build_exec_args(&cfg, "ln -sf /fuse/x /root/x");
@@ -549,7 +615,7 @@ mod tests {
     #[test]
     fn runtime_auto_prefers_podman() {
         let mock = MockSystemIo::new();
-        assert_eq!(Runtime::Auto.resolve(&mock, None), Some("podman"));
+        assert_eq!(Runtime::Auto.resolve(&mock, None), Some(RUNTIME_PODMAN));
     }
 
     #[test]
@@ -557,7 +623,7 @@ mod tests {
         let mut mock = MockSystemIo::new();
         mock.command_status = None;
         mock.unix_connected = true;
-        assert_eq!(Runtime::Auto.resolve(&mock, None), Some("docker"));
+        assert_eq!(Runtime::Auto.resolve(&mock, None), Some(RUNTIME_DOCKER));
     }
 
     #[test]
@@ -570,14 +636,14 @@ mod tests {
     #[test]
     fn runtime_podman_forces_podman() {
         let mock = MockSystemIo::new();
-        assert_eq!(Runtime::Podman.resolve(&mock, None), Some("podman"));
+        assert_eq!(Runtime::Podman.resolve(&mock, None), Some(RUNTIME_PODMAN));
     }
 
     #[test]
     fn runtime_docker_forces_docker() {
         let mut mock = MockSystemIo::new();
         mock.unix_connected = true;
-        assert_eq!(Runtime::Docker.resolve(&mock, None), Some("docker"));
+        assert_eq!(Runtime::Docker.resolve(&mock, None), Some(RUNTIME_DOCKER));
     }
 
     #[test]
@@ -585,7 +651,7 @@ mod tests {
         let mock = MockSystemIo::new();
         assert_eq!(
             Runtime::Podman.resolve(&mock, Some("flatpak-spawn --host")),
-            Some("podman")
+            Some(RUNTIME_PODMAN)
         );
     }
 

@@ -6,6 +6,7 @@
 //! connects to. It holds NO secret bytes in split mode: content goes to
 //! the data daemon through the oracle hub, metadata stays here.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::panic, unused_results))]
+#![cfg_attr(test, allow(unknown_lints, inline_literal))]
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
@@ -17,7 +18,7 @@ use tracing::{error, info, warn};
 use fuse_server::{OracleHub, ServerState};
 
 #[derive(Parser)]
-#[command(name = fuse_protocol::SERVER_BIN, about = "FUSE gatekeeper POLICY daemon (decisions + command socket; data lives in fused)")]
+#[command(name = fuse_protocol::SERVER_BIN, about = SERVER_ABOUT)]
 struct Cli {
     /// Accepted for backward compatibility with older orchestrators;
     /// mounting is the data daemon's job now.
@@ -28,7 +29,7 @@ struct Cli {
     /// Boot-time secret: NAME, FILE, HASH as three words — no
     /// delimiter grammar, nothing to escape (colons are ordinary
     /// path characters). Repeatable.
-    #[arg(long, num_args = 3, value_names = ["NAME", "FILE", "HASH"])]
+    #[arg(long, num_args = SECRET_SPEC_ARGS, value_names = SECRET_SPEC_NAMES)]
     secret: Vec<String>,
     #[arg(long)]
     allow_other: bool,
@@ -37,16 +38,16 @@ struct Cli {
     /// one. 0 (default) = spawn immediately — adoption is a RESTART-
     /// path feature; the client's respawn passes a nonzero window so
     /// cold starts pay nothing.
-    #[arg(long, default_value_t = 0)]
+    #[arg(long, default_value_t = ZERO_SECS)]
     adopt_window: u64,
     /// Substitute the supervised data-daemon binary (issue #94): the
     /// supervision seam — tests drive the lifecycle with a fake fused
     /// that needs no kernel FUSE mount. Same argv otherwise.
     #[arg(long)]
     fused_binary: Option<std::path::PathBuf>,
-    #[arg(long, default_value = "info")]
+    #[arg(long, default_value = DEFAULT_LOG_LEVEL)]
     log_level: String,
-    #[arg(long, default_value_t = 300)]
+    #[arg(long, default_value_t = DEFAULT_PENDING_SECS)]
     pending_timeout: u64,
     #[arg(long, default_value = fuse_protocol::DEFAULT_LOG_PATH)]
     log_path: PathBuf,
@@ -55,6 +56,49 @@ struct Cli {
     #[arg(long, default_value = fuse_protocol::DEFAULT_ORACLE_SOCKET)]
     oracle_socket: PathBuf,
 }
+
+/// Exit status for signal-caused shutdowns (128+SIGINT/TERM).
+const EXIT_SIGNALLED: i32 = 130;
+/// CLI defaults + --secret spec arity.
+const SECRET_SPEC_ARGS: usize = 3;
+const SERVER_ABOUT: &str = "FUSE gatekeeper POLICY daemon (decisions + command socket; data lives in fused)";
+// Necessity: table form (the strings ARE the spec field names).
+#[allow(unknown_lints)]
+#[allow(inline_literal)]
+const SECRET_SPEC_NAMES: [&str; 3] = ["NAME", "FILE", "HASH"];
+const ZERO_SECS: u64 = 0;
+const DEFAULT_LOG_LEVEL: &str = "info";
+const DEFAULT_PENDING_SECS: u64 = 300;
+/// Generic startup/config failure exit.
+const EXIT_FAILURE: i32 = 1;
+/// The takeover answer budget (an ancient daemon never answers).
+const TAKEOVER_BUDGET: Duration = Duration::from_secs(10);
+/// The takeover mailbox/resumed-Hello poll pace.
+const TAKEOVER_POLL: Duration = Duration::from_millis(50);
+/// The successor's inherited connection fd slot (dup2 before exec).
+const RESUME_SLOT_CONN: i32 = 3;
+/// The successor's inherited host-fd slots start here.
+const RESUME_SLOT_HOST_BASE: i32 = 4;
+/// The testkit's fake-version env (scrubbed from the successor: it IS
+/// this vintage).
+const ENV_FAKE_HELLO_VERSION: &str = "FUSE_FAKE_HELLO_VERSION";
+/// The takeover successor-missing message.
+const MSG_NO_SUCCESSOR: &str = "no data daemon binary for the takeover successor";
+/// The conservative secret mode for boot-time secrets (read-only).
+const BOOT_SECRET_MODE: u32 = 0o400;
+/// Poll cadence while waiting on spawned children/sockets.
+const SPAWN_POLL: Duration = Duration::from_millis(50);
+/// The mount-point flag (argv contract with fused).
+const MOUNT_POINT_FLAG: &str = "--mount-point";
+/// The unmount tool pair, most-specific first.
+// Necessity: table form (the strings ARE the unmount tool names).
+#[allow(unknown_lints)]
+#[allow(inline_literal)]
+const UNMOUNT_TOOLS: [&str; 2] = ["fusermount3", "fusermount"];
+/// The lazy-unmount flag.
+const LAZY_UNMOUNT_FLAG: &str = "-uz";
+/// Secrets arrive as flat triples.
+const SECRET_WORDS: usize = 3;
 
 /// Pre-computed CStrings for async-signal-safe unlink in the handler.
 static CLEANUP_SOCKETS: OnceLock<(std::ffi::CString, std::ffi::CString)> = OnceLock::new();
@@ -71,7 +115,7 @@ extern "C" fn shutdown_handler(_sig: libc::c_int) {
         // SAFETY: see above.
         let _unlinked = unsafe { libc::unlink(oracle_ptr) };
     }
-    let code = 130;
+    let code = EXIT_SIGNALLED;
     // SAFETY: _exit(2) is the async-signal-safe way out of a handler; it
     // intentionally skips atexit/destructors to avoid non-signal-safe
     // cleanup in this context.
@@ -88,7 +132,7 @@ fn stale_socket(path: &Path) {
     if path.exists() {
         if std::os::unix::net::UnixStream::connect(path).is_ok() {
             error!("Another server is running at {}. Kill it first.", path.display());
-            std::process::exit(1);
+            std::process::exit(EXIT_FAILURE);
         }
         warn!("Removing stale socket at {}", path.display());
         let _ = std::fs::remove_file(path);
@@ -162,7 +206,10 @@ fn main() {
 
     let hub = OracleHub::clone(&fuse_server::ORACLE_HUB);
     // num_args = 3: flat [name, file, hash, ...] triples; chunk them.
-    for spec in cli.secret.chunks(3) {
+    // Necessity: triple-chunked CLI values (chunks(3), spec[0..2]).
+    #[allow(unknown_lints)]
+    #[allow(inline_literal)]
+    for spec in cli.secret.chunks(SECRET_WORDS) {
         match parse_secret(&spec[0], &spec[1], &spec[2]) {
             Ok((name, host, hash)) => {
                 // MR4: register by stat — identity + size, never bytes.
@@ -170,7 +217,7 @@ fn main() {
                     Ok(md) => md,
                     Err(e) => {
                         error!("cannot stat {}: {e}", host.display());
-                        std::process::exit(1);
+                        std::process::exit(EXIT_FAILURE);
                     }
                 };
                 use std::os::unix::fs::MetadataExt;
@@ -179,13 +226,13 @@ fn main() {
                     md.len(),
                     md.ino()
                 );
-                state.add_with_mode(&name, host.clone(), md.len() as usize, &hash, 0o400);
+                state.add_with_mode(&name, host.clone(), md.len() as usize, &hash, BOOT_SECRET_MODE);
                 let inner = fuse_protocol::anonymize_path(&state.anon_salt, &name);
-                hub.serve(&name, &inner, 0o400);
+                hub.serve(&name, &inner, BOOT_SECRET_MODE);
             }
             Err(e) => {
                 error!("Bad --secret {:?}: {e}", spec);
-                std::process::exit(1);
+                std::process::exit(EXIT_FAILURE);
             }
         }
     }
@@ -197,7 +244,7 @@ fn main() {
     let _socket_server = std::thread::spawn(move || {
         if let Err(e) = fuse_server::run_socket_server(&socket_path, socket_state) {
             error!("Socket server error: {e}");
-            std::process::exit(1);
+            std::process::exit(EXIT_FAILURE);
         }
     });
 
@@ -208,7 +255,7 @@ fn main() {
     let oracle = std::thread::spawn(move || {
         if let Err(e) = fuse_server::run_oracle_server(&oracle_path, state, hub) {
             error!("Oracle server error: {e}");
-            std::process::exit(1);
+            std::process::exit(EXIT_FAILURE);
         }
     });
 
@@ -307,13 +354,16 @@ fn wait_for_adoption_offer(window: std::time::Duration) -> Option<fuse_server::A
         if std::time::Instant::now() >= deadline {
             return None;
         }
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::thread::sleep(SPAWN_POLL);
     }
 }
 
 /// Verify the daemon is OURS for this stack: its argv carries this
 /// mount point. Kernel-stable, works across every daemon vintage —
 /// no protocol involved (#65's exact-pid discipline, mountpoint form).
+// Necessity: /proc cmdline argv walking (windows(2), w[0]/w[1]).
+#[allow(unknown_lints)]
+#[allow(inline_literal)]
 fn daemon_serves_mountpoint(pid: u32, mp: &Path) -> bool {
     let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
         return false;
@@ -323,7 +373,7 @@ fn daemon_serves_mountpoint(pid: u32, mp: &Path) -> bool {
         .map(|b| std::str::from_utf8(b).unwrap_or(""))
         .collect();
     let mp_str = mp.to_string_lossy();
-    args.windows(2).any(|w| w[0] == "--mount-point" && w[1] == mp_str)
+    args.windows(2).any(|w| w[0] == MOUNT_POINT_FLAG && w[1] == mp_str)
 }
 
 /// The fresh-spawn branch: clear a stale mount (the #54-validated
@@ -345,7 +395,7 @@ fn spawn_fresh(cli: &Cli, mp: &Path) {
         Some(fused) => {
             info!("  mount-point:     {} (spawning supervised data daemon)", mp.display());
             let child = std::process::Command::new(&fused)
-                .arg("--mount-point")
+                .arg(MOUNT_POINT_FLAG)
                 .arg(mp)
                 .arg(fuse_protocol::ORACLE_SOCKET_FLAG)
                 .arg(&cli.oracle_socket)
@@ -370,7 +420,7 @@ fn spawn_fresh(cli: &Cli, mp: &Path) {
                  mount-less",
                 exe.display()
             );
-            std::process::exit(1);
+            std::process::exit(EXIT_FAILURE);
         }
     }
 }
@@ -383,7 +433,7 @@ fn takeover_transplant(cli: &Cli, mp: &Path, old_pid: u32) -> Result<(), String>
     use std::time::Instant;
     use std::os::fd::AsRawFd as _;
     // 1. the payload (bounded: an ancient daemon never answers).
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + TAKEOVER_BUDGET;
     let payload = loop {
         {
             let mut mbox = fuse_server::TAKEOVER_MAILBOX
@@ -396,11 +446,13 @@ fn takeover_transplant(cli: &Cli, mp: &Path, old_pid: u32) -> Result<(), String>
         if Instant::now() >= deadline {
             return Err("no takeover payload within 10s (daemon predates Surrender?)".into());
         }
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(TAKEOVER_POLL);
     };
-    if payload.fds.is_empty() {
+    let mut fd_iter = payload.fds.into_iter();
+    let Some(fuse_conn) = fd_iter.next() else {
         return Err("takeover payload carried no fds".into());
-    }
+    };
+    let host_conns: Vec<std::os::fd::OwnedFd> = fd_iter.collect();
 
     // 2. the session envelope for the successor: schema + state JSON.
     let state_path = std::env::temp_dir().join(format!(
@@ -409,8 +461,8 @@ fn takeover_transplant(cli: &Cli, mp: &Path, old_pid: u32) -> Result<(), String>
         old_pid
     ));
     let envelope = serde_json::json!({
-        "session_schema": payload.session_schema,
-        "state": payload.state,
+        fuse_protocol::oracle::TAKEOVER_KEY_SCHEMA: payload.session_schema,
+        fuse_protocol::oracle::TAKEOVER_KEY_STATE: payload.state,
     });
     std::fs::write(&state_path, envelope.to_string())
         .map_err(|e| format!("write {}: {e}", state_path.display()))?;
@@ -428,9 +480,9 @@ fn takeover_transplant(cli: &Cli, mp: &Path, old_pid: u32) -> Result<(), String>
                 .map(|d| d.join(fuse_protocol::FUSED_BIN))
                 .filter(|p| p.exists())
         })
-        .ok_or("no data daemon binary for the takeover successor")?;
-    let host_fds: Vec<i32> = payload.fds[1..].iter().map(|f| f.as_raw_fd()).collect();
-    let fuse_fd = payload.fds[0].as_raw_fd();
+        .ok_or_else(|| MSG_NO_SUCCESSOR.to_string())?;
+    let host_fds: Vec<i32> = host_conns.iter().map(|f| f.as_raw_fd()).collect();
+    let fuse_fd = fuse_conn.as_raw_fd();
     info!(
         "  mount-point:     {} — TAKING OVER the mount session (fd {fuse_fd}, \
          {} open host fds) into pid-space successor {}",
@@ -446,11 +498,11 @@ fn takeover_transplant(cli: &Cli, mp: &Path, old_pid: u32) -> Result<(), String>
         let mut cmd = std::process::Command::new(&successor);
         {
             let _a = cmd
-                .arg("--mount-point").arg(&mp_clone)
+                .arg(fuse_protocol::MOUNT_POINT_FLAG).arg(&mp_clone)
                 .arg(fuse_protocol::ORACLE_SOCKET_FLAG).arg(&oracle)
-                .arg("--resume-fd").arg("3")
-                .arg("--resume-fds-base").arg("4")
-                .arg("--resume-state").arg(&state_for_child);
+                .arg(fuse_protocol::RESUME_FD_FLAG).arg(RESUME_SLOT_CONN.to_string())
+                .arg(fuse_protocol::RESUME_FDS_BASE_FLAG).arg(RESUME_SLOT_HOST_BASE.to_string())
+                .arg(fuse_protocol::RESUME_STATE_FLAG).arg(&state_for_child);
         }
         use std::os::unix::process::CommandExt as _;
         let dup_into_slots = move || {
@@ -470,9 +522,9 @@ fn takeover_transplant(cli: &Cli, mp: &Path, old_pid: u32) -> Result<(), String>
                 }
                 Ok(())
             };
-            set(fuse_fd, 3)?;
+            set(fuse_fd, RESUME_SLOT_CONN)?;
             for (i, fd) in host_fds.iter().enumerate() {
-                set(*fd, 4 + i as i32)?;
+                set(*fd, RESUME_SLOT_HOST_BASE + i as i32)?;
             }
             Ok(())
         };
@@ -483,7 +535,7 @@ fn takeover_transplant(cli: &Cli, mp: &Path, old_pid: u32) -> Result<(), String>
             let _reg = unsafe { cmd.pre_exec(dup_into_slots) };
         }
         {
-            let _rm = cmd.env_remove("FUSE_FAKE_HELLO_VERSION"); // the successor IS this vintage
+            let _rm = cmd.env_remove(ENV_FAKE_HELLO_VERSION); // the successor IS this vintage
         }
         cmd.stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
@@ -497,7 +549,7 @@ fn takeover_transplant(cli: &Cli, mp: &Path, old_pid: u32) -> Result<(), String>
         .push(child.id());
 
     // 4. the successor's Hello = it serves. Retire the old daemon.
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + TAKEOVER_BUDGET;
     loop {
         if fuse_server::oracle_service::RESUMED_HELLO.swap(false, std::sync::atomic::Ordering::SeqCst) {
             break;
@@ -505,7 +557,7 @@ fn takeover_transplant(cli: &Cli, mp: &Path, old_pid: u32) -> Result<(), String>
         if Instant::now() >= deadline {
             return Err("successor never said Hello".into());
         }
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(TAKEOVER_POLL);
     }
     {
         let mut pending = fuse_server::TAKEOVER_PENDING
@@ -548,8 +600,8 @@ fn clear_stale_mount(mp: &Path) {
         return;
     }
     info!("  stale mount at {} — lazy unmounting", mp.display());
-    for tool in ["fusermount3", "fusermount"] {
-        let _clear = std::process::Command::new(tool).arg("-uz").arg(mp).output();
+    for tool in UNMOUNT_TOOLS {
+        let _clear = std::process::Command::new(tool).arg(LAZY_UNMOUNT_FLAG).arg(mp).output();
         if !enotconn(std::fs::metadata(mp)) {
             break;
         }
@@ -560,7 +612,7 @@ fn clear_stale_mount(mp: &Path) {
             mp.display(),
             mp.display()
         );
-        std::process::exit(1);
+        std::process::exit(EXIT_FAILURE);
     }
     let _rm = std::fs::remove_dir_all(mp);
     let _mk = std::fs::create_dir_all(mp);

@@ -15,6 +15,7 @@
 //! `~/.local/state/gatekeeper/policy.json` — state, not config
 //! (never hand-edited concurrently, not portable), and never /tmp
 //! (tmpfiles/tmpfs wipe on reboot would defeat the point).
+#![cfg_attr(test, allow(unknown_lints, inline_literal))]
 
 use std::io::Write as _;
 use std::path::PathBuf;
@@ -24,6 +25,18 @@ use serde::{Deserialize, Serialize};
 use crate::state::{PermittedHash, SecretRecord, ServerState};
 
 use crate::oracle_service::OracleHub;
+
+/// One-off store prose.
+const MSG_NO_SALT: &str = "policy store: no salt stored — keeping the freshly minted one";
+const MSG_LOCKDOWN: &str = "policy store: lockdown ARMED (issue #66) — refusing new unauthorized write";
+/// XDG-ish home layout pieces.
+const DIR_LOCAL: &str = ".local";
+const DIR_STATE: &str = "state";
+/// Fallbacks for absent/parent-less paths.
+const FALLBACK_CWD: &str = ".";
+const MISSING_SIZE: usize = 0;
+const LIVE_YES: bool = true;
+const LIVE_NO: bool = false;
 
 /// The on-disk shape. Access state persists as `access_count` and
 /// `unlimited` only: `reading_pid`/`read_progress` describe a live
@@ -64,16 +77,23 @@ struct PolicyHash {
 
 /// Resolved persistence location (see module docs).
 pub fn policy_path() -> PathBuf {
+    /// The XDG state home override key.
+const ENV_XDG_STATE: &str = "XDG_STATE_HOME";
+/// The fallback home key.
+const ENV_HOME: &str = "HOME";
+/// The store's directory and file names under the state root.
+const STORE_DIR: &str = "gatekeeper";
+const STORE_FILE: &str = "policy.json";
     if let Some(p) = std::env::var_os(fuse_protocol::ENV_POLICY_FILE) {
         return PathBuf::from(p);
     }
-    let base = std::env::var_os("XDG_STATE_HOME")
+    let base = std::env::var_os(ENV_XDG_STATE)
         .map(PathBuf::from)
         .unwrap_or_else(|| {
-            let home = std::env::var_os("HOME").unwrap_or_default();
-            PathBuf::from(home).join(".local").join("state")
+            let home = std::env::var_os(ENV_HOME).unwrap_or_default();
+            PathBuf::from(home).join(DIR_LOCAL).join(DIR_STATE)
         });
-    base.join("gatekeeper").join("policy.json")
+    base.join(STORE_DIR).join(STORE_FILE)
 }
 
 /// Load policy into `state` (and announce the tree to a connected
@@ -167,14 +187,14 @@ pub fn load(state: &mut ServerState, hub: &OracleHub) -> LoadReport {
     if let Some(salt) = fuse_protocol::Salt::from_bytes(hex_to_bytes(&file.salt)) {
         state.anon_salt = salt;
     } else {
-        tracing::info!("policy store: no salt stored — keeping the freshly minted one (issue #47)");
+        tracing::info!("{MSG_NO_SALT}");
         persist_locked(state);
     }
     // Issue #66: the retro-active lockdown is policy — armed state
     // survives restarts.
     if file.lockdown {
         state.set_lockdown_from_load(true);
-        tracing::info!("policy store: lockdown ARMED (issue #66) — refusing new unauthorized access");
+        tracing::info!("{MSG_LOCKDOWN}");
     }
     let mut report = LoadReport::default();
     for s in file.secrets {
@@ -186,8 +206,8 @@ pub fn load(state: &mut ServerState, hub: &OracleHub) -> LoadReport {
         // with NO identity — absence is Option, not an in-band (0,0)
         // sentinel — until the first stat-on-lookup discovers it.
         let (size, live) = match std::fs::metadata(&s.host_path) {
-            Ok(md) if md.is_file() => (md.len() as usize, true),
-            _ => (0, false),
+            Ok(md) if md.is_file() => (md.len() as usize, LIVE_YES),
+            _ => (MISSING_SIZE, LIVE_NO),
         };
         let ghost = !live;
         if ghost {
@@ -291,6 +311,9 @@ pub(crate) fn persist_locked(state: &ServerState) {
 }
 
 
+// Necessity: hex-pair walking (i*2, i*2+2, len/2).
+#[allow(unknown_lints)]
+#[allow(inline_literal)]
 fn hex_to_bytes(h: &str) -> Vec<u8> {
     (0..h.len() / 2)
         .filter_map(|i| u8::from_str_radix(&h[i * 2..i * 2 + 2], 16).ok())
@@ -302,7 +325,7 @@ fn bytes_to_hex(b: &[u8]) -> String {
 }
 
 fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
-    let dir = path.parent().unwrap_or(std::path::Path::new("."));
+    let dir = path.parent().unwrap_or(std::path::Path::new(FALLBACK_CWD));
     std::fs::create_dir_all(dir)?;
     // Exclusive-create, 0600 FROM THE FIRST BYTE (review: the old
     // path wrote content world-readable and chmod'ed afterwards), and

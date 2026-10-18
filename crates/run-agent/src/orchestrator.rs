@@ -1,3 +1,4 @@
+#![cfg_attr(test, allow(unknown_lints, inline_literal))]
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -16,14 +17,136 @@ use crate::config::{
 /// The Dockerfile must stay COPY/ADD-free so any build context works.
 const EMBEDDED_DOCKERFILE: &str = include_str!("../../../Dockerfile");
 
+/// Env var naming a substitute Dockerfile (debug/test builds only).
+const ENV_TEST_DOCKERFILE: &str = "RUN_AGENT_TEST_DOCKERFILE";
+/// The unmount helpers tried in turn: (binary, flag).
+// Necessity: external identifiers (names restate their values —
+// review on servyi/lints#16).
+#[allow(unknown_lints)]
+#[allow(inline_literal)]
+const FUSERMOUNT: &str = "fusermount";
+// Necessity: external identifiers (names restate their values —
+// review on servyi/lints#16).
+#[allow(unknown_lints)]
+#[allow(inline_literal)]
+const FUSERMOUNT3: &str = "fusermount3";
+// Necessity: external identifiers (names restate their values —
+// review on servyi/lints#16).
+#[allow(unknown_lints)]
+#[allow(inline_literal)]
+const UMOUNT: &str = "umount";
+const LAZY_UMOUNT_FLAG: &str = "-uz";
+const LAZY_UMOUNT_FLAG3: &str = "-uz";
+const UMOUNT_LAZY_FLAG: &str = "-l";
+// Necessity: table form (the pairs ARE the named constants above).
+#[allow(unknown_lints)]
+#[allow(inline_literal)]
+const UNMOUNT_HELPERS: [(&str, &str); 3] = [
+    (FUSERMOUNT, LAZY_UMOUNT_FLAG),
+    (FUSERMOUNT3, LAZY_UMOUNT_FLAG3),
+    (UMOUNT, UMOUNT_LAZY_FLAG),
+];
+/// Orphan-policy-daemon sweep.
+const PKILL_BIN: &str = "pkill";
+const PKILL_FULL: &str = "-f";
+/// Wire words for the stack status socket.
+const CMD_STATUS: &str = "status";
+const CMD_VERSION: &str = "version";
+const CMD_RESET: &str = "reset";
+/// Check names in status replies we gate on.
+const CHECK_FUSE_MOUNT: &str = "fuse-mount";
+const CHECK_SOURCE_FILE: &str = "source-file";
+/// Host mount propagation setup.
+const MOUNT_BIN: &str = "mount";
+const FLAG_MAKE_SHARED: &str = "--make-shared";
+/// Nested-container char-device passthroughs.
+// Necessity: external identifiers (names restate their values —
+// review on servyi/lints#16).
+#[allow(unknown_lints)]
+#[allow(inline_literal)]
+const DEV_FUSE: &str = "/dev/fuse";
+// Necessity: external identifiers (names restate their values —
+// review on servyi/lints#16).
+#[allow(unknown_lints)]
+#[allow(inline_literal)]
+const DEV_NET_TUN: &str = "/dev/net/tun";
+/// Nested container engine names.
+const RM_CMD: &str = "rm";
+const FORCE_FLAG: &str = "-f";
+const START_CMD: &str = "start";
+/// The docker runtime's canonical name.
+const RUNTIME_DOCKER: &str = "docker";
+/// Wait/poll durations.
+const UNMOUNT_SETTLE_MS: u64 = 500;
+const POLL_CADENCE_MS: u64 = 200;
+const QUICK_POLL_MS: u64 = 100;
+const SERVER_START_TIMEOUT: Duration = Duration::from_secs(10);
+const BUILD_TIMEOUT: Duration = Duration::from_secs(10);
+/// Container log file name.
+const SERVER_LOG_NAME: &str = "fuse-server.log";
+/// Nested fuse-server argv flags.
+const FLAG_MOUNT_POINT: &str = "--mount-point";
+const FLAG_SOCKET: &str = "--socket";
+const FLAG_LOG_LEVEL: &str = "--log-level";
+/// Wire word for adding a secret.
+const CMD_ADD: &str = "add";
+/// Fallback secret name when path components all sanitize away.
+const SECRET_FALLBACK: &str = "secret";
+/// Sanitizer replacement char + join separator.
+const SANITIZE_FALLBACK: char = '_';
+/// Empty-component placeholder.
+const EMPTY_COMPONENT: &str = "_";
+const SEP_JOIN: &str = "/";
+/// Rootless docker socket env var + URL scheme.
+const ENV_DOCKER_HOST: &str = "DOCKER_HOST";
+const URL_SCHEME_UNIX: &str = "unix://";
+/// Shell glue for the host-side link script.
+const SH_MKDIR_AND: &str = " && ";
+/// Image probe subcommands.
+const IMAGE_SUBCMD: &str = "image";
+const DOCKER_INSPECT: &str = "inspect";
+const PODMAN_EXISTS: &str = "exists";
+const INSPECT_FMT_ID: &str = "-f";
+const INSPECT_FMT_TPL: &str = "{{.Id}}";
+/// Image verbs + flags.
+const VERB_PULL: &str = "pull";
+const VERB_BUILD: &str = "build";
+const FLAG_TAG: &str = "-t";
+const FLAG_FILE: &str = "-f";
+/// `inspect -f {{.State.Running}}` reply when up.
+const STATE_RUNNING_TPL: &str = "{{.State.Running}}";
+const REPLY_TRUE: &str = "true";
+/// Healing probe verbs (exec stat -c %s under timeout).
+const EXEC_CMD: &str = "exec";
+const TIMEOUT_CMD: &str = "timeout";
+const STAT_CMD: &str = "stat";
+const STAT_FMT: &str = "-c";
+const STAT_SIZE_TPL: &str = "%s";
+/// The mount namespace secrets root.
+const FUSE_ROOT: &str = "/fuse";
+/// Sentinel inits for the supervision loop.
+const REBUILD_COUNTER_START: u8 = 0;
+const NO_PID: u32 = 0;
+/// Registry reference separator.
+const REGISTRY_SEP: char = '/';
+/// Trailing-separator check for container paths.
+const PATH_SEP: char = '/';
+/// Default pending timeout for the fresh state file.
+const DEFAULT_PENDING_TIMEOUT_SECS: u64 = 10;
+/// State file secrecy.
+const STATE_FILE_MODE: u32 = 0o600;
+/// Human verbs for the prompt.
+const HUMAN_PULL: &str = "Pull";
+const HUMAN_BUILD: &str = "Build";
+
 /// The Dockerfile content used for image builds.  Debug builds honor
 /// `RUN_AGENT_TEST_DOCKERFILE` (path) so tests can substitute a trivial
 /// image; release builds always use the embedded copy.
 fn dockerfile_content() -> Result<String, String> {
     #[cfg(debug_assertions)]
-    if let Some(p) = std::env::var_os("RUN_AGENT_TEST_DOCKERFILE") {
+    if let Some(p) = std::env::var_os(ENV_TEST_DOCKERFILE) {
         return std::fs::read_to_string(p)
-            .map_err(|e| format!("RUN_AGENT_TEST_DOCKERFILE: {e}"));
+            .map_err(|e| format!("{ENV_TEST_DOCKERFILE}: {e}"));
     }
     Ok(EMBEDDED_DOCKERFILE.to_string())
 }
@@ -36,6 +159,9 @@ fn run_streamed<S: SystemIo>(
     container_bin: &str,
     args: &[&str],
 ) -> Result<i32, String> {
+    // Necessity: wrapper argv splitting (parts[0], parts[1..]).
+    #[allow(unknown_lints)]
+    #[allow(inline_literal)]
     match wrapper {
         Some(w) => {
             let parts: Vec<&str> = w.split_whitespace().collect();
@@ -62,6 +188,9 @@ pub struct RunResult {
 /// Run `prog args`, prefixed with the runtime wrapper (e.g.
 /// `flatpak-spawn --host`) when one is configured. Returns whether the
 /// command reported success.
+// Necessity: argv assembly (parts[0], parts[1..]) of the wrapper split.
+#[allow(unknown_lints)]
+#[allow(inline_literal)]
 fn run_wrapped<S: SystemIo>(io: &S, wrapper: Option<&str>, prog: &str, args: &[&str]) -> bool {
     let mut parts: Vec<String> = Vec::new();
     if let Some(w) = wrapper {
@@ -71,6 +200,9 @@ fn run_wrapped<S: SystemIo>(io: &S, wrapper: Option<&str>, prog: &str, args: &[&
     }
     parts.push(prog.to_string());
     parts.extend(args.iter().map(|s| s.to_string()));
+    // Necessity: argv assembly (parts[0], parts[1..]).
+    #[allow(unknown_lints)]
+    #[allow(inline_literal)]
     let argv: Vec<&str> = parts[1..].iter().map(|s| s.as_str()).collect();
     io.run_command(&parts[0], &argv)
         .map(|o| o.success())
@@ -81,7 +213,7 @@ fn run_wrapped<S: SystemIo>(io: &S, wrapper: Option<&str>, prog: &str, args: &[&
 /// unmount, trying the available unmount helpers in turn. Returns true
 /// when one of them reports success.
 fn lazy_unmount<S: SystemIo>(io: &S, mount_point: &str, wrapper: Option<&str>) -> bool {
-    for (cmd, flag) in [("fusermount", "-uz"), ("fusermount3", "-uz"), ("umount", "-l")] {
+    for (cmd, flag) in UNMOUNT_HELPERS {
         if run_wrapped(io, wrapper, cmd, &[flag, mount_point]) {
             info!("Lazy unmount succeeded via {cmd} {flag}");
             return true;
@@ -104,8 +236,8 @@ fn teardown_server<S: SystemIo>(io: &mut S, config: &AgentConfig) {
     // match killed a `cargo test` runner; a name sweep kills every
     // policy daemon on a multi-stack machine).
     let pat = format!("--socket {}", config.socket_path.to_string_lossy());
-    let _stopped = run_wrapped(io, wrapper, "pkill", &["-f", &pat]);
-    io.sleep_ms(500);
+    let _stopped = run_wrapped(io, wrapper, PKILL_BIN, &[PKILL_FULL, &pat]);
+    io.sleep_ms(UNMOUNT_SETTLE_MS);
     if io.file_exists(&config.socket_path) {
         let _ = io.remove_path(&config.socket_path);
     }
@@ -118,7 +250,7 @@ fn server_version<F>(send: &F) -> Result<Option<String>, String>
 where
     F: Fn(&str, &str) -> Result<String, String>,
 {
-    let payload = send("version", "")?;
+    let payload = send(CMD_VERSION, "")?;
     let resp: fuse_protocol::Response =
         serde_json::from_str(payload.trim()).map_err(|e| format!("unparseable reply: {e}"))?;
     match resp {
@@ -134,10 +266,10 @@ where
 fn preflight_should_rebuild(results: &[crate::preflight::CheckResult]) -> bool {
     let mount_broken = results
         .iter()
-        .any(|r| !r.ok && r.check == "fuse-mount");
+        .any(|r| !r.ok && r.check == CHECK_FUSE_MOUNT);
     let host_broken = results
         .iter()
-        .any(|r| !r.ok && r.check == "source-file");
+        .any(|r| !r.ok && r.check == CHECK_SOURCE_FILE);
     mount_broken && !host_broken
 }
 
@@ -181,7 +313,7 @@ fn ensure_mount_point<S: SystemIo>(
 
     // Dead mount: clear it, wait for the lazy unmount, re-probe.
     let _unmounted = lazy_unmount(io, &mount_point.to_string_lossy(), wrapper);
-    io.sleep_ms(200);
+    io.sleep_ms(POLL_CADENCE_MS);
     match io.path_state(mount_point) {
         PathState::Dir | PathState::Missing => {
             info!("Recovered mount point {} from a stale FUSE mount", mount_point.display());
@@ -275,11 +407,11 @@ where
     // remediation.
     let socket = &config.socket_path;
     let mut server_was_spawned;
-    let mut stack_rebuilds = 0u8;
+    let mut stack_rebuilds = REBUILD_COUNTER_START;
     let mut force_respawn = false;
 
     let loaded = loop {
-        let mut spawned_server_pid = 0u32;
+        let mut spawned_server_pid = NO_PID;
         let mut server_healthy = false;
         server_was_spawned = false;
 
@@ -291,7 +423,7 @@ where
         // server leaves the socket behind and the kernel still accepts on
         // the backlog — later adds then die with 'Broken pipe'.  Do a real
         // read-only round-trip before trusting the server.
-        match send("status", "") {
+        match send(CMD_STATUS, "") {
             Ok(_) => {
                 info!("Reusing existing fuse-server at {}", socket.display());
                 server_healthy = true;
@@ -338,7 +470,7 @@ where
                 // Wait for lazy unmount, then remove + recreate. The
                 // seam (not thread::sleep) so the fuzz tier and mocks
                 // own time.
-                io.sleep_ms(200);
+                io.sleep_ms(POLL_CADENCE_MS);
                 let _ = io.remove_path(&config.mount_point);
 
                 io.create_dir_all(&config.mount_point).map_err(|e| format!(
@@ -361,9 +493,12 @@ where
                         parts.push(prog);
                         parts.extend(prefix);
                     }
-                    parts.push("mount".to_string());
-                    parts.push("--make-shared".to_string());
+                    parts.push(MOUNT_BIN.to_string());
+                    parts.push(FLAG_MAKE_SHARED.to_string());
                     parts.push(mount_str2);
+                    // Necessity: argv assembly (parts[0], parts[1..]).
+                    #[allow(unknown_lints)]
+                    #[allow(inline_literal)]
                     let prog = parts[0].clone();
                     let args: Vec<&str> = parts[1..].iter().map(|s| s.as_str()).collect();
                     let _ = io.run_command(&prog, &args);
@@ -378,8 +513,8 @@ where
                 .to_str()
                 .ok_or_else(|| format!("socket path is not valid UTF-8: {}", socket.display()))?;
             let mut fuse_args: Vec<&str> = vec![
-                "--mount-point", mount,
-                "--socket", sock,
+                FLAG_MOUNT_POINT, mount,
+                FLAG_SOCKET, sock,
             ];
             let oracle_arg: Option<String> = config
                 .oracle_socket
@@ -389,7 +524,7 @@ where
                 fuse_args.push(fuse_protocol::ORACLE_SOCKET_FLAG);
                 fuse_args.push(oracle);
             }
-            fuse_args.push("--log-level");
+            fuse_args.push(FLAG_LOG_LEVEL);
             let log_level_str = config.log_level.clone();
             fuse_args.push(&log_level_str);
             let args = fuse_args;
@@ -399,7 +534,7 @@ where
                 .to_str()
                 .ok_or_else(|| format!("fuse-server path is not valid UTF-8: {}", config.fuse_server_path.display()))?;
 
-            let log_path = config.agent_path.join("fuse-server.log");
+            let log_path = config.agent_path.join(SERVER_LOG_NAME);
             let log_str = log_path.to_str()
                 .ok_or_else(|| format!("log path is not valid UTF-8: {}", log_path.display()))?;
 
@@ -415,6 +550,9 @@ where
             cmd_parts.push(server_bin.to_string());
             cmd_parts.extend(args.iter().map(|s| s.to_string()));
 
+            // Necessity: argv assembly (cmd_parts[0], cmd_parts[1..]).
+            #[allow(unknown_lints)]
+            #[allow(inline_literal)]
             let spawn_prog = cmd_parts[0].clone();
             let spawn_args: Vec<&str> = cmd_parts[1..].iter().map(|s| s.as_str()).collect();
 
@@ -428,7 +566,7 @@ where
             );
 
             // Wait for socket.
-            let deadline = Instant::now() + Duration::from_secs(10);
+            let deadline = Instant::now() + SERVER_START_TIMEOUT;
             loop {
                 if io.try_unix_connect(socket) {
                     break;
@@ -445,7 +583,7 @@ where
                         "fuse-server socket did not appear within 10s (pid {pid} may have crashed){detail}"
                     ));
                 }
-                io.sleep_ms(100);
+                io.sleep_ms(QUICK_POLL_MS);
             }
             info!("Socket ready at {}", socket.display());
         }
@@ -553,7 +691,7 @@ where
     };
     info!("Using container runtime: {container_bin}");
 
-    if container_bin == "docker" && wrapper.is_none() {
+    if container_bin == RUNTIME_DOCKER && wrapper.is_none() {
         setup_rootless_docker();
     }
 
@@ -571,7 +709,7 @@ where
     // Pass through the char devices nested rootless podman needs, when
     // the host has them: /dev/fuse for fuse-overlayfs storage (and FUSE
     // work generally), /dev/net/tun for pasta/slirp networking.
-    let passthrough_devices: Vec<String> = ["/dev/fuse", "/dev/net/tun"]
+    let passthrough_devices: Vec<String> = [DEV_FUSE, DEV_NET_TUN]
         .into_iter()
         .filter(|d| io.file_exists(std::path::Path::new(d)))
         .map(str::to_string)
@@ -583,7 +721,12 @@ where
     if restart_container {
         info!("Restarting container {container_name}...");
         gentle_stop(io, wrapper, container_bin, &container_name);
-        let _ = run_with_wrapper(io, wrapper, container_bin, &["rm", "-f", &container_name]);
+        let _ = run_with_wrapper(
+            io,
+            wrapper,
+            container_bin,
+            &[RM_CMD, FORCE_FLAG, &container_name],
+        );
     }
 
     match check_container_running(io, wrapper, container_bin, &container_name) {
@@ -599,7 +742,7 @@ where
                 "Container {container_name} exists but is stopped — starting it \
                  (bind mounts are re-applied, data preserved)..."
             );
-            match run_with_wrapper(io, wrapper, container_bin, &["start", &container_name]) {
+            match run_with_wrapper(io, wrapper, container_bin, &[START_CMD, &container_name]) {
                 Ok(o) if o.success() => {
                     info!("Container started.");
                 }
@@ -671,7 +814,7 @@ where
     // ── 7. Auto-reset all secret counters ────────────────────────
     let mut reset_ok = true;
     for s in &loaded {
-        match send("reset", &s.fuse_name) {
+        match send(CMD_RESET, &s.fuse_name) {
             Ok(_) => {
                 info!("Auto-reset successful for '{}'.", s.fuse_name);
             }
@@ -740,18 +883,22 @@ fn secret_name(host: &Path) -> String {
                         if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
                             ch
                         } else {
-                            '_'
+                            SANITIZE_FALLBACK
                         }
                     })
                     .collect();
-                comps.push(if safe.is_empty() { "_".to_string() } else { safe });
+                comps.push(if safe.is_empty() {
+                    EMPTY_COMPONENT.to_string()
+                } else {
+                    safe
+                });
             }
         }
     }
     if comps.is_empty() {
-        "secret".to_string()
+        SECRET_FALLBACK.to_string()
     } else {
-        comps.join("/")
+        comps.join(SEP_JOIN)
     }
 }
 
@@ -799,7 +946,7 @@ where
     let fuse_name = secret_name(&canonical);
 
     let args = format!("{} {} {}", fuse_name, host.display(), config.binary_hash);
-    let reply = send("add", &args)
+    let reply = send(CMD_ADD, &args)
         .map_err(|e| format!("failed to add secret {fuse_name}: {e}"))?;
 
     // The server answers Added { inner } with the anonymized
@@ -844,7 +991,7 @@ fn resolve_dest(host: &Path, container: &Path) -> PathBuf {
     // str::ends_with is a hand-parsing primitive under the servyi
     // lint policy, so the char comparison stays.
     #[allow(clippy::chars_last_cmp)]
-    if container.to_string_lossy().chars().next_back() == Some('/') {
+    if container.to_string_lossy().chars().next_back() == Some(PATH_SEP) {
         if let Some(basename) = host.file_name() {
             return container.join(basename);
         }
@@ -863,12 +1010,15 @@ fn build_setup_script(loaded: &[LoadedSecret]) -> String {
             format!("mkdir -p \"$(dirname {path})\" && ln -sf {target} {path}")
         })
         .collect::<Vec<_>>()
-        .join(" && ")
+        .join(SH_MKDIR_AND)
 }
 
 fn setup_rootless_docker() {
-    let sock = format!("unix://{}", crate::config::rootless_docker_socket());
-    std::env::set_var("DOCKER_HOST", &sock);
+    let sock = format!(
+        "{URL_SCHEME_UNIX}{}",
+        crate::config::rootless_docker_socket()
+    );
+    std::env::set_var(ENV_DOCKER_HOST, &sock);
     info!("Docker rootless socket: {sock}");
 }
 
@@ -879,6 +1029,9 @@ fn run_with_wrapper<S: SystemIo>(
     runtime: &str,
     args: &[&str],
 ) -> Result<fuse_protocol::CommandOutput, fuse_protocol::IoError> {
+    // Necessity: wrapper argv splitting (parts[0], parts[1..]).
+    #[allow(unknown_lints)]
+    #[allow(inline_literal)]
     match wrapper {
         Some(w) => {
             let parts: Vec<&str> = w.split_whitespace().collect();
@@ -913,7 +1066,7 @@ fn prompt_yes_no(prompt: &str) -> bool {
         let _ = std::io::stdin().read_line(&mut line);
         let _ = tx.send(line);
     });
-    match rx.recv_timeout(Duration::from_secs(10)) {
+    match rx.recv_timeout(BUILD_TIMEOUT) {
         Ok(line) => matches!(line.trim(), "y" | "Y" | "yes"),
         Err(_) => {
             eprintln!("(timeout — defaulting to No)");
@@ -944,10 +1097,16 @@ fn ensure_image_available<S: SystemIo>(
     // `image exists` is podman-native; docker only has `image inspect`
     // (exit != 0 when missing).
     let probe = |io: &S| {
-        let args: Vec<&str> = if container_bin == "docker" {
-            vec!["image", "inspect", "-f", "{{.Id}}", image]
+        let args: Vec<&str> = if container_bin == RUNTIME_DOCKER {
+            vec![
+                IMAGE_SUBCMD,
+                DOCKER_INSPECT,
+                INSPECT_FMT_ID,
+                INSPECT_FMT_TPL,
+                image,
+            ]
         } else {
-            vec!["image", "exists", image]
+            vec![IMAGE_SUBCMD, PODMAN_EXISTS, image]
         };
         run_with_wrapper(io, wrapper, container_bin, &args)
             .map(|o| o.success())
@@ -961,10 +1120,10 @@ fn ensure_image_available<S: SystemIo>(
     // A local-only short name (the `agentbox` default) → build from the
     // embedded Dockerfile in a temp location.
     let tmp_ctx = std::env::temp_dir();
-    let (manual_cmd, verb, remedy) = if image.contains('/') {
+    let (manual_cmd, verb, remedy) = if image.contains(REGISTRY_SEP) {
         (
             format!("{container_bin} pull {image}"),
-            "Pull",
+            HUMAN_PULL,
             Remedy::Pull,
         )
     } else {
@@ -975,7 +1134,7 @@ fn ensure_image_available<S: SystemIo>(
                 dockerfile.display(),
                 tmp_ctx.display()
             ),
-            "Build",
+            HUMAN_BUILD,
             Remedy::Build { dockerfile },
         )
     };
@@ -996,9 +1155,9 @@ fn ensure_image_available<S: SystemIo>(
             }
             let df = dockerfile.to_string_lossy().to_string();
             let ctx_s = tmp_ctx.to_string_lossy().to_string();
-            streamed(vec!["build", "-t", image, "-f", &df, &ctx_s])
+            streamed(vec![VERB_BUILD, FLAG_TAG, image, FLAG_FILE, &df, &ctx_s])
         }
-        Remedy::Pull => streamed(vec!["pull", image]),
+        Remedy::Pull => streamed(vec![VERB_PULL, image]),
     }?;
     if code != 0 {
         return Err(format!("{verb} of image `{image}` failed with exit {code}"));
@@ -1019,8 +1178,13 @@ fn check_container_running<S: SystemIo>(    io: &S,
     runtime: &str,
     name: &str,
 ) -> Option<bool> {
-    match run_with_wrapper(io, wrapper, runtime, &["inspect", "-f", "{{.State.Running}}", name]) {
-        Ok(o) if o.success() => Some(o.stdout.trim() == "true"),
+    match run_with_wrapper(
+        io,
+        wrapper,
+        runtime,
+        &[DOCKER_INSPECT, INSPECT_FMT_ID, STATE_RUNNING_TPL, name],
+    ) {
+        Ok(o) if o.success() => Some(o.stdout.trim() == REPLY_TRUE),
         _ => None,
     }
 }
@@ -1038,6 +1202,10 @@ fn check_container_running<S: SystemIo>(    io: &S,
 /// The sweep walks /proc in pure shell (no pkill needed in the image) and
 /// skips PID 1 (signalling the init would race the intended stop).
 /// Best-effort: failures are ignored, `stop` follows regardless.
+// Necessity: embedded shell sweep + argv (sh -c, stop -t 2) — a
+// shell-script-shaped stop sequence, not constants to name.
+#[allow(unknown_lints)]
+#[allow(inline_literal)]
 fn gentle_stop<S: SystemIo>(
     io: &S,
     wrapper: Option<&str>,
@@ -1081,12 +1249,21 @@ fn verify_container_fuse<S: SystemIo>(
         loaded
             .iter()
             .filter(|s| {
-                let path = format!("/fuse/{}", s.fuse_name);
+                let path = format!("{FUSE_ROOT}/{}", s.fuse_name);
                 run_with_wrapper(
                     io,
                     wrapper,
                     container_bin,
-                    &["exec", container_name, "timeout", &secs, "stat", "-c", "%s", &path],
+                    &[
+                        EXEC_CMD,
+                        container_name,
+                        TIMEOUT_CMD,
+                        &secs,
+                        STAT_CMD,
+                        STAT_FMT,
+                        STAT_SIZE_TPL,
+                        &path,
+                    ],
                 )
                 .map(|o| !o.success())
                 .unwrap_or(true)
@@ -1107,7 +1284,7 @@ fn verify_container_fuse<S: SystemIo>(
         );
     }
     gentle_stop(io, wrapper, container_bin, container_name);
-    match run_with_wrapper(io, wrapper, container_bin, &["start", container_name]) {
+    match run_with_wrapper(io, wrapper, container_bin, &[START_CMD, container_name]) {
         Ok(o) if o.success() => {}
         Ok(o) => {
             return Err(format!(
@@ -1167,7 +1344,7 @@ fn write_state_file<S: SystemIo>(
         mount_point: config.mount_point.to_string_lossy().to_string(),
         socket: config.socket_path.to_string_lossy().to_string(),
         log_level: config.log_level.clone(),
-        pending_timeout: 10,
+        pending_timeout: DEFAULT_PENDING_TIMEOUT_SECS,
         runtime_wrapper: config.runtime_wrapper.clone(),
         oracle_socket: config
             .oracle_socket
@@ -1199,7 +1376,7 @@ fn write_state_file<S: SystemIo>(
     let state_path = fuse_protocol::state_file();
     if let Err(e) = io.write_file(&state_path, json.as_bytes()) {
         warn!("Failed to write state file: {e}");
-    } else if let Err(e) = io.set_file_mode(&state_path, 0o600) {
+    } else if let Err(e) = io.set_file_mode(&state_path, STATE_FILE_MODE) {
         warn!("Failed to set state file permissions: {e}");
     }
 }

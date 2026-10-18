@@ -12,6 +12,7 @@
 //! 2. `fuse-mount`  — the FUSE mount answers a `stat` of the hosted file
 //!    within a bounded time (run via `timeout(1)` so a dead mount cannot
 //!    wedge the orchestrator itself).
+#![cfg_attr(test, allow(unknown_lints, inline_literal))]
 
 use std::fmt;
 use std::path::Path;
@@ -20,6 +21,29 @@ use fuse_protocol::SystemIo;
 
 /// How long the FUSE mount may take to answer a `stat` before we declare
 /// it dead.  A healthy local FUSE fs answers in microseconds.
+/// Check names + verdicts reported in preflight results.
+const CHECK_SOURCE_FILE: &str = "source-file";
+const CHECK_FUSE_MOUNT: &str = "fuse-mount";
+const VERDICT_EXISTS: &str = "exists";
+const MSG_MOUNT_ANSWERS: &str = "mount answers";
+const MSG_ROOT_EMPTY: &str =
+    "mount root lists NOTHING (empty store — sync problem or data daemon still starting)";
+const MSG_RERUN: &str = "Resolve the above and rerun run-agent.";
+/// Probe binaries and flags.
+const TIMEOUT_BIN: &str = "timeout";
+const STAT_CMD: &str = "stat";
+const STAT_FMT: &str = "-c";
+const STAT_SIZE_TPL: &str = "%s";
+const LS_CMD: &str = "ls";
+const LS_ALL: &str = "-a";
+const DOT: &str = ".";
+const DOTDOT: &str = "..";
+const SPACE_SEP: &str = " ";
+/// Probe exit codes (GNU timeout passes the child's or 124 on its own).
+const EXIT_TIMEOUT: i32 = 124;
+const EXIT_NOT_FOUND: i32 = 1;
+const PLURAL_S: &str = "s";
+/// Retry/init counters.
 pub const DEFAULT_TIMEOUT_SECS: u64 = 3;
 
 /// A freshly spawned data daemon can take a moment to mount — adds land
@@ -78,10 +102,10 @@ fn check_source<S: SystemIo>(io: &S, s: &crate::orchestrator::LoadedSecret) -> C
     CheckResult {
         fuse_name: s.fuse_name.clone(),
         host_path: s.host_path.display().to_string(),
-        check: "source-file",
+        check: CHECK_SOURCE_FILE,
         ok,
         detail: if ok {
-            "exists".into()
+            VERDICT_EXISTS.into()
         } else {
             format!(
                 "source file {} no longer exists on the host — moved, deleted, or unreadable",
@@ -116,16 +140,16 @@ fn check_mount<S: SystemIo>(
     let mount_side_str = mount_side.display().to_string();
 
     let mut last_stderr;
-    let mut attempts = 0usize;
+    let mut attempts = 0;
     let (ok, detail) = loop {
         attempts += 1;
         let res = io.run_command(
-            "timeout",
-            &[&secs, "stat", "-c", "%s", &mount_side_str],
+            TIMEOUT_BIN,
+            &[&secs, STAT_CMD, STAT_FMT, STAT_SIZE_TPL, &mount_side_str],
         );
         match &res {
-            Ok(o) if o.success() => break (true, "mount answers".into()),
-            Ok(o) if o.status == Some(124) => {
+            Ok(o) if o.success() => break (true, MSG_MOUNT_ANSWERS.into()),
+            Ok(o) if o.status == Some(EXIT_TIMEOUT) => {
                 break (
                     false,
                     format!(
@@ -137,7 +161,7 @@ fn check_mount<S: SystemIo>(
                     ),
                 );
             }
-            Ok(o) if o.status == Some(1) => {
+            Ok(o) if o.status == Some(EXIT_NOT_FOUND) => {
                 last_stderr = o.stderr.trim().to_string();
                 let root = probe_mount_root(io, mount_point, timeout_secs);
                 // Mount up and serving OTHER names?  The name is
@@ -176,7 +200,7 @@ fn check_mount<S: SystemIo>(
     CheckResult {
         fuse_name: s.fuse_name.clone(),
         host_path: s.host_path.display().to_string(),
-        check: "fuse-mount",
+        check: CHECK_FUSE_MOUNT,
         ok,
         detail,
     }
@@ -200,18 +224,18 @@ fn probe_mount_root<S: SystemIo>(
 ) -> RootProbe {
     let secs = timeout_secs.to_string();
     let root_str = mount_point.display().to_string();
-    match io.run_command("timeout", &[&secs, "ls", "-a", &root_str]) {
+    match io.run_command(TIMEOUT_BIN, &[&secs, LS_CMD, LS_ALL, &root_str]) {
         Ok(o) if o.success() => {
             let names: Vec<&str> = o
                 .stdout
                 .lines()
                 .map(|l| l.trim())
-                .filter(|l| !l.is_empty() && *l != "." && *l != "..")
+                .filter(|l| !l.is_empty() && *l != DOT && *l != DOTDOT)
                 .collect();
             if names.is_empty() {
                 RootProbe::Empty
             } else {
-                RootProbe::Entries(names.join(" "))
+                RootProbe::Entries(names.join(SPACE_SEP))
             }
         }
         Ok(o) => RootProbe::Failed(format!(
@@ -235,7 +259,7 @@ fn mount_one_failure_detail(
 ) -> String {
     let root_part = match root {
         RootProbe::Entries(names) => format!("mount root lists: {names}"),
-        RootProbe::Empty => "mount root lists NOTHING (empty store — sync problem or data daemon still starting)".into(),
+        RootProbe::Empty => MSG_ROOT_EMPTY.into(),
         RootProbe::Failed(why) => why,
     };
     format!(
@@ -253,12 +277,12 @@ pub fn failure_summary(results: &[CheckResult]) -> Option<String> {
     let mut msg = format!(
         "pre-flight checks failed — aborting before container start ({} failure{}):\n",
         failures.len(),
-        if failures.len() == 1 { "" } else { "s" }
+        if failures.len() == 1 { "" } else { PLURAL_S }
     );
     for f in failures {
         msg.push_str(&format!("  {f}\n"));
     }
-    msg.push_str("Resolve the above and rerun run-agent.");
+    msg.push_str(MSG_RERUN);
     Some(msg)
 }
 
@@ -315,7 +339,7 @@ mod tests {
         // `timeout` exit code 124 = the stat was killed for not answering.
         let mock = MockSystemIo::new()
             .with_file("/host/auth.json", b"DATA")
-            .with_command_result("timeout", Some(124));
+            .with_command_result(TIMEOUT_BIN, Some(124));
         let loaded = vec![secret("/host/auth.json")];
         let results = run(&mock, &loaded, &mount_point(), DEFAULT_TIMEOUT_SECS);
         let mnt = results
@@ -338,7 +362,7 @@ mod tests {
         // `stat` exit code 1 = path not visible in the mount.
         let mock = MockSystemIo::new()
             .with_file("/host/auth.json", b"DATA")
-            .with_command_result("timeout", Some(1));
+            .with_command_result(TIMEOUT_BIN, Some(1));
         let loaded = vec![secret("/host/auth.json")];
         let results = run(&mock, &loaded, &mount_point(), DEFAULT_TIMEOUT_SECS);
         let mnt = results
@@ -367,10 +391,10 @@ mod tests {
                 "stat: cannot statx '/tmp/fgk-mnt/p100_s0': Transport endpoint is not connected",
             )
             // ls probe of the mount root: also fails (dead mount)
-            .with_command_result_when("timeout", "/tmp/fgk-mnt", Some(1))
+            .with_command_result_when(TIMEOUT_BIN, "/tmp/fgk-mnt", Some(1))
             // stat of the secret: persistent failure (added last = wins
             // on stat calls; the ls rule still applies to ls calls)
-            .with_command_result_when_n("timeout", "p100_s0", Some(1), MOUNT_APPEAR_RETRIES);
+            .with_command_result_when_n(TIMEOUT_BIN, "p100_s0", Some(1), MOUNT_APPEAR_RETRIES);
         let loaded = vec![secret("/host/auth.json")];
         let results = run(&mock, &loaded, &mount_point(), DEFAULT_TIMEOUT_SECS);
         let mnt = results
@@ -396,9 +420,9 @@ mod tests {
             .with_file("/host/auth.json", b"DATA")
             .with_command_stdout(".\n..\np9_s0_somebody_else")
             // ls of the root succeeds (default/0)
-            .with_command_result_when("timeout", "/tmp/fgk-mnt", Some(0))
+            .with_command_result_when(TIMEOUT_BIN, "/tmp/fgk-mnt", Some(0))
             // stat of the secret: persistent ENOENT
-            .with_command_result_when_n("timeout", "p100_s0", Some(1), MOUNT_APPEAR_RETRIES);
+            .with_command_result_when_n(TIMEOUT_BIN, "p100_s0", Some(1), MOUNT_APPEAR_RETRIES);
         let loaded = vec![secret("/host/auth.json")];
         let results = run(&mock, &loaded, &mount_point(), DEFAULT_TIMEOUT_SECS);
         let mnt = results
@@ -425,8 +449,8 @@ mod tests {
         let mock = MockSystemIo::new()
             .with_file("/host/auth.json", b"DATA")
             .with_command_stdout("p9_s0_somebody_else")
-            .with_command_result_when("timeout", "/tmp/fgk-mnt", Some(0))
-            .with_command_result_when_n("timeout", "p100_s0", Some(1), MOUNT_APPEAR_RETRIES);
+            .with_command_result_when(TIMEOUT_BIN, "/tmp/fgk-mnt", Some(0))
+            .with_command_result_when_n(TIMEOUT_BIN, "p100_s0", Some(1), MOUNT_APPEAR_RETRIES);
         let loaded = vec![secret("/host/auth.json")];
         let results = run(&mock, &loaded, &mount_point(), DEFAULT_TIMEOUT_SECS);
         let mnt = results
@@ -451,7 +475,7 @@ mod tests {
         // rebuild happens).
         let mock = MockSystemIo::new()
             .with_file("/host/auth.json", b"DATA")
-            .with_command_result_when_n("timeout", "p100_s0", Some(1), 2);
+            .with_command_result_when_n(TIMEOUT_BIN, "p100_s0", Some(1), 2);
         let loaded = vec![secret("/host/auth.json")];
         let results = run(&mock, &loaded, &mount_point(), DEFAULT_TIMEOUT_SECS);
         let mnt = results
@@ -498,7 +522,7 @@ mod tests {
         let mock = MockSystemIo::new()
             .with_file("/host/a.json", b"A")
             .with_file("/host/b.json", b"B")
-            .with_command_result("timeout", Some(124));
+            .with_command_result(TIMEOUT_BIN, Some(124));
         let loaded = vec![
             LoadedSecret {
                 fuse_name: "p100_s0".into(),

@@ -14,6 +14,7 @@
 //! package-hash lookup → one-read semantics → pending + wait until
 //! grant/expiry → Allow/Deny. The data daemon serves bytes only on
 //! Allow.
+#![cfg_attr(test, allow(unknown_lints, inline_literal))]
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -21,6 +22,29 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tracing::{error, info, warn};
+
+/// The broad permission mask (mode bits only, no file-type).
+const MODE_MASK: u32 = 0o7777;
+/// The plain rwx mask (add/serve path).
+pub(crate) const MODE_MASK_PLAIN: u32 = 0o777;
+/// Deny reason when the name is not served.
+pub(crate) const REASON_NOT_FOUND: &str = "secret not found";
+/// Default deny reason: no adjudication granted.
+const REASON_ACCESS_DENIED: &str = "access denied";
+/// Deny reason when a granted secret's host file vanished mid-grant.
+const REASON_VANISHED: &str = "secret vanished while granted";
+/// Poll cadence while a pending hash lookup resolves.
+const PENDING_POLL: Duration = Duration::from_millis(25);
+/// Write bound per hub broadcast (#77).
+const HUB_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+/// The recvmsg buffer fill byte.
+const RECV_FILL: u8 = 0;
+/// The recvmsg buffer size.
+const RECV_BUFFER_SIZE: usize = 4096;
+/// The control-wire line terminator.
+const LINE_END: u8 = b'\n';
+/// The sibling helper's binary name.
+const HASHD_BIN: &str = "hashd";
 
 use fuse_protocol::oracle::{OracleCommand, OracleReply, OracleRequest};
 use fuse_protocol::PendingAccessInfo;
@@ -118,7 +142,7 @@ pub(crate) fn compute_pid_hash(
 fn sibling_hashd_binary() -> Option<String> {
     std::env::current_exe()
         .ok()
-        .and_then(|exe| exe.parent().map(|dir| dir.join("hashd")))
+        .and_then(|exe| exe.parent().map(|dir| dir.join(HASHD_BIN)))
         .filter(|p| p.exists())
         .map(|p| p.display().to_string())
 }
@@ -144,7 +168,7 @@ fn stat_secret(state: &ServerState, name: &str) -> OracleReply {
             kdev: fuse_protocol::KDev(md.dev()),
             kino: fuse_protocol::Kino(md.ino()),
             size: md.len(),
-            mode: md.permissions().mode() & 0o7777,
+            mode: md.permissions().mode() & MODE_MASK,
             regular: md.is_file(),
         },
         Err(_) => OracleReply::Gone,
@@ -264,18 +288,18 @@ fn adjudicate(state: &ServerState, name: &str, pid: u32, offset: usize, size: us
         ReadOutcome::Granted => OracleReply::Allow,
         ReadOutcome::DeniedLocked => OracleReply::Deny {
             errno: libc::EACCES,
-            reason: "lockdown armed: new unauthorized access is refused".into(),
+            reason: crate::state::REASON_LOCKDOWN.into(),
         },
         ReadOutcome::NotFound => OracleReply::Deny {
             errno: libc::ENOENT,
-            reason: "secret not found".into(),
+            reason: REASON_NOT_FOUND.into(),
         },
         ReadOutcome::AlreadyAccessed | ReadOutcome::HashMismatch { .. } => {
             // Narrowed above; re-run only to fetch the denial text.
             let reason = state
                 .attempt_read(name, pid, None, offset, size)
                 .denial_reason()
-                .unwrap_or_else(|| "access denied".into());
+                .unwrap_or_else(|| REASON_ACCESS_DENIED.into());
             let timeout = *state
             .pending_timeout
             .lock()
@@ -305,7 +329,7 @@ fn adjudicate(state: &ServerState, name: &str, pid: u32, offset: usize, size: us
                     }
                     return OracleReply::Deny {
                         errno: libc::ENOENT,
-                        reason: "secret vanished while granted".into(),
+                        reason: REASON_VANISHED.into(),
                     };
                 }
                 // Expiry FIRST (issue #66): the honest reason at the
@@ -326,7 +350,7 @@ fn adjudicate(state: &ServerState, name: &str, pid: u32, offset: usize, size: us
                         reason: format!("pending {id} denied: {reason}"),
                     };
                 }
-                std::thread::sleep(Duration::from_millis(25));
+                std::thread::sleep(PENDING_POLL);
             }
         }
     }
@@ -469,7 +493,7 @@ fn handle_conn_first(
         // and broadcast drops the connection exactly like a dead peer
         // (logged below); the daemon's reconnect re-syncs from the
         // snapshot.
-        let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(2)));
+        let _ = stream.set_write_timeout(Some(HUB_WRITE_TIMEOUT));
         hub.controls.lock()
             .expect("oracle hub lock: never held across a panic — poisoning means a server bug").push(stream);
         return;
@@ -569,7 +593,7 @@ fn recv_first_line_with_fds(
     let mut line = Vec::new();
     let mut owned_fds: Vec<std::os::fd::OwnedFd> = Vec::new();
     let fd = conn.as_raw_fd();
-    let mut buf = [0u8; 4096];
+    let mut buf = [RECV_FILL; RECV_BUFFER_SIZE];
     let mut cmsg_space = nix::cmsg_space!(libc::cmsghdr, std::os::unix::io::RawFd);
     loop {
         let n = {
@@ -600,7 +624,7 @@ fn recv_first_line_with_fds(
             return Err("connection closed before a full line".into());
         }
         line.extend_from_slice(&buf[..n]);
-        if let Some(nl) = line.iter().position(|&b| b == b'\n') {
+        if let Some(nl) = line.iter().position(|&b| b == LINE_END) {
             line.truncate(nl);
             return Ok((String::from_utf8_lossy(&line).into_owned(), owned_fds));
         }

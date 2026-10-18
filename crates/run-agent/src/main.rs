@@ -1,4 +1,5 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::panic, unused_results))]
+#![cfg_attr(test, allow(unknown_lints, inline_literal))]
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -9,12 +10,40 @@ use run_agent::{
 
 use fuse_protocol::SystemIo;
 use tracing::error;
+
+/// CLI default values (clap attribute positions).
+const DEFAULT_SERVER_BIN: &str = "fuse-server";
+const RUNTIME_AUTO: &str = "auto";
+const DEFAULT_IMAGE_NAME: &str = "agentbox";
+const DEFAULT_MEM: &str = "224G";
+const DEFAULT_CPU: &str = "90";
+const DEFAULT_LEVEL: &str = "info";
+/// Exit code for unusable CLI input.
+const EXIT_USAGE: i32 = 2;
+/// Clap metadata.
+const BIN_NAME: &str = "run-agent";
+const BIN_ABOUT: &str = "Launch a secure agent session: FUSE gatekeeper + container";
+const VALUE_HOST: &str = "HOST";
+const VALUE_CONTAINER: &str = "CONTAINER";
+/// Pair arity of --secret values.
+const SECRET_PAIR: usize = 2;
+/// Plans-dir convention (relative to cwd).
+// Necessity: external identifiers (names restate their values —
+// review on servyi/lints#16).
+#[allow(unknown_lints)]
+#[allow(inline_literal)]
+const PLANS_SHARED: &str = "./plans/shared";
+const YES_SHORT: char = 'y';
+/// Container lifecycle verbs.
+const STOP_CMD: &str = "stop";
+const RM_CMD: &str = "rm";
+const FORCE_FLAG: &str = "-f";
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
 #[command(
-    name = "run-agent",
-    about = "Launch a secure agent session: FUSE gatekeeper + container"
+    name = BIN_NAME,
+    about = BIN_ABOUT
 )]
 struct Cli {
     /// Guest subfolder under ~/.config/ (e.g. `goose`).
@@ -34,11 +63,11 @@ struct Cli {
     /// Can be specified multiple times. Two separate words — no
     /// delimiter grammar, nothing to escape: colons and tildes are
     /// ordinary path characters (the shell expands ~ in both).
-    #[arg(long, num_args = 2, value_names = ["HOST", "CONTAINER"])]
+    #[arg(long, num_args = SECRET_PAIR, value_names = [VALUE_HOST, VALUE_CONTAINER])]
     secret: Vec<String>,
 
     /// Path to the fuse-server binary.
-    #[arg(long, default_value = "fuse-server")]
+    #[arg(long, default_value = DEFAULT_SERVER_BIN)]
     fuse_server: PathBuf,
 
     /// Unix socket path for the shared fuse-server.
@@ -65,7 +94,7 @@ struct Cli {
     pidns_host: bool,
 
     /// Container runtime to use.
-    #[arg(long, default_value = "auto")]
+    #[arg(long, default_value = RUNTIME_AUTO)]
     runtime: Runtime,
 
     /// Wrapper command for the container runtime (e.g. "flatpak-spawn --host"
@@ -74,24 +103,24 @@ struct Cli {
     runtime_wrapper: Option<String>,
 
     /// Container image name.
-    #[arg(long, default_value = "agentbox")]
+    #[arg(long, default_value = DEFAULT_IMAGE_NAME)]
     image: String,
 
     /// Memory limit for the container.
-    #[arg(long, default_value = "224G")]
+    #[arg(long, default_value = DEFAULT_MEM)]
     memory: String,
 
     /// CPU limit for the container.
-    #[arg(long, default_value = "90")]
+    #[arg(long, default_value = DEFAULT_CPU)]
     cpus: String,
 
     /// Non-interactively accept remediation prompts (e.g. building the
     /// missing agentbox image).
-    #[arg(long, short = 'y')]
+    #[arg(long, short = YES_SHORT)]
     yes: bool,
 
     /// Log level for the fuse-server (e.g. "info", "debug", "warn").
-    #[arg(long, default_value = "info")]
+    #[arg(long, default_value = DEFAULT_LEVEL)]
     log_level: String,
 
     /// Stop and remove the persistent container, then exit.
@@ -107,6 +136,9 @@ struct Cli {
     container_args: Vec<String>,
 }
 
+/// Default container runtime when resolution fails.
+const FALLBACK_RUNTIME: &str = "podman";
+
 fn main() -> ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
@@ -116,6 +148,10 @@ fn main() -> ExitCode {
 
     // num_args = 2: values arrive as flat [host, container, ...]
     // pairs; chunk them (indexing, not parsing).
+    // Necessity: pair-chunked CLI values (chunks(2), pair[0]/pair[1]) —
+    // the flat [host, container] wire layout of --secret.
+    #[allow(unknown_lints)]
+    #[allow(inline_literal)]
     let secrets: Vec<SecretMapping> = cli
         .secret
         .chunks(2)
@@ -123,7 +159,7 @@ fn main() -> ExitCode {
         .collect::<Result<_, _>>()
         .unwrap_or_else(|e| {
             error!("{e}");
-            std::process::exit(2);
+            std::process::exit(EXIT_USAGE);
         });
 
     let no_hash = cli.hash.is_none();
@@ -154,7 +190,7 @@ fn main() -> ExitCode {
     config.auto_confirm = cli.yes;
     config.log_level = cli.log_level;
 
-    let plans_candidate = std::path::Path::new("./plans/shared");
+    let plans_candidate = std::path::Path::new(PLANS_SHARED);
     if plans_candidate.exists() {
         config.plans_path = Some(plans_candidate.to_path_buf());
     }
@@ -165,21 +201,24 @@ fn main() -> ExitCode {
     if cli.stop {
         let name = config.container_name();
         let wrapper = config.runtime_wrapper.as_deref();
-        let bin = config.runtime.resolve(&io, wrapper).unwrap_or("podman");
+        let bin = config.runtime.resolve(&io, wrapper).unwrap_or(FALLBACK_RUNTIME);
         eprintln!("Stopping container {name}...");
+        // Necessity: wrapper argv splitting (parts[0], parts[1..]).
+        #[allow(unknown_lints)]
+        #[allow(inline_literal)]
         match wrapper {
             Some(w) => {
                 let parts: Vec<&str> = w.split_whitespace().collect();
                 let mut a: Vec<&str> = parts[1..].to_vec();
-                a.extend(&[bin, "stop", &name]);
+                a.extend(&[bin, STOP_CMD, &name]);
                 let _ = io.run_command(parts[0], &a);
                 let mut b: Vec<&str> = parts[1..].to_vec();
-                b.extend(&[bin, "rm", "-f", &name]);
+                b.extend(&[bin, RM_CMD, FORCE_FLAG, &name]);
                 let _ = io.run_command(parts[0], &b);
             }
             None => {
-                let _ = io.run_command(bin, &["stop", &name]);
-                let _ = io.run_command(bin, &["rm", "-f", &name]);
+                let _ = io.run_command(bin, &[STOP_CMD, &name]);
+                let _ = io.run_command(bin, &[RM_CMD, FORCE_FLAG, &name]);
             }
         }
         eprintln!("Done.");
