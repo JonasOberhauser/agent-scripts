@@ -112,6 +112,29 @@ fn proc_err(e: procfs::ProcError) -> IoError {
     }
 }
 
+/// The terminal heal, parameterized for behavior tests (issue #51):
+/// on a real tty, `stty sane` runs FIRST (line discipline), then the
+/// escape-level restore bytes (mouse capture incl. SGR 1006, alternate
+/// screen, cursor) go out and are flushed. Off a tty it must be a
+/// complete no-op — healing a pipe would corrupt piped output.
+pub(crate) fn heal_terminal_impl(
+    is_tty: bool,
+    out: &mut dyn std::io::Write,
+    stty_sane: impl FnOnce(),
+) {
+    if !is_tty {
+        return;
+    }
+    // Raw mode first: stty sane restores line discipline and default
+    // special chars on our stdin (the tty the child borrowed).
+    stty_sane();
+    // Then the escape-level modes stty knows nothing about.  Mirrors
+    // servatui's restore sequence; keep in sync with its
+    // terminal_restore module.
+    let _ = out.write_all(servyi_servatui::TERMINAL_RESTORE_BYTES);
+    let _ = out.flush();
+}
+
 fn hex_sha256(data: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(data);
@@ -276,20 +299,13 @@ impl SystemIo for RealSystemIo {
 
     fn heal_terminal(&self) {
         use std::io::IsTerminal;
-        use std::io::Write;
-        if !std::io::stdout().is_terminal() {
-            return;
-        }
-        // Raw mode first: stty sane restores line discipline and default
-        // special chars on our stdin (the tty the child borrowed).
-        let _ = std::process::Command::new(STTY_BIN).arg(STTY_RESET).status();
-        // Then the escape-level modes stty knows nothing about: mouse
-        // capture (incl. SGR 1006 — the dead-scroll-wheel culprit),
-        // alternate screen, hidden cursor. Mirrors servatui's restore
-        // sequence; keep in sync with its terminal_restore module.
-        let mut out = std::io::stdout();
-        let _ = out.write_all(servyi_servatui::TERMINAL_RESTORE_BYTES);
-        let _ = out.flush();
+        heal_terminal_impl(
+            std::io::stdout().is_terminal(),
+            &mut std::io::stdout(),
+            || {
+                let _ = std::process::Command::new(STTY_BIN).arg(STTY_RESET).status();
+            },
+        );
     }
 
     fn sha256_file(&self, path: &Path) -> Result<String, IoError> {
@@ -904,7 +920,48 @@ mod path_membership_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{inspect_hint, map_files_hint};
+    use super::{heal_terminal_impl, inspect_hint, map_files_hint};
+
+    /// Issue #51: on a tty the heal runs `stty sane` first, then the
+    /// servatui restore bytes, flushed — asserted on the write stream
+    /// and the stty effect, not on internal call counts.
+    #[test]
+    fn heal_on_a_tty_runs_stty_then_restore_bytes() {
+        let stty_ran = std::sync::atomic::AtomicBool::new(false);
+        let order = std::sync::atomic::AtomicUsize::new(0);
+        let stty_at = std::sync::atomic::AtomicUsize::new(usize::MAX);
+        let mut out = Vec::new();
+        heal_terminal_impl(true, &mut out, || {
+            stty_at.store(
+                order.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+            stty_ran.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        assert!(stty_ran.load(std::sync::atomic::Ordering::SeqCst), "stty sane must run");
+        assert_eq!(
+            out,
+            servyi_servatui::TERMINAL_RESTORE_BYTES,
+            "the restore bytes written are exactly servatui's (dead-scroll-wheel guard)"
+        );
+        // stty precedes the byte write: one ordered write happened after it
+        assert_eq!(
+            stty_at.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "stty sane must precede the escape-level restore"
+        );
+    }
+
+    /// Off a tty (pipes, redirects, CI) the heal must touch NOTHING —
+    /// healing a pipe would corrupt piped output.
+    #[test]
+    fn heal_off_a_tty_is_a_noop() {
+        let mut out = Vec::new();
+        let mut stty_ran = false;
+        heal_terminal_impl(false, &mut out, || stty_ran = true);
+        assert!(out.is_empty(), "no bytes may go to a non-tty stdout");
+        assert!(!stty_ran, "no stty may run against a non-tty stdout");
+    }
 
     /// A dead pid fails closed AND names the procfs source it tried —
     /// no on-disk path is ever consulted (TOCTOU: paths race with swaps).
