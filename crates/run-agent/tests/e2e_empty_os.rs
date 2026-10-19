@@ -420,3 +420,121 @@ fn e2e_auto_build_creates_image_and_container() {
         "container was not created; run-agent output:\n{text}\npodman ps -a:\n{names}"
     );
 }
+
+
+// ── issue #51: the TERM sweep actually TERMs container processes ──
+//
+// Behavioral counterpart of the argv-ordering mock tests: a process
+// inside the container traps SIGTERM and drops a marker into /root —
+// the named `{agent}_home` volume, which survives the rm/recreate of
+// --restart-container.  Only the sweep TERMs non-init processes
+// directly (`podman stop` signals pid 1; the trap lives in a child
+// started via `exec -d`), so the marker on the volume after a restart
+// proves the sweep reached it BEFORE the stop/rm, on a real /proc.
+#[test]
+#[ignore = "needs real podman + /dev/fuse; run with --ignored on a capable host"]
+fn e2e_restart_terms_trapped_container_processes() {
+    require_environment("e2e_restart_terms_trapped_container_processes");
+    assert!(
+        registry_reachable(),
+        "e2e_restart_terms_trapped_container_processes: refusing to skip —          cannot reach quay.io:443 to pull the alpine control image"
+    );
+    let os = EmptyOs::new("termsweep");
+
+    // run-agent hardcodes --workdir /workspace (no such dir in
+    // debian-slim) and a `sleep infinity` container command (GNU
+    // coreutils only — busybox sleep rejects 'infinity', see the
+    // logs in this test's CI history).  One layer on debian-slim
+    // fixes both.
+    let df = os.root.join("Dockerfile");
+    std::fs::write(&df, "FROM docker.io/library/debian:bookworm-slim\nRUN mkdir -p /workspace\n")
+        .expect("write Dockerfile");
+    let image = "localhost/termsweep-test:latest";
+    let build = os.podman(&[
+        "build", "-t", image, "-f", &df.to_string_lossy(), &os.root.to_string_lossy(),
+    ]);
+    assert!(build.status.success(), "image build failed: {}", {
+        let mut t = String::from_utf8_lossy(&build.stdout).into_owned();
+        t.push_str(&String::from_utf8_lossy(&build.stderr));
+        t
+    });
+
+    // Session 1: create the persistent container.  The headless exec
+    // afterwards fails by design (run-agent is a TTY tool), and the
+    // session-end teardown stops the container — start it back up: the
+    // victim must be alive IN it for the sweep to find it.
+    let session1 = os.run_agent(Some(image), &[]);
+    let session1_text = output_text(&session1);
+
+    let named = os.podman(&["ps", "-a", "--format", "{{.Names}}|{{.State}}|{{.Status}}"]);
+    let ps_text = String::from_utf8_lossy(&named.stdout).into_owned();
+    let container = ps_text
+        .lines()
+        .next()
+        .and_then(|l| l.split('|').next())
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| panic!("no container after session 1:\nps:\n{ps_text}\nsession:\n{session1_text}"));
+    let start = os.podman(&["start", &container]);
+    assert!(
+        start.status.success(),
+        "precondition: could not start {container}: {}{}",
+        String::from_utf8_lossy(&start.stdout),
+        String::from_utf8_lossy(&start.stderr),
+    );
+
+    // Diagnostics when the container refuses to stay up: the whole
+    // point of this test is a REAL /proc inside a running container.
+    let running = os.podman(&["ps", "--format", "{{.Names}}"]);
+    let is_up = String::from_utf8_lossy(&running.stdout)
+        .lines()
+        .any(|l| l.trim() == container);
+    if !is_up {
+        let inspect = os.podman(&[
+            "inspect", "--format",
+            "state={{.State.State}} exit={{.State.ExitCode}} err={{.State.Error}}",
+            &container,
+        ]);
+        let logs = os.podman(&["logs", &container]);
+        panic!(
+            "container {container} is not RUNNING after `podman start` — the TERM \
+             sweep test needs a live /proc.\nps -a:\n{ps_text}\ninspect: {}{}\nlogs: \
+             {}{}\nsession 1 output:\n{session1_text}",
+            String::from_utf8_lossy(&inspect.stdout),
+            String::from_utf8_lossy(&inspect.stderr),
+            String::from_utf8_lossy(&logs.stdout),
+            String::from_utf8_lossy(&logs.stderr),
+        );
+    }
+
+    // The victim: a non-init process that marks on TERM.
+    let exec = os.podman(&[
+        "exec", "-d", &container, "sh", "-c",
+        "trap 'touch /root/termed' TERM; sleep 9999",
+    ]);
+    assert!(
+        exec.status.success(),
+        "spawning the trapped victim failed: {}{}",
+        String::from_utf8_lossy(&exec.stdout),
+        String::from_utf8_lossy(&exec.stderr),
+    );
+
+    // Session 2: --restart-container runs gentle_stop (the /proc sweep)
+    // BEFORE stop/rm; the volume-backed marker must survive into the
+    // recreated container.  Session-end stops that one too — start it
+    // before probing.
+    let _ = os.run_agent(Some(image), &["--restart-container"]);
+    let _ = os.podman(&["start", &container]);
+
+    let marker = os.podman(&["exec", &container, "test", "-f", "/root/termed"]);
+    let probe_text = {
+        let mut t = String::from_utf8_lossy(&marker.stdout).into_owned();
+        t.push_str(&String::from_utf8_lossy(&marker.stderr));
+        t
+    };
+    assert!(
+        marker.status.success(),
+        "the trapped process never saw SIGTERM — the TERM sweep did not reach          non-init container processes on a real /proc (issue #51).\n{probe_text}"
+    );
+}
