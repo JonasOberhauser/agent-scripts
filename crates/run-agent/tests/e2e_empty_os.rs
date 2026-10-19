@@ -662,8 +662,14 @@ fn e2e_container_reads_secret_bytes_from_fuse() {
 
 /// --pidns-host's observable contract: /proc inside the container is
 /// the HOST pid namespace — pid 1 is the host's init, not the
-/// container's `sleep`.  That resolvability is what lets the policy
-/// daemon verify a reader's /proc/<pid>/exe (the flag's whole point).
+/// container's `sleep`.  Probed via `/proc/1/comm`, which is
+/// world-readable: `/proc/1/exe` is gated by ptrace-may-access, and
+/// the host's init runs as REAL root while the rootless container's
+/// root is the mapped unprivileged user — pid 1 is *visible* but its
+/// exe is *not resolvable* from inside (empty `readlink` output, a
+/// /proc permission property, not a broken --pidns-host).  The
+/// run-agent use case reads the exe of SAME-uid agent processes, to
+/// which the gate does not apply.
 #[test]
 #[ignore = "needs real podman + /dev/fuse; run with --ignored on a capable host"]
 fn e2e_pidns_host_shows_the_host_proc() {
@@ -678,17 +684,17 @@ fn e2e_pidns_host_shows_the_host_proc() {
     let container = sole_container(&os);
     must_start(&os, &container);
 
-    let exe = os.podman(&["exec", &container, "readlink", "/proc/1/exe"]);
-    let resolved = String::from_utf8_lossy(&exe.stdout).trim().to_string();
+    let comm = os.podman(&["exec", &container, "cat", "/proc/1/comm"]);
+    let pid1 = String::from_utf8_lossy(&comm.stdout).trim().to_string();
     assert!(
-        exe.status.success() && resolved.starts_with('/'),
-        "/proc/1/exe must resolve inside a --pidns-host container: \
-         {resolved:?}\n{}\nsession:\n{text}",
-        String::from_utf8_lossy(&exe.stderr),
+        comm.status.success() && !pid1.is_empty(),
+        "/proc/1/comm must be readable inside a --pidns-host container: \
+         {pid1:?}\n{}\nsession:\n{text}",
+        String::from_utf8_lossy(&comm.stderr),
     );
-    assert!(
-        !resolved.ends_with("/sleep"),
+    assert_ne!(
+        pid1, "sleep",
         "pid 1 inside the container is the container's own sleep — this is \
-         a PRIVATE pidns, not --pidns-host (resolved: {resolved})"
+         a PRIVATE pidns, not --pidns-host (comm: {pid1})"
     );
 }
