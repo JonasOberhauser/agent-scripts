@@ -461,15 +461,19 @@ fn e2e_restart_terms_trapped_container_processes() {
     // afterwards fails by design (run-agent is a TTY tool), and the
     // session-end teardown stops the container — start it back up: the
     // victim must be alive IN it for the sweep to find it.
-    let _ = os.run_agent(Some(image), &[]);
+    let session1 = os.run_agent(Some(image), &[]);
+    let session1_text = output_text(&session1);
 
-    let named = os.podman(&["ps", "-a", "--format", "{{.Names}}"]);
-    let container = String::from_utf8_lossy(&named.stdout)
+    let named = os.podman(&["ps", "-a", "--format", "{{.Names}}|{{.State}}|{{.Status}}"]);
+    let ps_text = String::from_utf8_lossy(&named.stdout).into_owned();
+    let container = ps_text
         .lines()
+        .next()
+        .and_then(|l| l.split('|').next())
         .map(str::trim)
-        .find(|l| !l.is_empty())
+        .filter(|l| !l.is_empty())
         .map(str::to_string)
-        .expect("a container must exist after the first session");
+        .unwrap_or_else(|| panic!("no container after session 1:\nps:\n{ps_text}\nsession:\n{session1_text}"));
     let start = os.podman(&["start", &container]);
     assert!(
         start.status.success(),
@@ -477,6 +481,30 @@ fn e2e_restart_terms_trapped_container_processes() {
         String::from_utf8_lossy(&start.stdout),
         String::from_utf8_lossy(&start.stderr),
     );
+
+    // Diagnostics when the container refuses to stay up: the whole
+    // point of this test is a REAL /proc inside a running container.
+    let running = os.podman(&["ps", "--format", "{{.Names}}"]);
+    let is_up = String::from_utf8_lossy(&running.stdout)
+        .lines()
+        .any(|l| l.trim() == container);
+    if !is_up {
+        let inspect = os.podman(&[
+            "inspect", "--format",
+            "state={{.State.State}} exit={{.State.ExitCode}} err={{.State.Error}}",
+            &container,
+        ]);
+        let logs = os.podman(&["logs", &container]);
+        panic!(
+            "container {container} is not RUNNING after `podman start` — the TERM \
+             sweep test needs a live /proc.\nps -a:\n{ps_text}\ninspect: {}{}\nlogs: \
+             {}{}\nsession 1 output:\n{session1_text}",
+            String::from_utf8_lossy(&inspect.stdout),
+            String::from_utf8_lossy(&inspect.stderr),
+            String::from_utf8_lossy(&logs.stdout),
+            String::from_utf8_lossy(&logs.stderr),
+        );
+    }
 
     // The victim: a non-init process that marks on TERM.
     let exec = os.podman(&[
