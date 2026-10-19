@@ -1212,8 +1212,8 @@ fn gentle_stop<S: SystemIo>(
     container_bin: &str,
     container_name: &str,
 ) {
-    let sweep = "for p in /proc/[0-9]*; do pid=${p##*/}; if [ \"$pid\" != 1 ]; then \
-                 kill -TERM \"$pid\" 2>/dev/null; fi; done; true";
+    let sweep = "for p in /proc/[0-9]*; do pid=$p; if [ \"$pid\" != 1 ]; then \
+                 kill -TERM \"$pid\" 2>/dev/null; fi; done; true"; // FAULT C2
     let _ = run_with_wrapper(
         io,
         wrapper,
