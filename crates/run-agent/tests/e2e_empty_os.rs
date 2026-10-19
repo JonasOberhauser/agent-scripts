@@ -47,7 +47,100 @@ use std::io::Write as _;
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+// ── bounded commands (triage for the CI hang of #120) ──────────
+//
+// The #52-contract e2e tier is the FIRST CI exercise of reading the
+// bind-mounted FUSE fs from inside a rootless container — the first
+// run hung there for 23 minutes, ate the step's 25-minute budget,
+// and (because libtest prints failure output only at the END) also
+// swallowed the sibling test's panic text. A tier that can block on
+// a container syscall must bound every blocking command: on expiry
+// the command is killed and the harness FAILS IN SECONDS carrying
+// whatever output the pipes still gave.
+
+/// Poll pace while waiting for a bounded command.
+const BOUNDED_POLL: Duration = Duration::from_millis(100);
+/// Grace for draining a killed command's pipes: grandchildren
+/// (conmon, container processes) may hold the write ends forever —
+/// a full read would hang the harness again.
+const BOUNDED_DRAIN_GRACE: Duration = Duration::from_secs(2);
+/// Image builds pull base layers on CI (~3 minutes observed).
+const BOUND_BUILD: Duration = Duration::from_secs(600);
+/// A run-agent session: the other tests return within ~30 seconds.
+const BOUND_RUN_AGENT: Duration = Duration::from_secs(120);
+/// The safety bound for the pre-existing tests (unchanged behavior
+/// in practice; the step budget is 1500s).
+const BOUND_RUN_AGENT_SAFETY: Duration = Duration::from_secs(900);
+/// podman queries and one-shot execs inside the container.
+const BOUND_PODMAN_QUERY: Duration = Duration::from_secs(30);
+const BOUND_PODMAN_START: Duration = Duration::from_secs(60);
+const BOUND_PODMAN_EXEC: Duration = Duration::from_secs(60);
+
+/// Run `cmd` to completion, but never longer than `limit`: on expiry
+/// the child is killed and the test FAILS immediately with the
+/// command's identity and whatever output was drained — the triage
+/// shape (evidence in seconds instead of a job corpse in 25 minutes).
+fn bounded_output(mut cmd: Command, limit: Duration, what: &str) -> std::process::Output {
+    let mut child = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| panic!("spawn {what}: {e}"));
+    let deadline = Instant::now() + limit;
+    loop {
+        if let Some(_status) = child.try_wait().expect("poll bounded child") {
+            return child.wait_with_output().expect("collect bounded output");
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            break;
+        }
+        std::thread::sleep(BOUNDED_POLL);
+    }
+    // Killed on expiry: drain the pipes with a grace (readers EOF on
+    // their own when no survivor holds the write end) and fail with
+    // the evidence.
+    let out = drain_slot(child.stdout.take(), BOUNDED_DRAIN_GRACE);
+    let err = drain_slot(child.stderr.take(), BOUNDED_DRAIN_GRACE);
+    panic!(
+        "TRIAGE: `{what}` exceeded {limit:?} and was killed \
+         (the command never finished — see the captured output and \
+         the run-agent session text in the assertion above it, if \
+         any)\n--- killed stdout ---\n{}\n--- killed stderr ---\n{}",
+        out.as_deref().unwrap_or("(pipe still held by a survivor)"),
+        err.as_deref().unwrap_or("(pipe still held by a survivor)"),
+    );
+}
+
+/// Read a killed child's pipe to EOF within `grace`, returning what
+/// arrived. A survivor process (conmon, the container) may hold the
+/// write end forever — `None` then, rather than a second hang.
+fn drain_slot<R: std::io::Read + Send + 'static>(pipe: Option<R>, _grace: Duration) -> Option<String> {
+    let mut file = pipe?;
+    let slot = Arc::new(Mutex::new(None));
+    let reader = {
+        let slot = Arc::clone(&slot);
+        std::thread::spawn(move || {
+            let mut buf = String::new();
+            let drained = file.read_to_string(&mut buf).is_ok();
+            *slot.lock().expect("drain slot") = drained.then_some(buf);
+        })
+    };
+    let deadline = Instant::now() + BOUNDED_DRAIN_GRACE;
+    loop {
+        if let Some(got) = slot.lock().expect("drain slot").take() {
+            return Some(got);
+        }
+        if Instant::now() >= deadline || reader.is_finished() {
+            return None;
+        }
+        std::thread::sleep(BOUNDED_POLL);
+    }
+}
 
 // ── availability probes ────────────────────────────────────────
 
@@ -212,6 +305,17 @@ impl EmptyOs {
     /// `image=None` keeps the naive-user default (`agentbox`): a local-only
     /// image no registry can resolve, as in issue #1.
     fn run_agent(&self, image: Option<&str>, extra_args: &[&str]) -> std::process::Output {
+        self.run_agent_within(BOUND_RUN_AGENT_SAFETY, image, extra_args)
+    }
+
+    /// run-agent with an explicit bound (the triage tier must fail in
+    /// seconds, not eat the job's 25-minute budget).
+    fn run_agent_within(
+        &self,
+        limit: Duration,
+        image: Option<&str>,
+        extra_args: &[&str],
+    ) -> std::process::Output {
         let ws = self.root.join("ws");
         std::fs::create_dir_all(&ws).expect("create workspace");
         let fuse_server = find_fuse_server().expect("fuse-server binary");
@@ -240,18 +344,26 @@ impl EmptyOs {
         }
         cmd.args(extra_args)
             .current_dir(&ws)
-            .stdin(Stdio::null())
-            .output()
-            .expect("spawn run-agent")
+            .stdin(Stdio::null());
+        bounded_output(cmd, limit, "run-agent e2e-agent session")
     }
 
     fn podman(&self, args: &[&str]) -> std::process::Output {
         let mut cmd = Command::new("podman");
-        self.env(&mut cmd)
-            .args(args)
-            .stdin(Stdio::null())
-            .output()
-            .expect("spawn podman")
+        self.env(&mut cmd).args(args).stdin(Stdio::null());
+        cmd.output().expect("spawn podman")
+    }
+
+    /// podman with an explicit bound — used by the #52 triage tier.
+    fn podman_within(
+        &self,
+        limit: Duration,
+        what: &str,
+        args: &[&str],
+    ) -> std::process::Output {
+        let mut cmd = Command::new("podman");
+        self.env(&mut cmd).args(args).stdin(Stdio::null());
+        bounded_output(cmd, limit, what)
     }
 }
 
@@ -486,7 +598,11 @@ fn e2e_restart_terms_trapped_container_processes() {
 
     // Diagnostics when the container refuses to stay up: the whole
     // point of this test is a REAL /proc inside a running container.
-    let running = os.podman(&["ps", "--format", "{{.Names}}"]);
+    let running = os.podman_within(
+        BOUND_PODMAN_QUERY,
+        "podman ps (must_start)",
+        &["ps", "--format", "{{.Names}}"],
+    );
     let is_up = String::from_utf8_lossy(&running.stdout)
         .lines()
         .any(|l| l.trim() == container);
@@ -556,9 +672,11 @@ fn build_workspace_image(os: &EmptyOs, tag: &str) {
         "FROM docker.io/library/debian:bookworm-slim\nRUN mkdir -p /workspace\n",
     )
     .expect("write Dockerfile");
-    let build = os.podman(&[
-        "build", "-t", tag, "-f", &df.to_string_lossy(), &os.root.to_string_lossy(),
-    ]);
+    let build = os.podman_within(
+        BOUND_BUILD,
+        "podman build (workspace image)",
+        &["build", "-t", tag, "-f", &df.to_string_lossy(), &os.root.to_string_lossy()],
+    );
     assert!(
         build.status.success(),
         "image build failed: {}{}",
@@ -568,7 +686,11 @@ fn build_workspace_image(os: &EmptyOs, tag: &str) {
 }
 
 fn sole_container(os: &EmptyOs) -> String {
-    let named = os.podman(&["ps", "-a", "--format", "{{.Names}}"]);
+    let named = os.podman_within(
+        BOUND_PODMAN_QUERY,
+        "podman ps -a (sole container)",
+        &["ps", "-a", "--format", "{{.Names}}"],
+    );
     String::from_utf8_lossy(&named.stdout)
         .lines()
         .map(str::trim)
@@ -583,7 +705,11 @@ fn must_start(os: &EmptyOs, container: &str) {
         .lines()
         .any(|l| l.trim() == container);
     if !is_up {
-        let start = os.podman(&["start", container]);
+        let start = os.podman_within(
+            BOUND_PODMAN_START,
+            "podman start (must_start)",
+            &["start", container],
+        );
         assert!(
             start.status.success(),
             "could not start {container}: {}{}",
@@ -619,7 +745,8 @@ fn e2e_container_reads_secret_bytes_from_fuse() {
     // on a pty forever — the `-t` allocation never forwards our
     // null-stdin EOF — which is exactly how this test hung its first
     // CI run for 25 minutes (the triage capture showed the prompt).
-    let out = os.run_agent(
+    let out = os.run_agent_within(
+        BOUND_RUN_AGENT,
         Some(image),
         &[
             "--secret",
@@ -646,7 +773,11 @@ fn e2e_container_reads_secret_bytes_from_fuse() {
         .expect("state file records the inner fuse_name")
         .to_string();
 
-    let cat = os.podman(&["exec", &container, "cat", &format!("/fuse/{fuse_name}")]);
+    let cat = os.podman_within(
+        BOUND_PODMAN_EXEC,
+        "podman exec cat /fuse/<inner-name> — the #52 reachability contract",
+        &["exec", &container, "cat", &format!("/fuse/{fuse_name}")],
+    );
     assert!(
         cat.status.success(),
         "cat /fuse/{fuse_name} failed: {}{}\nsession:\n{text}",
@@ -659,7 +790,11 @@ fn e2e_container_reads_secret_bytes_from_fuse() {
         "bytes through /fuse must be the host secret's, exactly"
     );
 
-    let unshare = os.podman(&["exec", &container, "unshare", "-Ur", "true"]);
+    let unshare = os.podman_within(
+        BOUND_PODMAN_EXEC,
+        "podman exec unshare -Ur true — seccomp namespace admission",
+        &["exec", &container, "unshare", "-Ur", "true"],
+    );
     assert!(
         unshare.status.success(),
         "the shipped seccomp profile denies namespace syscalls \
@@ -691,13 +826,17 @@ fn e2e_pidns_host_shows_the_host_proc() {
     // interactive exec IS the product; headless tests must give it a
     // terminating command instead of relying on podman's no-command
     // error path).
-    let out = os.run_agent(Some(image), &["--pidns-host", "/bin/true"]);
+    let out = os.run_agent_within(BOUND_RUN_AGENT, Some(image), &["--pidns-host", "/bin/true"]);
     let text = output_text(&out);
 
     let container = sole_container(&os);
     must_start(&os, &container);
 
-    let comm = os.podman(&["exec", &container, "cat", "/proc/1/comm"]);
+    let comm = os.podman_within(
+        BOUND_PODMAN_EXEC,
+        "podman exec cat /proc/1/comm — the --pidns-host observable",
+        &["exec", &container, "cat", "/proc/1/comm"],
+    );
     let pid1 = String::from_utf8_lossy(&comm.stdout).trim().to_string();
     assert!(
         comm.status.success() && !pid1.is_empty(),
@@ -710,4 +849,28 @@ fn e2e_pidns_host_shows_the_host_proc() {
         "pid 1 inside the container is the container's own sleep — this is \
          a PRIVATE pidns, not --pidns-host (comm: {pid1})"
     );
+}
+
+// ── bounded_output self-tests (no podman needed; guard the guard) ──
+
+/// A fast command runs to completion through the bounded path.
+#[test]
+fn bounded_output_returns_a_fast_command() {
+    let mut probe = Command::new("echo");
+    probe.arg("probe");
+    let out = bounded_output(probe, BOUND_PODMAN_QUERY, "echo probe");
+    assert!(out.status.success(), "echo must succeed");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "probe\n");
+}
+
+/// A stuck command is killed at the deadline and FAILS with the
+/// TRIAGE marker — the 25-minute job corpse of #120's first CI run
+/// becomes a seconds-fast failure carrying the marker and whatever
+/// output drained.
+#[test]
+#[should_panic(expected = "TRIAGE: `sleep probe` exceeded")]
+fn bounded_output_kills_a_stuck_command() {
+    let mut cmd = Command::new("sleep");
+    cmd.arg("60");
+    bounded_output(cmd, Duration::from_secs(1), "sleep probe");
 }
