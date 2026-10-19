@@ -441,11 +441,13 @@ fn e2e_restart_terms_trapped_container_processes() {
     );
     let os = EmptyOs::new("termsweep");
 
-    // run-agent hardcodes --workdir /workspace; alpine has none, so a
-    // plain alpine container dies on chdir the moment it starts.  One
-    // layer on top of alpine fixes that.
+    // run-agent hardcodes --workdir /workspace (no such dir in
+    // debian-slim) and a `sleep infinity` container command (GNU
+    // coreutils only — busybox sleep rejects 'infinity', see the
+    // logs in this test's CI history).  One layer on debian-slim
+    // fixes both.
     let df = os.root.join("Dockerfile");
-    std::fs::write(&df, "FROM quay.io/libpod/alpine:latest\nRUN mkdir -p /workspace\n")
+    std::fs::write(&df, "FROM docker.io/library/debian:bookworm-slim\nRUN mkdir -p /workspace\n")
         .expect("write Dockerfile");
     let image = "localhost/termsweep-test:latest";
     let build = os.podman(&[
