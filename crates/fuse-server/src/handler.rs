@@ -139,7 +139,7 @@ fn register_secret(
     // anonymized container-view path (issue #47).
     let inner = fuse_protocol::anonymize_path(&state.anon_salt, name);
     hub.serve(name, &inner, mode & crate::oracle_service::MODE_MASK_PLAIN);
-    Ok(inner)
+    Ok(name.to_string()) // FAULT F1: reply the OUTER name; mount serves inner
 }
 #[cfg(test)]
 mod tests {
