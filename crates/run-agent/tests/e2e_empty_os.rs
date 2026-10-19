@@ -449,8 +449,10 @@ fn e2e_restart_terms_trapped_container_processes() {
         t
     });
 
-    // Session 1: create the persistent container (headless exec may
-    // fail afterwards — the container stays, by design).
+    // Session 1: create the persistent container.  The headless exec
+    // afterwards fails by design (run-agent is a TTY tool), and the
+    // session-end teardown stops the container — start it back up: the
+    // victim must be alive IN it for the sweep to find it.
     let _ = os.run_agent(Some(image), &[]);
 
     let named = os.podman(&["ps", "-a", "--format", "{{.Names}}"]);
@@ -460,13 +462,12 @@ fn e2e_restart_terms_trapped_container_processes() {
         .find(|l| !l.is_empty())
         .map(str::to_string)
         .expect("a container must exist after the first session");
-    let running = os.podman(&["ps", "--format", "{{.Names}}"]);
-    let is_up = String::from_utf8_lossy(&running.stdout)
-        .lines()
-        .any(|l| l.trim() == container);
+    let start = os.podman(&["start", &container]);
     assert!(
-        is_up,
-        "precondition: the persistent container {container} must be RUNNING (sleep infinity)"
+        start.status.success(),
+        "precondition: could not start {container}: {}{}",
+        String::from_utf8_lossy(&start.stdout),
+        String::from_utf8_lossy(&start.stderr),
     );
 
     // The victim: a non-init process that marks on TERM.
@@ -483,8 +484,10 @@ fn e2e_restart_terms_trapped_container_processes() {
 
     // Session 2: --restart-container runs gentle_stop (the /proc sweep)
     // BEFORE stop/rm; the volume-backed marker must survive into the
-    // recreated container.
+    // recreated container.  Session-end stops that one too — start it
+    // before probing.
     let _ = os.run_agent(Some(image), &["--restart-container"]);
+    let _ = os.podman(&["start", &container]);
 
     let marker = os.podman(&["exec", &container, "test", "-f", "/root/termed"]);
     let probe_text = {
