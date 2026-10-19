@@ -393,8 +393,8 @@ pub fn build_create_args(config: &AgentConfig, devices: &[String]) -> Vec<String
     if config.pidns_host {
         args.push(PID_FLAG.into());
         args.push(PID_HOST.into());
-        args.push(PID_FLAG.into());
-        args.push("container".into()); // FAULT F3: last-wins override
+        args.push("--pidns".into());
+        args.push("private".into()); // FAULT F3: later override wins
     }
 
     args.push(config.image_name.clone());
