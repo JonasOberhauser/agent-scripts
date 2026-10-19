@@ -440,12 +440,20 @@ fn e2e_restart_terms_trapped_container_processes() {
         "e2e_restart_terms_trapped_container_processes: refusing to skip —          cannot reach quay.io:443 to pull the alpine control image"
     );
     let os = EmptyOs::new("termsweep");
-    let image = "quay.io/libpod/alpine:latest";
 
-    let pull = os.podman(&["pull", image]);
-    assert!(pull.status.success(), "pre-pull failed: {}", {
-        let mut t = String::from_utf8_lossy(&pull.stdout).into_owned();
-        t.push_str(&String::from_utf8_lossy(&pull.stderr));
+    // run-agent hardcodes --workdir /workspace; alpine has none, so a
+    // plain alpine container dies on chdir the moment it starts.  One
+    // layer on top of alpine fixes that.
+    let df = os.root.join("Dockerfile");
+    std::fs::write(&df, "FROM quay.io/libpod/alpine:latest\nRUN mkdir -p /workspace\n")
+        .expect("write Dockerfile");
+    let image = "localhost/termsweep-test:latest";
+    let build = os.podman(&[
+        "build", "-t", image, "-f", &df.to_string_lossy(), &os.root.to_string_lossy(),
+    ]);
+    assert!(build.status.success(), "image build failed: {}", {
+        let mut t = String::from_utf8_lossy(&build.stdout).into_owned();
+        t.push_str(&String::from_utf8_lossy(&build.stderr));
         t
     });
 
