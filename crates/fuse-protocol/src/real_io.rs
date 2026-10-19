@@ -963,6 +963,117 @@ mod tests {
         assert!(!stty_ran, "no stty may run against a non-tty stdout");
     }
 
+    // ── the REAL wiring, on a real pty (issue #51: fault-injection
+    // review showed the impl-level tests cannot see a gutted real
+    // closure).  `script` runs the re-execed child on a pty; the PATH
+    // shim records whether production actually ran `stty sane`.
+
+    /// Child mode: perform the REAL heal (stdout is the pty `script`
+    /// allocated) and exit before the other tests.
+    #[test]
+    fn heal_real_wiring_child_mode() {
+        if std::env::var_os("HEAL_CHILD").is_none() {
+            return;
+        }
+        RealSystemIo::new().heal_terminal();
+        std::process::exit(0);
+    }
+
+    fn stty_shim(dir: &std::path::Path) -> std::path::PathBuf {
+        let shim = dir.join("stty");
+        std::fs::write(&shim, "#!/bin/sh\nprintf \"%s\\n\" \"$@\" >> \"$STTY_LOG\"\n").unwrap();
+        make_executable(&shim);
+        shim
+    }
+
+    fn make_executable(path: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perm = std::fs::metadata(path).unwrap().permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(path, perm).unwrap();
+    }
+
+    #[test]
+    fn heal_real_wiring_on_a_pty_runs_stty_and_writes_restore_bytes() {
+        if std::env::var_os("HEAL_CHILD").is_some() {
+            return; // the child must not run its own parent assertions
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let stty_log = dir.path().join("stty.log");
+        let shim_dir = dir.path().join("bin");
+        std::fs::create_dir(&shim_dir).unwrap();
+        stty_shim(&shim_dir);
+
+        let exe = std::env::current_exe().unwrap();
+        let child = std::process::Command::new("script")
+            .arg("-qec")
+            .arg(format!("{} heal_real_wiring_child_mode --nocapture", exe.display()))
+            .arg("/dev/null")
+            .env("HEAL_CHILD", "1")
+            .env("STTY_LOG", &stty_log)
+            .env("PATH", format!("{}:{}", shim_dir.display(), std::env::var("PATH").unwrap_or_default()))
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .expect("spawn script(1) pty wrapper");
+
+        let mut tty_out = String::from_utf8_lossy(&child.stdout).into_owned();
+        tty_out.push_str(&String::from_utf8_lossy(&child.stderr));
+        // script(1) may rewrite newlines; compare on the byte sequences
+        // that matter: the exact restore bytes must appear in the tty
+        // stream.
+        let restore = String::from_utf8(servyi_servatui::TERMINAL_RESTORE_BYTES.to_vec()).unwrap();
+        assert!(
+            tty_out.contains(&restore),
+            "the REAL heal did not write servatui's restore bytes to the \
+             pty; tty output was {:?}",
+            tty_out
+        );
+        let stty_calls = std::fs::read_to_string(&stty_log).unwrap_or_default();
+        assert_eq!(
+            stty_calls.trim(),
+            "sane",
+            "the REAL heal did not run `stty sane` (shim log: {stty_calls:?})"
+        );
+    }
+
+    /// The gate itself, on the real fn: piped stdout (no pty) — the
+    /// heal must leave the pipe free of restore bytes and the shim
+    /// un-invoked.
+    #[test]
+    fn heal_real_wiring_off_a_tty_touches_nothing() {
+        if std::env::var_os("HEAL_CHILD").is_some() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let stty_log = dir.path().join("stty.log");
+        let shim_dir = dir.path().join("bin");
+        std::fs::create_dir(&shim_dir).unwrap();
+        stty_shim(&shim_dir);
+
+        let exe = std::env::current_exe().unwrap();
+        let child = std::process::Command::new(exe)
+            .args(["heal_real_wiring_child_mode", "--nocapture"])
+            .env("HEAL_CHILD", "1")
+            .env("STTY_LOG", &stty_log)
+            .env("PATH", format!("{}:{}", shim_dir.display(), std::env::var("PATH").unwrap_or_default()))
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .expect("spawn re-exec child");
+
+        let piped = String::from_utf8_lossy(&child.stdout).into_owned();
+        let restore = String::from_utf8(servyi_servatui::TERMINAL_RESTORE_BYTES.to_vec()).unwrap();
+        assert!(
+            !piped.contains(&restore),
+            "the REAL heal wrote restore bytes to a non-tty stdout: {piped:?}"
+        );
+        assert!(
+            !stty_log.exists(),
+            "the REAL heal ran stty against a non-tty stdout"
+        );
+    }
+
     /// A dead pid fails closed AND names the procfs source it tried —
     /// no on-disk path is ever consulted (TOCTOU: paths race with swaps).
     #[test]
