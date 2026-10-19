@@ -611,6 +611,14 @@ fn e2e_container_reads_secret_bytes_from_fuse() {
     // Wildcard hash (the kit's own tier uses it): every reader is
     // permitted — the point here is the /fuse reachability contract,
     // not the approval flow.
+    //
+    // The trailing `/bin/true` is the session COMMAND: after setup,
+    // run-agent exec's INTERACTIVELY into the container (that session
+    // IS the product), and a headless harness must hand it a command
+    // that terminates. Without it the exec'd bash sits at its prompt
+    // on a pty forever — the `-t` allocation never forwards our
+    // null-stdin EOF — which is exactly how this test hung its first
+    // CI run for 25 minutes (the triage capture showed the prompt).
     let out = os.run_agent(
         Some(image),
         &[
@@ -619,6 +627,7 @@ fn e2e_container_reads_secret_bytes_from_fuse() {
             "/root/secret.json",
             "--hash",
             "*",
+            "/bin/true",
         ],
     );
     let text = output_text(&out);
@@ -678,7 +687,11 @@ fn e2e_pidns_host_shows_the_host_proc() {
     let image = "localhost/fuse-pidns:latest";
     build_workspace_image(&os, image);
 
-    let out = os.run_agent(Some(image), &["--pidns-host"]);
+    // Trailing session command (see e2e_container_reads: the
+    // interactive exec IS the product; headless tests must give it a
+    // terminating command instead of relying on podman's no-command
+    // error path).
+    let out = os.run_agent(Some(image), &["--pidns-host", "/bin/true"]);
     let text = output_text(&out);
 
     let container = sole_container(&os);
