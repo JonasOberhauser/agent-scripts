@@ -47,7 +47,6 @@ use std::io::Write as _;
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 // ── bounded commands (triage for the CI hang of #120) ──────────
@@ -58,15 +57,11 @@ use std::time::{Duration, Instant};
 // and (because libtest prints failure output only at the END) also
 // swallowed the sibling test's panic text. A tier that can block on
 // a container syscall must bound every blocking command: on expiry
-// the command is killed and the harness FAILS IN SECONDS carrying
-// whatever output the pipes still gave.
+// the command is killed and the test FAILS IN SECONDS carrying the
+// output it produced.
 
 /// Poll pace while waiting for a bounded command.
 const BOUNDED_POLL: Duration = Duration::from_millis(100);
-/// Grace for draining a killed command's pipes: grandchildren
-/// (conmon, container processes) may hold the write ends forever —
-/// a full read would hang the harness again.
-const BOUNDED_DRAIN_GRACE: Duration = Duration::from_secs(2);
 /// Image builds pull base layers on CI (~3 minutes observed).
 const BOUND_BUILD: Duration = Duration::from_secs(600);
 /// A run-agent session: the other tests return within ~30 seconds.
@@ -81,62 +76,41 @@ const BOUND_PODMAN_EXEC: Duration = Duration::from_secs(60);
 
 /// Run `cmd` to completion, but never longer than `limit`: on expiry
 /// the child is killed and the test FAILS immediately with the
-/// command's identity and whatever output was drained — the triage
-/// shape (evidence in seconds instead of a job corpse in 25 minutes).
+/// command's identity and its captured output — the triage shape
+/// (evidence in seconds instead of a job corpse in 25 minutes).
+///
+/// stdout/stderr go to FILES, not pipes: the command's children
+/// (run-agent spawns fuse-server, fused, conmon...) inherit the
+/// write ends, and after a kill they can hold a pipe forever — the
+/// first triage run printed "(pipe still held by a survivor)"
+/// instead of the session text. Files survive both the killer and
+/// the orphans, and read back the same either way.
 fn bounded_output(mut cmd: Command, limit: Duration, what: &str) -> std::process::Output {
+    let out_file = tempfile::NamedTempFile::new().expect("triage stdout file");
+    let err_file = tempfile::NamedTempFile::new().expect("triage stderr file");
     let mut child = cmd
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdout(out_file.reopen().expect("reopen stdout file"))
+        .stderr(err_file.reopen().expect("reopen stderr file"))
         .spawn()
         .unwrap_or_else(|e| panic!("spawn {what}: {e}"));
     let deadline = Instant::now() + limit;
     loop {
-        if let Some(_status) = child.try_wait().expect("poll bounded child") {
-            return child.wait_with_output().expect("collect bounded output");
+        if let Some(status) = child.try_wait().expect("poll bounded child") {
+            return std::process::Output {
+                status,
+                stdout: std::fs::read(out_file.path()).expect("read stdout file"),
+                stderr: std::fs::read(err_file.path()).expect("read stderr file"),
+            };
         }
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
-            break;
-        }
-        std::thread::sleep(BOUNDED_POLL);
-    }
-    // Killed on expiry: drain the pipes with a grace (readers EOF on
-    // their own when no survivor holds the write end) and fail with
-    // the evidence.
-    let out = drain_slot(child.stdout.take(), BOUNDED_DRAIN_GRACE);
-    let err = drain_slot(child.stderr.take(), BOUNDED_DRAIN_GRACE);
-    panic!(
-        "TRIAGE: `{what}` exceeded {limit:?} and was killed \
-         (the command never finished — see the captured output and \
-         the run-agent session text in the assertion above it, if \
-         any)\n--- killed stdout ---\n{}\n--- killed stderr ---\n{}",
-        out.as_deref().unwrap_or("(pipe still held by a survivor)"),
-        err.as_deref().unwrap_or("(pipe still held by a survivor)"),
-    );
-}
-
-/// Read a killed child's pipe to EOF within `grace`, returning what
-/// arrived. A survivor process (conmon, the container) may hold the
-/// write end forever — `None` then, rather than a second hang.
-fn drain_slot<R: std::io::Read + Send + 'static>(pipe: Option<R>, _grace: Duration) -> Option<String> {
-    let mut file = pipe?;
-    let slot = Arc::new(Mutex::new(None));
-    let reader = {
-        let slot = Arc::clone(&slot);
-        std::thread::spawn(move || {
-            let mut buf = String::new();
-            let drained = file.read_to_string(&mut buf).is_ok();
-            *slot.lock().expect("drain slot") = drained.then_some(buf);
-        })
-    };
-    let deadline = Instant::now() + BOUNDED_DRAIN_GRACE;
-    loop {
-        if let Some(got) = slot.lock().expect("drain slot").take() {
-            return Some(got);
-        }
-        if Instant::now() >= deadline || reader.is_finished() {
-            return None;
+            let out = std::fs::read_to_string(out_file.path()).unwrap_or_default();
+            let err = std::fs::read_to_string(err_file.path()).unwrap_or_default();
+            panic!(
+                "TRIAGE: `{what}` exceeded {limit:?} and was killed \
+                 (the command never finished)\n--- killed stdout ---\n{out}\n--- killed stderr ---\n{err}"
+            );
         }
         std::thread::sleep(BOUNDED_POLL);
     }
