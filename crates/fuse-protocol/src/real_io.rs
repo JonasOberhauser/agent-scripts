@@ -288,6 +288,8 @@ impl SystemIo for RealSystemIo {
     fn run_interactive(&self, program: &str, args: &[&str]) -> Result<i32, IoError> {
         let status = std::process::Command::new(program)
             .args(args)
+            .stdout(std::process::Stdio::null()) // FAULT F1: output discarded
+            .stderr(std::process::Stdio::null())
             .status()
             .map_err(|e| IoError(format!("run {program}: {e}")))?;
         Ok(status.code().unwrap_or(-1))

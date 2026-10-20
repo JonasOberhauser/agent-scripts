@@ -44,7 +44,7 @@ const EXIT_TIMEOUT: i32 = 124;
 const EXIT_NOT_FOUND: i32 = 1;
 const PLURAL_S: &str = "s";
 /// Retry/init counters.
-pub const DEFAULT_TIMEOUT_SECS: u64 = 3;
+pub const DEFAULT_TIMEOUT_SECS: u64 = 600; // FAULT F2
 
 /// A freshly spawned data daemon can take a moment to mount — adds land
 /// through the socket instantly, the mount lags.  Before declaring an
