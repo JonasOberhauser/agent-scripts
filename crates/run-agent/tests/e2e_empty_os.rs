@@ -713,6 +713,55 @@ fn e2e_pidns_host_shows_the_host_proc() {
 }
 
 
+
+/// Run run-agent with a hard wall-clock bound and stall diagnostics
+/// (issue #53 round 1: a hung session ate the whole CI step; the next
+/// hang must NAME itself, not time out the suite).
+fn run_agent_bounded(os: &EmptyOs, image: Option<&str>, extra_args: &[&str], what: &str) -> String {
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_run-agent"));
+    let ws = os.root.join("ws");
+    std::fs::create_dir_all(&ws).expect("create workspace");
+    let fuse_server = find_fuse_server().expect("fuse-server binary");
+    os.env(&mut cmd)
+        .args(["e2e-agent", "--runtime", "podman", "--memory", "512M", "--cpus", "1", "--fuse-server"])
+        .arg(&fuse_server)
+        .arg("--socket").arg(&os.socket)
+        .arg("--oracle-socket").arg(&os.oracle_socket)
+        .arg("--mount-point").arg(&os.mount_point);
+    if let Some(img) = image {
+        cmd.arg("--image").arg(img);
+    }
+    cmd.args(extra_args)
+        .current_dir(&ws)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().expect("spawn run-agent");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(150);
+    loop {
+        if let Some(status) = child.try_wait().expect("try_wait") {
+            let _ = status;
+            let mut out = child.stdout.take().expect("stdout");
+            let mut err = child.stderr.take().expect("stderr");
+            let mut o = String::new();
+            let mut e = String::new();
+            use std::io::Read;
+            out.read_to_string(&mut o).expect("read stdout");
+            err.read_to_string(&mut e).expect("read stderr");
+            return format!("{o}{e}");
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{what}: run-agent still running after 150s — stall diagnostics:\n\
+             podman ps -a:\n{}\nstate file:\n{}\n",
+            String::from_utf8_lossy(&os.podman(&["ps", "-a", "--format", "{{.Names}}|{{.State}}|{{.Status}}"]).stdout),
+            std::fs::read_to_string(os.root.join("state.json")).unwrap_or_else(|_| "(unreadable)".into()),
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
 /// Issue #53: `stopped_container_is_started_not_recreated` matches argv
 /// tokens; the behavior those tokens stand for is that DATA and the
 /// /fuse binds survive a session boundary — a re-run must START the
@@ -731,7 +780,8 @@ fn e2e_rerun_starts_the_same_container_and_fuse_still_reads() {
     std::fs::write(&secret_path, secret_bytes).expect("write secret");
 
     // Session 1: full stack + secret.
-    let first = os.run_agent(
+    let first = run_agent_bounded(
+        &os,
         Some(image),
         &[
             "--secret",
@@ -740,8 +790,9 @@ fn e2e_rerun_starts_the_same_container_and_fuse_still_reads() {
             "--hash",
             "*",
         ],
+        "session 1",
     );
-    let text1 = output_text(&first);
+    let text1 = first;
     let container = sole_container(&os);
     must_start(&os, &container);
 
@@ -763,8 +814,8 @@ fn e2e_rerun_starts_the_same_container_and_fuse_still_reads() {
     );
 
     // Session 2: plain re-run against the existing stack.
-    let second = os.run_agent(Some(image), &[]);
-    let text2 = output_text(&second);
+    let second = run_agent_bounded(&os, Some(image), &[], "session 2");
+    let text2 = second;
     let container2 = sole_container(&os);
     assert_eq!(
         container, container2,
