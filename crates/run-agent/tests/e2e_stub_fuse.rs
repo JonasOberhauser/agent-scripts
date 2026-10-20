@@ -498,6 +498,28 @@ fn preflight_probe_is_bounded_in_wall_time_on_a_hung_stat() {
     let out = seam.run_with(None, 120, &["--yes", "--secret", &secret.to_string_lossy(), "/root/s.txt"], Some(&dockerfile));
     let wall = started.elapsed();
     let _ = std::io::stderr().write_all(out.combined.as_bytes());
+    // The spawned server's stderr lands in its log file under the
+    // agent dir — surface it on any failure path (round 1 died at
+    // `add` with only "server closed the connection" to go on).
+    let mut logs = String::new();
+    let mut stack = vec![dir.path().to_path_buf()];
+    while let Some(d) = stack.pop() {
+        if let Ok(rd) = std::fs::read_dir(&d) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if p.extension().is_some_and(|x| x == "log") {
+                    logs.push_str(&format!(
+                        "--- {}:\n{}\n",
+                        p.display(),
+                        std::fs::read_to_string(&p).unwrap_or_default()
+                    ));
+                }
+            }
+        }
+    }
+    let _ = std::io::stderr().write_all(logs.as_bytes());
 
     assert!(
         wall < std::time::Duration::from_secs(40),
