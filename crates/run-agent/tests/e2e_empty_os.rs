@@ -711,3 +711,93 @@ fn e2e_pidns_host_shows_the_host_proc() {
          a PRIVATE pidns, not --pidns-host (comm: {pid1})"
     );
 }
+
+
+/// Issue #53: `stopped_container_is_started_not_recreated` matches argv
+/// tokens; the behavior those tokens stand for is that DATA and the
+/// /fuse binds survive a session boundary — a re-run must START the
+/// same container (named volume keeps the marker) and the secret must
+/// still read through /fuse afterwards.
+#[test]
+#[ignore = "needs real podman + /dev/fuse; run with --ignored on a capable host"]
+fn e2e_rerun_starts_the_same_container_and_fuse_still_reads() {
+    require_environment("e2e_rerun_starts_the_same_container_and_fuse_still_reads");
+    let os = EmptyOs::new("rerun");
+    let image = "localhost/fuse-rerun:latest";
+    build_workspace_image(&os, image);
+
+    let secret_path = os.home.join("secret.json");
+    let secret_bytes = br#"{"token":"survives-the-rerun"}"#;
+    std::fs::write(&secret_path, secret_bytes).expect("write secret");
+
+    // Session 1: full stack + secret.
+    let first = os.run_agent(
+        Some(image),
+        &[
+            "--secret",
+            &secret_path.to_string_lossy(),
+            "/root/secret.json",
+            "--hash",
+            "*",
+        ],
+    );
+    let text1 = output_text(&first);
+    let container = sole_container(&os);
+    must_start(&os, &container);
+
+    // The state file pins the session-1 identity; capture it to prove
+    // the SAME container (not a recreate) serves session 2.
+    let state1: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(os.root.join("state.json"))
+            .unwrap_or_else(|e| panic!("state file after session 1: {e}; session:\n{text1}")),
+    )
+    .expect("state parses");
+
+    // Plant a marker in the agent-home named volume.
+    let mark = os.podman(&["exec", &container, "touch", "/root/data-marker"]);
+    assert!(
+        mark.status.success(),
+        "planting the marker failed: {}{}",
+        String::from_utf8_lossy(&mark.stdout),
+        String::from_utf8_lossy(&mark.stderr),
+    );
+
+    // Session 2: plain re-run against the existing stack.
+    let second = os.run_agent(Some(image), &[]);
+    let text2 = output_text(&second);
+    let container2 = sole_container(&os);
+    assert_eq!(
+        container, container2,
+        "a re-run must reuse the existing container, not recreate it"
+    );
+    must_start(&os, &container2);
+
+    // The marker survived the session boundary (data preserved).
+    let survived = os.podman(&["exec", &container, "test", "-f", "/root/data-marker"]);
+    assert!(
+        survived.status.success(),
+        "the data marker did not survive the re-run — the container was \
+         recreated (or the volume lost): {}{}\nsession 2:\n{text2}",
+        String::from_utf8_lossy(&survived.stdout),
+        String::from_utf8_lossy(&survived.stderr),
+    );
+
+    // And /fuse still serves the secret after the re-run.
+    let state2: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(os.root.join("state.json"))
+            .unwrap_or_else(|e| panic!("state file after session 2: {e}")),
+    )
+    .expect("state parses");
+    let fuse_name = state2["secrets"][0]["fuse_name"]
+        .as_str()
+        .or_else(|| state1["secrets"][0]["fuse_name"].as_str())
+        .expect("inner fuse_name")
+        .to_string();
+    let cat = os.podman(&["exec", &container, "cat", &format!("/fuse/{fuse_name}")]);
+    assert!(
+        cat.status.success(),
+        "cat /fuse/{fuse_name} failed after the re-run: {}{}\nsession 2:\n{text2}",
+        String::from_utf8_lossy(&cat.stdout),
+        String::from_utf8_lossy(&cat.stderr),
+    );
+}

@@ -441,4 +441,74 @@ fn auto_yes_builds_trivial_image_and_reaches_creation() {
         "flow did not reach creation:\n{}",
         out.combined
     );
+
+    // Issue #53: the BUILD itself must be visible to the user as it
+    // happens (run_interactive streams podman's stdio into ours), not
+    // just dispatched — plumbing-level assertions cannot see a build
+    // that silently buffers or discards output.
+    assert!(
+        out.combined.contains("STEP 1")
+            || out.combined.contains("COMMIT agentbox")
+            || out.combined.contains("Writing manifest"),
+        "podman's build progress never reached run-agent's stdio — the \
+         user would stare at a silent prompt during a long build:\n{}",
+        out.combined
+    );
+}
+
+// ── issue #53: the /fuse probe is bounded in WALL TIME ──────────
+//
+// The unit tier simulates a hung mount by faking exit code 124; the
+// property it stands for — a stuck stat can never wedge the session
+// past `timeout` — is only real when the clock is.  This image plants
+// a `stat` that sleeps far beyond the probe's deadline; without the
+// bounding, every attempt would cost the full sleep.
+#[test]
+#[ignore = "needs real podman to pass runtime resolution; run with --ignored on a capable host"]
+fn preflight_probe_is_bounded_in_wall_time_on_a_hung_stat() {
+    assert!(
+        Command::new("podman")
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false),
+        "refusing to skip: this test needs a real podman on PATH"
+    );
+    let dir = tempfile::tempdir().expect("tempdir");
+    // /workspace for run-agent's workdir; a `stat` that sleeps 60s —
+    // an order of magnitude beyond the 3s probe deadline (x4 retries).
+    let dockerfile = dir.path().join("hung-stat.Dockerfile");
+    std::fs::write(
+        &dockerfile,
+        "FROM docker.io/library/debian:bookworm-slim\n\
+         RUN mkdir -p /workspace \\\n\
+         && printf '#!/bin/sh\\nsleep 60\\n' > /usr/local/bin/stat \\\n\
+         && chmod +x /usr/local/bin/stat\n",
+    )
+    .expect("write Dockerfile");
+    let seam = Seam::new(&dir, "hungstat");
+
+    let secret = dir.path().join("secret.txt");
+    std::fs::write(&secret, b"HUNG-PROBE").expect("write secret");
+
+    let started = Instant::now();
+    let out = seam.run_with(None, 120, &["--yes", "--secret", &secret.to_string_lossy(), "/root/s.txt"], Some(&dockerfile));
+    let wall = started.elapsed();
+    let _ = std::io::stderr().write_all(out.combined.as_bytes());
+
+    assert!(
+        wall < std::time::Duration::from_secs(40),
+        "the probe ran unbounded in wall time ({wall:?}) — a hung stat \
+         must be cut off at the timeout deadline, not slept through:\n{}",
+        out.combined
+    );
+    assert!(
+        out.combined.contains("did not answer") || out.combined.contains("pre-flight"),
+        "a persistently hung mount must abort with the pre-flight \
+         diagnostic, not limp on:\n{}",
+        out.combined
+    );
 }
