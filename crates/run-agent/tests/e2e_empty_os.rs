@@ -932,8 +932,14 @@ fn e2e_probe_is_bounded_in_wall_time_on_a_hung_stat() {
         "the probe ran unbounded in wall time ({wall:?}) — a hung stat \
          must be cut off at the timeout deadline, not slept through:\n{out}"
     );
+    // Bounded-abort diagnostics on the probe path: the preflight tier
+    // ("did not answer a stat within") or the orchestrator's heal path
+    // ("bind is stale and a stop/start did not heal" — which costs at
+    // least two full bounded probe rounds).  The ENOENT startup escape
+    // ("not visible in the FUSE mount") must stay excluded.
     assert!(
-        out.contains("did not answer a stat within"),
-        "a persistently hung mount must abort via the TIMEOUT path:\n{out}"
+        out.contains("did not answer a stat within")
+            || out.contains("bind is stale and a stop/start did not heal"),
+        "a persistently hung mount must abort via a bounded probe path:\n{out}"
     );
 }
