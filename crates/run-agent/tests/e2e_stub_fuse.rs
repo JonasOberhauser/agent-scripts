@@ -396,6 +396,16 @@ fn secret_wiring_follows_the_server_reported_inner_name() {
         None,
     );
     let _ = std::io::stderr().write_all(out.combined.as_bytes());
+    // The double rotted once already (word grammar vs the JSON frame:
+    // every add failed with "server closed the connection" while this
+    // test stayed green — vacuous, the exact shape #53 exists to kill).
+    // Pin both directions: the add MUST succeed against the double...
+    assert!(
+        !out.combined.contains("failed to add secret"),
+        "the stub double no longer speaks the command protocol:\n{}",
+        out.combined
+    );
+    // ...and preflight must follow the server-reported name.
     assert!(
         !out.combined.contains("never visible in the FUSE mount"),
         "preflight stat'ed the OUTER form — the #47 half-wiring is back:\n{}",
@@ -489,10 +499,22 @@ fn preflight_probe_is_bounded_in_wall_time_on_a_hung_stat() {
          && chmod +x /usr/local/bin/stat\n",
     )
     .expect("write Dockerfile");
-    let seam = Seam::new(&dir, "hungstat");
-
     let secret = dir.path().join("secret.txt");
     std::fs::write(&secret, b"HUNG-PROBE").expect("write secret");
+
+    // Pre-build so the measured window contains only the session, not
+    // the base-image pull.
+    let seam = Seam::new(&dir, "hungstat");
+    let pre = seam.podman(&[
+        "build", "-t", "agentbox", "-f", &dockerfile.to_string_lossy(),
+        &dir.path().to_string_lossy(),
+    ]);
+    assert!(
+        pre.status.success(),
+        "pre-build of the hung-stat image failed: {}{}",
+        String::from_utf8_lossy(&pre.stdout),
+        String::from_utf8_lossy(&pre.stderr),
+    );
 
     let started = Instant::now();
     let out = seam.run_with(None, 120, &["--yes", "--secret", &secret.to_string_lossy(), "/root/s.txt"], Some(&dockerfile));
