@@ -538,3 +538,176 @@ fn e2e_restart_terms_trapped_container_processes() {
         "the trapped process never saw SIGTERM — the TERM sweep did not reach          non-init container processes on a real /proc (issue #51).\n{probe_text}"
     );
 }
+
+
+// ── issue #52: the container contract, observed FROM INSIDE ──────
+//
+// The unit tier asserts flag PRESENCE (-v /fuse, seccomp=…, --pid
+// host); the properties those flags exist to produce were verified
+// nowhere.  These read /fuse, exercise namespaces, and inspect /proc
+// from inside a real container on a real stack.
+
+fn build_workspace_image(os: &EmptyOs, tag: &str) {
+    // run-agent hardcodes --workdir /workspace and a `sleep infinity`
+    // container command (GNU coreutils): one layer on debian-slim.
+    let df = os.root.join("Dockerfile");
+    std::fs::write(
+        &df,
+        "FROM docker.io/library/debian:bookworm-slim\nRUN mkdir -p /workspace\n",
+    )
+    .expect("write Dockerfile");
+    let build = os.podman(&[
+        "build", "-t", tag, "-f", &df.to_string_lossy(), &os.root.to_string_lossy(),
+    ]);
+    assert!(
+        build.status.success(),
+        "image build failed: {}{}",
+        String::from_utf8_lossy(&build.stdout),
+        String::from_utf8_lossy(&build.stderr),
+    );
+}
+
+fn sole_container(os: &EmptyOs) -> String {
+    let named = os.podman(&["ps", "-a", "--format", "{{.Names}}"]);
+    String::from_utf8_lossy(&named.stdout)
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .map(str::to_string)
+        .expect("a container must exist")
+}
+
+fn must_start(os: &EmptyOs, container: &str) {
+    let running = os.podman(&["ps", "--format", "{{.Names}}"]);
+    let is_up = String::from_utf8_lossy(&running.stdout)
+        .lines()
+        .any(|l| l.trim() == container);
+    if !is_up {
+        let start = os.podman(&["start", container]);
+        assert!(
+            start.status.success(),
+            "could not start {container}: {}{}",
+            String::from_utf8_lossy(&start.stdout),
+            String::from_utf8_lossy(&start.stderr),
+        );
+    }
+}
+
+/// A secret's BYTES reach a reader inside the container through /fuse,
+/// and the shipped seccomp profile still admits namespace syscalls
+/// (`unshare -Ur true` — what nested rootless podman needs).
+#[test]
+#[ignore = "needs real podman + /dev/fuse; run with --ignored on a capable host"]
+fn e2e_container_reads_secret_bytes_from_fuse() {
+    require_environment("e2e_container_reads_secret_bytes_from_fuse");
+    let os = EmptyOs::new("fusecontract");
+    let image = "localhost/fuse-contract:latest";
+    build_workspace_image(&os, image);
+
+    let secret_path = os.home.join("secret.json");
+    let secret_bytes = br#"{"token":"the-e2e-contract-bytes"}"#;
+    std::fs::write(&secret_path, secret_bytes).expect("write secret");
+
+    // Wildcard hash (the kit's own tier uses it): every reader is
+    // permitted — the point here is the /fuse reachability contract,
+    // not the approval flow.
+    //
+    // The trailing `/bin/true` is the session COMMAND: after setup,
+    // run-agent exec's INTERACTIVELY into the container (that session
+    // IS the product), and a headless harness must hand it a command
+    // that terminates. Without it the exec'd bash sits at its prompt
+    // on a pty forever — the `-t` allocation never forwards our
+    // null-stdin EOF — which is exactly how this test hung its first
+    // CI run for 25 minutes (the triage capture showed the prompt).
+    let out = os.run_agent(
+        Some(image),
+        &[
+            "--secret",
+            &secret_path.to_string_lossy(),
+            "/root/secret.json",
+            "--hash",
+            "*",
+            "/bin/true",
+        ],
+    );
+    let text = output_text(&out);
+
+    let container = sole_container(&os);
+    must_start(&os, &container);
+
+    // The container-side name is the INNER name the server reported
+    // (issue #47) — read it from the state file, not our own argv.
+    let state_bytes = std::fs::read(os.root.join("state.json"))
+        .unwrap_or_else(|e| panic!("state file unreadable ({e}); session:\n{text}"));
+    let state: serde_json::Value =
+        serde_json::from_slice(&state_bytes).expect("state file parses");
+    let fuse_name = state["secrets"][0]["fuse_name"]
+        .as_str()
+        .expect("state file records the inner fuse_name")
+        .to_string();
+
+    let cat = os.podman(&["exec", &container, "cat", &format!("/fuse/{fuse_name}")]);
+    assert!(
+        cat.status.success(),
+        "cat /fuse/{fuse_name} failed: {}{}\nsession:\n{text}",
+        String::from_utf8_lossy(&cat.stdout),
+        String::from_utf8_lossy(&cat.stderr),
+    );
+    assert_eq!(
+        cat.stdout,
+        secret_bytes.to_vec(),
+        "bytes through /fuse must be the host secret's, exactly"
+    );
+
+    let unshare = os.podman(&["exec", &container, "unshare", "-Ur", "true"]);
+    assert!(
+        unshare.status.success(),
+        "the shipped seccomp profile denies namespace syscalls \
+         (unshare -Ur true): {}{}",
+        String::from_utf8_lossy(&unshare.stdout),
+        String::from_utf8_lossy(&unshare.stderr),
+    );
+}
+
+/// --pidns-host's observable contract: /proc inside the container is
+/// the HOST pid namespace — pid 1 is the host's init, not the
+/// container's `sleep`.  Probed via `/proc/1/comm`, which is
+/// world-readable: `/proc/1/exe` is gated by ptrace-may-access, and
+/// the host's init runs as REAL root while the rootless container's
+/// root is the mapped unprivileged user — pid 1 is *visible* but its
+/// exe is *not resolvable* from inside (empty `readlink` output, a
+/// /proc permission property, not a broken --pidns-host).  The
+/// run-agent use case reads the exe of SAME-uid agent processes, to
+/// which the gate does not apply.
+#[test]
+#[ignore = "needs real podman + /dev/fuse; run with --ignored on a capable host"]
+fn e2e_pidns_host_shows_the_host_proc() {
+    require_environment("e2e_pidns_host_shows_the_host_proc");
+    let os = EmptyOs::new("pidnshost");
+    let image = "localhost/fuse-pidns:latest";
+    build_workspace_image(&os, image);
+
+    // Trailing session command (see e2e_container_reads: the
+    // interactive exec IS the product; headless tests must give it a
+    // terminating command instead of relying on podman's no-command
+    // error path).
+    let out = os.run_agent(Some(image), &["--pidns-host", "/bin/true"]);
+    let text = output_text(&out);
+
+    let container = sole_container(&os);
+    must_start(&os, &container);
+
+    let comm = os.podman(&["exec", &container, "cat", "/proc/1/comm"]);
+    let pid1 = String::from_utf8_lossy(&comm.stdout).trim().to_string();
+    assert!(
+        comm.status.success() && !pid1.is_empty(),
+        "/proc/1/comm must be readable inside a --pidns-host container: \
+         {pid1:?}\n{}\nsession:\n{text}",
+        String::from_utf8_lossy(&comm.stderr),
+    );
+    assert_ne!(
+        pid1, "sleep",
+        "pid 1 inside the container is the container's own sleep — this is \
+         a PRIVATE pidns, not --pidns-host (comm: {pid1})"
+    );
+}
