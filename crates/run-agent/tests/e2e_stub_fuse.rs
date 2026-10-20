@@ -503,14 +503,19 @@ fn preflight_probe_is_bounded_in_wall_time_on_a_hung_stat() {
     std::fs::write(&secret, b"HUNG-PROBE").expect("write secret");
 
     let seam = Seam::new(&dir, "hungstat");
-    // The stub answers Added{inner: "stub-<outer>"}: pre-create the
-    // INNER entry in the fake mount so the STARTUP host-side check
-    // passes — the wall clock must measure the IN-CONTAINER probe
-    // (round 1 of the fault probe passed vacuously by aborting at
-    // startup, never reaching the shim).
-    std::fs::create_dir_all(&seam.mount_point).expect("mount dir");
-    std::fs::write(seam.mount_point.join("stub-secret.txt"), b"HUNG-PROBE")
-        .expect("pre-create the INNER mount entry");
+    // The stub answers Added{inner: "stub-<outer>"} where the outer
+    // name is the PATH-SHAPED form of the host file (round 3 of the
+    // fault probe: `stub-tmp/.tmpXXX/secret.txt`, not a bare
+    // `stub-secret.txt`).  Pre-create that tree in the fake mount so
+    // the STARTUP host-side check passes — the wall clock must then
+    // measure the IN-CONTAINER probe against the sleeping stat.
+    let outer = secret
+        .to_string_lossy()
+        .trim_start_matches('/')
+        .to_string();
+    let inner = seam.mount_point.join(format!("stub-{outer}"));
+    std::fs::create_dir_all(inner.parent().expect("parent")).expect("mount tree");
+    std::fs::write(&inner, b"HUNG-PROBE").expect("pre-create the INNER mount entry");
 
     // Pre-build so the measured window contains only the session, not
     // the base-image pull.
