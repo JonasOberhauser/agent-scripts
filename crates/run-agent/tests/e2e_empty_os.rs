@@ -733,10 +733,24 @@ fn run_agent_bounded(os: &EmptyOs, image: Option<&str>, extra_args: &[&str], wha
     }
     cmd.args(extra_args)
         .current_dir(&ws)
-        .stdin(Stdio::null())
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = cmd.spawn().expect("spawn run-agent");
+    // A session ends when the USER exits the interactive shell: type
+    // `exit` once the setup phase has surely run (the exec'd bash on a
+    // pty otherwise sits forever — an open session).  The pipe closes
+    // (EOF) when the feeder thread drops the last handle.
+    {
+        let feed = child.stdin.take().expect("stdin");
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(25));
+            use std::io::Write;
+            let mut feed = feed;
+            let _ = feed.write_all(b"exit\n");
+            let _ = feed.flush();
+        });
+    }
 
     let deadline = std::time::Instant::now() + Duration::from_secs(150);
     loop {
