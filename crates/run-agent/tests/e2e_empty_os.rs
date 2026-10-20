@@ -887,7 +887,7 @@ fn e2e_probe_is_bounded_in_wall_time_on_a_hung_stat() {
     require_environment("e2e_probe_is_bounded_in_wall_time_on_a_hung_stat");
     let os = EmptyOs::new("hungstat");
     // debian + /workspace + a sleeping `stat` (60s >> the 3s deadline
-    /// 4 retries).
+    // x4 retries).
     let df = os.root.join("Dockerfile");
     std::fs::write(
         &df,
