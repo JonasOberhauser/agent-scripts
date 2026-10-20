@@ -872,3 +872,68 @@ fn e2e_rerun_starts_the_same_container_and_fuse_still_reads() {
         String::from_utf8_lossy(&cat.stderr),
     );
 }
+
+
+/// Issue #53, real-stack version: the /fuse probe is bounded in WALL
+/// TIME. The unit tier fakes exit 124; the stub tier cannot host it
+/// (its fake mount never passes the startup check for a path-shaped
+/// secret — rounds 1-4 of the fault probe). Here the real stack's
+/// startup check passes (real mount, real inner), and the container's
+/// `stat` is a shim that sleeps far beyond the probe deadline: the
+/// session must abort within the bound with the TIMEOUT diagnostic.
+#[test]
+#[ignore = "needs real podman + /dev/fuse; run with --ignored on a capable host"]
+fn e2e_probe_is_bounded_in_wall_time_on_a_hung_stat() {
+    require_environment("e2e_probe_is_bounded_in_wall_time_on_a_hung_stat");
+    let os = EmptyOs::new("hungstat");
+    // debian + /workspace + a sleeping `stat` (60s >> the 3s deadline
+    /// 4 retries).
+    let df = os.root.join("Dockerfile");
+    std::fs::write(
+        &df,
+        "FROM docker.io/library/debian:bookworm-slim\n\
+         RUN mkdir -p /workspace \\\n\
+         && printf '#!/bin/sh\\nsleep 60\\n' > /usr/local/bin/stat \\\n\
+         && chmod +x /usr/local/bin/stat\n",
+    )
+    .expect("write Dockerfile");
+    let image = "localhost/fuse-hungstat:latest";
+    let build = os.podman(&[
+        "build", "-t", image, "-f", &df.to_string_lossy(), &os.root.to_string_lossy(),
+    ]);
+    assert!(
+        build.status.success(),
+        "image build failed: {}{}",
+        String::from_utf8_lossy(&build.stdout),
+        String::from_utf8_lossy(&build.stderr),
+    );
+
+    let secret_path = os.home.join("secret.json");
+    std::fs::write(&secret_path, br#"{"t":"hung"}"#).expect("write secret");
+
+    let started = std::time::Instant::now();
+    let out = run_agent_bounded(
+        &os,
+        Some(image),
+        &[
+            "--secret",
+            &secret_path.to_string_lossy(),
+            "/root/secret.json",
+            "--hash",
+            "*",
+        ],
+        "hung-stat session",
+    );
+    let wall = started.elapsed();
+    let _ = std::io::stderr().write_all(out.as_bytes());
+
+    assert!(
+        wall < Duration::from_secs(90),
+        "the probe ran unbounded in wall time ({wall:?}) — a hung stat \
+         must be cut off at the timeout deadline, not slept through:\n{out}"
+    );
+    assert!(
+        out.contains("did not answer a stat within"),
+        "a persistently hung mount must abort via the TIMEOUT path:\n{out}"
+    );
+}
