@@ -558,10 +558,14 @@ fn preflight_probe_is_bounded_in_wall_time_on_a_hung_stat() {
          must be cut off at the timeout deadline, not slept through:\n{}",
         out.combined
     );
+    // The TIMEOUT-specific diagnostic: a fast ENOENT-style abort
+    // ("not visible in the FUSE mount") must NOT satisfy this test —
+    // only the bounded-time exhaustion counts (fault-probe round 2
+    // caught a fast-path escape via the generic "pre-flight" text).
     assert!(
-        out.combined.contains("did not answer") || out.combined.contains("pre-flight"),
-        "a persistently hung mount must abort with the pre-flight \
-         diagnostic, not limp on:\n{}",
+        out.combined.contains("did not answer a stat within"),
+        "a persistently hung mount must abort via the TIMEOUT path — \
+         a fast-path abort means the probe was never measured:\n{}",
         out.combined
     );
 }
