@@ -751,13 +751,19 @@ fn run_agent_bounded(os: &EmptyOs, image: Option<&str>, extra_args: &[&str], wha
             err.read_to_string(&mut e).expect("read stderr");
             return format!("{o}{e}");
         }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "{what}: run-agent still running after 150s — stall diagnostics:\n\
-             podman ps -a:\n{}\nstate file:\n{}\n",
-            String::from_utf8_lossy(&os.podman(&["ps", "-a", "--format", "{{.Names}}|{{.State}}|{{.Status}}"]).stdout),
-            std::fs::read_to_string(os.root.join("state.json")).unwrap_or_else(|_| "(unreadable)".into()),
-        );
+        if std::time::Instant::now() >= deadline {
+            let ps = std::process::Command::new("ps")
+                .args(["-eo", "pid,ppid,stat,etime,args", "--forest"])
+                .output()
+                .expect("ps");
+            panic!(
+                "{what}: run-agent still running after 150s — stall diagnostics:\n\
+                 process tree:\n{}\npodman ps -a:\n{}\nstate file:\n{}\n",
+                String::from_utf8_lossy(&ps.stdout),
+                String::from_utf8_lossy(&os.podman(&["ps", "-a", "--format", "{{.Names}}|{{.State}}|{{.Status}}"]).stdout),
+                std::fs::read_to_string(os.root.join("state.json")).unwrap_or_else(|_| "(unreadable)".into()),
+            );
+        }
         std::thread::sleep(Duration::from_millis(200));
     }
 }
