@@ -708,8 +708,16 @@ mod tests {
             }
         }
         assert!(cleared, "lazy unmount must succeed on the dead mount");
-        std::fs::create_dir(&mount)
-            .expect("after the lazy unmount the mountpoint is a usable directory");
+        // OBSERVED (CI, first round): the lazy unmount leaves the name
+        // as an EXISTING plain directory — create_dir answers EEXIST,
+        // which is exactly why recovery uses create_dir_all.  Usable
+        // means: metadata sees a directory and create_dir_all succeeds.
+        assert!(
+            std::fs::metadata(&mount).is_ok_and(|m| m.is_dir()),
+            "after the lazy unmount the mountpoint must BE a directory"
+        );
+        std::fs::create_dir_all(&mount)
+            .expect("after the lazy unmount the mountpoint is usable (create_dir_all)");
     }
 
     /// The other kill half (#50): a killed data daemon remounts fresh
