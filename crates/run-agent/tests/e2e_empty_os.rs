@@ -993,12 +993,30 @@ fn e2e_startup_recovery_after_a_killed_data_daemon() {
     let container = sole_container(&os);
     must_start(&os, &container);
     let cat = os.podman(&["exec", &container, "cat", &format!("/fuse/{fuse_name}")]);
-    assert!(
-        cat.status.success(),
-        "cat /fuse/{fuse_name} failed after recovery: {}{}\nsession 2:\n{text2}",
-        String::from_utf8_lossy(&cat.stdout),
-        String::from_utf8_lossy(&cat.stderr),
-    );
+    if !cat.status.success() {
+        // Name the killer: is the HOST mount alive, is the data
+        // daemon alive, what does the container's bind point at?
+        let host_stat = std::fs::metadata(&os.mount_point);
+        let fused = std::process::Command::new("pgrep")
+            .args(["-af", "fused"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default();
+        let inspect = os.podman(&[
+            "inspect", "--format",
+            "{{range .Mounts}}{{.Source}} -> {{.Destination}} ({{.Type}}){{println}}{{end}}",
+            &container,
+        ]);
+        panic!(
+            "cat /fuse/{fuse_name} failed after recovery: {}{}\n\
+             host mount metadata: {host_stat:?}\nfused processes:\n{fused}\n\
+             container mounts: {}{}\nsession 2:\n{text2}",
+            String::from_utf8_lossy(&cat.stdout),
+            String::from_utf8_lossy(&cat.stderr),
+            String::from_utf8_lossy(&inspect.stdout),
+            String::from_utf8_lossy(&inspect.stderr),
+        );
+    }
     assert_eq!(cat.stdout, secret_bytes.to_vec(), "bytes must survive the kill+recovery");
 }
 
