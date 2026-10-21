@@ -1000,7 +1000,7 @@ fn e2e_startup_recovery_after_a_killed_data_daemon() {
         !text2.contains("did not answer")
             && !text2.contains("bind is stale")
             && !text2.contains("pre-flight checks failed"),
-        "session 2 must recover the dead mount, not abort:\n{text2}"
+        "session 2 must recover the dead mount (inner {fuse_name}), not abort:\n{text2}"
     );
 }
 
