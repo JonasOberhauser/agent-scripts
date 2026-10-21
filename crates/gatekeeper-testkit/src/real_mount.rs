@@ -648,6 +648,70 @@ mod tests {
         assert_eq!(split.read("s").expect("post-reset read"), b"KIT-KEEP");
     }
 
+
+    /// Issue #54: validate MockSystemIo's stale-mount world model
+    /// against a REALLY killed data daemon. The mock's honesty note
+    /// hedge says "assumed, not observed" — this test is the
+    /// observation: SIGKILL fused, then check the kernel's actual
+    /// leftovers stat/mkdir exactly as the mock models them, and
+    /// that the lazy unmount restores a usable directory (the
+    /// orchestrator's recovery precondition).
+    #[test]
+    fn dead_mount_leftovers_match_the_mock_model() {
+        if !real_mount_available() {
+            eprintln!("skipping: real-mount tier unavailable here (CI exercises it)");
+            return;
+        }
+        let mut split = Stack::new()
+            .secret("s", b"KIT-STALE", "*")
+            .spawn_real_mount();
+        assert_eq!(split.read("s").expect("first read"), b"KIT-STALE");
+        let mount = split.mount().to_path_buf();
+
+        split.kill_data();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        // The mock (real_io.rs stale_mounts) claims: the kernel KEEPS
+        // the name; stat fails with ENOTCONN ("Transport endpoint is
+        // not connected"); create_dir_all answers EEXIST. Observe all
+        // three on the real kernel.
+        let meta = std::fs::metadata(&mount);
+        let err = meta.err().expect("stat on a dead FUSE mount must FAIL");
+        assert!(
+            err.to_string().contains("Transport endpoint is not connected")
+                || err.raw_os_error() == Some(libc::ECONNRESET)
+                || err.raw_os_error() == Some(libc::EBUSY),
+            "the kernel's real leftover-state differs from the mock model — \
+             refine the mock (issue #54): {err}"
+        );
+
+        let mkdir = std::fs::create_dir(&mount);
+        let mkdir_err = mkdir.err().map(|e| e.raw_os_error());
+        assert_eq!(
+            mkdir_err,
+            Some(Some(libc::EEXIST)),
+            "create_dir on the kept name must be EEXIST (mock model)"
+        );
+
+        // The recovery precondition: a lazy unmount clears it and the
+        // name becomes a usable plain directory again.
+        let mut cleared = false;
+        for (b, flag) in UNMOUNT_SWEEP {
+            if std::process::Command::new(b)
+                .arg(flag)
+                .arg(&mount)
+                .status()
+                .is_ok_and(|s| s.success())
+            {
+                cleared = true;
+                break;
+            }
+        }
+        assert!(cleared, "lazy unmount must succeed on the dead mount");
+        std::fs::create_dir(&mount)
+            .expect("after the lazy unmount the mountpoint is a usable directory");
+    }
+
     /// The other kill half (#50): a killed data daemon remounts fresh
     /// on the same mountpoint.
     #[test]

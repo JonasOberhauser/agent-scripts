@@ -921,3 +921,91 @@ fn e2e_probe_is_bounded_in_wall_time_on_a_hung_stat() {
         "a persistently hung mount must abort via a bounded probe path:\n{out}"
     );
 }
+
+
+/// Issue #54: run-agent's startup recovery against a GENUINELY dead
+/// mount — SIGKILL the real `fused` between sessions; session 2 must
+/// clear the leftover (the mock models it as ENOTCONN + EEXIST) and
+/// bring a fresh stack that still serves the secret's bytes.
+#[test]
+#[ignore = "needs real podman + /dev/fuse; run with --ignored on a capable host"]
+fn e2e_startup_recovery_after_a_killed_data_daemon() {
+    require_environment("e2e_startup_recovery_after_a_killed_data_daemon");
+    let os = EmptyOs::new("deadmount");
+    let image = "localhost/fuse-deadmount:latest";
+    build_workspace_image(&os, image);
+
+    let secret_path = os.home.join("secret.json");
+    let secret_bytes = br#"{"token":"survives-the-daemon-kill"}"#;
+    std::fs::write(&secret_path, secret_bytes).expect("write secret");
+
+    let text1 = os.run_session(
+        Some(image),
+        &[
+            "--secret",
+            &secret_path.to_string_lossy(),
+            "/root/secret.json",
+            "--hash",
+            "*",
+        ],
+        "session 1",
+    );
+    let _ = std::io::stderr().write_all(text1.as_bytes());
+
+    // Kill the data daemon hard: the kernel keeps the dead mount —
+    // exactly the leftover state the mock models.
+    let pat = format!("fused.*{}", regex_escape(&os.mount_point.to_string_lossy()));
+    let pgrep = std::process::Command::new("pgrep")
+        .arg("-f")
+        .arg(&pat)
+        .output()
+        .expect("pgrep fused");
+    let pids: Vec<String> = String::from_utf8_lossy(&pgrep.stdout)
+        .split_whitespace()
+        .map(str::to_string)
+        .collect();
+    assert!(
+        !pids.is_empty(),
+        "the data daemon must be running after session 1 (pattern {pat})"
+    );
+    for pid in &pids {
+        let _ = std::process::Command::new("kill").arg("-9").arg(pid).status();
+    }
+
+    // Session 2 against the genuinely dead mount: recovery must run
+    // (lazy unmount, fresh stack) and the secret must read again.
+    let text2 = os.run_session(Some(image), &[], "session 2 (dead mount)");
+    let _ = std::io::stderr().write_all(text2.as_bytes());
+
+    let container = sole_container(&os);
+    must_start(&os, &container);
+    let state: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(os.root.join("state.json"))
+            .unwrap_or_else(|e| panic!("state file after recovery: {e}")),
+    )
+    .expect("state parses");
+    let fuse_name = state["secrets"][0]["fuse_name"]
+        .as_str()
+        .expect("inner fuse_name")
+        .to_string();
+    let cat = os.podman(&["exec", &container, "cat", &format!("/fuse/{fuse_name}")]);
+    assert!(
+        cat.status.success(),
+        "cat /fuse/{fuse_name} failed after recovery: {}{}\nsession 2:\n{text2}",
+        String::from_utf8_lossy(&cat.stdout),
+        String::from_utf8_lossy(&cat.stderr),
+    );
+    assert_eq!(cat.stdout, secret_bytes.to_vec(), "bytes must survive the kill+recovery");
+}
+
+/// Escape regex metacharacters in a path for `pgrep -f` patterns.
+fn regex_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if !c.is_ascii_alphanumeric() && c != '/' && c != '_' && c != '-' && c != '.' {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}

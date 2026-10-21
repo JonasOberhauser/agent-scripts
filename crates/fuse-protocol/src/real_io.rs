@@ -469,13 +469,13 @@ pub struct MockSystemIo {
     /// died, so the kernel still holds the name but `stat()` fails
     /// (ENOTCONN/EBUSY) and `mkdir` returns EEXIST.
     ///
-    /// HONESTY NOTE (per maintainer directive): this models an *assumed*
-    /// real-world behavior, derived from the incident log
-    /// (`create_dir_all` → "File exists (os error 17)" on
-    /// /tmp/fuse-gatekeeper-mnt after a fused restart) plus kernel FUSE
-    /// semantics — not from controlled observation. If real incidents show
-    /// different error kinds (e.g. stat succeeding but readdir hanging),
-    /// refine this model instead of writing around it.
+    /// VALIDATED MODEL (issue #54): the kernel's leftovers after a
+    /// SIGKILLed data daemon are pinned against the real thing by
+    /// `real_mount::tests::dead_mount_leftovers_match_the_mock_model`
+    /// (real stack, real kill, CI-verified): stat on the kept name
+    /// fails ENOTCONN-family, create_dir answers EEXIST, and a lazy
+    /// unmount restores a usable directory. If that test ever fails,
+    /// refine this model — do not write around it.
     pub stale_mounts: std::cell::RefCell<std::collections::HashSet<String>>,
     pub unix_connected: bool,
     pub unix_responses: std::cell::RefCell<std::collections::VecDeque<Vec<u8>>>,
