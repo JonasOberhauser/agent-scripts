@@ -6,26 +6,30 @@
 //! `rustc` spawn fails on hosts whose linker setup differs from
 //! cargo's, e.g. gcc-less minimal hosts).
 //!
-//! Contract: one request line per connection. `add NAME ...` answers
-//! `Added { inner: "stub-<name>" }` — the anonymized container-view
-//! form (#47/#58) the caller must wire container paths to; anything
-//! else answers Ok. Deterministic inner form so the tier can ASSERT
-//! the caller followed the server-reported name.
+//! Wire contract (servyi_servatui TypedConnection framing): each
+//! connection sends the command NAME as a JSON string line, then the
+//! Command as a JSON object line; the reply is one JSON Response
+//! line, and the client closes with a `null` line. `add_secret`
+//! answers `Added { inner: "stub-<name>" }` — the anonymized
+//! container-view form (#47/#58) the caller must wire container paths
+//! to; `get_version` answers the real `fuse_protocol::VERSION`
+//! (matching vintages, so the restart machinery stays out of the
+//! way); everything else answers Ok. Deterministic inner form so the
+//! tier can ASSERT the caller followed the server-reported name.
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 
-/// argv/wire vocabulary of the stub.
+/// argv vocabulary of the stub.
 const FLAG_SOCKET: &str = "--socket";
-const CMD_ADD: &str = "add";
-#[allow(unknown_lints)]
-#[allow(inline_literal)]
-const REPLY_OK: &str = "{\"type\":\"ok\"}\n";
 const EXIT_USAGE: i32 = 2;
 const EXIT_BIND: i32 = 3;
+/// JSON command tags the stub answers with substance.
+const TAG_ADD_SECRET: &str = "add_secret";
+const TAG_GET_VERSION: &str = "get_version";
 
-// Necessity: argv walking (skip(1), flag matching) and the WORD reply
-// grammar (split(' ')) — a hand-rolled wire stub, not constants to name.
+// Necessity: argv walking (skip(1), flag matching) and the two-line
+// JSON frame (name line, command line) — a hand-rolled wire stub.
 #[allow(unknown_lints)]
 #[allow(inline_literal)]
 fn main() {
@@ -52,20 +56,46 @@ fn main() {
     for conn in listener.incoming() {
         let Ok(conn) = conn else { continue };
         let mut w = conn;
-        let mut reader = BufReader::new(w.try_clone().expect("clone stub conn"));
-        let mut line = String::new();
-        if reader.read_line(&mut line).is_err() {
+        let mut reader = BufReader::new(match w.try_clone() {
+            Ok(c) => c,
+            Err(_) => continue,
+        });
+        // Frame: name line, then the command object line.
+        let mut name_line = String::new();
+        if reader.read_line(&mut name_line).is_err() {
             continue;
         }
-            // request grammar: WORD args — plain split
-            let mut words = line.split(' ');
-            let reply = match (words.next(), words.next()) {
-                (Some(CMD_ADD), Some(name)) => {
-                    format!("{{\"type\":\"added\",\"inner\":\"stub-{name}\"}}\n")
+        let mut cmd_line = String::new();
+        if reader.read_line(&mut cmd_line).is_err() {
+            continue;
+        }
+        let reply = match serde_json::from_str::<serde_json::Value>(cmd_line.trim()) {
+            Ok(cmd) => match cmd.get("type").and_then(|t| t.as_str()) {
+                Some(TAG_ADD_SECRET) => {
+                    let name = cmd
+                        .get("name")
+                        .and_then(|n| n.as_str())
+                        .unwrap_or_default();
+                    format!(
+                        "{{\"type\":\"added\",\"inner\":\"stub-{name}\"}}\n"
+                    )
                 }
-                _ => REPLY_OK.to_string(),
-            };
+                Some(TAG_GET_VERSION) => {
+                    format!(
+                        "{{\"type\":\"version\",\"version\":\"{}\"}}\n",
+                        fuse_protocol::VERSION
+                    )
+                }
+                _ => "{\"type\":\"ok\"}\n".to_string(),
+            },
+            Err(_) => "{\"type\":\"ok\"}\n".to_string(),
+        };
         let _ = w.write_all(reply.as_bytes());
         let _ = w.flush();
+        // The client closes the frame with a null line; consume it so
+        // the connection ends cleanly before the next accept.
+        let mut tail = String::new();
+        let _ = reader.read_line(&mut tail);
+        let _ = name_line;
     }
 }

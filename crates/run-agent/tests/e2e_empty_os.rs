@@ -207,42 +207,91 @@ impl EmptyOs {
             .env("RUST_LOG", "error")
     }
 
-    /// Run the real run-agent binary inside this empty OS, with no TTY on
-    /// stdin — exactly how the orchestrator spawns it in production.
-    /// `image=None` keeps the naive-user default (`agentbox`): a local-only
-    /// image no registry can resolve, as in issue #1.
-    fn run_agent(&self, image: Option<&str>, extra_args: &[&str]) -> std::process::Output {
+
+
+    /// The shared run-agent invocation: argv, environment, cwd. The
+    /// session POLICY (stdin shape, wall bound, diagnostics) is the
+    /// caller's choice — review on #124: one builder, no duplication.
+    fn base_run_agent_command(
+        &self,
+        image: Option<&str>,
+        extra_args: &[&str],
+    ) -> Command {
         let ws = self.root.join("ws");
         std::fs::create_dir_all(&ws).expect("create workspace");
         let fuse_server = find_fuse_server().expect("fuse-server binary");
-
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_run-agent"));
         self.env(&mut cmd)
-            .args([
-                "e2e-agent",
-                "--runtime",
-                "podman",
-                "--memory",
-                "512M",
-                "--cpus",
-                "1",
-                "--fuse-server",
-            ])
+            .args(["e2e-agent", "--runtime", "podman", "--memory", "512M", "--cpus", "1", "--fuse-server"])
             .arg(&fuse_server)
-            .arg("--socket")
-            .arg(&self.socket)
-            .arg("--oracle-socket")
-            .arg(&self.oracle_socket)
-            .arg("--mount-point")
-            .arg(&self.mount_point);
+            .arg("--socket").arg(&self.socket)
+            .arg("--oracle-socket").arg(&self.oracle_socket)
+            .arg("--mount-point").arg(&self.mount_point);
         if let Some(img) = image {
             cmd.arg("--image").arg(img);
         }
-        cmd.args(extra_args)
-            .current_dir(&ws)
+        cmd.args(extra_args).current_dir(&ws);
+        cmd
+    }
+
+    /// Unbounded legacy shape: null stdin, wait for exit (the original
+    /// `run_agent`; kept for callers that assert on the raw Output).
+    fn run_agent(&self, image: Option<&str>, extra_args: &[&str]) -> std::process::Output {
+        self.base_run_agent_command(image, extra_args)
             .stdin(Stdio::null())
             .output()
             .expect("spawn run-agent")
+    }
+
+    /// Session-shaped run: stdin is a pipe fed `exit\n` after the
+    /// grace (the harness's user leaves the shell), a hard wall bound
+    /// fails with stall diagnostics instead of eating the CI step
+    /// (ps tree, podman ps, the state file), and the combined
+    /// stdout+stderr text is the return.
+    fn run_session(&self, image: Option<&str>, extra_args: &[&str], what: &str) -> String {
+        let mut cmd = self.base_run_agent_command(image, extra_args);
+        cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        let mut child = cmd.spawn().expect("spawn run-agent");
+        {
+            let feed = child.stdin.take().expect("stdin");
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_secs(25));
+                use std::io::Write;
+                let mut feed = feed;
+                let _ = feed.write_all(b"exit\n");
+                let _ = feed.flush();
+            });
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(150);
+        loop {
+            if let Some(_status) = child.try_wait().expect("try wait") {
+                let mut out = child.stdout.take().expect("stdout");
+                let mut err = child.stderr.take().expect("stderr");
+                let mut o = String::new();
+                let mut e = String::new();
+                use std::io::Read;
+                out.read_to_string(&mut o).expect("read stdout");
+                err.read_to_string(&mut e).expect("read stderr");
+                return format!("{o}{e}");
+            }
+            if std::time::Instant::now() >= deadline {
+                let ps = std::process::Command::new("ps")
+                    .args(["-eo", "pid,ppid,stat,etime,args", "--forest"])
+                    .output()
+                    .expect("ps");
+                panic!(
+                    "{what}: run-agent still running after 150s — stall diagnostics:\n\
+                     process tree:\n{}\npodman ps -a:\n{}\nstate file:\n{}\n",
+                    String::from_utf8_lossy(&ps.stdout),
+                    String::from_utf8_lossy(
+                        &self.podman(&["ps", "-a", "--format", "{{.Names}}|{{.State}}|{{.Status}}"]).stdout
+                    ),
+                    std::fs::read_to_string(self.root.join("state.json"))
+                        .unwrap_or_else(|_| "(unreadable)".into()),
+                );
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
     }
 
     fn podman(&self, args: &[&str]) -> std::process::Output {
@@ -709,5 +758,166 @@ fn e2e_pidns_host_shows_the_host_proc() {
         pid1, "sleep",
         "pid 1 inside the container is the container's own sleep — this is \
          a PRIVATE pidns, not --pidns-host (comm: {pid1})"
+    );
+}
+
+
+
+/// Issue #53: `stopped_container_is_started_not_recreated` matches argv
+/// tokens; the behavior those tokens stand for is that DATA and the
+/// /fuse binds survive a session boundary — a re-run must START the
+/// same container (named volume keeps the marker) and the secret must
+/// still read through /fuse afterwards.
+#[test]
+#[ignore = "needs real podman + /dev/fuse; run with --ignored on a capable host"]
+fn e2e_rerun_starts_the_same_container_and_fuse_still_reads() {
+    require_environment("e2e_rerun_starts_the_same_container_and_fuse_still_reads");
+    let os = EmptyOs::new("rerun");
+    let image = "localhost/fuse-rerun:latest";
+    build_workspace_image(&os, image);
+
+    let secret_path = os.home.join("secret.json");
+    let secret_bytes = br#"{"token":"survives-the-rerun"}"#;
+    std::fs::write(&secret_path, secret_bytes).expect("write secret");
+
+    // Session 1: full stack + secret.
+    let first = os.run_session(Some(image),
+        &[
+            "--secret",
+            &secret_path.to_string_lossy(),
+            "/root/secret.json",
+            "--hash",
+            "*",
+        ],
+        "session 1",
+    );
+    let text1 = first;
+    let _ = std::io::stderr().write_all(text1.as_bytes());
+    let container = sole_container(&os);
+    must_start(&os, &container);
+
+    // The state file pins the session-1 identity; capture it to prove
+    // the SAME container (not a recreate) serves session 2.
+    let state1: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(os.root.join("state.json"))
+            .unwrap_or_else(|e| panic!("state file after session 1: {e}; session:\n{text1}")),
+    )
+    .expect("state parses");
+
+    // Plant a marker in the agent-home named volume.
+    let mark = os.podman(&["exec", &container, "touch", "/root/data-marker"]);
+    assert!(
+        mark.status.success(),
+        "planting the marker failed: {}{}",
+        String::from_utf8_lossy(&mark.stdout),
+        String::from_utf8_lossy(&mark.stderr),
+    );
+
+    // Session 2: plain re-run against the existing stack.
+    let second = os.run_session(Some(image), &[], "session 2");
+    let text2 = second;
+    let container2 = sole_container(&os);
+    assert_eq!(
+        container, container2,
+        "a re-run must reuse the existing container, not recreate it"
+    );
+    must_start(&os, &container2);
+
+    // The marker survived the session boundary (data preserved).
+    let survived = os.podman(&["exec", &container, "test", "-f", "/root/data-marker"]);
+    assert!(
+        survived.status.success(),
+        "the data marker did not survive the re-run — the container was \
+         recreated (or the volume lost): {}{}\nsession 2:\n{text2}",
+        String::from_utf8_lossy(&survived.stdout),
+        String::from_utf8_lossy(&survived.stderr),
+    );
+
+    // And /fuse still serves the secret after the re-run.
+    let state2: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(os.root.join("state.json"))
+            .unwrap_or_else(|e| panic!("state file after session 2: {e}")),
+    )
+    .expect("state parses");
+    let fuse_name = state2["secrets"][0]["fuse_name"]
+        .as_str()
+        .or_else(|| state1["secrets"][0]["fuse_name"].as_str())
+        .expect("inner fuse_name")
+        .to_string();
+    let cat = os.podman(&["exec", &container, "cat", &format!("/fuse/{fuse_name}")]);
+    assert!(
+        cat.status.success(),
+        "cat /fuse/{fuse_name} failed after the re-run: {}{}\nsession 2:\n{text2}",
+        String::from_utf8_lossy(&cat.stdout),
+        String::from_utf8_lossy(&cat.stderr),
+    );
+}
+
+
+/// Issue #53, real-stack version: the /fuse probe is bounded in WALL
+/// TIME. The unit tier fakes exit 124; the stub tier cannot host it
+/// (its fake mount never passes the startup check for a path-shaped
+/// secret — rounds 1-4 of the fault probe). Here the real stack's
+/// startup check passes (real mount, real inner), and the container's
+/// `stat` is a shim that sleeps far beyond the probe deadline: the
+/// session must abort within the bound with the TIMEOUT diagnostic.
+#[test]
+#[ignore = "needs real podman + /dev/fuse; run with --ignored on a capable host"]
+fn e2e_probe_is_bounded_in_wall_time_on_a_hung_stat() {
+    require_environment("e2e_probe_is_bounded_in_wall_time_on_a_hung_stat");
+    let os = EmptyOs::new("hungstat");
+    // debian + /workspace + a sleeping `stat` (60s >> the 3s deadline
+    // x4 retries).
+    let df = os.root.join("Dockerfile");
+    std::fs::write(
+        &df,
+        "FROM docker.io/library/debian:bookworm-slim\n\
+         RUN mkdir -p /workspace \\\n\
+         && printf '#!/bin/sh\\nsleep 60\\n' > /usr/local/bin/stat \\\n\
+         && chmod +x /usr/local/bin/stat\n",
+    )
+    .expect("write Dockerfile");
+    let image = "localhost/fuse-hungstat:latest";
+    let build = os.podman(&[
+        "build", "-t", image, "-f", &df.to_string_lossy(), &os.root.to_string_lossy(),
+    ]);
+    assert!(
+        build.status.success(),
+        "image build failed: {}{}",
+        String::from_utf8_lossy(&build.stdout),
+        String::from_utf8_lossy(&build.stderr),
+    );
+
+    let secret_path = os.home.join("secret.json");
+    std::fs::write(&secret_path, br#"{"t":"hung"}"#).expect("write secret");
+
+    let started = std::time::Instant::now();
+    let out = os.run_session(Some(image),
+        &[
+            "--secret",
+            &secret_path.to_string_lossy(),
+            "/root/secret.json",
+            "--hash",
+            "*",
+        ],
+        "hung-stat session",
+    );
+    let wall = started.elapsed();
+    let _ = std::io::stderr().write_all(out.as_bytes());
+
+    assert!(
+        wall < Duration::from_secs(90),
+        "the probe ran unbounded in wall time ({wall:?}) — a hung stat \
+         must be cut off at the timeout deadline, not slept through:\n{out}"
+    );
+    // Bounded-abort diagnostics on the probe path: the preflight tier
+    // ("did not answer a stat within") or the orchestrator's heal path
+    // ("bind is stale and a stop/start did not heal" — which costs at
+    // least two full bounded probe rounds).  The ENOENT startup escape
+    // ("not visible in the FUSE mount") must stay excluded.
+    assert!(
+        out.contains("did not answer a stat within")
+            || out.contains("bind is stale and a stop/start did not heal"),
+        "a persistently hung mount must abort via a bounded probe path:\n{out}"
     );
 }

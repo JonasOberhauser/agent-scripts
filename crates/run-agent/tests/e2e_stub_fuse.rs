@@ -396,6 +396,16 @@ fn secret_wiring_follows_the_server_reported_inner_name() {
         None,
     );
     let _ = std::io::stderr().write_all(out.combined.as_bytes());
+    // The double rotted once already (word grammar vs the JSON frame:
+    // every add failed with "server closed the connection" while this
+    // test stayed green — vacuous, the exact shape #53 exists to kill).
+    // Pin both directions: the add MUST succeed against the double...
+    assert!(
+        !out.combined.contains("failed to add secret"),
+        "the stub double no longer speaks the command protocol:\n{}",
+        out.combined
+    );
+    // ...and preflight must follow the server-reported name.
     assert!(
         !out.combined.contains("never visible in the FUSE mount"),
         "preflight stat'ed the OUTER form — the #47 half-wiring is back:\n{}",
@@ -441,4 +451,18 @@ fn auto_yes_builds_trivial_image_and_reaches_creation() {
         "flow did not reach creation:\n{}",
         out.combined
     );
+
+    // Issue #53: the BUILD itself must be visible to the user as it
+    // happens (run_interactive streams podman's stdio into ours), not
+    // just dispatched — plumbing-level assertions cannot see a build
+    // that silently buffers or discards output.
+    assert!(
+        out.combined.contains("STEP 1")
+            || out.combined.contains("COMMIT agentbox")
+            || out.combined.contains("Writing manifest"),
+        "podman's build progress never reached run-agent's stdio — the \
+         user would stare at a silent prompt during a long build:\n{}",
+        out.combined
+    );
 }
+
