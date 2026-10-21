@@ -676,7 +676,7 @@ mod tests {
         // not connected"); create_dir_all answers EEXIST. Observe all
         // three on the real kernel.
         let meta = std::fs::metadata(&mount);
-        let err = meta.err().expect("stat on a dead FUSE mount must FAIL");
+        let err = meta.expect_err("stat on a dead FUSE mount must FAIL");
         assert!(
             err.to_string().contains("Transport endpoint is not connected")
                 || err.raw_os_error() == Some(libc::ECONNRESET)
