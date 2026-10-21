@@ -952,6 +952,19 @@ fn e2e_startup_recovery_after_a_killed_data_daemon() {
     );
     let _ = std::io::stderr().write_all(text1.as_bytes());
 
+    // Session 2 runs WITHOUT --secret: its state file records nothing
+    // to re-add — the server's policy store is the persistence.  Pin
+    // the inner name from SESSION 1's state.
+    let state1: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(os.root.join("state.json"))
+            .unwrap_or_else(|e| panic!("state file after session 1: {e}")),
+    )
+    .expect("state parses");
+    let fuse_name = state1["secrets"][0]["fuse_name"]
+        .as_str()
+        .expect("inner fuse_name in session-1 state")
+        .to_string();
+
     // Kill the data daemon hard: the kernel keeps the dead mount —
     // exactly the leftover state the mock models.
     let pat = format!("fused.*{}", regex_escape(&os.mount_point.to_string_lossy()));
@@ -979,15 +992,6 @@ fn e2e_startup_recovery_after_a_killed_data_daemon() {
 
     let container = sole_container(&os);
     must_start(&os, &container);
-    let state: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(os.root.join("state.json"))
-            .unwrap_or_else(|e| panic!("state file after recovery: {e}")),
-    )
-    .expect("state parses");
-    let fuse_name = state["secrets"][0]["fuse_name"]
-        .as_str()
-        .expect("inner fuse_name")
-        .to_string();
     let cat = os.podman(&["exec", &container, "cat", &format!("/fuse/{fuse_name}")]);
     assert!(
         cat.status.success(),
