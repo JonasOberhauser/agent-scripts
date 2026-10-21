@@ -792,6 +792,7 @@ fn e2e_rerun_starts_the_same_container_and_fuse_still_reads() {
         "session 1",
     );
     let text1 = first;
+    let _ = std::io::stderr().write_all(text1.as_bytes());
     let container = sole_container(&os);
     must_start(&os, &container);
 
