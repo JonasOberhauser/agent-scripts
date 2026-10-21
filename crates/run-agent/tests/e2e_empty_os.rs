@@ -207,42 +207,91 @@ impl EmptyOs {
             .env("RUST_LOG", "error")
     }
 
-    /// Run the real run-agent binary inside this empty OS, with no TTY on
-    /// stdin — exactly how the orchestrator spawns it in production.
-    /// `image=None` keeps the naive-user default (`agentbox`): a local-only
-    /// image no registry can resolve, as in issue #1.
-    fn run_agent(&self, image: Option<&str>, extra_args: &[&str]) -> std::process::Output {
+
+
+    /// The shared run-agent invocation: argv, environment, cwd. The
+    /// session POLICY (stdin shape, wall bound, diagnostics) is the
+    /// caller's choice — review on #124: one builder, no duplication.
+    fn base_run_agent_command(
+        &self,
+        image: Option<&str>,
+        extra_args: &[&str],
+    ) -> Command {
         let ws = self.root.join("ws");
         std::fs::create_dir_all(&ws).expect("create workspace");
         let fuse_server = find_fuse_server().expect("fuse-server binary");
-
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_run-agent"));
         self.env(&mut cmd)
-            .args([
-                "e2e-agent",
-                "--runtime",
-                "podman",
-                "--memory",
-                "512M",
-                "--cpus",
-                "1",
-                "--fuse-server",
-            ])
+            .args(["e2e-agent", "--runtime", "podman", "--memory", "512M", "--cpus", "1", "--fuse-server"])
             .arg(&fuse_server)
-            .arg("--socket")
-            .arg(&self.socket)
-            .arg("--oracle-socket")
-            .arg(&self.oracle_socket)
-            .arg("--mount-point")
-            .arg(&self.mount_point);
+            .arg("--socket").arg(&self.socket)
+            .arg("--oracle-socket").arg(&self.oracle_socket)
+            .arg("--mount-point").arg(&self.mount_point);
         if let Some(img) = image {
             cmd.arg("--image").arg(img);
         }
-        cmd.args(extra_args)
-            .current_dir(&ws)
+        cmd.args(extra_args).current_dir(&ws);
+        cmd
+    }
+
+    /// Unbounded legacy shape: null stdin, wait for exit (the original
+    /// `run_agent`; kept for callers that assert on the raw Output).
+    fn run_agent(&self, image: Option<&str>, extra_args: &[&str]) -> std::process::Output {
+        self.base_run_agent_command(image, extra_args)
             .stdin(Stdio::null())
             .output()
             .expect("spawn run-agent")
+    }
+
+    /// Session-shaped run: stdin is a pipe fed `exit\n` after the
+    /// grace (the harness's user leaves the shell), a hard wall bound
+    /// fails with stall diagnostics instead of eating the CI step
+    /// (ps tree, podman ps, the state file), and the combined
+    /// stdout+stderr text is the return.
+    fn run_session(&self, image: Option<&str>, extra_args: &[&str], what: &str) -> String {
+        let mut cmd = self.base_run_agent_command(image, extra_args);
+        cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        let mut child = cmd.spawn().expect("spawn run-agent");
+        {
+            let feed = child.stdin.take().expect("stdin");
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_secs(25));
+                use std::io::Write;
+                let mut feed = feed;
+                let _ = feed.write_all(b"exit\n");
+                let _ = feed.flush();
+            });
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(150);
+        loop {
+            if let Some(_status) = child.try_wait().expect("try wait") {
+                let mut out = child.stdout.take().expect("stdout");
+                let mut err = child.stderr.take().expect("stderr");
+                let mut o = String::new();
+                let mut e = String::new();
+                use std::io::Read;
+                out.read_to_string(&mut o).expect("read stdout");
+                err.read_to_string(&mut e).expect("read stderr");
+                return format!("{o}{e}");
+            }
+            if std::time::Instant::now() >= deadline {
+                let ps = std::process::Command::new("ps")
+                    .args(["-eo", "pid,ppid,stat,etime,args", "--forest"])
+                    .output()
+                    .expect("ps");
+                panic!(
+                    "{what}: run-agent still running after 150s — stall diagnostics:\n\
+                     process tree:\n{}\npodman ps -a:\n{}\nstate file:\n{}\n",
+                    String::from_utf8_lossy(&ps.stdout),
+                    String::from_utf8_lossy(
+                        &self.podman(&["ps", "-a", "--format", "{{.Names}}|{{.State}}|{{.Status}}"]).stdout
+                    ),
+                    std::fs::read_to_string(self.root.join("state.json"))
+                        .unwrap_or_else(|_| "(unreadable)".into()),
+                );
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
     }
 
     fn podman(&self, args: &[&str]) -> std::process::Output {
@@ -714,74 +763,6 @@ fn e2e_pidns_host_shows_the_host_proc() {
 
 
 
-/// Run run-agent with a hard wall-clock bound and stall diagnostics
-/// (issue #53 round 1: a hung session ate the whole CI step; the next
-/// hang must NAME itself, not time out the suite).
-fn run_agent_bounded(os: &EmptyOs, image: Option<&str>, extra_args: &[&str], what: &str) -> String {
-    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_run-agent"));
-    let ws = os.root.join("ws");
-    std::fs::create_dir_all(&ws).expect("create workspace");
-    let fuse_server = find_fuse_server().expect("fuse-server binary");
-    os.env(&mut cmd)
-        .args(["e2e-agent", "--runtime", "podman", "--memory", "512M", "--cpus", "1", "--fuse-server"])
-        .arg(&fuse_server)
-        .arg("--socket").arg(&os.socket)
-        .arg("--oracle-socket").arg(&os.oracle_socket)
-        .arg("--mount-point").arg(&os.mount_point);
-    if let Some(img) = image {
-        cmd.arg("--image").arg(img);
-    }
-    cmd.args(extra_args)
-        .current_dir(&ws)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = cmd.spawn().expect("spawn run-agent");
-    // A session ends when the USER exits the interactive shell: type
-    // `exit` once the setup phase has surely run (the exec'd bash on a
-    // pty otherwise sits forever — an open session).  The pipe closes
-    // (EOF) when the feeder thread drops the last handle.
-    {
-        let feed = child.stdin.take().expect("stdin");
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_secs(25));
-            use std::io::Write;
-            let mut feed = feed;
-            let _ = feed.write_all(b"exit\n");
-            let _ = feed.flush();
-        });
-    }
-
-    let deadline = std::time::Instant::now() + Duration::from_secs(150);
-    loop {
-        if let Some(status) = child.try_wait().expect("try_wait") {
-            let _ = status;
-            let mut out = child.stdout.take().expect("stdout");
-            let mut err = child.stderr.take().expect("stderr");
-            let mut o = String::new();
-            let mut e = String::new();
-            use std::io::Read;
-            out.read_to_string(&mut o).expect("read stdout");
-            err.read_to_string(&mut e).expect("read stderr");
-            return format!("{o}{e}");
-        }
-        if std::time::Instant::now() >= deadline {
-            let ps = std::process::Command::new("ps")
-                .args(["-eo", "pid,ppid,stat,etime,args", "--forest"])
-                .output()
-                .expect("ps");
-            panic!(
-                "{what}: run-agent still running after 150s — stall diagnostics:\n\
-                 process tree:\n{}\npodman ps -a:\n{}\nstate file:\n{}\n",
-                String::from_utf8_lossy(&ps.stdout),
-                String::from_utf8_lossy(&os.podman(&["ps", "-a", "--format", "{{.Names}}|{{.State}}|{{.Status}}"]).stdout),
-                std::fs::read_to_string(os.root.join("state.json")).unwrap_or_else(|_| "(unreadable)".into()),
-            );
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    }
-}
-
 /// Issue #53: `stopped_container_is_started_not_recreated` matches argv
 /// tokens; the behavior those tokens stand for is that DATA and the
 /// /fuse binds survive a session boundary — a re-run must START the
@@ -800,9 +781,7 @@ fn e2e_rerun_starts_the_same_container_and_fuse_still_reads() {
     std::fs::write(&secret_path, secret_bytes).expect("write secret");
 
     // Session 1: full stack + secret.
-    let first = run_agent_bounded(
-        &os,
-        Some(image),
+    let first = os.run_session(Some(image),
         &[
             "--secret",
             &secret_path.to_string_lossy(),
@@ -834,7 +813,7 @@ fn e2e_rerun_starts_the_same_container_and_fuse_still_reads() {
     );
 
     // Session 2: plain re-run against the existing stack.
-    let second = run_agent_bounded(&os, Some(image), &[], "session 2");
+    let second = os.run_session(Some(image), &[], "session 2");
     let text2 = second;
     let container2 = sole_container(&os);
     assert_eq!(
@@ -912,9 +891,7 @@ fn e2e_probe_is_bounded_in_wall_time_on_a_hung_stat() {
     std::fs::write(&secret_path, br#"{"t":"hung"}"#).expect("write secret");
 
     let started = std::time::Instant::now();
-    let out = run_agent_bounded(
-        &os,
-        Some(image),
+    let out = os.run_session(Some(image),
         &[
             "--secret",
             &secret_path.to_string_lossy(),
