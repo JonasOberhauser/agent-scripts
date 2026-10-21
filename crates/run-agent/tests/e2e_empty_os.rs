@@ -987,7 +987,7 @@ fn e2e_startup_recovery_after_a_killed_data_daemon() {
 
     // Session 2 against the genuinely dead mount: recovery must run
     // (lazy unmount, fresh stack) and the secret must read again.
-    let text2 = os.run_session(Some(image), &[], "session 2 (dead mount)");
+    let text2 = os.run_session(Some(image), &["/bin/true"], "session 2 (dead mount)");
     let _ = std::io::stderr().write_all(text2.as_bytes());
 
     let container = sole_container(&os);
