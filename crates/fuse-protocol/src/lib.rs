@@ -75,6 +75,12 @@ pub const DEFAULT_ORACLE_SOCKET: &str = "/tmp/fuse-gatekeeper-oracle.sock";
 /// (typed by fuse-server, fused, run-agent, and fuse-client's
 /// respawn argv — one spelling).
 pub const ORACLE_SOCKET_FLAG: &str = "--oracle-socket";
+/// The fused mount-point flag.
+pub const MOUNT_POINT_FLAG: &str = "--mount-point";
+/// The takeover-resume flags (server → successor argv, #103).
+pub const RESUME_FD_FLAG: &str = "--resume-fd";
+pub const RESUME_FDS_BASE_FLAG: &str = "--resume-fds-base";
+pub const RESUME_STATE_FLAG: &str = "--resume-state";
 /// The policy daemon's binary name (clap name, orchestrator default).
 pub const SERVER_BIN: &str = "fuse-server";
 /// The data daemon's binary name (clap name, policy-daemon spawn).

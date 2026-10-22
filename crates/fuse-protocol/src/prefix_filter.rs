@@ -15,6 +15,12 @@
 ///
 /// The candidates that start with `prefix`, in order, unchanged —
 /// pure filtering; formatting stays with the callers.
+/// Does `s` carry `prefix`? A classification of the link-target
+/// namespace (/proc fd targets), routed through the sanctioned seam.
+pub fn has_prefix(s: &str, prefix: &str) -> bool {
+    prefixed([s], prefix).next().is_some()
+}
+
 pub fn prefixed<'a, I, S>(candidates: I, prefix: &'a str) -> impl Iterator<Item = S> + 'a
 where
     I: IntoIterator<Item = S> + 'a,

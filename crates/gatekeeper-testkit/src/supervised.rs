@@ -156,6 +156,11 @@ impl SupervisedStack {
         self.policy.id()
     }
 
+    /// The stack's mountpoint path.
+    pub fn mount(&self) -> &std::path::Path {
+        &self.mount
+    }
+
     /// The stack's private root (sockets, logs, policy store).
     pub fn root(&self) -> &std::path::Path {
         self._root.path()

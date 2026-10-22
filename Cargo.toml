@@ -27,3 +27,10 @@ sha2 = "0.10"
 nix = { version = "0.29", features = ["socket", "uio"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# VENDORED fuser (#103): one added constructor — Session::from_fd_resumed
+# (take over an ALREADY-INITIALIZED connection; stock from_fd waits for
+# an INIT the kernel sends only once per connection). Delta documented
+# in vendor/fuser/README-GATEKEEPER.md; upstreamable.
+[patch.crates-io]
+fuser = { path = "vendor/fuser" }

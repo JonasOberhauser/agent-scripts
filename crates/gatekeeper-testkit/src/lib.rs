@@ -734,6 +734,54 @@ mod adopt_tests {
         );
     }
 
+    /// #103 fd handover, kernel-free tier: an INCOMPATIBLE survivor
+    /// that knows Surrender hands its (stand-in) fd + session over,
+    /// the server TRANSPLANTS into a same-vintage successor with the
+    /// resume argv, and RETIRES the old daemon (it exits 0). The
+    /// wire is real end to end; only the fd is a stand-in (real
+    /// /dev/fuse continuity is the real-mount tier's, CI-verified).
+    #[test]
+    fn an_incompatible_survivor_surrenders_and_the_session_is_transplanted() {
+        let mut stack = Stack::new()
+            .pending_timeout(Duration::from_secs(5))
+            .adopt_window(3)
+            .env("FUSE_FAKE_HELLO_VERSION", "0.0.1")
+            .spawn_supervised();
+        let daemons = stack.daemon_pids();
+        assert_eq!(daemons.len(), 1, "precondition");
+        let old = daemons[0];
+
+        stack.kill_policy();
+        let _new_server = respawn_policy(&stack, 3);
+
+        // takeover: "TAKING OVER" in the log, the OLD daemon retired
+        // (gone), a successor daemon alive carrying --resume-fd.
+        assert!(
+            wait_until(20, || {
+                stack.server_log_contains("TAKING OVER the mount session")
+                    && !stack.daemon_pids().contains(&old)
+                    && !stack.daemon_pids().is_empty()
+            }),
+            "takeover did not complete — daemons {:?} — {}",
+            stack.daemon_pids(),
+            stack.server_log()
+        );
+        // the successor's argv carries the resume contract
+        let out = std::process::Command::new("pgrep")
+            .arg("-af")
+            .arg(format!(
+                "fake-fused.*{}.*resume-fd",
+                stack.mount().display()
+            ))
+            .output()
+            .expect("pgrep -af");
+        let argv = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            argv.contains("--resume-fd 3") && argv.contains("--resume-state"),
+            "successor must resume the session: {argv}"
+        );
+    }
+
     /// No survivor (fresh boot, adoption window set): fresh spawn —
     /// a NEW daemon pid, gate times out honestly.
     #[test]
@@ -756,12 +804,15 @@ mod adopt_tests {
         );
     }
 
-    /// Incompatible vintage: NOT adopted (the #37 mixed-vintage trap)
-    /// — the server spawns a fresh daemon instead. Both live: the
-    /// stale one is parked (not reaped, per the trusted-host call),
-    /// the fresh one serves.
+    /// Incompatible vintage: not ADOPTED (the #37 mixed-vintage trap)
+    /// — and now not parked either: the survivor SURRENDERS its
+    /// session, the server TRANSPLANTS it into a same-vintage
+    /// successor, and the old daemon RETIRES (exits 0, its own
+    /// choice after handing over — not a reap). The detailed wire
+    /// assertions live in the takeover test below; this pins the
+    /// outcome shape: exactly one daemon when the dust settles.
     #[test]
-    fn an_incompatible_survivor_is_not_adopted() {
+    fn an_incompatible_survivor_is_replaced_by_takeover() {
         let mut stack = Stack::new()
             .pending_timeout(Duration::from_secs(5))
             .adopt_window(3)
@@ -775,18 +826,13 @@ mod adopt_tests {
         let _new_server = respawn_policy(&stack, 3);
 
         assert!(
-            wait_until(10, || {
-                stack.daemon_pids().len() == 2
-                    && stack.server_log_contains("not adoptable")
+            wait_until(20, || {
+                !stack.daemon_pids().contains(&stale) && stack.daemon_pids().len() == 1
             }),
-            "an incompatible survivor must be refused adoption and a \
-             fresh daemon spawned — daemons {:?} — {}",
+            "the takeover must retire the old daemon and leave exactly \
+             one successor — daemons {:?} — {}",
             stack.daemon_pids(),
             stack.server_log()
-        );
-        assert!(
-            stack.daemon_pids().contains(&stale),
-            "no reaping: the stale daemon stays parked (trusted host)"
         );
     }
 

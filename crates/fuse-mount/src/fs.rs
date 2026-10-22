@@ -40,7 +40,7 @@ use fuser::{
     FileAttr, FileType, Filesystem, KernelConfig, Request, ReplyAttr, ReplyData, ReplyDirectory,
     ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs,
 };
-use tracing::warn;
+use tracing::{info, warn};
 
 /// The fuse inode number (review: newtype pattern). Opaque to the
 /// kernel and to the container — only ever minted here.
@@ -84,7 +84,7 @@ struct FinoRecord {
     path: PathBuf,
 }
 
-struct StoreInner {
+pub struct StoreInner {
     /// ONE increment-only counter for every node. The only invariants
     /// the FUSE ABI puts on inodes are: root is FUSE_ROOT_ID, live
     /// inodes identify at most one node each, and a number stays bound
@@ -516,11 +516,39 @@ fn open_secret_timeout(
 pub struct FusedFs {
     store: Store,
     oracle: String,
+    /// #103 takeover: fh → host fd for opens made by the PREDECESSOR
+    /// (their fd numbers arrive renumbered via SCM_RIGHTS, so the
+    /// kernel's old fh numbers must resolve through this map). Empty
+    /// on a fresh mount; new opens bypass it (fh = our own fd number).
+    resumed_fds: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u64, std::os::fd::OwnedFd>>>,
 }
 
 impl FusedFs {
     pub fn new(store: Store, oracle_socket: &str) -> Self {
-        Self { store, oracle: oracle_socket.to_string() }
+        Self {
+            store,
+            oracle: oracle_socket.to_string(),
+            resumed_fds: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+        }
+    }
+
+    /// Install the predecessor's open-host-fd table (#103): `fh` is
+    /// the number the KERNEL still references; the fd is the
+    /// renumbered dup received in the takeover batch. RELEASE closes
+    /// through this map; reads by the kernel (DIRECT_IO preads go
+    /// through OUR read path using fh) resolve here too.
+    pub fn resume_fds(
+        &mut self,
+        table: impl IntoIterator<Item = (u64, std::os::fd::OwnedFd)>,
+    ) {
+        let mut map = self.resumed_fds
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        for (fh, fd) in table {
+            let _old = map.insert(fh, fd);
+        }
     }
 
     fn file_attr(&self, ino: u64, size: u64, uid: u32, gid: u32, mode: u32) -> FileAttr {
@@ -740,12 +768,22 @@ impl Filesystem for FusedFs {
         _lock_owner: Option<u64>,
         reply: ReplyData,
     ) {
-        // fh IS the host fd: pread it. Fills exactly `size` bytes
-        // except at EOF (the kernel substitutes zeroes otherwise).
+        // fh IS the host fd — or, for a PREDECESSOR's open (#103
+        // takeover), the renumbered dup in the resumed table. Resolve
+        // once; the map lock never spans a syscall.
+        let resumed = {
+            let map = self.resumed_fds
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            map.get(&fh).map(|owned| {
+                use std::os::fd::AsRawFd as _;
+                owned.as_raw_fd()
+            })
+        };
         let mut out = vec![0u8; size as usize];
         let mut filled = 0usize;
         while filled < size as usize {
-            let fd = fh as i32;
+            let fd = resumed.unwrap_or(fh as i32);
             let dst = out[filled..].as_mut_ptr() as *mut libc::c_void;
             let len = size as usize - filled;
             let at = offset + filled as i64;
@@ -774,6 +812,18 @@ impl Filesystem for FusedFs {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
+        // A PREDECESSOR-issued fh resolves through the takeover map
+        // (its fd number was renumbered in flight, #103); dropping
+        // the OwnedFd closes it. Our own opens use fh = fd number.
+        {
+            let mut map = self.resumed_fds
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if map.remove(&fh).is_some() {
+                reply.ok();
+                return;
+            }
+        }
         // SAFETY: fh was issued by our open as a live fd.
         let fd = fh as i32;
         // SAFETY: `fd` is the kernel handle being released here.
@@ -849,12 +899,227 @@ impl Filesystem for FusedFs {
     }
 }
 
+// ── #103 takeover: session state serialization (schema 1) ──────
+
+/// The daemon-side takeover session schema number. Bump when the
+/// payload shape changes incompatibly; a successor that does not
+/// understand the number DECLINES (never serves a half-understood
+/// session).
+pub const TAKEOVER_SESSION_SCHEMA: u32 = 1;
+
+/// The serialized session: everything the successor needs to serve
+/// the SAME kernel connection — the fino space (so every live inode
+/// keeps meaning what it meant), the frozen tree, the label bijection
+/// (#47), the identity records, and the negotiated FUSE protocol
+/// version (a resumed session never sees INIT — the constructor takes
+/// the version from here).
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct TakeoverState {
+    pub next_fino: u64,
+    pub tree: Vec<TakeoverNode>,
+    pub labels: Vec<(String, String)>,
+    pub identities: Vec<(u64, TakeoverFinoRecord)>,
+    /// The open HOST fds, in SCM_RIGHTS order: `fh` is the number the
+    /// kernel still references; the fd itself arrives as
+    /// payload_fd\[1 + fd_index\]. The successor maps fh → its own
+    /// received fd and serves reads/closes through the map.
+    pub open_fds: Vec<TakeoverOpenFd>,
+    pub proto_major: u32,
+    pub proto_minor: u32,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct TakeoverNode {
+    pub path: String,
+    pub file: Option<TakeoverFileNode>,
+    pub dir_children: Option<Vec<String>>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct TakeoverFileNode {
+    pub fino: u64,
+    pub mode: u32,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct TakeoverFinoRecord {
+    pub identity: Option<(u64, u64)>,
+    pub path: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct TakeoverOpenFd {
+    pub fh: u64,
+    pub fd_index: usize,
+}
+
+/// Snapshot the store as a takeover payload (schema 1). `open_fds`
+/// are discovered from the PROCESS fd table: every fd that is neither
+/// stdio, the /dev/fuse connection, nor one of the known oracle
+/// sockets is a host secret fd whose number IS its fh (open forgot
+/// the OwnedFd into the table with exactly that number).
+pub fn takeover_snapshot(
+    s: &StoreInner,
+    exclude_fds: &[i32],
+    proto_major: u32,
+    proto_minor: u32,
+) -> (TakeoverState, Vec<i32>) {
+    let tree = s
+        .tree
+        .iter()
+        .map(|(path, node)| TakeoverNode {
+            path: path.to_string_lossy().into_owned(),
+            file: match node {
+                Node::File { fino, mode } => Some(TakeoverFileNode {
+                    fino: fino.0,
+                    mode: *mode,
+                }),
+                Node::Dir { .. } => None,
+            },
+            dir_children: match node {
+                Node::Dir { children } => Some(children.keys().cloned().collect()),
+                Node::File { .. } => None,
+            },
+        })
+        .collect();
+    let labels = s.root_labels.iter().map(|(o, i)| (o.clone(), i.clone())).collect();
+    let identities = s
+        .identities
+        .iter()
+        .map(|(fino, rec)| {
+            (
+                fino.0,
+                TakeoverFinoRecord {
+                    identity: rec.identity
+                        .as_ref()
+                        .map(|id| (id.kdev.0, id.kino.0)),
+                    path: rec.path.to_string_lossy().into_owned(),
+                },
+            )
+        })
+        .collect();
+
+    // open host fds: /proc/self/fd minus the known set. fd numbers =
+    // fh values (open's contract: the forgotten OwnedFd's number).
+    let mut host_fds: Vec<i32> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(PROC_SELF_FD) {
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let Ok(fd) = name.parse::<i32>() else { continue };
+            if fd < STDIO_FD_LIMIT || exclude_fds.contains(&fd) {
+                continue;
+            }
+            // only REAL files (host secrets); sockets/pipes/eve are
+            // not transferable state (sockets cannot cross SCM_RIGHTS
+            // meaningfully and belong to live connections of ours).
+            let target = std::fs::read_link(format!("{PROC_SELF_FD}/{fd}"))
+                .unwrap_or_default();
+            let target_str = target.to_string_lossy();
+            if ANON_LINK_PREFIXES
+                .iter()
+                .any(|pfx| fuse_protocol::prefix_filter::has_prefix(&target_str, pfx))
+            {
+                continue;
+            }
+            host_fds.push(fd);
+        }
+    }
+    host_fds.sort();
+    let open_fds = host_fds
+        .iter()
+        .enumerate()
+        .map(|(i, &fd)| TakeoverOpenFd { fh: fd as u64, fd_index: i })
+        .collect();
+
+    (
+        TakeoverState {
+            next_fino: s.next_fino,
+            tree,
+            labels,
+            identities,
+            open_fds,
+            proto_major,
+            proto_minor,
+        },
+        host_fds,
+    )
+}
+
+impl Store {
+    /// Install a restored inner state (#103 takeover resume).
+    pub fn install_restored(&self, inner: StoreInner) {
+        let mut guard = self
+            .0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        *guard = inner;
+    }
+}
+
+/// Rebuild a StoreInner from a takeover payload (schema 1).
+pub fn takeover_restore(state: &TakeoverState) -> Result<StoreInner, String> {
+    let mut tree = std::collections::BTreeMap::new();
+    let _root = tree.insert(
+        std::path::PathBuf::new(),
+        Node::Dir { children: std::collections::BTreeMap::new() },
+    );
+    for n in &state.tree {
+        let path = std::path::PathBuf::from(&n.path);
+        match (&n.file, &n.dir_children) {
+            (Some(f), _) => {
+                let _prev = tree.insert(
+                    path,
+                    Node::File { fino: FuseIno(f.fino), mode: f.mode },
+                );
+            }
+            (None, Some(children)) => {
+                let _prev = tree.insert(
+                    path,
+                    Node::Dir {
+                        children: children
+                            .iter()
+                            .map(|c| (c.clone(), ()))
+                            .collect(),
+                    },
+                );
+            }
+            (None, None) => return Err(format!("takeover node {:?} is neither file nor dir", n.path)),
+        }
+    }
+    let mut root_labels = bimap::BiBTreeMap::new();
+    for (o, i) in &state.labels {
+        let _ins = root_labels.insert(o.clone(), i.clone());
+    }
+    let mut identities = std::collections::HashMap::new();
+    for (fino, rec) in &state.identities {
+        let _ins = identities.insert(
+            FuseIno(*fino),
+            FinoRecord {
+                identity: rec.identity
+                    .map(|(kdev, kino)| {
+                        fuse_protocol::oracle::HostIdentity {
+                            kdev: fuse_protocol::oracle::KDev(kdev),
+                            kino: fuse_protocol::Kino(kino),
+                        }
+                    }),
+                path: std::path::PathBuf::from(&rec.path),
+            },
+        );
+    }
+    Ok(StoreInner {
+        next_fino: state.next_fino,
+        tree,
+        root_labels,
+        identities,
+    })
+}
+
 /// Apply one oracle control line to the store. Returns whether the
 /// line was understood. Unparsable lines are LOUD — silently dropping
 /// them produced the PR #37 field report: an old fuse-server upserting
 /// to a newer fused left an alive-but-empty mount with no diagnostic
 /// anywhere.
-fn apply_control_line(store: &Store, line: &str) -> bool {
+fn apply_control_line(store: &Store, oracle: &std::path::Path, line: &str) -> bool {
     // The Hello ack ({"type":"ok"}) shares the control stream with
     // commands — replies are not commands; consuming silently is
     // correct; flagging it as a parse failure would cry "version
@@ -871,6 +1136,30 @@ fn apply_control_line(store: &Store, line: &str) -> bool {
             store.remove(&name);
             true
         }
+        // #103 fd handover: dup the live /dev/fuse connection fd plus
+        // every open host fd, snapshot the session, ship the batch as
+        // one SCM_RIGHTS message on a FRESH oracle connection. The
+        // kernel connection lives while ANY fd referencing it is open
+        // — our dups + the server's + the successor's carry it across
+        // the swap. We keep serving until Retire.
+        Ok(OracleCommand::Surrender) => {
+            match surrender(store, oracle) {
+                Ok(()) => info!(
+                    "surrendered the mount session (fds + state) — serving until retire"
+                ),
+                Err(e) => warn!(
+                    "surrender failed ({e}) — the restart will fall back to a fresh mount"
+                ),
+            }
+            true
+        }
+        // The successor is serving on its own dups: exit cleanly (our
+        // fd copies close with us; the kernel connection survives on
+        // the successor's).
+        Ok(OracleCommand::Retire) => {
+            info!("retired by the policy daemon — exiting 0");
+            std::process::exit(0);
+        }
         Err(e) => {
             warn!(
                 "oracle control line not understood ({e}): {line:?} — version skew between \
@@ -879,6 +1168,110 @@ fn apply_control_line(store: &Store, line: &str) -> bool {
             false
         }
     }
+}
+
+/// Perform the fd handover (#103). Returns Err when the live
+/// /dev/fuse connection fd cannot be found (mock-fuse tier, or a
+/// daemon not serving a real mount) — the caller degrades honestly.
+fn surrender(store: &Store, oracle: &std::path::Path) -> Result<(), String> {
+    use std::os::fd::AsRawFd as _;
+    // 1. find the live /dev/fuse fd (a REAL file, in our fd table).
+    let mut fuse_fd: Option<i32> = None;
+    if let Ok(entries) = std::fs::read_dir(PROC_SELF_FD) {
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let Ok(fd) = name.parse::<i32>() else { continue };
+            if let Ok(target) = std::fs::read_link(format!("{PROC_SELF_FD}/{fd}")) {
+                if target == std::path::Path::new(DEV_FUSE) {
+                    fuse_fd = Some(fd);
+                    break;
+                }
+            }
+        }
+    }
+    let fuse_fd = fuse_fd.ok_or_else(|| format!("no live {DEV_FUSE} fd (not a real mount)"))?;
+    let exclude = [fuse_fd];
+
+    // 2. snapshot (state + discovered open host fds).
+    let (state, host_fds) = {
+        let inner = store
+            .0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        // the negotiated protocol version: this build mounted with
+        // abi-7-9, and the kernel never negotiates above the
+        // daemon's offer — resuming with our compiled maximum is
+        // exact.
+        takeover_snapshot(
+            &inner,
+            &exclude,
+            KERNEL_ABI_MAJOR,
+            KERNEL_ABI_MINOR,
+        )
+    };
+
+    // 3. dup everything (the originals live on: ours keep serving).
+    use std::os::fd::FromRawFd as _;
+    let mut owned: Vec<std::os::fd::OwnedFd> = Vec::with_capacity(1 + host_fds.len());
+    for fd in std::iter::once(fuse_fd).chain(host_fds.iter().copied()) {
+        let dup = nix_dup(fd)?;
+        // SAFETY: dup is a live descriptor returned by the clone
+        // above; ownership transfers to the OwnedFd.
+        owned.push(unsafe { std::os::fd::OwnedFd::from_raw_fd(dup) });
+    }
+
+    // 4. fresh connection, one line + one SCM_RIGHTS batch.
+    let mut conn = UnixStream::connect(oracle).map_err(|e| format!("connect oracle: {e}"))?;
+    let payload = OracleRequest::SurrenderPayload {
+        session_schema: TAKEOVER_SESSION_SCHEMA,
+        state: serde_json::to_value(&state).map_err(|e| e.to_string())?,
+    };
+    let line = serde_json::to_string(&payload).map_err(|e| e.to_string())?;
+    let raws: Vec<i32> = owned.iter().map(|f| f.as_raw_fd()).collect();
+    send_line_with_fds(&mut conn, &line, &raws)?;
+    // the ack is optional; drain what arrives.
+    let mut ack = String::new();
+    let _rd = BufReader::new(&conn).read_line(&mut ack);
+    Ok(())
+}
+
+/// dup(2) with hoisted operands (the unsafe_scope lint's one-op rule).
+fn nix_dup(fd: i32) -> Result<i32, String> {
+    use std::os::fd::{BorrowedFd, IntoRawFd as _};
+    // SAFETY: fd is a live descriptor owned by the caller for the
+    // duration of this call; the borrow ends before return.
+    let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+    let dup = borrowed
+        .try_clone_to_owned()
+        .map_err(|e| format!("dup fd {fd}: {e}"))?;
+    Ok(dup.into_raw_fd())
+}
+
+/// One line + one SCM_RIGHTS batch (the mirror of the server's
+/// read-with-cmsg).
+fn send_line_with_fds(
+    conn: &mut UnixStream,
+    line: &str,
+    fds: &[std::os::fd::RawFd],
+) -> Result<(), String> {
+    use nix::sys::socket::{sendmsg, ControlMessage, MsgFlags};
+    use std::io::IoSlice;
+    use std::os::unix::io::AsRawFd as _;
+    let payload_bytes = format!("{line}\n");
+    let iov = [IoSlice::new(payload_bytes.as_bytes())];
+    let cmsg = [ControlMessage::ScmRights(fds)];
+    let sent = sendmsg::<()>(
+        conn.as_raw_fd(),
+        &iov,
+        &cmsg,
+        MsgFlags::empty(),
+        None,
+    )
+    .map_err(|e| format!("sendmsg: {e}"))?;
+    if sent == 0 {
+        return Err("sendmsg wrote nothing".into());
+    }
+    Ok(())
 }
 
 /// statvfs traditional values (the frozen-tree convention). The
@@ -897,6 +1290,24 @@ const MODE_DIR: u16 = 0o555;
 const IO_BUFFER: usize = 4096;
 /// The control socket's connect timeout.
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(10);
+// Necessity: the path IS the kernel's stable name (not a choice).
+#[allow(unknown_lints)]
+#[allow(inline_literal)]
+const PROC_SELF_FD: &str = "/proc/self/fd";
+// Necessity: the device path IS its stable name (not a choice).
+#[allow(unknown_lints)]
+#[allow(inline_literal)]
+const DEV_FUSE: &str = "/dev/fuse";
+/// fds below this are std streams, never host secrets.
+const STDIO_FD_LIMIT: i32 = 3;
+// Necessity: table form (the strings ARE the kernel's link prefixes).
+#[allow(unknown_lints)]
+#[allow(inline_literal)]
+const ANON_LINK_PREFIXES: [&str; 3] = ["socket:", "pipe:", "anon_inode:"];
+/// The kernel ABI this build offers on resume (mounts negotiate
+/// abi-7-9; the kernel never negotiates above the daemon's offer).
+const KERNEL_ABI_MAJOR: u32 = 7;
+const KERNEL_ABI_MINOR: u32 = 9;
 
 /// Maintain the CONTROL connection to the policy daemon: say hello,
 /// then apply every Serve/Remove it pushes. Reconnects on loss.
@@ -933,7 +1344,8 @@ pub fn run_control_loop(store: Store, oracle_socket: String) {
                 match reader.read_line(&mut line) {
                     Ok(0) | Err(_) => break,
                     Ok(_) => {
-                        let _applied = apply_control_line(&store, &line);
+                        let _applied =
+                            apply_control_line(&store, std::path::Path::new(&oracle_socket), &line);
                     }
                 }
             }
@@ -945,6 +1357,58 @@ pub fn run_control_loop(store: Store, oracle_socket: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── #103 takeover: snapshot/restore round-trips the session ──
+
+    fn sample_inner() -> StoreInner {
+        let mut s = StoreInner::new();
+        let _ = mint_fino(&mut s, Path::new("api.yaml"), Some(
+            fuse_protocol::oracle::HostIdentity {
+                kdev: fuse_protocol::oracle::KDev(9),
+                kino: fuse_protocol::oracle::Kino(77),
+            },
+        ));
+        s
+    }
+
+    #[test]
+    fn takeover_state_round_trips() {
+        let inner = sample_inner();
+        let (ts, _fds) = takeover_snapshot(&inner, &[], 7, 9);
+        let json = serde_json::to_value(&ts).expect("serialize");
+        let ts2: TakeoverState = serde_json::from_value(json).expect("deserialize");
+        let restored = takeover_restore(&ts2).expect("restore");
+        assert_eq!(restored.next_fino, inner.next_fino);
+        assert_eq!(restored.tree.len(), inner.tree.len());
+        let found = restored
+            .identities
+            .values()
+            .any(|r| match r.identity.as_ref() {
+                Some(id) => id.kdev.0 == 9 && id.kino.0 == 77,
+                None => false,
+            });
+        assert!(found, "identity record survived the round trip");
+        // proto version carried for the resumed constructor
+        assert_eq!((ts.proto_major, ts.proto_minor), (7, 9));
+    }
+
+    #[test]
+    fn takeover_restore_rejects_shapeless_nodes() {
+        let ts = TakeoverState {
+            next_fino: 1,
+            tree: vec![TakeoverNode {
+                path: "x".into(),
+                file: None,
+                dir_children: None,
+            }],
+            labels: vec![],
+            identities: vec![],
+            open_fds: vec![],
+            proto_major: 7,
+            proto_minor: 9,
+        };
+        assert!(takeover_restore(&ts).is_err());
+    }
 
     // ── fuzz: the control channel (the real daemon code, in-process) ──
 
@@ -1054,7 +1518,7 @@ mod tests {
                         _ => String::from_utf8_lossy(&[(rng.next() % 256) as u8; 6]).into_owned(),
                     },
                 };
-                let _ = apply_control_line(&s, &line);
+                let _ = apply_control_line(&s, std::path::Path::new("/nonexistent-oracle"), &line);
             }
             assert_tree_invariants(&s, seed);
         }
@@ -1176,7 +1640,7 @@ mod tests {
         // parse failure would cry "version skew" on every healthy
         // connection (seen live while reproducing #39).
         let s = Store::default();
-        assert!(!apply_control_line(&s, r#"{"type":"ok"}"#));
+        assert!(!apply_control_line(&s, std::path::Path::new("/nonexistent-oracle"), r#"{"type":"ok"}"#));
     }
 
     #[test]
