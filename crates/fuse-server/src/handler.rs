@@ -144,6 +144,7 @@ fn register_secret(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{BufRead as _, Write as _};
     fn hub() -> crate::oracle_service::OracleHub {
         crate::oracle_service::OracleHub::new()
     }
@@ -199,27 +200,64 @@ mod tests {
 
     #[test]
     fn add_then_remove() {
-        let s = ServerState::new();
+        // Issue #56: the mount seam must not be stubbed by absence —
+        // a REAL control connection (as the oracle_service snapshot
+        // test does it) must receive the Serve line for the add.
+        let dir = tempfile::tempdir().unwrap();
+        let oracle = dir.path().join("h56.sock");
+        let s = std::sync::Arc::new(ServerState::new());
+        let hub = crate::oracle_service::OracleHub::new();
+        {
+            let (st, hb, p) = (std::sync::Arc::clone(&s), hub.clone(), oracle.clone());
+            std::thread::spawn(move || {
+                let _ = crate::oracle_service::run_oracle_server(&p, st, hb);
+            });
+        }
+        for _ in 0..200 {
+            if oracle.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let mut conn = std::os::unix::net::UnixStream::connect(&oracle).unwrap();
+        conn.write_all(b"{\"type\":\"hello\"}\n").unwrap();
+        let mut reader = std::io::BufReader::new(conn.try_clone().unwrap());
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap(); // Ok ack
+
         let src = std::env::temp_dir().join("mr4-new.bin");
         std::fs::write(&src, b"DATA").unwrap();
         let resp = handle_command(
             Command::AddSecret { name: "new".into(), path: src.to_str().unwrap().into(), hash: "h".into(), mode: 0o600 },
-            &s,
-            &hub(),
+            &*s,
+            &hub,
         );
         assert!(matches!(resp, Response::Added { .. }));
 
+        // The Serve line ARRIVES on the control connection (mount seam).
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        let cmd: fuse_protocol::oracle::OracleCommand =
+            serde_json::from_str(line.trim()).unwrap();
+        assert!(
+            matches!(
+                &cmd,
+                fuse_protocol::oracle::OracleCommand::Serve { name, .. } if name == "new"
+            ),
+            "the add must reach the mount seam: {cmd:?}"
+        );
+
         // grant-forever round trip on a pending with a package hash
         s.add("k", "/tmp/host/k", 1, "h");
-        let _ = handle_command(Command::GrantForever { id: 1 }, &s, &hub()); // unknown id -> error, no panic
+        let _ = handle_command(Command::GrantForever { id: 1 }, &*s, &hub); // unknown id -> error, no panic
         let id = {
             s.create_pending("k", 7, Some("pkg"), "mismatch", None);
             s.pending.iter().next().unwrap().id
         };
-        let resp = handle_command(Command::GrantForever { id }, &s, &hub());
+        let resp = handle_command(Command::GrantForever { id }, &*s, &hub);
         assert_eq!(resp, Response::Ok);
 
-        let resp = handle_command(Command::RemoveSecret { name: "new".into() }, &s, &hub());
+        let resp = handle_command(Command::RemoveSecret { name: "new".into() }, &*s, &hub);
         assert_eq!(resp, Response::Ok);
     }
 
