@@ -2918,9 +2918,15 @@ mod tests {
             "[forever] must RENDER highlighted under the mouse (issue #55)"
         );
 
+        // Move into the row's TEXT area: inside the panel, swallowed,
+        // but over no button (row.x itself lands on a button — the
+        // fault probe caught the clearing assert being vacuous).
         assert!(
-            matches!(layer_obj.on_event(&moved(row.x, row.y), &ctx), EventResult::Swallow),
-            "Moved off (still inside the panel, over no button) swallowed"
+            matches!(
+                layer_obj.on_event(&moved(row.x + 5, row.y), &ctx),
+                EventResult::Swallow
+            ),
+            "Moved into the text area swallowed"
         );
         let mut off = Vec::new();
         layer_obj.on_overlay(&mut ctx, &mut off); // frame 3: hover gone
