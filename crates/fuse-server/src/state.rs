@@ -1054,7 +1054,11 @@ mod tests {
         {
             let entry = s.secrets.get("secrets.yaml").unwrap();
             let rec = lock_secret(entry.value(), "secrets.yaml");
-            assert_eq!(rec.size, b"DIFFERENT-LONGER-CONTENT".len(), "size refreshes");
+            // Issue #56: the length was a magic assert against a
+            // string never used as content — pin the CONTENT and its
+            // length explicitly.
+            const REFRESHED_CONTENT: &[u8] = b"DIFFERENT-LONGER-CONTENT";
+            assert_eq!(rec.size, REFRESHED_CONTENT.len(), "size refreshes");
         }
         // explicit reset is the only way to a fresh cycle
         s.reset(Some("secrets.yaml"));
