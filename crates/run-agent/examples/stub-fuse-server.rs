@@ -56,17 +56,26 @@ fn main() {
     for conn in listener.incoming() {
         let Ok(conn) = conn else { continue };
         let mut w = conn;
+        // Bounded reads: a client that dies mid-frame (or never sends
+        // the closing null) must not wedge the accept loop — a CI
+        // failure showed the NEXT connection never being served.
+        let _ = w.set_read_timeout(Some(std::time::Duration::from_secs(5)));
         let mut reader = BufReader::new(match w.try_clone() {
             Ok(c) => c,
-            Err(_) => continue,
+            Err(e) => {
+                eprintln!("stub: clone conn failed: {e}");
+                continue;
+            }
         });
         // Frame: name line, then the command object line.
         let mut name_line = String::new();
-        if reader.read_line(&mut name_line).is_err() {
+        if let Err(e) = reader.read_line(&mut name_line) {
+            eprintln!("stub: name read failed: {e}");
             continue;
         }
         let mut cmd_line = String::new();
-        if reader.read_line(&mut cmd_line).is_err() {
+        if let Err(e) = reader.read_line(&mut cmd_line) {
+            eprintln!("stub: command read failed: {e}");
             continue;
         }
         let reply = match serde_json::from_str::<serde_json::Value>(cmd_line.trim()) {
@@ -93,7 +102,9 @@ fn main() {
         let _ = w.write_all(reply.as_bytes());
         let _ = w.flush();
         // The client closes the frame with a null line; consume it so
-        // the connection ends cleanly before the next accept.
+        // the connection ends cleanly.  Bounded: a client that never
+        // sends it (or dies first) must not hold the accept loop.
+        let _ = w.set_read_timeout(Some(std::time::Duration::from_millis(500)));
         let mut tail = String::new();
         let _ = reader.read_line(&mut tail);
         let _ = name_line;
