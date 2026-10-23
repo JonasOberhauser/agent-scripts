@@ -396,6 +396,14 @@ fn secret_wiring_follows_the_server_reported_inner_name() {
         None,
     );
     let _ = std::io::stderr().write_all(out.combined.as_bytes());
+    // The spawned server's stderr lands in its log file — surface it
+    // whenever the double looks rotted (one CI flake showed "server
+    // closed the connection" with the protocol locally verified).
+    if out.combined.contains("failed to add secret") {
+        if let Ok(log) = std::fs::read_to_string(seam.ws.join("fuse-server.log")) {
+            eprintln!("--- stub fuse-server.log:\n{log}");
+        }
+    }
     // The double rotted once already (word grammar vs the JSON frame:
     // every add failed with "server closed the connection" while this
     // test stayed green — vacuous, the exact shape #53 exists to kill).
