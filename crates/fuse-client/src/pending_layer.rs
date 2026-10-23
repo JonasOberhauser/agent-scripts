@@ -1718,6 +1718,48 @@ mod tests {
         assert!(dimmed(widgets.last().unwrap()), "all in flight dims the all-row");
     }
 
+
+    /// Render every widget entry into a Buffer and join the visible
+    /// cell text — the user-visible surface, not internal state.
+    fn rendered_text(widgets: &[servyi_servatui::WidgetEntry]) -> String {
+        let mut out = String::new();
+        for e in widgets {
+            let mut buf = ratatui::buffer::Buffer::empty(e.area);
+            e.widget.render_ref(e.area, &mut buf);
+            for c in buf.content() {
+                out.push(c.symbol().chars().next().unwrap_or(' '));
+            }
+        }
+        out
+    }
+
+    /// Whether the CELLS of `rect` render with the given modifier.
+    /// Buttons are spans inside row widgets, so the widget COVERING
+    /// the rect is rendered and only the rect's cells are checked.
+    fn area_has_modifier(
+        widgets: &[servyi_servatui::WidgetEntry],
+        rect: ratatui::layout::Rect,
+        m: ratatui::style::Modifier,
+    ) -> bool {
+        for e in widgets {
+            if !e.area.intersects(rect) {
+                continue;
+            }
+            let mut buf = ratatui::buffer::Buffer::empty(e.area);
+            e.widget.render_ref(e.area, &mut buf);
+            for y in rect.y..rect.y + rect.height {
+                for x in rect.x..rect.x + rect.width {
+                    if let Some(c) = buf.cell((x, y)) {
+                        if c.modifier.contains(m) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+
     /// Disabled buttons are CLICK noops: after a decision is
     /// dispatched, clicking the row's other buttons (and the all-row)
     /// must not produce a second dispatch.
@@ -1813,11 +1855,23 @@ mod tests {
         };
         layer_obj.on_overlay(&mut ctx, &mut widgets);
         layer_obj.in_flight.borrow_mut().insert(31, Instant::now());
+        let mut grayed = Vec::new();
+        layer_obj.on_overlay(&mut ctx, &mut grayed);
+        let row_area = row_rect(panel_rect(ctx.terminal_area), 0);
+        assert!(
+            area_has_modifier(&grayed, row_area, Modifier::DIM),
+            "precondition: the in-flight row renders grayed"
+        );
         *layer_obj.pending.lock().unwrap() = Vec::new();
-        layer_obj.on_overlay(&mut ctx, &mut widgets);
+        let mut cleared = Vec::new();
+        layer_obj.on_overlay(&mut ctx, &mut cleared);
         assert!(
             layer_obj.in_flight.borrow().is_empty(),
             "consumed decision must clear in-flight"
+        );
+        assert!(
+            !area_has_modifier(&cleared, row_area, Modifier::DIM),
+            "the row must RENDER un-grayed once the request disappears (issue #55)"
         );
     }
 
@@ -1837,8 +1891,14 @@ mod tests {
             .in_flight
             .borrow_mut()
             .insert(31, Instant::now() - IN_FLIGHT_TIMEOUT - Duration::from_secs(1));
-        layer_obj.on_overlay(&mut ctx, &mut widgets);
+        let mut expired = Vec::new();
+        layer_obj.on_overlay(&mut ctx, &mut expired);
         assert!(layer_obj.in_flight.borrow().is_empty(), "stale in-flight must expire");
+        let row_area = row_rect(panel_rect(ctx.terminal_area), 0);
+        assert!(
+            !area_has_modifier(&expired, row_area, Modifier::DIM),
+            "a lost reply must not gray the row forever (issue #55)"
+        );
     }
 
     /// The too-small warning reaches the shell's LOG WINDOW via the
@@ -1882,15 +1942,6 @@ mod tests {
     /// rows, no clickable buttons.
     #[test]
     fn too_small_shell_shows_hint_not_buttons() {
-        let dir = tempfile::tempdir().unwrap();
-        let sock = dir.path().join("panel.sock");
-        fake_server(&sock, vec![31]);
-
-        let pending: PendingIds = Arc::new(Mutex::new(ids(&[31])));
-        let mut display = servatui_display::Display::with_palette(Vec::new());
-        display.add_layer(Box::new(layer(pending, &sock)));
-        // Terminal narrower than PANEL_WIDTH.
-        let _ = display; // frame below needs the real overlay path.
         let mut layer_obj = layer(Arc::new(Mutex::new(ids(&[31]))), Path::new("/x"));
         let mut widgets = Vec::new();
         let mut ctx = servatui_display::LayerCtx {
@@ -1899,31 +1950,21 @@ mod tests {
             terminal_area: Rect::new(0, 0, 40, 24),
             my_widgets: &[],
         };
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            layer_obj.on_overlay(&mut ctx, &mut widgets)
-        }));
-        let text: String = widgets
-            .iter()
-            .map(|w| w.name.to_string())
-            .collect::<Vec<_>>()
-            .join(",");
-        let _ = text;
-        let mut layer2 = layer(Arc::new(Mutex::new(ids(&[31]))), Path::new("/x"));
-        let mut w2 = Vec::new();
-        // Direct: too small → hint widgets exist, grid has no buttons.
-        let mut ctx2 = servatui_display::LayerCtx {
-            id: servatui_display::LayerId::BUILTIN,
-            color: Color::Reset,
-            terminal_area: Rect::new(0, 0, 40, 24),
-            my_widgets: &[],
-        };
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            layer2.on_overlay(&mut ctx2, &mut w2)
-        }));
+        layer_obj.on_overlay(&mut ctx, &mut widgets);
+
+        // The RENDERED surface (issue #55): the hint text is visible...
+        let text = rendered_text(&widgets);
         assert!(
-            layer2.grid.children.is_empty(),
-            "no clickable buttons in the small-shell fallback"
+            text.contains("pending"),
+            "the small-shell hint must render the pending-command hint: {text:?}"
         );
+        // ...and NO button labels render anywhere.
+        for label in [LABEL_GRANT, LABEL_DENY, LABEL_GRANT_ALL, LABEL_DENY_ALL] {
+            assert!(
+                !text.contains(label),
+                "no clickable buttons may render below the minimum width: {label} in {text:?}"
+            );
+        }
     }
 
     #[test]
@@ -2780,6 +2821,22 @@ mod tests {
             "cursor must land on the LIVE row below, not the grayed one"
         );
         assert_eq!(layer_obj.owner.get(), Owner::Keyboard);
+
+        // The rendered outcome (issue #55): the landed row's [deny]
+        // shows the keyboard highlight; the grayed row shows none.
+        let mut taken = Vec::new();
+        layer_obj.on_overlay(&mut ctx, &mut taken);
+        let panel = panel_rect(ctx.terminal_area);
+        let (live_deny, _) = button_pair(row_rect(panel, 1), false);
+        let (dead_deny, _) = button_pair(row_rect(panel, 0), false);
+        assert!(
+            area_has_modifier(&taken, live_deny, Modifier::REVERSED),
+            "the keyboard cursor must RENDER its highlight on the live row"
+        );
+        assert!(
+            !area_has_modifier(&taken, dead_deny, Modifier::REVERSED),
+            "the grayed row must not render a highlight"
+        );
     }
 
     /// Regression (live finding): the all-row buttons must highlight
@@ -2836,23 +2893,49 @@ mod tests {
         let sock = dir.path().join("panel.sock");
         fake_server(&sock, vec![31, 37]);
 
-        let pending: PendingIds = Arc::new(Mutex::new(ids(&[31, 37])));
-        let mut display = servatui_display::Display::with_palette(Vec::new());
-        display.add_layer(Box::new(layer(pending, &sock)));
-        frame_with_pending(&mut display);
+        // Issue #55: the name promises hover UPDATES across frames —
+        // assert the rendered highlight, not just that events swallow.
+        let mut layer_obj = layer(Arc::new(Mutex::new(ids(&[31, 37]))), &sock);
+        let mut ctx = servatui_display::LayerCtx {
+            id: servatui_display::LayerId::BUILTIN,
+            color: Color::Reset,
+            terminal_area: Rect::new(0, 0, 80, 24),
+            my_widgets: &[],
+        };
+        let mut widgets = Vec::new();
+        layer_obj.on_overlay(&mut ctx, &mut widgets); // frame 1: grid
 
-        let row = row_rect(panel_rect(Rect::new(0, 0, 80, 24)), 1);
+        let row = row_rect(panel_rect(ctx.terminal_area), 1);
         let forever = forever_rect(row);
         assert!(
-            display.route_event(&moved(forever.x + 1, forever.y)),
-            "Moved swallowed"
+            matches!(layer_obj.on_event(&moved(forever.x + 1, forever.y), &ctx), EventResult::Swallow),
+            "Moved over [forever] swallowed"
         );
-        frame_with_pending(&mut display);
+        let mut hovered = Vec::new();
+        layer_obj.on_overlay(&mut ctx, &mut hovered); // frame 2: WITH hover
         assert!(
-            display.route_event(&moved(row.x, row.y)),
-            "Moved off (still inside the panel, over no button) swallowed"
+            area_has_modifier(&hovered, forever, Modifier::REVERSED),
+            "[forever] must RENDER highlighted under the mouse (issue #55)"
         );
-        frame_with_pending(&mut display);
+
+        // Move to the cell just LEFT of the leftmost button:
+        // derived from the button geometry, inside the panel, over no
+        // button (row.x itself can land on a button — the fault probe
+        // caught the clearing assert being vacuous).
+        let text_cell = (forever.x.saturating_sub(1), row.y);
+        assert!(
+            matches!(
+                layer_obj.on_event(&moved(text_cell.0, text_cell.1), &ctx),
+                EventResult::Swallow
+            ),
+            "Moved into the text area swallowed"
+        );
+        let mut off = Vec::new();
+        layer_obj.on_overlay(&mut ctx, &mut off); // frame 3: hover gone
+        assert!(
+            !area_has_modifier(&off, forever, Modifier::REVERSED),
+            "the highlight must RENDER away after moving off"
+        );
     }
 
     #[test]

@@ -269,6 +269,46 @@ impl Seam {
     }
 }
 
+
+// ── the stub double vs the REAL client path (no podman needed) ──
+//
+// The CI failure "failed to add secret ... server closed the
+// connection" is reproducible only through run_command_once's
+// TypedConnection framing — a raw socket driver is not the same
+// proof.  This drives the actual library call against the actual
+// example binary.
+#[test]
+fn stub_double_speaks_run_command_once() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let stub = compile_stub_fuse_server(dir.path());
+    let sock = dir.path().join("probe.sock");
+    let mut child = Command::new(&stub)
+        .arg("--socket")
+        .arg(&sock)
+        .stdin(Stdio::null())
+        .spawn()
+        .expect("spawn stub");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !sock.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let cmd = fuse_protocol::protocol::Command::AddSecret {
+        name: "secrets.yaml".into(),
+        path: "/tmp/x".into(),
+        hash: "*".into(),
+        mode: 0o600,
+    };
+    let reply = fuse_protocol::servatui_protocols::run_command_once(&sock, "add", &cmd);
+    let _ = child.kill();
+    let _ = child.wait();
+    match reply {
+        Ok(fuse_protocol::Response::Added { inner }) => {
+            assert!(inner.contains("secrets.yaml"), "stub inner form: {inner}");
+        }
+        other => panic!("run_command_once against the stub: {other:?}"),
+    }
+}
+
 // ── tests ───────────────────────────────────────────────────────
 
 #[test]
@@ -396,6 +436,14 @@ fn secret_wiring_follows_the_server_reported_inner_name() {
         None,
     );
     let _ = std::io::stderr().write_all(out.combined.as_bytes());
+    // The spawned server's stderr lands in its log file — surface it
+    // whenever the double looks rotted (one CI flake showed "server
+    // closed the connection" with the protocol locally verified).
+    if out.combined.contains("failed to add secret") {
+        if let Ok(log) = std::fs::read_to_string(seam.ws.join("fuse-server.log")) {
+            eprintln!("--- stub fuse-server.log:\n{log}");
+        }
+    }
     // The double rotted once already (word grammar vs the JSON frame:
     // every add failed with "server closed the connection" while this
     // test stayed green — vacuous, the exact shape #53 exists to kill).
