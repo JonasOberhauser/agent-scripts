@@ -2918,12 +2918,14 @@ mod tests {
             "[forever] must RENDER highlighted under the mouse (issue #55)"
         );
 
-        // Move into the row's TEXT area: inside the panel, swallowed,
-        // but over no button (row.x itself lands on a button — the
-        // fault probe caught the clearing assert being vacuous).
+        // Move to the cell just LEFT of the leftmost button:
+        // derived from the button geometry, inside the panel, over no
+        // button (row.x itself can land on a button — the fault probe
+        // caught the clearing assert being vacuous).
+        let text_cell = (forever.x.saturating_sub(1), row.y);
         assert!(
             matches!(
-                layer_obj.on_event(&moved(row.x + 5, row.y), &ctx),
+                layer_obj.on_event(&moved(text_cell.0, text_cell.1), &ctx),
                 EventResult::Swallow
             ),
             "Moved into the text area swallowed"
