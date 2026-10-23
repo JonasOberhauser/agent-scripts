@@ -229,7 +229,7 @@ mod tests {
         std::fs::write(&src, b"DATA").unwrap();
         let resp = handle_command(
             Command::AddSecret { name: "new".into(), path: src.to_str().unwrap().into(), hash: "h".into(), mode: 0o600 },
-            &*s,
+            &s,
             &hub,
         );
         assert!(matches!(resp, Response::Added { .. }));
@@ -249,15 +249,15 @@ mod tests {
 
         // grant-forever round trip on a pending with a package hash
         s.add("k", "/tmp/host/k", 1, "h");
-        let _ = handle_command(Command::GrantForever { id: 1 }, &*s, &hub); // unknown id -> error, no panic
+        let _ = handle_command(Command::GrantForever { id: 1 }, &s, &hub); // unknown id -> error, no panic
         let id = {
             s.create_pending("k", 7, Some("pkg"), "mismatch", None);
             s.pending.iter().next().unwrap().id
         };
-        let resp = handle_command(Command::GrantForever { id }, &*s, &hub);
+        let resp = handle_command(Command::GrantForever { id }, &s, &hub);
         assert_eq!(resp, Response::Ok);
 
-        let resp = handle_command(Command::RemoveSecret { name: "new".into() }, &*s, &hub);
+        let resp = handle_command(Command::RemoveSecret { name: "new".into() }, &s, &hub);
         assert_eq!(resp, Response::Ok);
     }
 
