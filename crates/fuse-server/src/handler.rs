@@ -220,6 +220,9 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         let mut conn = std::os::unix::net::UnixStream::connect(&oracle).unwrap();
+        // Bounded wait: a missing Serve line must FAIL in seconds with
+        // the timeout as evidence, never hang the suite (#120's lesson).
+        conn.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
         conn.write_all(b"{\"type\":\"hello\"}\n").unwrap();
         let mut reader = std::io::BufReader::new(conn.try_clone().unwrap());
         let mut line = String::new();
@@ -234,9 +237,12 @@ mod tests {
         );
         assert!(matches!(resp, Response::Added { .. }));
 
-        // The Serve line ARRIVES on the control connection (mount seam).
+        // The Serve line ARRIVES on the control connection (mount seam);
+        // the read timeout above turns its absence into a fast failure.
         line.clear();
-        reader.read_line(&mut line).unwrap();
+        reader
+            .read_line(&mut line)
+            .expect("the Serve line must arrive within the read timeout");
         let cmd: fuse_protocol::oracle::OracleCommand =
             serde_json::from_str(line.trim()).unwrap();
         assert!(
