@@ -283,4 +283,6 @@ terminating session command), never by wedging a pty.
 
 House style: squash merges only; test-first commits for bugfix PRs
 (the failing test, then the fix); issues filed for every real finding
-a probe uncovers, even (especially) when it was bycatch.
+a probe uncovers, even (especially) when it was bycatch. Tracked
+binaries are CI-enforced (#104): the hygiene step fails the build on
+any NUL-byte file in the tree — the fixture-binary incident class.
