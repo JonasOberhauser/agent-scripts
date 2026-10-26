@@ -97,7 +97,16 @@ mod tests {
             "add answers Added (with the container-view name): {lines:?}"
         );
 
-        assert!(state.secrets.contains_key("new.yaml"));
+        // Issue #56: the SERVER's OWN DashMap is not the contract —
+        // a follow-up `status` through the socket must LIST the new
+        // secret to the client.
+        let lines = app.run_cli_command("status", "").unwrap();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("new.yaml")),
+            "status must list the added secret for the CLIENT: {lines:?}"
+        );
     }
 
     #[test]
