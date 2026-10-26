@@ -89,7 +89,8 @@ fn main() {
             continue;
         }
         eprintln!(
-            "stub: conn#{conn_n} name={} cmd={}",
+            "stub: conn#{conn_n} (+{:?}) name={} cmd={}",
+            conn_started.elapsed(),
             name_line.trim(),
             cmd_line.trim()
         );
@@ -114,14 +115,28 @@ fn main() {
             },
             Err(_) => "{\"type\":\"ok\"}\n".to_string(),
         };
-        let _ = w.write_all(reply.as_bytes());
-        let _ = w.flush();
+        if let Err(e) = w.write_all(reply.as_bytes()) {
+            eprintln!("stub: conn#{conn_n} reply write failed: {e}");
+            continue;
+        }
+        if let Err(e) = w.flush() {
+            eprintln!("stub: conn#{conn_n} reply flush failed: {e}");
+            continue;
+        }
         // The client closes the frame with a null line; consume it so
         // the connection ends cleanly.  Bounded: a client that never
         // sends it (or dies first) must not hold the accept loop.
         let _ = w.set_read_timeout(Some(std::time::Duration::from_millis(500)));
         let mut tail = String::new();
-        let _ = reader.read_line(&mut tail);
+        match reader.read_line(&mut tail) {
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!(
+                    "stub: conn#{conn_n} tail read failed (reply was sent): {e}"
+                );
+            }
+        }
+        eprintln!("stub: conn#{conn_n} done in {:?}", conn_started.elapsed());
         let _ = name_line;
     }
 }
