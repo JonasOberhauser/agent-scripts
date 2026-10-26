@@ -267,7 +267,12 @@ fn main() {
             let version_ok = offer
                 .version
                 .as_deref()
-                .is_some_and(|v| fuse_protocol::versions_compatible(v, fuse_protocol::VERSION));
+                .is_some_and(|v| {
+                    // The ORACLE axis (#109): the adoption decision is
+                    // about the fused↔server dialect, not the cmd-
+                    // socket version a client bump would move.
+                    fuse_protocol::versions_compatible(v, fuse_protocol::ORACLE_PROTOCOL_VERSION)
+                });
             let mp_ok = daemon_serves_mountpoint(offer.pid, mp);
             if version_ok && mp_ok {
                 info!(

@@ -916,7 +916,10 @@ pub fn run_control_loop(store: Store, oracle_socket: String) {
                 w,
                 "{}",
                 serde_json::to_string(&OracleRequest::Hello {
-                    version: Some(fuse_protocol::VERSION.to_string()),
+                    // The ORACLE axis (#109), not the workspace
+                    // version: a client-only bump must not re-skin an
+                    // unchanged daemon as a new dialect.
+                    version: Some(fuse_protocol::ORACLE_PROTOCOL_VERSION.to_string()),
                 })
                 .expect("serializing Hello: internal enum, infallible")
             )
@@ -1267,5 +1270,40 @@ mod tests {
             std::time::Duration::from_secs(5),
         );
         assert!(r.is_err(), "EOF with no reply line must be an error, got: {r:?}");
+    }
+}
+
+#[cfg(test)]
+mod hello_axis_tests {
+    use fuse_protocol::oracle::OracleRequest;
+    use fuse_protocol::ORACLE_PROTOCOL_VERSION;
+
+    /// Issue #109: the Hello's version field is the ORACLE-dialect
+    /// axis, NOT the workspace version — a client-only bump (which
+    /// moves only `VERSION`) must not re-skin an unchanged daemon as
+    /// a new dialect.  Under the pre-split code (Hello carrying
+    /// `VERSION`) this test fails by construction.
+    #[test]
+    fn hello_carries_the_oracle_axis_not_the_workspace_version() {
+        let wire = serde_json::to_string(&OracleRequest::Hello {
+            version: Some(fuse_protocol::ORACLE_PROTOCOL_VERSION.to_string()),
+        })
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&wire).unwrap();
+        assert_eq!(
+            v["version"].as_str().unwrap(),
+            ORACLE_PROTOCOL_VERSION,
+            "the Hello dialect field keys on the oracle axis"
+        );
+    }
+
+    /// The two axes are independent constants; at the split they are
+    /// value-equal by design (compat with every same-vintage deploy),
+    /// so pin IDENTITY, not inequality: the senders must reference
+    /// THIS constant (compile-checked) and the value is its own.
+    #[test]
+    fn oracle_axis_is_its_own_constant() {
+        // Not env-derived: the axis is hand-versioned dialect history.
+        assert_eq!(ORACLE_PROTOCOL_VERSION, "0.34.0");
     }
 }

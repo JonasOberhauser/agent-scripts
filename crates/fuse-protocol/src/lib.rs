@@ -32,6 +32,23 @@ pub mod servatui_protocols;
 // Changing it without coordination breaks cross-version compatibility.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// The ORACLE-dialect version (issue #109): the version axis of the
+/// fused↔server wire (the control-channel Hello, the adoption gate,
+/// the mixed-vintage warning).  It is INDEPENDENT of [`VERSION`]:
+///
+/// - `VERSION` (the workspace version) is the cmd-socket axis —
+///   server↔client `GetVersion` compatibility.  A client-only change
+///   bumps it and MUST NOT make an unchanged fused look incompatible
+///   with an unchanged server.
+/// - THIS constant bumps ONLY when the oracle dialect changes
+///   (Hello/Ask/Serve/Remove shapes, SCM_RIGHTS usage) — additive
+///   fields only, ever (freeze discipline).
+///
+/// Pinned to the workspace version at the split (#109) so every
+/// deployed binary of the same vintage remains compatible across the
+/// axis introduction; it evolves on its own from here.
+pub const ORACLE_PROTOCOL_VERSION: &str = "0.34.0";
+
 /// The client-server handshake compares only major and minor versions:
 /// patch releases never change the wire protocol and must not force a
 /// restart of the long-running shared server.  Unparseable versions
@@ -163,5 +180,33 @@ mod tests {
     fn missing_patch_component_still_compares_major_minor() {
         assert!(protocol_compatible("0.26", "0.26.3"));
         assert!(!protocol_compatible("0.26", "0.27"));
+    }
+}
+
+#[cfg(test)]
+mod oracle_axis_tests {
+    use super::ORACLE_PROTOCOL_VERSION;
+
+    /// Issue #109: the oracle axis is its own hand-versioned constant,
+    /// not env-derived — dialect history, independent of the workspace
+    /// (cmd-socket) version.  Pinned at the split to the then-current
+    /// workspace version so same-vintage deploys stay compatible.
+    #[test]
+    fn oracle_axis_is_a_hand_versioned_constant() {
+        assert_eq!(ORACLE_PROTOCOL_VERSION, "0.34.0");
+    }
+
+    /// The Hello wire shape carries the axis additively (freeze
+    /// discipline): an old parser reading a NEW Hello must keep
+    /// working — the field stays a bare optional string.
+    #[test]
+    fn hello_wire_shape_is_additive() {
+        let wire = serde_json::to_string(&crate::oracle::OracleRequest::Hello {
+            version: Some(ORACLE_PROTOCOL_VERSION.to_string()),
+        })
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&wire).unwrap();
+        assert_eq!(v["type"].as_str().unwrap(), "hello");
+        assert!(v["version"].is_string());
     }
 }

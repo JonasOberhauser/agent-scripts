@@ -370,7 +370,7 @@ fn handle_conn(state: &Arc<ServerState>, hub: &OracleHub, conn: UnixStream) {
         // with nothing in any log. Surface the skew the moment we can
         // see it. Old daemons send no version — we cannot check those.
         match version.as_deref() {
-            Some(v) if !fuse_protocol::versions_compatible(v, fuse_protocol::VERSION) => {
+            Some(v) if !fuse_protocol::versions_compatible(v, fuse_protocol::ORACLE_PROTOCOL_VERSION) => {
                 warn!(
                     "data daemon reports protocol v{} vs server v{} — mixed vintages; \
                      its mount may silently miss content. Rebuild (cargo build \
