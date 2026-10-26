@@ -66,6 +66,7 @@ const PKILL_FULL: &str = "-f";
 const PKILL_BIN: &str = "pkill";
 /// The orphan probe's help check.
 const PROBE_HELP: &str = "--help";
+const PROBE_VERSION: &str = "--version";
 const SEP_PATH: char = '/';
 /// Placeholder when a stale state names no binary.
 const UNKNOWN_SERVER: &str = "<unknown (old server)>";
@@ -657,7 +658,9 @@ fn read_state_file() -> Option<ServerStateFile> {
 pub(crate) enum BinaryResolution {
     /// The recorded path exists — use it.
     Recorded(std::path::PathBuf),
-    /// Recorded is gone; the sibling beside THIS executable exists.
+    /// Recorded is gone (or the WRONG VINTAGE — issue #98's original
+    /// shape); the sibling beside THIS executable is version-
+    /// compatible and substitutes.
     SiblingSubstitute {
         recorded: std::path::PathBuf,
         sibling: std::path::PathBuf,
@@ -667,14 +670,40 @@ pub(crate) enum BinaryResolution {
         recorded: std::path::PathBuf,
         sibling: std::path::PathBuf,
     },
+    /// A binary exists but reports an INCOMPATIBLE protocol version
+    /// (mixed vintage): spawning it reproduces the very mismatch the
+    /// restart is trying to fix.
+    Incompatible {
+        path: std::path::PathBuf,
+        version: String,
+    },
 }
 
 /// Resolve the respawn's server binary. `sibling_dir` is the client's
 /// own executable directory (injected for tests).
+/// Probe: a candidate's reported protocol version (`<candidate>
+/// --version`). None = not probeable — treated as incompatible (an
+/// unprobeable server is a mixed-vintage risk).
+/// A candidate-binary version probe (injected for tests).
+pub(crate) trait VersionProbe {
+    fn version_of(&self, path: &std::path::Path) -> Option<String>;
+}
+
+/// The production probe: `<candidate> --version`.
+pub(crate) struct CliVersionProbe;
+
+impl VersionProbe for CliVersionProbe {
+    fn version_of(&self, path: &std::path::Path) -> Option<String> {
+        probe_server_version(path)
+    }
+}
+
 pub(crate) fn resolve_server_binary(
     recorded: &str,
     sibling_dir: Option<&std::path::Path>,
+    probe: &dyn VersionProbe,
 ) -> BinaryResolution {
+    let _ = probe; // CURRENT behavior (this commit): vintage ignored
     let rec = std::path::PathBuf::from(recorded);
     if rec.exists() {
         return BinaryResolution::Recorded(rec);
@@ -717,8 +746,30 @@ pub(crate) fn binary_diagnosis(res: &BinaryResolution) -> String {
                 )
             }
         }
+        BinaryResolution::Incompatible { path, version } => format!(
+            "the server binary at {} reports protocol version {} — \\
+             INCOMPATIBLE with this client ({}): spawning it would \\
+             reproduce the very mismatch the restart is meant to fix \\
+             (mixed vintage). Remediation: cargo build --workspace \\
+             (rebuilds every binary to one vintage), or re-run run-agent \\
+             (writes a fresh state file).",
+            path.display(),
+            version,
+            CLIENT_VERSION
+        ),
         other => format!("usable: {other:?}"),
     }
+}
+
+/// Run `<candidate> --version` and extract the version token. None =
+/// not probeable (exec failed, pre-flag binary, unparseable output).
+pub(crate) fn probe_server_version(p: &std::path::Path) -> Option<String> {
+    let out = std::process::Command::new(p).arg(PROBE_VERSION).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.split_whitespace().last().map(str::to_string)
 }
 
 fn start_server_from_state(app: &App, state: &ServerStateFile, log_path: Option<&str>) {
@@ -737,6 +788,7 @@ fn start_server_from_state(app: &App, state: &ServerStateFile, log_path: Option<
     let resolution = resolve_server_binary(
         &state.server_binary,
         sibling_dir.as_deref(),
+        &CliVersionProbe,
     );
     let effective_binary = match &resolution {
         BinaryResolution::Recorded(p) => p.clone(),
@@ -747,7 +799,7 @@ fn start_server_from_state(app: &App, state: &ServerStateFile, log_path: Option<
             );
             sibling.clone()
         }
-        BinaryResolution::Missing { .. } => {
+        BinaryResolution::Missing { .. } | BinaryResolution::Incompatible { .. } => {
             eprintln!("  ERROR: {}", binary_diagnosis(&resolution));
             std::process::exit(EXIT_FAILURE);
         }
@@ -1185,6 +1237,113 @@ fn completion_scripts_delegate_to_the_binary() {
 #[cfg(test)]
 mod tests {
 
+    /// Issue #98's ORIGINAL shape (maintainer challenge): the recorded
+    /// binary EXISTS but is the WRONG VINTAGE — the restart must not
+    /// respawn the very mismatch it is trying to fix.
+    /// Probes for the resolution tests (structs, not closures: the
+    /// HRTB limitation makes closure coercions flaky here).
+    struct Fixed(Option<String>);
+    impl VersionProbe for Fixed {
+        fn version_of(&self, _p: &std::path::Path) -> Option<String> {
+            self.0.clone()
+        }
+    }
+    struct PerPath(Vec<(std::path::PathBuf, String)>);
+    impl VersionProbe for PerPath {
+        fn version_of(&self, p: &std::path::Path) -> Option<String> {
+            self.0
+                .iter()
+                .find(|(k, _)| k == p)
+                .map(|(_, v)| v.clone())
+        }
+    }
+
+    /// A version string definitely INCOMPATIBLE with this client
+    /// (major.minor differs): derived, not hardcoded, so version
+    /// bumps keep the test honest.
+    fn wrong_vintage() -> String {
+        let mut parts = CLIENT_VERSION.split('.');
+        let major = parts.next().unwrap_or("0");
+        let minor: u32 = parts.next().unwrap_or("0").parse().unwrap_or(0);
+        format!("{}.{}.0", major, minor + 1)
+    }
+
+    #[test]
+    fn resolution_prefers_the_recorded_binary_when_vintage_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let rec = dir.path().join("fuse-server");
+        std::fs::write(&rec, b"BIN").unwrap();
+        let probe = Fixed(Some(CLIENT_VERSION.to_string()));
+        assert_eq!(
+            resolve_server_binary(rec.to_str().unwrap(), None, &probe),
+            BinaryResolution::Recorded(rec.clone()),
+        );
+    }
+
+    #[test]
+    fn recorded_wrong_vintage_substitutes_a_compatible_sibling() {
+        let dir = tempfile::tempdir().unwrap();
+        let rec = dir.path().join("fuse-server");
+        std::fs::write(&rec, b"OLD-BIN").unwrap();
+        let sibling_dir = tempfile::tempdir().unwrap();
+        let sibling = sibling_dir.path().join("fuse-server");
+        std::fs::write(&sibling, b"NEW-BIN").unwrap();
+        // The recorded binary answers the version probe with an
+        // incompatible vintage, the sibling with the client's own.
+        let probe = PerPath(vec![
+            (rec.clone(), wrong_vintage()),
+            (sibling.clone(), CLIENT_VERSION.to_string()),
+        ]);
+        assert_eq!(
+            resolve_server_binary(rec.to_str().unwrap(), Some(sibling_dir.path()), &probe),
+            BinaryResolution::SiblingSubstitute { recorded: rec.clone(), sibling: sibling.clone() },
+            "a mixed-vintage recorded binary must NOT be respawned when a \
+             compatible sibling exists"
+        );
+    }
+
+    #[test]
+    fn wrong_vintage_everywhere_reports_incompatible_not_respawn() {
+        let dir = tempfile::tempdir().unwrap();
+        let rec = dir.path().join("fuse-server");
+        std::fs::write(&rec, b"OLD-BIN").unwrap();
+        let expected_version = wrong_vintage();
+        let probe = Fixed(Some(expected_version.clone()));
+        assert_eq!(
+            resolve_server_binary(rec.to_str().unwrap(), None, &probe),
+            BinaryResolution::Incompatible {
+                path: rec.clone(),
+                version: expected_version,
+            },
+            "spawning the stale vintage would reproduce the mismatch"
+        );
+    }
+
+    #[test]
+    fn unprobeable_binary_is_incompatible_not_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let rec = dir.path().join("fuse-server");
+        std::fs::write(&rec, b"OPAQUE-BIN").unwrap();
+        let probe = Fixed(None);
+        assert!(matches!(
+            resolve_server_binary(rec.to_str().unwrap(), None, &probe),
+            BinaryResolution::Incompatible { .. }
+        ));
+    }
+
+    #[test]
+    fn diagnosis_names_mixed_vintage_and_the_full_rebuild() {
+        let res = BinaryResolution::Incompatible {
+            path: "/old/checkout/fuse-server".into(),
+            version: "0.32.0".into(),
+        };
+        let text = binary_diagnosis(&res);
+        assert!(text.contains("INCOMPATIBLE"), "{text}");
+        assert!(text.contains("mixed vintage"), "{text}");
+        assert!(text.contains("cargo build --workspace"), "{text}");
+        assert!(text.contains("run-agent"), "{text}");
+    }
+
     // ── issue #98: stale recorded server_binary ────────────────────
 
     /// A recorded binary that exists is used as-is.
@@ -1195,8 +1354,9 @@ mod tests {
         std::fs::write(&rec, b"BIN").unwrap();
         let sibling_dir = tempfile::tempdir().unwrap();
         std::fs::write(sibling_dir.path().join("fuse-server"), b"BIN").unwrap();
+        let probe = Fixed(Some(CLIENT_VERSION.to_string()));
         assert_eq!(
-            resolve_server_binary(rec.to_str().unwrap(), Some(sibling_dir.path())),
+            resolve_server_binary(rec.to_str().unwrap(), Some(sibling_dir.path()), &probe),
             BinaryResolution::Recorded(rec.clone()),
             "an existing recorded path wins over the sibling"
         );
@@ -1211,9 +1371,10 @@ mod tests {
         let sibling_dir = tempfile::tempdir().unwrap();
         let sibling = sibling_dir.path().join("fuse-server");
         std::fs::write(&sibling, b"BIN").unwrap();
+        let probe = Fixed(Some(CLIENT_VERSION.to_string()));
         assert_eq!(
-            resolve_server_binary(rec.to_str().unwrap(), Some(sibling_dir.path())),
-            BinaryResolution::SiblingSubstitute { recorded: rec.clone(), sibling },
+            resolve_server_binary(rec.to_str().unwrap(), Some(sibling_dir.path()), &probe),
+            BinaryResolution::SiblingSubstitute { recorded: rec.clone(), sibling: sibling.clone() },
             "a stale recorded path must fall back to the sibling"
         );
     }
@@ -1224,8 +1385,9 @@ mod tests {
     fn resolution_reports_missing_when_neither_exists() {
         let rec = "/nonexistent/checkout/target/debug/fuse-server";
         let sibling_dir = tempfile::tempdir().unwrap();
+        let probe = Fixed(None);
         assert!(matches!(
-            resolve_server_binary(rec, Some(sibling_dir.path())),
+            resolve_server_binary(rec, Some(sibling_dir.path()), &probe),
             BinaryResolution::Missing { .. }
         ));
     }
