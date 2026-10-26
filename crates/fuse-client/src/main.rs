@@ -703,21 +703,71 @@ pub(crate) fn resolve_server_binary(
     sibling_dir: Option<&std::path::Path>,
     probe: &dyn VersionProbe,
 ) -> BinaryResolution {
-    let _ = probe; // CURRENT behavior (this commit): vintage ignored
     let rec = std::path::PathBuf::from(recorded);
-    if rec.exists() {
-        return BinaryResolution::Recorded(rec);
-    }
     // The client's own sibling (same convention the server uses to
     // find `fused`): a release-only client build has no sibling
     // either — then Missing must degrade to the build/run-agent hint.
     let sibling = sibling_dir
         .map(|d| d.join(fuse_protocol::SERVER_BIN))
         .unwrap_or_else(|| std::path::PathBuf::from(fuse_protocol::SERVER_BIN));
-    if sibling.exists() {
+
+    // A candidate is USABLE only if it exists AND reports a protocol
+    // version compatible with this client (major.minor). Unprobeable =
+    // incompatible: an old binary without --version, or one that will
+    // not run, is exactly the mixed-vintage risk (issue #98's
+    // original shape: the file exists, the vintage is wrong).
+    let usable = |p: &std::path::Path| -> Result<(), BinaryResolution> {
+        if !p.exists() {
+            return Err(BinaryResolution::Missing {
+                recorded: rec.clone(),
+                sibling: sibling.clone(),
+            });
+        }
+        match probe.version_of(p) {
+            Some(v) if fuse_protocol::versions_compatible(&v, CLIENT_VERSION) => Ok(()),
+            Some(v) => Err(BinaryResolution::Incompatible {
+                path: p.to_path_buf(),
+                version: v,
+            }),
+            None => Err(BinaryResolution::Incompatible {
+                path: p.to_path_buf(),
+                version: "(unprobeable)".to_string(),
+            }),
+        }
+    };
+
+    // Recorded first — but only when its VINTAGE fits; a stale
+    // recorded binary falls through to the sibling instead of
+    // respawn-reproducing the mismatch.
+    if usable(&rec).is_ok() {
+        return BinaryResolution::Recorded(rec);
+    }
+    if rec.exists() && sibling.exists() && usable(&sibling).is_ok() {
         return BinaryResolution::SiblingSubstitute { recorded: rec, sibling };
     }
-    BinaryResolution::Missing { recorded: rec, sibling }
+    match usable(&rec) {
+        Err(e @ BinaryResolution::Missing { .. }) => {
+            // recorded gone: the sibling alone decides.
+            if sibling.exists() && usable(&sibling).is_ok() {
+                return BinaryResolution::SiblingSubstitute { recorded: rec, sibling };
+            }
+            e
+        }
+        Err(e @ (BinaryResolution::Incompatible { .. }
+        | BinaryResolution::Recorded(_)
+        | BinaryResolution::SiblingSubstitute { .. })) => {
+            // recorded exists but wrong vintage; try the sibling,
+            // else the Incompatible diagnosis is the honest answer.
+            // (Recorded/SiblingSubstitute cannot occur as Err — the
+            // unreachable! arm below pins that — but the compiler
+            // cannot know.)
+            if sibling.exists() && usable(&sibling).is_ok() {
+                return BinaryResolution::SiblingSubstitute { recorded: rec, sibling };
+            }
+            e
+        }
+        Ok(()) => unreachable!("usable checked above"),
+    }
 }
 
 /// The diagnosis/remediation text for a failed resolution (issue #98:
@@ -916,7 +966,35 @@ fn start_server_from_state(app: &App, state: &ServerStateFile, log_path: Option<
         std::thread::sleep(SOCKET_IO_TIMEOUT);
     }
 
-    eprintln!("Restoring {} secret(s)...", state.secrets.len());
+        // Issue #98: never claim readiness for a server we did not
+    // verify — the old text printed the CLIENT's version
+    // unconditionally, so a stale-vintage respawn looked "ready"
+    // while still speaking the mismatched protocol.
+    let server_version = match app.run_cli_command_raw(fuse_protocol::cmd::VERSION, "") {
+        Ok((_, raw)) => serde_json::from_slice::<fuse_protocol::Response>(&raw)
+            .ok()
+            .and_then(|r| match r {
+                fuse_protocol::Response::Version { version } => Some(version),
+                _ => None,
+            }),
+        Err(_) => None,
+    };
+    match server_version.as_deref().filter(|v| fuse_protocol::versions_compatible(v, CLIENT_VERSION)) {
+        Some(v) => eprintln!("Server ready (v{v})."),
+        None => {
+            eprintln!(
+                "Server came up but reports version {:?} — INCOMPATIBLE with this \
+                 client ({}): the spawned binary is a different vintage (mixed \
+                 vintage, issue #98). Remediation: cargo build --workspace, or \
+                 re-run run-agent (writes a fresh state file).",
+                server_version.as_deref().unwrap_or("?"),
+                CLIENT_VERSION
+            );
+            std::process::exit(EXIT_FAILURE);
+        }
+    }
+
+eprintln!("Restoring {} secret(s)...", state.secrets.len());
     for entry in &state.secrets {
         let args = format!("{} {} {}", entry.fuse_name, entry.host_path, entry.hash);
         match app.run_cli_command(fuse_protocol::cmd::ADD, &args) {
@@ -924,7 +1002,6 @@ fn start_server_from_state(app: &App, state: &ServerStateFile, log_path: Option<
             Err(e) => eprintln!("  Error restoring {}: {e}", entry.fuse_name),
         }
     }
-    eprintln!("Server ready (v{}).", CLIENT_VERSION);
 }
 
 // Necessity: wrapper argv splitting (wparts[0], wparts[1..]) in the
