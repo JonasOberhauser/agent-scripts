@@ -675,10 +675,19 @@ pub(crate) fn resolve_server_binary(
     sibling_dir: Option<&std::path::Path>,
 ) -> BinaryResolution {
     let rec = std::path::PathBuf::from(recorded);
-    // CURRENT behavior (issue #98): the recorded path is used
-    // unconditionally — stale or not.
-    let _ = sibling_dir;
-    BinaryResolution::Recorded(rec)
+    if rec.exists() {
+        return BinaryResolution::Recorded(rec);
+    }
+    // The client's own sibling (same convention the server uses to
+    // find `fused`): a release-only client build has no sibling
+    // either — then Missing must degrade to the build/run-agent hint.
+    let sibling = sibling_dir
+        .map(|d| d.join(fuse_protocol::SERVER_BIN))
+        .unwrap_or_else(|| std::path::PathBuf::from(fuse_protocol::SERVER_BIN));
+    if sibling.exists() {
+        return BinaryResolution::SiblingSubstitute { recorded: rec, sibling };
+    }
+    BinaryResolution::Missing { recorded: rec, sibling }
 }
 
 /// The diagnosis/remediation text for a failed resolution (issue #98:
@@ -718,26 +727,62 @@ fn start_server_from_state(app: &App, state: &ServerStateFile, log_path: Option<
         cmd_args.push(lp.into());
     }
 
+    // Issue #98: the recorded binary may be stale (cargo clean, moved
+    // checkout, release-only client build).  Resolve BEFORE touching
+    // anything — Missing must not remove the socket it cannot re-serve.
+    let sibling_dir = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(|p| p.to_path_buf()));
+    let resolution = resolve_server_binary(
+        &state.server_binary,
+        sibling_dir.as_deref(),
+    );
+    let effective_binary = match &resolution {
+        BinaryResolution::Recorded(p) => p.clone(),
+        BinaryResolution::SiblingSubstitute { sibling, .. } => {
+            eprintln!(
+                "  NOTE: recorded binary is gone; using the sibling {}",
+                sibling.display()
+            );
+            sibling.clone()
+        }
+        BinaryResolution::Missing { .. } => {
+            eprintln!("  ERROR: {}", binary_diagnosis(&resolution));
+            std::process::exit(EXIT_FAILURE);
+        }
+    };
+    let effective_binary_str = effective_binary.to_string_lossy().into_owned();
+
     // Necessity: wrapper argv splitting (parts[0], parts[1..]).
     #[allow(unknown_lints)]
     #[allow(inline_literal)]
     let (spawn_prog, spawn_args): (String, Vec<String>) = if let Some(w) = &state.runtime_wrapper {
         let parts: Vec<String> = w.split_whitespace().map(|s| s.to_string()).collect();
         let mut args = parts[1..].to_vec();
-        args.push(state.server_binary.clone());
+        args.push(effective_binary_str.clone());
         args.extend(cmd_args);
         (parts[0].clone(), args)
     } else {
-        (state.server_binary.clone(), cmd_args)
+        (effective_binary_str.clone(), cmd_args)
     };
 
-    eprintln!("  Binary:   {}", state.server_binary);
+    eprintln!("  Binary:   {} (recorded: {})", effective_binary.display(), state.server_binary);
     eprintln!("  Wrapper:  {}", state.runtime_wrapper.as_deref().unwrap_or("(none)"));
     eprintln!("  Program:  {spawn_prog}");
     eprintln!("  Args:     {}", spawn_args.join(" "));
 
     if std::process::Command::new(&spawn_prog).arg(PROBE_HELP).output().is_err() {
-        eprintln!("  WARNING: cannot execute '{spawn_prog}' — check PATH");
+        // Issue #98: "check PATH" misdiagnosed stale absolute paths.
+        // A bare NAME failing is PATH-flavored; an absolute path
+        // failing is executability (permissions, format) — name that.
+        if spawn_prog.contains('/') {
+            eprintln!(
+                "  WARNING: cannot execute '{spawn_prog}' — permissions or format, \
+                 not PATH; the diagnosis below applies"
+            );
+        } else {
+            eprintln!("  WARNING: cannot execute '{spawn_prog}' — check PATH");
+        }
     }
 
     eprintln!("  Cleaning up stale socket...");
@@ -801,6 +846,7 @@ fn start_server_from_state(app: &App, state: &ServerStateFile, log_path: Option<
         }
         Err(e) => {
             eprintln!("Failed to start server: {e}");
+            eprintln!("{}", binary_diagnosis(&resolution));
             eprintln!("Start it manually with: run-agent ...");
             std::process::exit(EXIT_FAILURE);
         }
