@@ -136,6 +136,22 @@ fn main() {
                 );
             }
         }
+        // RACE FIX (the #128/#131 CI flake): the client's frame ends
+        // with TWO write_all calls (`null`, then `\n`); dropping the
+        // connection the instant the tail line lands can interleave
+        // BETWEEN them — the second write hits EPIPE and the whole
+        // exchange reports "server closed the connection" although
+        // the reply was delivered.  Hold the connection until the
+        // CLIENT closes (its SocketConnection drops when the call
+        // returns), bounded by the timeout.
+        loop {
+            let mut more = String::new();
+            match reader.read_line(&mut more) {
+                Ok(0) => break, // client closed first — safe to drop
+                Ok(_) => continue,
+                Err(_) => break, // timeout: drop rather than wedge
+            }
+        }
         eprintln!("stub: conn#{conn_n} done in {:?}", conn_started.elapsed());
         let _ = name_line;
     }
