@@ -283,4 +283,9 @@ terminating session command), never by wedging a pty.
 
 House style: squash merges only; test-first commits for bugfix PRs
 (the failing test, then the fix); issues filed for every real finding
-a probe uncovers, even (especially) when it was bycatch.
+a probe uncovers, even (especially) when it was bycatch. After
+cloning, wire the binary-protection hook once (#104):
+
+```sh
+git config core.hooksPath hooks
+```
