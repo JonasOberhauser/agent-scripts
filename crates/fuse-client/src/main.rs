@@ -66,6 +66,7 @@ const PKILL_FULL: &str = "-f";
 const PKILL_BIN: &str = "pkill";
 /// The orphan probe's help check.
 const PROBE_HELP: &str = "--help";
+const SEP_PATH: char = '/';
 /// Placeholder when a stale state names no binary.
 const UNKNOWN_SERVER: &str = "<unknown (old server)>";
 /// Status-query failure prose.
@@ -701,7 +702,7 @@ pub(crate) fn binary_diagnosis(res: &BinaryResolution) -> String {
                  (stale after cargo clean, a moved checkout, or a \\
                  release-only client build)"
             );
-            if !recorded_str.contains('/') {
+            if !recorded_str.contains(SEP_PATH) {
                 format!(
                     "{stale}\n  and a bare name failed — also check PATH.\n\
                      Remediation: cargo build --bin fuse-server, or re-run \\
@@ -775,7 +776,7 @@ fn start_server_from_state(app: &App, state: &ServerStateFile, log_path: Option<
         // Issue #98: "check PATH" misdiagnosed stale absolute paths.
         // A bare NAME failing is PATH-flavored; an absolute path
         // failing is executability (permissions, format) — name that.
-        if spawn_prog.contains('/') {
+        if spawn_prog.contains(SEP_PATH) {
             eprintln!(
                 "  WARNING: cannot execute '{spawn_prog}' — permissions or format, \
                  not PATH; the diagnosis below applies"
