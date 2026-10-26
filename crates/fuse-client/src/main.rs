@@ -645,6 +645,72 @@ fn read_state_file() -> Option<ServerStateFile> {
     serde_json::from_slice(&data).ok()
 }
 
+
+// ── issue #98: the state file's recorded server_binary goes stale ──
+//
+/// How the respawn resolves the server binary (issue #98): the
+/// recorded path may be gone (cargo clean, moved checkout, or a
+/// release-only client build), and the client's own sibling binary
+/// is often a valid stand-in.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum BinaryResolution {
+    /// The recorded path exists — use it.
+    Recorded(std::path::PathBuf),
+    /// Recorded is gone; the sibling beside THIS executable exists.
+    SiblingSubstitute {
+        recorded: std::path::PathBuf,
+        sibling: std::path::PathBuf,
+    },
+    /// Neither exists: name it, do not spawn.
+    Missing {
+        recorded: std::path::PathBuf,
+        sibling: std::path::PathBuf,
+    },
+}
+
+/// Resolve the respawn's server binary. `sibling_dir` is the client's
+/// own executable directory (injected for tests).
+pub(crate) fn resolve_server_binary(
+    recorded: &str,
+    sibling_dir: Option<&std::path::Path>,
+) -> BinaryResolution {
+    let rec = std::path::PathBuf::from(recorded);
+    // CURRENT behavior (issue #98): the recorded path is used
+    // unconditionally — stale or not.
+    let _ = sibling_dir;
+    BinaryResolution::Recorded(rec)
+}
+
+/// The diagnosis/remediation text for a failed resolution (issue #98:
+/// "check PATH" misdiagnosed a stale absolute path).
+pub(crate) fn binary_diagnosis(res: &BinaryResolution) -> String {
+    match res {
+        BinaryResolution::Missing { recorded, sibling } => {
+            let recorded_str = recorded.to_string_lossy();
+            let stale = format!(
+                "the recorded server binary no longer exists:\n  {recorded_str}\n\
+                 (stale after cargo clean, a moved checkout, or a \\
+                 release-only client build)"
+            );
+            if !recorded_str.contains('/') {
+                format!(
+                    "{stale}\n  and a bare name failed — also check PATH.\n\
+                     Remediation: cargo build --bin fuse-server, or re-run \\
+                     run-agent (writes a fresh state file)."
+                )
+            } else {
+                format!(
+                    "{stale}\n  and no sibling '{}' beside this client.\n\
+                     Remediation: cargo build --bin fuse-server, or re-run \\
+                     run-agent (writes a fresh state file).",
+                    sibling.display()
+                )
+            }
+        }
+        other => format!("usable: {other:?}"),
+    }
+}
+
 fn start_server_from_state(app: &App, state: &ServerStateFile, log_path: Option<&str>) {
     let mut cmd_args = respawn_argv(state);
     if let Some(lp) = log_path {
@@ -1071,6 +1137,84 @@ fn completion_scripts_delegate_to_the_binary() {
 #[cfg(test)]
 #[cfg(test)]
 mod tests {
+
+    // ── issue #98: stale recorded server_binary ────────────────────
+
+    /// A recorded binary that exists is used as-is.
+    #[test]
+    fn resolution_prefers_the_recorded_binary_when_it_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let rec = dir.path().join("fuse-server");
+        std::fs::write(&rec, b"BIN").unwrap();
+        let sibling_dir = tempfile::tempdir().unwrap();
+        std::fs::write(sibling_dir.path().join("fuse-server"), b"BIN").unwrap();
+        assert_eq!(
+            resolve_server_binary(rec.to_str().unwrap(), Some(sibling_dir.path())),
+            BinaryResolution::Recorded(rec.clone()),
+            "an existing recorded path wins over the sibling"
+        );
+    }
+
+    /// The recorded path gone + a sibling beside the client: the
+    /// sibling substitutes, ANNOUNCED (not silently, not raw-ENOENT).
+    #[test]
+    fn resolution_falls_back_to_the_client_sibling() {
+        let dir = tempfile::tempdir().unwrap();
+        let rec = dir.path().join("gone").join("fuse-server");
+        let sibling_dir = tempfile::tempdir().unwrap();
+        let sibling = sibling_dir.path().join("fuse-server");
+        std::fs::write(&sibling, b"BIN").unwrap();
+        assert_eq!(
+            resolve_server_binary(rec.to_str().unwrap(), Some(sibling_dir.path())),
+            BinaryResolution::SiblingSubstitute { recorded: rec.clone(), sibling },
+            "a stale recorded path must fall back to the sibling"
+        );
+    }
+
+    /// Neither exists: Missing — the caller must NAME it and stop,
+    /// not remove the socket and fail at spawn with raw ENOENT.
+    #[test]
+    fn resolution_reports_missing_when_neither_exists() {
+        let rec = "/nonexistent/checkout/target/debug/fuse-server";
+        let sibling_dir = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            resolve_server_binary(rec, Some(sibling_dir.path())),
+            BinaryResolution::Missing { .. }
+        ));
+    }
+
+    /// The diagnosis must not say PATH for an absolute stale path,
+    /// and must name the remediations (build the server / run-agent).
+    #[test]
+    fn diagnosis_names_staleness_and_remediation_not_path() {
+        let res = BinaryResolution::Missing {
+            recorded: "/gone/target/debug/fuse-server".into(),
+            sibling: "/client/dir/fuse-server".into(),
+        };
+        let text = binary_diagnosis(&res);
+        assert!(!text.contains("check PATH"), "misdiagnosis is the bug: {text}");
+        assert!(text.contains("no longer exists"), "must name the stale path: {text}");
+        assert!(
+            text.contains("cargo build --bin fuse-server"),
+            "must name the rebuild: {text}"
+        );
+        assert!(
+            text.contains("run-agent"),
+            "must name the fresh-state path: {text}"
+        );
+    }
+
+    /// A BARE recorded name failing IS a PATH-flavored problem — the
+    /// hint belongs there and only there.
+    #[test]
+    fn diagnosis_keeps_the_path_hint_for_bare_names() {
+        let res = BinaryResolution::Missing {
+            recorded: "fuse-server".into(),
+            sibling: "/client/dir/fuse-server".into(),
+        };
+        let text = binary_diagnosis(&res);
+        assert!(text.contains("check PATH"), "bare name: PATH hint applies: {text}");
+    }
     use super::*;
 
 
