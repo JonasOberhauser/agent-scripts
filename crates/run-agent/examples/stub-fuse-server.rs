@@ -52,9 +52,15 @@ fn main() {
             std::process::exit(EXIT_BIND);
         }
     };
+    let mut conn_n: u32 = 0;
     eprintln!("stub-fuse-server: listening at {}", path.display());
     for conn in listener.incoming() {
-        let Ok(conn) = conn else { continue };
+        let Ok(conn) = conn else {
+            eprintln!("stub: accept error");
+            continue;
+        };
+        conn_n += 1;
+        let conn_started = std::time::Instant::now();
         let mut w = conn;
         // Bounded reads: a client that dies mid-frame (or never sends
         // the closing null) must not wedge the accept loop — a CI
@@ -70,14 +76,23 @@ fn main() {
         // Frame: name line, then the command object line.
         let mut name_line = String::new();
         if let Err(e) = reader.read_line(&mut name_line) {
-            eprintln!("stub: name read failed: {e}");
+            eprintln!("stub: conn#{conn_n} name read failed after {:?}: {e}", conn_started.elapsed());
             continue;
         }
         let mut cmd_line = String::new();
         if let Err(e) = reader.read_line(&mut cmd_line) {
-            eprintln!("stub: command read failed: {e}");
+            eprintln!(
+                "stub: conn#{conn_n} command read failed after {:?} (name={:?}): {e}",
+                conn_started.elapsed(),
+                name_line.trim()
+            );
             continue;
         }
+        eprintln!(
+            "stub: conn#{conn_n} name={} cmd={}",
+            name_line.trim(),
+            cmd_line.trim()
+        );
         let reply = match serde_json::from_str::<serde_json::Value>(cmd_line.trim()) {
             Ok(cmd) => match cmd.get("type").and_then(|t| t.as_str()) {
                 Some(TAG_ADD_SECRET) => {
