@@ -374,7 +374,9 @@ pub(crate) fn classify_mount_fs_type(fs_type: i64) -> MountLiveness {
     }
 }
 
-/// Whether a live FUSE superblock serves `path` (statfs f_type).
+/// Whether a live FUSE superblock serves `path` (statfs f_type) —
+/// the #127 startup probe (review: no shutdown probe; the question
+/// is whether RECONNECTION gets stuck, answered by the e2e).
 fn fuse_mount_alive(path: &std::path::Path) -> bool {
     use std::os::unix::ffi::OsStrExt;
     let c = std::ffi::CString::new(path.as_os_str().as_bytes());
@@ -394,24 +396,6 @@ fn fuse_mount_alive(path: &std::path::Path) -> bool {
     rc == 0 && classify_mount_fs_type(st.f_type as i64) == MountLiveness::FuseAlive
 }
 
-/// The #127 honesty check: after the session, verify the mount we are
-/// leaving behind is a LIVE FUSE superblock; if the path is a plain
-/// directory the stack will not serve /fuse after this session and
-/// the fd cannot be reconnected (takeover, #103, not yet real) —
-/// warn with the next step instead of letting the next read discover
-/// ENOTCONN.
-fn warn_if_mount_not_fuse(mount_point: &std::path::Path) {
-    if !fuse_mount_alive(mount_point) {
-        warn!(
-            "the FUSE mount at {} is GONE (plain directory, not a live \
-             superblock): this stack will not serve /fuse after this \
-             session, and the fd cannot be reconnected (seamless \
-             takeover is #103). The next run-agent session rebuilds \
-             the stack — or re-run now to rebuild before you need it.",
-            mount_point.display()
-        );
-    }
-}
 
 
 
@@ -893,10 +877,6 @@ where
         warn!("Session exited with code {exit_code}.");
     }
 
-    // #127: leave-behind honesty — the mount we hand to whatever runs
-    // after us must be a live FUSE superblock, or the user must hear
-    // it from us, not from an ENOTCONN.
-    warn_if_mount_not_fuse(&config.mount_point);
 
     // ── 7. Auto-reset all secret counters ────────────────────────
     let mut reset_ok = true;

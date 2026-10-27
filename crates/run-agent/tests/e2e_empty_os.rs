@@ -1002,6 +1002,34 @@ fn e2e_startup_recovery_after_a_killed_data_daemon() {
             && !text2.contains("pre-flight checks failed"),
         "session 2 must recover the dead mount (inner {fuse_name}), not abort:\n{text2}"
     );
+
+    // Review on #135 — THE question: reconnecting to the existing
+    // agentbox after the recovered stack died with its session (the
+    // #127 world: plain dir where the mount was, stale state file) —
+    // does the new connection come up cleanly or get STUCK?  Session
+    // 3 is that reconnection; run_session's wall bound turns any hang
+    // into a named failure.
+    let text3 = os.run_session(Some(image), &["/bin/true"], "session 3 (reconnect)");
+    let _ = std::io::stderr().write_all(text3.as_bytes());
+    assert!(
+        !text3.contains("did not answer")
+            && !text3.contains("bind is stale")
+            && !text3.contains("pre-flight checks failed"),
+        "reconnection must not get stuck or abort:\n{text3}"
+    );
+
+    // A fresh stack SURVIVES its session (the #52 invariant): the
+    // reconnect's stack serves bytes afterwards.
+    let container3 = sole_container(&os);
+    must_start(&os, &container3);
+    let cat = os.podman(&["exec", &container3, "cat", &format!("/fuse/{fuse_name}")]);
+    assert!(
+        cat.status.success(),
+        "cat /fuse/{fuse_name} failed after reconnection: {}{}\nsession 3:\n{text3}",
+        String::from_utf8_lossy(&cat.stdout),
+        String::from_utf8_lossy(&cat.stderr),
+    );
+    assert_eq!(cat.stdout, secret_bytes.to_vec(), "bytes must survive the reconnection");
 }
 
 /// Escape regex metacharacters in a path for `pgrep -f` patterns.
