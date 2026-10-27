@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use fuse_protocol::SystemIo;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::config::{
     build_create_args, build_exec_args, AgentConfig, NESTED_SECCOMP_PROFILE,
