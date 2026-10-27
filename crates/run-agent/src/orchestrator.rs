@@ -344,6 +344,73 @@ fn ensure_mount_point<S: SystemIo>(
         }
     }
 }
+// ── #127: FUSE liveness detection ─────────────────────────────────
+//
+// Maintainer ruling on #127: a recovered stack dying after its
+// session has no reasonable fix — the best available is DETECTION:
+// know whether the mount is alive, and when it is gone and the fd
+// cannot be reconnected (the #103 takeover is the only reconnect
+// path, not yet real), say so loudly instead of leaving the user to
+// discover ENOTCONN on the next read.
+
+/// Linux FUSE superblock magic (`statfs(2)` f_type).
+const FUSE_SUPER_MAGIC: i64 = 0x6573_5546;
+
+/// Classify a `statfs` f_type for mount liveness.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum MountLiveness {
+    /// A live FUSE superblock serves this path.
+    FuseAlive,
+    /// Not a FUSE mount: a plain directory, or nothing.
+    NotFuse,
+}
+
+/// Pure classification (unit-tested); the io side is one statfs call.
+pub(crate) fn classify_mount_fs_type(fs_type: i64) -> MountLiveness {
+    if fs_type == FUSE_SUPER_MAGIC {
+        MountLiveness::FuseAlive
+    } else {
+        MountLiveness::NotFuse
+    }
+}
+
+/// Whether a live FUSE superblock serves `path` (statfs f_type).
+fn fuse_mount_alive(path: &std::path::Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes());
+    let Ok(cpath) = c else {
+        return false;
+    };
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    let cpath_ptr = cpath.as_ptr();
+    let st_ptr = &mut st;
+    // SAFETY: statfs(2) writes into a caller-owned  struct at
+    // a valid pointer derived from a local; the path is a valid
+    // NUL-terminated CString. Return value checked; no other
+    // preconditions.
+    let rc = unsafe { libc::statfs(cpath_ptr, st_ptr) };
+    rc == 0 && classify_mount_fs_type(st.f_type as i64) == MountLiveness::FuseAlive
+}
+
+/// The #127 honesty check: after the session, verify the mount we are
+/// leaving behind is a LIVE FUSE superblock; if the path is a plain
+/// directory the stack will not serve /fuse after this session and
+/// the fd cannot be reconnected (takeover, #103, not yet real) —
+/// warn with the next step instead of letting the next read discover
+/// ENOTCONN.
+fn warn_if_mount_not_fuse(mount_point: &std::path::Path) {
+    if !fuse_mount_alive(mount_point) {
+        warn!(
+            "the FUSE mount at {} is GONE (plain directory, not a live \
+             superblock): this stack will not serve /fuse after this \
+             session, and the fd cannot be reconnected (seamless \
+             takeover is #103). The next run-agent session rebuilds \
+             the stack — or re-run now to rebuild before you need it.",
+            mount_point.display()
+        );
+    }
+}
+
 
 
 /// Full orchestration loop — the Rust replacement for `run-agent.sh`.
@@ -810,6 +877,11 @@ where
     } else {
         warn!("Session exited with code {exit_code}.");
     }
+
+    // #127: leave-behind honesty — the mount we hand to whatever runs
+    // after us must be a live FUSE superblock, or the user must hear
+    // it from us, not from an ENOTCONN.
+    warn_if_mount_not_fuse(&config.mount_point);
 
     // ── 7. Auto-reset all secret counters ────────────────────────
     let mut reset_ok = true;
@@ -1388,6 +1460,53 @@ fn write_state_file<S: SystemIo>(
 #[allow(unknown_lints)]
 #[allow(custom_parser)]
 mod tests {
+
+    // ── #127: FUSE liveness classification ──────────────────────
+
+    #[test]
+    fn fuse_magic_classifies_alive() {
+        assert_eq!(
+            classify_mount_fs_type(0x6573_5546),
+            MountLiveness::FuseAlive,
+            "the FUSE_SUPER_MAGIC value must classify as alive"
+        );
+    }
+
+    #[test]
+    fn everything_else_classifies_not_fuse() {
+        // ext4, tmpfs, overlayfs, and the "gone" shapes all mean NOT
+        // a live FUSE superblock — only the magic number claims
+        // liveness (deliberately conservative).
+        for fs_type in [0xEF53_i64, 0x0102_1997, 0x794C_7630, -1, 0] {
+            assert_eq!(
+                classify_mount_fs_type(fs_type),
+                MountLiveness::NotFuse,
+                "f_type {fs_type:#x} must not claim FUSE liveness"
+            );
+        }
+    }
+
+    /// The real probe on a plain directory: NOT FuseAlive — the exact
+    /// #127 surface (a recovered stack's leftover plain dir).
+    #[test]
+    fn plain_directory_is_not_a_live_fuse_mount() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let cpath =
+            std::ffi::CString::new(dir.path().as_os_str().as_bytes()).unwrap();
+        let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+        // SAFETY: statfs(2) into a caller-owned local; valid CString.
+        let cpath_ptr = cpath.as_ptr();
+        let st_ptr = &mut st;
+        // SAFETY: statfs(2) into a caller-owned local; valid CString.
+        let rc = unsafe { libc::statfs(cpath_ptr, st_ptr) };
+        assert_eq!(rc, 0, "statfs on a tempdir must succeed");
+        assert_eq!(
+            classify_mount_fs_type(st.f_type as i64),
+            MountLiveness::NotFuse,
+            "a tempdir (tmpfs/overlay in tests) is not FUSE"
+        );
+    }
     use super::*;
     use crate::config::{AgentConfig, Runtime, SecretMapping};
     use fuse_protocol::MockSystemIo;
