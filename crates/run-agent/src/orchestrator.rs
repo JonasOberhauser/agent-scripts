@@ -353,6 +353,9 @@ fn ensure_mount_point<S: SystemIo>(
 // path, not yet real), say so loudly instead of leaving the user to
 // discover ENOTCONN on the next read.
 
+/// Where users report problems (end-user messages link here).
+const NEW_ISSUE_URL: &str = "https://github.com/JonasOberhauser/agent-scripts/issues/new";
+
 /// Linux FUSE superblock magic (`statfs(2)` f_type).
 const FUSE_SUPER_MAGIC: i64 = 0x6573_5546;
 
@@ -454,13 +457,23 @@ where
     // shape). The rebuild below is correct — this names WHY, so the
     // fresh stack reads as explained, not as a mystery.
     if std::path::Path::new(&fuse_protocol::state_file()).exists() && !fuse_mount_alive(&config.mount_point) {
+        // Audience discipline (review on #127): the WARN speaks to the
+        // END USER — plain words, an action taken, and where to go if
+        // it recurs; the engineer detail (issue references, the
+        // detection mechanism) lives one level down in debug!.
         warn!(
-            "detected a dead stack: the mount at {} is gone (plain \
-             directory — it died with its session, #127). Rebuilding \
-             now; approvals persist in the policy store. Note: a \
-             rebuilt stack serves THIS session; if it again dies with \
-             the session, re-run to rebuild (seamless takeover, #103, \
-             is the durable fix).",
+            "The connection between the agentbox and your operating system \
+             was detected broken. The agentbox has been restarted with a \
+             new connection to repair this problem. If the problem \
+             persists, please raise an issue at {NEW_ISSUE_URL}."
+        );
+        debug!(
+            "dead-stack detection (#127): statfs says the mountpoint {} is \
+             not a live FUSE superblock while a state file exists — the \
+             previous stack died with its session. Rebuilding; approvals \
+             persist in the policy store. Known shape: a rebuilt stack may \
+             again die with its session (two CI observations, zero \
+             counterexamples); the durable fix is seamless takeover (#103).",
             config.mount_point.display()
         );
     }
