@@ -424,15 +424,15 @@ pub(crate) fn discover_mount_stack(mount_point: &std::path::Path) -> Vec<Discove
             .filter(|a| !a.is_empty())
             .collect();
         let has_mp = args
-            .windows(2)
-            .any(|w| w[0] == FLAG_MOUNT_POINT && w[1] == mp);
+            .windows(ARGV_PAIR)
+            .any(|w| w[ARGV_FLAG] == FLAG_MOUNT_POINT && w[ARGV_VALUE] == mp);
         if !has_mp {
             continue;
         }
         let flag_value = |flag: &str| {
-            args.windows(2)
-                .find(|w| w[0] == flag)
-                .and_then(|w| w.get(1))
+            args.windows(ARGV_PAIR)
+                .find(|w| w[ARGV_FLAG] == flag)
+                .and_then(|w| w.get(ARGV_VALUE))
                 .cloned()
         };
         let bin = args
