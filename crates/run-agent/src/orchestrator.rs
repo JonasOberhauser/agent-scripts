@@ -1695,18 +1695,16 @@ mod tests {
         let mp = format!("/tmp/gk-discover-{}", std::process::id());
         let sock = format!("{mp}.sock");
         let oracle = format!("{mp}.oracle");
-        let mut child = std::process::Command::new("/bin/sleep")
-            .args([
-                "30",
-                FLAG_MOUNT_POINT,
-                &mp,
-                FLAG_SOCKET,
-                &sock,
-                ORACLE_FLAG,
-                &oracle,
-            ])
+        // The probe must STAY ALIVE with arbitrary trailing argv
+        // (/bin/sleep would reject the flags and die — a zombie's
+        // cmdline reads empty and the scan finds nothing; the CI
+        // failure of the first round was exactly that race).
+        let mut child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("sleep 30")
+            .args([FLAG_MOUNT_POINT, &mp, FLAG_SOCKET, &sock, ORACLE_FLAG, &oracle])
             .spawn()
-            .expect("spawn sleep probe");
+            .expect("spawn sh probe");
         let found = discover_mount_stack(std::path::Path::new(&mp));
         let _ = child.kill();
         let _ = child.wait();
@@ -1714,7 +1712,7 @@ mod tests {
             found,
             vec![DiscoveredDaemon {
                 pid: child.id(),
-                bin: "sleep".to_string(),
+                bin: "sh".to_string(),
                 socket: Some(sock),
                 oracle_socket: Some(oracle),
             }],
