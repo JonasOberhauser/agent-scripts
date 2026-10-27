@@ -18,6 +18,16 @@ distinguishable. The version handshake ignores the patch component and
 compares only major & minor — patch releases never force a restart of
 the long-running shared server.
 
+**Two version axes (#109)**: the workspace version above is the
+CMD-SOCKET axis (server↔client, `GetVersion`). The fused↔server oracle
+dialect has its own constant, `fuse_protocol::ORACLE_PROTOCOL_VERSION`
+(carried by the control-channel Hello; the adoption gate and the
+mixed-vintage warning key on it). Bump each axis ONLY for its own
+surface: a client-only change must never make an unchanged fused look
+incompatible with an unchanged server, and an oracle-dialect change
+bumps its axis alone. Both compare major.minor only; both are
+additive-fields-only on the wire.
+
 On startup, `fuse-client` sends `GetVersion` to the running server. If the
 versions differ, the client offers to restart the server:
 1. Reads `/tmp/fuse-gatekeeper-state.json` (written by the orchestrator)
