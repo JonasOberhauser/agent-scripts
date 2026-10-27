@@ -455,9 +455,12 @@ where
     // fresh stack reads as explained, not as a mystery.
     if std::path::Path::new(&fuse_protocol::state_file()).exists() && !fuse_mount_alive(&config.mount_point) {
         warn!(
-            "the previous stack's mount at {} is GONE (plain directory): \
-             its stack died with its session (#127). Starting a fresh \
-             stack — approvals persist in the policy store.",
+            "detected a dead stack: the mount at {} is gone (plain \
+             directory — it died with its session, #127). Rebuilding \
+             now; approvals persist in the policy store. Note: a \
+             rebuilt stack serves THIS session; if it again dies with \
+             the session, re-run to rebuild (seamless takeover, #103, \
+             is the durable fix).",
             config.mount_point.display()
         );
     }
