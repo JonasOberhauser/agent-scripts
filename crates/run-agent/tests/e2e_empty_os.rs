@@ -572,8 +572,11 @@ fn e2e_restart_terms_trapped_container_processes() {
     // Session 2: --restart-container runs gentle_stop (the /proc sweep)
     // BEFORE stop/rm; the volume-backed marker must survive into the
     // recreated container.  Session-end stops that one too — start it
-    // before probing.
-    let _ = os.run_agent(Some(image), &["--restart-container"]);
+    // before probing.  Surface BOTH sessions' output on failure (the
+    // #60 discovery rounds failed here twice with no visibility).
+    let session2 = os.run_agent(Some(image), &["--restart-container"]);
+    let text2 = output_text(&session2);
+    let _ = std::io::stderr().write_all(text2.as_bytes());
     let _ = os.podman(&["start", &container]);
 
     let marker = os.podman(&["exec", &container, "test", "-f", "/root/termed"]);
@@ -584,7 +587,7 @@ fn e2e_restart_terms_trapped_container_processes() {
     };
     assert!(
         marker.status.success(),
-        "the trapped process never saw SIGTERM — the TERM sweep did not reach          non-init container processes on a real /proc (issue #51).\n{probe_text}"
+        "the trapped process never saw SIGTERM — the TERM sweep did not reach \\\n         non-init container processes on a real /proc (issue #51).\\\nsession 2:\\n{text2}\\n{probe_text}"
     );
 }
 
