@@ -392,6 +392,11 @@ pub(crate) enum StackDiscovery {
 /// one (the data daemon) are context.
 pub(crate) fn classify_discovery(mut found: Vec<DiscoveredDaemon>) -> StackDiscovery {
     found.retain(|d| d.socket.is_some());
+    // Controllers sharing one socket are ONE stack (an old and a
+    // respawned server during a restart window, or another agent's
+    // run-agent argv-naming the same bundle while joining) — the
+    // socket is the identity, not the pid.
+    found.dedup_by(|a, b| a.socket == b.socket);
     match found.len() {
         0 => StackDiscovery::None,
         1 => StackDiscovery::Owned(Box::new(found.remove(0))),
@@ -418,11 +423,21 @@ pub(crate) fn discover_mount_stack(mount_point: &std::path::Path) -> Vec<Discove
     let Ok(dir) = std::fs::read_dir("/proc") else {
         return found;
     };
+    let own_pid = std::process::id();
     for entry in dir.flatten() {
         let name = entry.file_name();
         let Some(pid) = name.to_str().and_then(|n| n.parse::<u32>().ok()) else {
             continue;
         };
+        // Never ourselves: run-agent's OWN argv carries --mount-point
+        // and --socket, so the orchestrator would otherwise discover
+        // itself as a second controller of the very stack it is
+        // about to join (the round-3 CI failure: session 2 refused
+        // as "ambiguous" listing pid 8771 fuse-server and pid 9001
+        // run-agent — the same process that was scanning).
+        if pid == own_pid {
+            continue;
+        }
         let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
             continue;
         };
@@ -1657,6 +1672,19 @@ fn write_state_file<S: SystemIo>(
 #[allow(unknown_lints)]
 #[allow(custom_parser)]
 mod tests {
+
+    #[test]
+    fn controllers_sharing_one_socket_are_one_stack() {
+        // An old and a respawned server (restart window), or a
+        // joining agent's argv naming the same bundle: the SOCKET is
+        // the identity, not the pid — never Ambiguous for this shape.
+        let a = daemon(7, "fuse-server", Some("/tmp/s.sock"));
+        let b = daemon(9001, "run-agent", Some("/tmp/s.sock"));
+        assert_eq!(
+            classify_discovery(vec![a.clone(), b]),
+            StackDiscovery::Owned(Box::new(a)),
+        );
+    }
 
     // ── #60: discovery classification ─────────────────────────────
 
