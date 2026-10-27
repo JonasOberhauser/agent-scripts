@@ -71,6 +71,19 @@ const DEFAULT_LOG_LEVEL: &str = "info";
 const DEFAULT_PENDING_SECS: u64 = 300;
 /// Generic startup/config failure exit.
 const EXIT_FAILURE: i32 = 1;
+/// The takeover answer budget (an ancient daemon never answers).
+const TAKEOVER_BUDGET: Duration = Duration::from_secs(10);
+/// The takeover mailbox/resumed-Hello poll pace.
+const TAKEOVER_POLL: Duration = Duration::from_millis(50);
+/// The successor's inherited connection fd slot (dup2 before exec).
+const RESUME_SLOT_CONN: i32 = 3;
+/// The successor's inherited host-fd slots start here.
+const RESUME_SLOT_HOST_BASE: i32 = 4;
+/// The testkit's fake-version env (scrubbed from the successor: it IS
+/// this vintage).
+const ENV_FAKE_HELLO_VERSION: &str = "FUSE_FAKE_HELLO_VERSION";
+/// The takeover successor-missing message.
+const MSG_NO_SUCCESSOR: &str = "no data daemon binary for the takeover successor";
 /// The conservative secret mode for boot-time secrets (read-only).
 const BOOT_SECRET_MODE: u32 = 0o400;
 /// Poll cadence while waiting on spawned children/sockets.
@@ -278,14 +291,27 @@ fn main() {
                     offer.version.as_deref().unwrap_or("?")
                 );
                 ADOPTED_DAEMON_PID.store(offer.pid, std::sync::atomic::Ordering::SeqCst);
+            } else if !version_ok {
+                // #103 fd handover: the incompatible daemon keeps its
+                // MOUNT — ask it to surrender the session (pushed when
+                // its Hello reported the mismatch) and transplant the
+                // connection fd into a same-vintage successor.
+                match takeover_transplant(&cli, mp, offer.pid) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        warn!(
+                            "  mount-point: {} — takeover failed ({e}); spawning fresh",
+                            mp.display()
+                        );
+                        spawn_fresh(&cli, mp);
+                    }
+                }
             } else {
                 warn!(
                     "  mount-point:     {} — surviving daemon pid {} not adoptable \
-                     (version {:?} compatible={}, serves mountpoint={}); spawning fresh",
+                     (serves mountpoint={}); spawning fresh",
                     mp.display(),
                     offer.pid,
-                    offer.version,
-                    version_ok,
                     mp_ok
                 );
                 spawn_fresh(&cli, mp);
@@ -308,6 +334,11 @@ fn main() {
 /// child: it survives this server's death by design and reconnects to
 /// the NEXT one — that is the adopt flow's whole point.
 static ADOPTED_DAEMON_PID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+
+/// Pids of takeover-successor daemons (waited at shutdown, killed on
+/// handler exit — they are children like spawn_fresh's).
+static RESPAWNED_CHILDREN: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
 
 fn wait_for_adoption_offer(window: std::time::Duration) -> Option<fuse_server::AdoptionOffer> {
     let deadline = std::time::Instant::now() + window;
@@ -392,6 +423,168 @@ fn spawn_fresh(cli: &Cli, mp: &Path) {
             std::process::exit(EXIT_FAILURE);
         }
     }
+}
+
+/// #103 fd handover: wait for the incompatible daemon's Surrender
+/// payload (its Hello-mismatch pushed the Surrender word), then
+/// spawn a SAME-VINTAGE successor with the connection fd pre-dup2'd
+/// to 3 and the open host fds at 4+ — the mount never goes down.
+fn takeover_transplant(cli: &Cli, mp: &Path, old_pid: u32) -> Result<(), String> {
+    use std::time::Instant;
+    use std::os::fd::AsRawFd as _;
+    // 1. the payload (bounded: an ancient daemon never answers).
+    let deadline = Instant::now() + TAKEOVER_BUDGET;
+    let payload = loop {
+        {
+            let mut mbox = fuse_server::TAKEOVER_MAILBOX
+                .lock()
+                .expect("takeover lock: no panics under it by contract");
+            if let Some(p) = mbox.take() {
+                break p;
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err("no takeover payload within 10s (daemon predates Surrender?)".into());
+        }
+        std::thread::sleep(TAKEOVER_POLL);
+    };
+    let mut fd_iter = payload.fds.into_iter();
+    let Some(fuse_conn) = fd_iter.next() else {
+        return Err("takeover payload carried no fds".into());
+    };
+    let host_conns: Vec<std::os::fd::OwnedFd> = fd_iter.collect();
+
+    // 2. the session envelope for the successor: schema + state JSON.
+    let state_path = std::env::temp_dir().join(format!(
+        "gatekeeper-takeover-{}-{}.json",
+        std::process::id(),
+        old_pid
+    ));
+    let envelope = serde_json::json!({
+        fuse_protocol::oracle::TAKEOVER_KEY_SCHEMA: payload.session_schema,
+        fuse_protocol::oracle::TAKEOVER_KEY_STATE: payload.state,
+    });
+    std::fs::write(&state_path, envelope.to_string())
+        .map_err(|e| format!("write {}: {e}", state_path.display()))?;
+
+    // 3. spawn the successor: fd 3 = the connection, 4+ = host fds
+    //    (pre_exec dup2 — the fd table is wired before exec).
+    let exe = std::env::current_exe().expect("current exe");
+    // The #94 seam precedence (same as spawn_fresh): an explicit
+    // --fused-binary wins over the exe-sibling default.
+    let successor = cli
+        .fused_binary
+        .clone()
+        .or_else(|| {
+            exe.parent()
+                .map(|d| d.join(fuse_protocol::FUSED_BIN))
+                .filter(|p| p.exists())
+        })
+        .ok_or_else(|| MSG_NO_SUCCESSOR.to_string())?;
+    let host_fds: Vec<i32> = host_conns.iter().map(|f| f.as_raw_fd()).collect();
+    let fuse_fd = fuse_conn.as_raw_fd();
+    info!(
+        "  mount-point:     {} — TAKING OVER the mount session (fd {fuse_fd}, \
+         {} open host fds) into pid-space successor {}",
+        mp.display(),
+        host_fds.len(),
+        successor.display()
+    );
+    let mp_clone = mp.to_path_buf();
+    let oracle = cli.oracle_socket.clone();
+    let state_for_child = state_path.to_string_lossy().into_owned();
+    let mut child = {
+        let host_fds = host_fds.clone();
+        let mut cmd = std::process::Command::new(&successor);
+        {
+            let _a = cmd
+                .arg(fuse_protocol::MOUNT_POINT_FLAG).arg(&mp_clone)
+                .arg(fuse_protocol::ORACLE_SOCKET_FLAG).arg(&oracle)
+                .arg(fuse_protocol::RESUME_FD_FLAG).arg(RESUME_SLOT_CONN.to_string())
+                .arg(fuse_protocol::RESUME_FDS_BASE_FLAG).arg(RESUME_SLOT_HOST_BASE.to_string())
+                .arg(fuse_protocol::RESUME_STATE_FLAG).arg(&state_for_child);
+        }
+        use std::os::unix::process::CommandExt as _;
+        let dup_into_slots = move || {
+            // dup2 the inherited fds into their contract slots.
+            let set = |fd: i32, slot: i32| -> std::io::Result<()> {
+                if fd == slot {
+                    return Ok(());
+                }
+                let fd_b = fd;
+                let slot_b = slot;
+                // SAFETY: plain dup2 of two live descriptors between
+                // fork and exec; no allocation, no locks; operands
+                // are the hoisted bindings.
+                let rc = unsafe { libc::dup2(fd_b, slot_b) };
+                if rc < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            };
+            set(fuse_fd, RESUME_SLOT_CONN)?;
+            for (i, fd) in host_fds.iter().enumerate() {
+                set(*fd, RESUME_SLOT_HOST_BASE + i as i32)?;
+            }
+            Ok(())
+        };
+        {
+            // SAFETY: the closure runs between fork and exec and calls
+            // only dup2 — no allocation, no locks; operands are the
+            // hoisted bindings.
+            let _reg = unsafe { cmd.pre_exec(dup_into_slots) };
+        }
+        {
+            let _rm = cmd.env_remove(ENV_FAKE_HELLO_VERSION); // the successor IS this vintage
+        }
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+            .map_err(|e| format!("spawn successor: {e}"))?
+    };
+    RESPAWNED_CHILDREN
+        .lock()
+        .expect("respawned-children lock")
+        .push(child.id());
+
+    // 4. the successor's Hello = it serves. Retire the old daemon.
+    let deadline = Instant::now() + TAKEOVER_BUDGET;
+    loop {
+        if fuse_server::oracle_service::RESUMED_HELLO.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            break;
+        }
+        if Instant::now() >= deadline {
+            return Err("successor never said Hello".into());
+        }
+        std::thread::sleep(TAKEOVER_POLL);
+    }
+    {
+        let mut pending = fuse_server::TAKEOVER_PENDING
+            .lock()
+            .expect("takeover lock: no panics under it by contract");
+        if let Some(p) = pending.take() {
+            if let Some(mut ctrl) = p.control {
+                use std::io::Write as _;
+                let _w = writeln!(
+                    ctrl,
+                    "{}",
+                    serde_json::to_string(&fuse_protocol::oracle::OracleCommand::Retire)
+                        .expect("internal enum: infallible")
+                );
+                let _f = ctrl.flush();
+            }
+        }
+    }
+    // The successor outlives this server (it serves until ITS
+    // successor or retirement) — reaping happens on its own thread,
+    // never blocking the gate.
+    let _reaper = std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    let _ = std::fs::remove_file(&state_path);
+    info!("takeover complete: the mount session lives on the successor");
+    Ok(())
 }
 
 /// A dead FUSE mount occupies the path (ENOTCONN corpse — the #54
