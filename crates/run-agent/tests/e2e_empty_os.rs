@@ -1002,6 +1002,29 @@ fn e2e_startup_recovery_after_a_killed_data_daemon() {
             && !text2.contains("pre-flight checks failed"),
         "session 2 must recover the dead mount (inner {fuse_name}), not abort:\n{text2}"
     );
+
+    // Review on #135 — THE question: reconnecting to the existing
+    // agentbox after the recovered stack died with its session (the
+    // #127 world: plain dir where the mount was, stale state file) —
+    // does the new connection come up cleanly or get STUCK?  Session
+    // 3 is that reconnection; run_session's wall bound turns any hang
+    // into a named failure.
+    let text3 = os.run_session(Some(image), &["/bin/true"], "session 3 (reconnect)");
+    let _ = std::io::stderr().write_all(text3.as_bytes());
+    assert!(
+        !text3.contains("did not answer")
+            && !text3.contains("bind is stale")
+            && !text3.contains("pre-flight checks failed"),
+        "reconnection must not get stuck or abort:\n{text3}"
+    );
+
+    // Post-session stack longevity is #127's open question, NOT this
+    // test's contract — and the observation that broadened it: this
+    // reconnect's rebuilt stack ALSO died with its session (ENOTCONN
+    // on the follow-up cat), so #127 is not recovery-only: ANY session
+    // that rebuilds over an existing state file leaves a dead stack.
+    // Virgin-fresh builds survive (the #52 e2es pin that); the
+    // boundary is rebuild-under-existing-state. Tracked in #127.
 }
 
 /// Escape regex metacharacters in a path for `pgrep -f` patterns.
