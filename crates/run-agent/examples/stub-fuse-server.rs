@@ -6,26 +6,30 @@
 //! `rustc` spawn fails on hosts whose linker setup differs from
 //! cargo's, e.g. gcc-less minimal hosts).
 //!
-//! Contract: one request line per connection. `add NAME ...` answers
-//! `Added { inner: "stub-<name>" }` — the anonymized container-view
-//! form (#47/#58) the caller must wire container paths to; anything
-//! else answers Ok. Deterministic inner form so the tier can ASSERT
-//! the caller followed the server-reported name.
+//! Wire contract (servyi_servatui TypedConnection framing): each
+//! connection sends the command NAME as a JSON string line, then the
+//! Command as a JSON object line; the reply is one JSON Response
+//! line, and the client closes with a `null` line. `add_secret`
+//! answers `Added { inner: "stub-<name>" }` — the anonymized
+//! container-view form (#47/#58) the caller must wire container paths
+//! to; `get_version` answers the real `fuse_protocol::VERSION`
+//! (matching vintages, so the restart machinery stays out of the
+//! way); everything else answers Ok. Deterministic inner form so the
+//! tier can ASSERT the caller followed the server-reported name.
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 
-/// argv/wire vocabulary of the stub.
+/// argv vocabulary of the stub.
 const FLAG_SOCKET: &str = "--socket";
-const CMD_ADD: &str = "add";
-#[allow(unknown_lints)]
-#[allow(inline_literal)]
-const REPLY_OK: &str = "{\"type\":\"ok\"}\n";
 const EXIT_USAGE: i32 = 2;
 const EXIT_BIND: i32 = 3;
+/// JSON command tags the stub answers with substance.
+const TAG_ADD_SECRET: &str = "add_secret";
+const TAG_GET_VERSION: &str = "get_version";
 
-// Necessity: argv walking (skip(1), flag matching) and the WORD reply
-// grammar (split(' ')) — a hand-rolled wire stub, not constants to name.
+// Necessity: argv walking (skip(1), flag matching) and the two-line
+// JSON frame (name line, command line) — a hand-rolled wire stub.
 #[allow(unknown_lints)]
 #[allow(inline_literal)]
 fn main() {
@@ -48,24 +52,107 @@ fn main() {
             std::process::exit(EXIT_BIND);
         }
     };
+    let mut conn_n: u32 = 0;
     eprintln!("stub-fuse-server: listening at {}", path.display());
     for conn in listener.incoming() {
-        let Ok(conn) = conn else { continue };
+        let Ok(conn) = conn else {
+            eprintln!("stub: accept error");
+            continue;
+        };
+        conn_n += 1;
+        let conn_started = std::time::Instant::now();
         let mut w = conn;
-        let mut reader = BufReader::new(w.try_clone().expect("clone stub conn"));
-        let mut line = String::new();
-        if reader.read_line(&mut line).is_err() {
+        // Bounded reads: a client that dies mid-frame (or never sends
+        // the closing null) must not wedge the accept loop — a CI
+        // failure showed the NEXT connection never being served.
+        let _ = w.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+        let mut reader = BufReader::new(match w.try_clone() {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("stub: clone conn failed: {e}");
+                continue;
+            }
+        });
+        // Frame: name line, then the command object line.
+        let mut name_line = String::new();
+        if let Err(e) = reader.read_line(&mut name_line) {
+            eprintln!("stub: conn#{conn_n} name read failed after {:?}: {e}", conn_started.elapsed());
             continue;
         }
-            // request grammar: WORD args — plain split
-            let mut words = line.split(' ');
-            let reply = match (words.next(), words.next()) {
-                (Some(CMD_ADD), Some(name)) => {
-                    format!("{{\"type\":\"added\",\"inner\":\"stub-{name}\"}}\n")
+        let mut cmd_line = String::new();
+        if let Err(e) = reader.read_line(&mut cmd_line) {
+            eprintln!(
+                "stub: conn#{conn_n} command read failed after {:?} (name={:?}): {e}",
+                conn_started.elapsed(),
+                name_line.trim()
+            );
+            continue;
+        }
+        eprintln!(
+            "stub: conn#{conn_n} (+{:?}) name={} cmd={}",
+            conn_started.elapsed(),
+            name_line.trim(),
+            cmd_line.trim()
+        );
+        let reply = match serde_json::from_str::<serde_json::Value>(cmd_line.trim()) {
+            Ok(cmd) => match cmd.get("type").and_then(|t| t.as_str()) {
+                Some(TAG_ADD_SECRET) => {
+                    let name = cmd
+                        .get("name")
+                        .and_then(|n| n.as_str())
+                        .unwrap_or_default();
+                    format!(
+                        "{{\"type\":\"added\",\"inner\":\"stub-{name}\"}}\n"
+                    )
                 }
-                _ => REPLY_OK.to_string(),
-            };
-        let _ = w.write_all(reply.as_bytes());
-        let _ = w.flush();
+                Some(TAG_GET_VERSION) => {
+                    format!(
+                        "{{\"type\":\"version\",\"version\":\"{}\"}}\n",
+                        fuse_protocol::VERSION
+                    )
+                }
+                _ => "{\"type\":\"ok\"}\n".to_string(),
+            },
+            Err(_) => "{\"type\":\"ok\"}\n".to_string(),
+        };
+        if let Err(e) = w.write_all(reply.as_bytes()) {
+            eprintln!("stub: conn#{conn_n} reply write failed: {e}");
+            continue;
+        }
+        if let Err(e) = w.flush() {
+            eprintln!("stub: conn#{conn_n} reply flush failed: {e}");
+            continue;
+        }
+        // The client closes the frame with a null line; consume it so
+        // the connection ends cleanly.  Bounded: a client that never
+        // sends it (or dies first) must not hold the accept loop.
+        let _ = w.set_read_timeout(Some(std::time::Duration::from_millis(500)));
+        let mut tail = String::new();
+        match reader.read_line(&mut tail) {
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!(
+                    "stub: conn#{conn_n} tail read failed (reply was sent): {e}"
+                );
+            }
+        }
+        // RACE FIX (the #128/#131 CI flake): the client's frame ends
+        // with TWO write_all calls (`null`, then `\n`); dropping the
+        // connection the instant the tail line lands can interleave
+        // BETWEEN them — the second write hits EPIPE and the whole
+        // exchange reports "server closed the connection" although
+        // the reply was delivered.  Hold the connection until the
+        // CLIENT closes (its SocketConnection drops when the call
+        // returns), bounded by the timeout.
+        loop {
+            let mut more = String::new();
+            match reader.read_line(&mut more) {
+                Ok(0) => break, // client closed first — safe to drop
+                Ok(_) => continue,
+                Err(_) => break, // timeout: drop rather than wedge
+            }
+        }
+        eprintln!("stub: conn#{conn_n} done in {:?}", conn_started.elapsed());
+        let _ = name_line;
     }
 }

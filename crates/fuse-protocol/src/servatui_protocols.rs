@@ -583,7 +583,12 @@ pub fn run_command_once(
     }
     let resp: crate::Response =
         serde_json::from_slice(&raw).map_err(|e| e.to_string())?;
-    conn.send_typed(&())?;
+    // Best-effort close frame: the reply is parsed, the conversation
+    // is COMPLETE — a peer that already closed (EPIPE on this write)
+    // must not fail the call.  The #128/#131 CI flake was exactly
+    // this: the stub's close raced the newline half of this write and
+    // a successful add reported "server closed the connection".
+    let _ = conn.send_typed(&());
     Ok(resp)
 }
 

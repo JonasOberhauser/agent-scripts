@@ -18,7 +18,7 @@ use tracing::{error, info, warn};
 use fuse_server::{OracleHub, ServerState};
 
 #[derive(Parser)]
-#[command(name = fuse_protocol::SERVER_BIN, about = SERVER_ABOUT)]
+#[command(name = fuse_protocol::SERVER_BIN, version = fuse_protocol::VERSION, about = SERVER_ABOUT)]
 struct Cli {
     /// Accepted for backward compatibility with older orchestrators;
     /// mounting is the data daemon's job now.

@@ -277,8 +277,35 @@ mod tests {
 
     #[test]
     fn privileges_probe_returns_bool() {
-        // Any environment: must answer, never panic.
-        let _ = privileges_ok();
+        // Issue #56: a bare `let _` asserted literally nothing. The
+        // honest oracle is the kernel gate itself, probed directly:
+        // read a sleep child's map_files entry and require the probe
+        // to agree — catching plumbing regressions (wrong file,
+        // inverted gate) in any environment, privileged or not.
+        let mut child = std::process::Command::new(SLEEP_BIN)
+            .arg(CHECK_DELAY_SECS)
+            .spawn()
+            .expect("spawn sleep probe child");
+        let gate_open = (|| {
+            let maps = std::fs::read_to_string(format!("/proc/{}/maps", child.id())).ok()?;
+            let range = maps
+                .lines()
+                .find(|l| l.contains(SLASH))?
+                .split_whitespace()
+                .next()?
+                .to_string();
+            Some(
+                std::fs::read(format!("/proc/{}/map_files/{}", child.id(), range)).is_ok(),
+            )
+        })()
+        .unwrap_or(false);
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(
+            privileges_ok(),
+            gate_open,
+            "the probe must agree with a direct probe of the map_files gate"
+        );
     }
 
     #[test]

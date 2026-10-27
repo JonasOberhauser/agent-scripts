@@ -34,7 +34,15 @@ cargo test -p fuse-server                # fuse-server only (unit)
 cargo clippy --workspace                 # zero warnings required
 ```
 
-The workspace has six crates: `fuse-protocol`, `fuse-server`, `fuse-client`, `run-agent`, `hashd`, `fuse-mount`.
+The workspace has seven crates: `fuse-protocol`, `fuse-server`, `fuse-client`,
+`run-agent`, `hashd`, `fuse-mount`, `gatekeeper-testkit` (see Testing Philosophy).
+
+CI enforces more than clippy: the `lint-policy` job runs the servyi lint
+stack (`servyi/lints` action, built from that repo's main) with
+`-D unsafe_scope -D workspace_lints_table -D non_test_panic_allow
+-D unsound_constructor -D inline_literal` over `--workspace --all-targets`,
+and the `stack-lint` job denies hand-built stacks (see below). A locally
+green `cargo clippy` does not imply a green CI lint run.
 
 ## Architecture
 
@@ -227,3 +235,54 @@ After running — locally or in CI — verify the number and that the new test
 NAMES actually appear. A silently no-op'd patch (missed conflict hunk,
 failed string replace, empty commit) otherwise hides as "still green, one
 test short". A green run you didn't count is a green run you didn't check.
+
+### Test tiers: put each test where it can actually fail
+
+| Tier | Where | Runs | Use for |
+|---|---|---|---|
+| Unit (`#[cfg(test)]` in src, `tests/*.rs`) | every crate | local + CI | logic, wire formats, rendered output (assert on the real surface — ratatui `Buffer`s for TUI, not internal widget state) |
+| Kit real-mount (`gatekeeper-testkit`, availability-gated) | `fuse_e2e` etc. | CI (has /dev/fuse) | kernel truth: kill points, mount leftovers, snapshot replay |
+| Stub seam (`e2e_stub_fuse`) | run-agent | CI (`--include-ignored`) | run-agent flows against the contract-double server; the stub must speak the CURRENT wire (see #124/#128 rot incidents) |
+| Real podman (`e2e_empty_os`, `#[ignore]`) | run-agent | CI (`--include-ignored`) | whole-stack behavior: container contract, recovery, wall-time bounds |
+
+Wrong-tier tests pass vacuously: a stub-tier mount check can never see a
+path-shaped secret's startup failure; a mock argv assert can never see a
+flag's semantics. Choose the lowest tier that can genuinely fail.
+
+### Pull requests: prove the tests can fail
+
+Every test-only or test-adding PR must include a **fault-injection
+check**: inject a production fault the OLD tests miss; the new tests
+must go red while every existing test stays green. Run it where the
+tests run (unit tier: locally; podman tiers: a draft fault-probe PR,
+closed with the CI evidence). Also verify the converse: new behavioral
+tests PASS against pre-PR production code — they pin behavior, not the
+diff. (#117/#120/#124/#126/#128 set the pattern; #125 was a probe.)
+
+Vigilance for vacuous passes, learned the hard way:
+
+- **Message-absence asserts** pass while the flow dies earlier — pair
+  them with a positive assert (the add succeeded, the run reached
+  creation).
+- **Fast-path escapes** satisfy generic diagnostics (a "pre-flight"
+  match on an ENOENT abort that never measured the probe) — require
+  the outcome-specific wording.
+- **Tier doubles rot silently** — a stub that stops speaking the wire
+  keeps every absence-assert green; doubles need a rot-alarm (an
+  assert that they ANSWER) and bounded reads so a half-frame cannot
+  wedge the accept loop.
+- **A mock's "assumed" world model is a hypothesis** — pin it with an
+  observation test on the real tier (the #54 pattern: honesty note
+  becomes VALIDATED MODEL; when observation diverges, fix the mock).
+
+Bounded harnesses: every e2e that can hang gets a wall-clock watchdog
+plus stall diagnostics (process tree, `podman ps`, the state file, the
+server log) — a hang must NAME itself in seconds, not eat the 25-minute
+CI budget. Sessions end the way a user's do (`exit` on stdin, or a
+terminating session command), never by wedging a pty.
+
+House style: squash merges only; test-first commits for bugfix PRs
+(the failing test, then the fix); issues filed for every real finding
+a probe uncovers, even (especially) when it was bycatch. Tracked
+binaries are CI-enforced (#104): the hygiene step fails the build on
+any NUL-byte file in the tree — the fixture-binary incident class.

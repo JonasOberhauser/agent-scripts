@@ -11,3 +11,10 @@ fuse_mnt/
 tmp/
 *.log
 fuse-gatekeeper-state.json
+
+# Binary-junk sweep protection (#104): these recur as untracked
+# bycatch in working trees (the fixture-binary incident class) and are
+# never repo content.
+target-container/
+/bar.txt
+/wl-copy
