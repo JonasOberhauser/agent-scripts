@@ -381,6 +381,8 @@ fn fuse_mount_alive(path: &std::path::Path) -> bool {
     let Ok(cpath) = c else {
         return false;
     };
+    // SAFETY: zeroed() on a plain-old-data libc struct produces the
+    // statfs(2) out-parameter contract (all-zero is a valid input).
     let mut st: libc::statfs = unsafe { std::mem::zeroed() };
     let cpath_ptr = cpath.as_ptr();
     let st_ptr = &mut st;
