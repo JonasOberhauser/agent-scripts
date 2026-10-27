@@ -370,20 +370,28 @@ pub(crate) struct DiscoveredDaemon {
 /// The outcome of scanning for the stack anchored at a mountpoint.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) enum StackDiscovery {
-    /// No live daemon names this mountpoint.
+    /// No CONTROLLER (no `--socket`-carrying daemon) names this
+    /// mountpoint.  A `fused`-only or bare mount takes the existing
+    /// recovery paths — nothing to join or refuse.
     #[default]
     None,
-    /// Exactly one owner: its controlling pieces.
+    /// Exactly one controller: the stack's server, whose `--socket`
+    /// is the join key.  (A HEALTHY stack has TWO argv-matchers — the
+    /// server and its supervised `fused` — the server owns the
+    /// mountpoint; the daemon list is context, not ownership.  The
+    /// parked-stale shape of a #93 mixed-vintage refusal also has one
+    /// server: the server knows which daemon it actually supervises.)
     Owned(Box<DiscoveredDaemon>),
-    /// More than one daemon argv-matches (the parked-stale shape of a
-    /// mixed-vintage refusal, or pre-fix shadowing).  NOT safe to
-    /// join blindly — ask the listed SERVER which daemon it actually
-    /// supervises.
+    /// More than one CONTROLLER claims the mountpoint — genuinely
+    /// ambiguous ownership; refuse rather than pick a side.
     Ambiguous(Vec<DiscoveredDaemon>),
 }
 
-/// Pure: classify a set of argv-matching daemons.
+/// Pure: classify a set of argv-matching daemons.  Controllers are
+/// the daemons carrying `--socket` (the join key); daemons without
+/// one (the data daemon) are context.
 pub(crate) fn classify_discovery(mut found: Vec<DiscoveredDaemon>) -> StackDiscovery {
+    found.retain(|d| d.socket.is_some());
     match found.len() {
         0 => StackDiscovery::None,
         1 => StackDiscovery::Owned(Box::new(found.remove(0))),
@@ -1675,14 +1683,47 @@ mod tests {
     }
 
     #[test]
-    fn two_daemons_is_ambiguous_never_a_silent_pick() {
-        // The parked-stale shape: joining either blindly would be the
-        // mix-and-match this issue exists to kill.
+    fn two_controllers_is_ambiguous_never_a_silent_pick() {
+        // Two SOCKET-carrying daemons: genuinely contested ownership.
         let found = vec![
             daemon(7, "fuse-server", Some("/tmp/old.sock")),
             daemon(9, "fuse-server", Some("/tmp/new.sock")),
         ];
         assert_eq!(classify_discovery(found.clone()), StackDiscovery::Ambiguous(found));
+    }
+
+    #[test]
+    fn the_healthy_pair_is_owned_by_the_server() {
+        // A healthy stack has TWO argv-matchers — the server and its
+        // supervised fused.  Ownership is the SERVER's (its --socket
+        // is the join key); the daemon is context.  (Round 1 of the
+        // e2e failed exactly here: the pair read as Ambiguous and the
+        // restart session refused to run.)
+        let server = daemon(7, "fuse-server", Some("/tmp/s.sock"));
+        let fused = DiscoveredDaemon {
+            pid: 9,
+            bin: "fused".to_string(),
+            socket: None,
+            oracle_socket: Some("/tmp/oracle.sock".to_string()),
+        };
+        assert_eq!(
+            classify_discovery(vec![server.clone(), fused]),
+            StackDiscovery::Owned(Box::new(server)),
+        );
+    }
+
+    #[test]
+    fn fused_without_a_server_is_the_recovery_path() {
+        // A live daemon but no controller (crashed server): nothing
+        // to join or refuse — the existing recovery/adoption paths
+        // apply.
+        let fused = DiscoveredDaemon {
+            pid: 9,
+            bin: "fused".to_string(),
+            socket: None,
+            oracle_socket: Some("/tmp/oracle.sock".to_string()),
+        };
+        assert_eq!(classify_discovery(vec![fused]), StackDiscovery::None);
     }
 
     /// The real /proc scan finds a live process by its argv — this
