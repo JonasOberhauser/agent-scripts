@@ -464,6 +464,19 @@ where
     // "File exists" (issue #23). Recover instead of aborting: lazy-
     // unmount, then retry; a plain file blocking the name is removed.
     ensure_mount_point(io, &config.mount_point, config.runtime_wrapper.as_deref())?;
+    // #127, startup half (review on #135): with a state file present,
+    // a mountpoint that is NOT a live FUSE superblock means the
+    // previous stack died with its session (the recovered-stack
+    // shape). The rebuild below is correct — this names WHY, so the
+    // fresh stack reads as explained, not as a mystery.
+    if std::path::Path::new(&fuse_protocol::state_file()).exists() && !fuse_mount_alive(&config.mount_point) {
+        warn!(
+            "the previous stack's mount at {} is GONE (plain directory): \
+             its stack died with its session (#127). Starting a fresh \
+             stack — approvals persist in the policy store.",
+            config.mount_point.display()
+        );
+    }
     info!("Workspace folders ready.");
 
     // ── 2..4.5  Build-and-verify loop ────────────────────────────
