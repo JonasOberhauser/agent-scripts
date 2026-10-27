@@ -1509,8 +1509,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cpath =
             std::ffi::CString::new(dir.path().as_os_str().as_bytes()).unwrap();
+        // SAFETY: zeroed() on a plain-old-data libc struct produces
+        // the statfs(2) out-parameter contract.
         let mut st: libc::statfs = unsafe { std::mem::zeroed() };
-        // SAFETY: statfs(2) into a caller-owned local; valid CString.
         let cpath_ptr = cpath.as_ptr();
         let st_ptr = &mut st;
         // SAFETY: statfs(2) into a caller-owned local; valid CString.
