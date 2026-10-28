@@ -79,6 +79,7 @@ mod tests {
     #[test]
     fn response_status_round_trip() {
         let resp = Response::Status {
+            mount_point: String::new(),
             secrets: vec![SecretStatus {
                 inner: String::new(),
             name: "a".into(),

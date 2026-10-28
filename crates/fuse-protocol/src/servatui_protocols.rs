@@ -37,7 +37,7 @@ pub fn print_response(resp: &Response, out: &mut dyn Console) {
             out.print_line(&format!("added — container view: /fuse/{inner}"))
         }
         Response::Error { message } => out.print_error(message),
-        Response::Status { secrets, lockdown } => {
+        Response::Status { secrets, lockdown, .. } => {
             if *lockdown {
                 out.print_line("lockdown: ON — new unauthorized access is refused");
             }
@@ -646,6 +646,7 @@ mod completer_mapping_tests {
     #[test]
     fn values_come_from_the_matching_response() {
         let status = Response::Status {
+            mount_point: String::new(),
             secrets: vec![crate::protocol::SecretStatus {
                 name: "a.yaml".into(),
                 access_count: 0,
@@ -714,6 +715,7 @@ mod tests {
         // far too long. The map moved to its own command; status is
         // back to the compact shape and must NOT render inner names.
         let resp = Response::Status {
+            mount_point: String::new(),
             secrets: vec![crate::protocol::SecretStatus {
                 inner: "ab12/cd34/ef56/789a".into(),
                 name: "var/home/jonas/secrets/zai.key".into(),
@@ -750,6 +752,7 @@ mod tests {
         //   bar/secret.txt     6    167    blah -- hash1
         //                                  bloo -- hash2
         let resp = Response::Status {
+            mount_point: String::new(),
             secrets: vec![
                 crate::protocol::SecretStatus {
                     inner: "i1/i2/i3/i4".into(),
@@ -800,6 +803,7 @@ mod tests {
     fn status_renders_collapsed_names() {
         use crate::protocol::SecretStatus;
         let resp = Response::Status {
+            mount_point: String::new(),
             secrets: vec![
                 SecretStatus {
                     inner: "i0".into(),
