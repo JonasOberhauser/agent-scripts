@@ -8,7 +8,7 @@ pub mod protocols;
 pub mod socket;
 pub mod state;
 
-pub use handler::handle_command;
+pub use handler::{handle_command, SERVED_MOUNT_POINT};
 pub use oracle_service::{run_oracle_server, OracleHub, ORACLE_HUB};
 pub use socket::run_socket_server;
 pub use protocols::server_protocols;

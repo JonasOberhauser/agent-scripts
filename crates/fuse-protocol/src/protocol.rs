@@ -385,6 +385,13 @@ pub enum Response {
         /// (defaulted) so old clients still parse.
         #[serde(default)]
         lockdown: bool,
+        /// The mountpoint this server controls (issue #60 step ③:
+        /// "what mountpoint are you controlling?").  Additive and
+        /// defaulted: old servers' replies parse without it (empty —
+        /// callers must treat empty as unknown, not as mismatch).
+        /// The socket-reuse cross-check keys on it.
+        #[serde(default)]
+        mount_point: String,
     },
     MountList { mounts: Vec<MountEntry> },
     PendingList { pending: Vec<PendingAccessInfo> },
@@ -407,6 +414,19 @@ pub struct MapEntry {
 
 #[cfg(test)]
 mod tests {
+
+    /// Issue #60 step ③: the additive mount_point field — an OLD
+    /// server's reply (no field) parses to the empty default, never
+    /// errors.
+    #[test]
+    fn status_mount_point_field_is_additive() {
+        let old_wire = r#"{"type":"Status","secrets":[]}"#;
+        let r: super::Response = serde_json::from_str(old_wire).expect("old replies parse");
+        assert!(
+            matches!(r, super::Response::Status { ref mount_point, .. } if mount_point.is_empty()),
+            "absent field defaults to empty (unknown), not a parse error"
+        );
+    }
     use super::Salt;
     fn s4lt() -> Salt {
         Salt::from_bytes(b"salt".to_vec()).unwrap()

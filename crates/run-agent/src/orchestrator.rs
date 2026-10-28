@@ -260,6 +260,25 @@ where
     }
 }
 
+/// The mountpoint the answering server CONTROLS, from the status
+/// reply's additive field (issue #60 step ③: "what mountpoint are you
+/// controlling?").  `None` = the field was absent/empty (an old
+/// server) — callers must treat that as unknown, not as mismatch.
+fn server_mount_point<F>(send: &F) -> Result<Option<String>, String>
+where
+    F: Fn(&str, &str) -> Result<String, String>,
+{
+    let payload = send(CMD_STATUS, "")?;
+    let resp: fuse_protocol::Response =
+        serde_json::from_str(payload.trim()).map_err(|e| format!("unparseable reply: {e}"))?;
+    match resp {
+        fuse_protocol::Response::Status { mount_point, .. } => {
+            Ok(if mount_point.is_empty() { None } else { Some(mount_point) })
+        }
+        _ => Ok(None),
+    }
+}
+
 /// Whether a failed pre-flight justifies rebuilding the stack: a
 /// broken mount side does (an orphaned or dead mount heals by
 /// respawning server + data daemon), a missing host-side source file
@@ -720,8 +739,47 @@ where
         // read-only round-trip before trusting the server.
         match send(CMD_STATUS, "") {
             Ok(_) => {
-                info!("Reusing existing fuse-server at {}", socket.display());
-                server_healthy = true;
+                // Issue #60 step ③: the reused server must control
+                // OUR mountpoint — a server answering on this socket
+                // while serving a different mount is the
+                // my-socket-your-mount mix-and-match.
+                match server_mount_point(send) {
+                    Ok(Some(mp)) if mp == config.mount_point.to_string_lossy() => {
+                        info!(
+                            "Reusing existing fuse-server at {} (controls {})",
+                            socket.display(),
+                            mp
+                        );
+                        server_healthy = true;
+                    }
+                    Ok(Some(other)) => {
+                        return Err(format!(
+                            "fuse-server at {} controls a DIFFERENT mountpoint \
+                             ({other}, expected {}) — a socket/mountpoint \
+                             mix-and-match; refusing to reuse it",
+                            socket.display(),
+                            config.mount_point.display()
+                        ));
+                    }
+                    Ok(None) => {
+                        // Old server without the field: unknown, not
+                        // mismatch — reuse stands (the discovery scan
+                        // already guarded the live-mount case).
+                        info!(
+                            "Reusing existing fuse-server at {} (old vintage: \
+                             mountpoint field absent)",
+                            socket.display()
+                        );
+                        server_healthy = true;
+                    }
+                    Err(e) => {
+                        warn!(
+                            "fuse-server at {} failed the mountpoint probe \
+                             ({e}); respawning a fresh server",
+                            socket.display()
+                        );
+                    }
+                }
             }
             Err(e) => {
                 warn!(
@@ -2219,7 +2277,16 @@ mod tests {
         mock.unix_connected = true;
 
         let cfg = test_config();
-        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(String::new()), false);
+        // The double speaks the wire (#60 step ③ made the reuse
+        // check parse the status reply): minimal valid status.
+        let status_wire = r#"{"type":"Status","secrets":[],"lockdown":false}"#.to_string();
+        let result = run_agent(&mut mock, &cfg, &|name, _| {
+            if name == CMD_STATUS {
+                Ok(status_wire.clone())
+            } else {
+                Ok(String::new())
+            }
+        }, false);
 
         assert!(result.is_ok(), "got: {:?}", result.err());
         assert!(!result.unwrap().server_was_spawned);
@@ -2650,8 +2717,12 @@ mod tests {
         mock.unix_connected = true;
 
         let cfg = test_config();
+        let status_wire = r#"{"type":"Status","secrets":[],"lockdown":false}"#.to_string();
         let result = run_agent(&mut mock, &cfg, &|name, _| {
-            if name == "version" {
+            if name == CMD_STATUS {
+                return Ok(status_wire.clone());
+            }
+            if name == CMD_VERSION {
                 let mut p = payloads.borrow_mut();
                 if p.is_empty() {
                     return Ok(format!(
@@ -2853,7 +2924,14 @@ mod tests {
         mock.unix_connected = true;
 
         let cfg = test_config();
-        let result = run_agent(&mut mock, &cfg, &|_, _| Ok(String::new()), false);
+        let status_wire = r#"{"type":"Status","secrets":[],"lockdown":false}"#.to_string();
+        let result = run_agent(&mut mock, &cfg, &|name, _| {
+            if name == CMD_STATUS {
+                Ok(status_wire.clone())
+            } else {
+                Ok(String::new())
+            }
+        }, false);
         assert!(result.is_ok());
         assert!(
             mock.spawned.is_empty(),

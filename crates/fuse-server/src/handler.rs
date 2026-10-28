@@ -3,6 +3,10 @@ use fuse_protocol::{Command, Response};
 
 use crate::state::ServerState;
 
+/// The mountpoint this process controls (issue #60 step ③), set once
+/// at startup before the socket accepts.
+pub static SERVED_MOUNT_POINT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
 /// One-off lockdown prose (issue #66 reference).
 const MSG_LOCKDOWN_ARMED: &str = "lockdown armed (issue #66): current grants keep working; new unauthorized access is refused";
 
@@ -22,9 +26,14 @@ pub fn handle_command(cmd: Command, state: &ServerState, hub: &crate::oracle_ser
             tracing::info!("{MSG_LOCKDOWN_ARMED}");
             Response::Ok
         }
-        Command::Status => {
-            Response::Status { secrets: state.status(), lockdown: state.lockdown() }
-        }
+        Command::Status => Response::Status {
+            secrets: state.status(),
+            lockdown: state.lockdown(),
+            mount_point: crate::SERVED_MOUNT_POINT
+                .get()
+                .cloned()
+                .unwrap_or_default(),
+        },
 
         Command::ShowMap => Response::Map {
             entries: state
@@ -143,6 +152,22 @@ fn register_secret(
 }
 #[cfg(test)]
 mod tests {
+
+    /// Issue #60 step ③: the status reply answers "what mountpoint
+    /// are you controlling?" — from the once-per-process lock.
+    #[test]
+    fn status_reply_names_the_controlled_mountpoint() {
+        let s = std::sync::Arc::new(ServerState::new());
+        let resp = handle_command(Command::Status, &s, &hub());
+        match resp {
+            Response::Status { mount_point, .. } => {
+                // The lock is unset in tests: empty = unknown (the
+                // additive-field contract).
+                assert_eq!(mount_point, "");
+            }
+            other => panic!("status reply shape changed: {other:?}"),
+        }
+    }
     use super::*;
     use std::io::{BufRead as _, Write as _};
     fn hub() -> crate::oracle_service::OracleHub {

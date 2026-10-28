@@ -225,6 +225,17 @@ fn main() {
     }
     let state = Arc::new(state);
 
+    // Issue #60 step ③: record the controlled mountpoint BEFORE the
+    // socket accepts, so every status reply can answer "what
+    // mountpoint are you controlling?" (the socket-reuse cross-check).
+    let _ = fuse_server::SERVED_MOUNT_POINT.set(
+        cli.mount_point
+            .as_deref()
+            .unwrap_or(std::path::Path::new(fuse_protocol::DEFAULT_MOUNT_POINT))
+            .display()
+            .to_string(),
+    );
+
     // ── Command socket (fuse-client / servatui) ──────────────────
     let socket_path = cli.socket.clone();
     let socket_state = Arc::clone(&state);
