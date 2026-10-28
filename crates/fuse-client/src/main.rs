@@ -194,17 +194,18 @@ fn main() {
             })
     });
     let app = App::builder(&socket).protocol_all(protocols).build();
+    let app_socket_path = socket.clone();
 
     if let Some((name, _)) = matches.subcommand() {
         if name == local::RESTART {
             let log_path = discover_log_path(&app);
-            restart_server(&app, log_path.as_deref());
+            restart_server(&app, &app_socket_path, log_path.as_deref());
             return;
         }
     }
 
     if app.server_running() {
-        check_version_or_restart(&app);
+        check_version_or_restart(&app, &app_socket_path);
     } else {
         check_start_server(&app);
     }
@@ -477,7 +478,7 @@ fn discover_log_path(app: &App) -> Option<String> {
         })
 }
 
-fn check_version_or_restart(app: &App) {
+fn check_version_or_restart(app: &App, socket: &std::path::Path) {
     use fuse_protocol::Response;
 
     let server_version = match app.run_cli_command_raw(fuse_protocol::cmd::VERSION, "") {
@@ -522,7 +523,7 @@ fn check_version_or_restart(app: &App) {
         if t.is_empty() { fuse_protocol::DEFAULT_LOG_PATH.to_string() } else { t.to_string() }
     });
 
-    restart_server(app, Some(&log_path));
+    restart_server(app, socket, Some(&log_path));
 }
 
 /// How the restart stops the old server, as DATA: the pid the state
@@ -645,6 +646,16 @@ fn respawn_argv(state: &ServerStateFile) -> Vec<String> {
 fn read_state_file() -> Option<ServerStateFile> {
     let data = std::fs::read(fuse_protocol::state_file()).ok()?;
     serde_json::from_slice(&data).ok()
+}
+
+/// Issue #60 step ④: the state file NAMES its stack (socket +
+/// mountpoint).  A restart must act on ITS OWN stack's file — the
+/// default path is shared by every stack that kept the defaults, so
+/// the file may describe a different agentbox's stack (the last
+/// writer's).  Mismatch refuses with the file's identity instead of
+/// respawning a foreign stack.
+fn state_file_matches_stack(state: &ServerStateFile, socket: &std::path::Path) -> bool {
+    std::path::Path::new(&state.socket) == socket
 }
 
 
@@ -1008,7 +1019,7 @@ eprintln!("Restoring {} secret(s)...", state.secrets.len());
 // privileged kill path.
 #[allow(unknown_lints)]
 #[allow(inline_literal)]
-fn restart_server(app: &App, log_path: Option<&str>) {
+fn restart_server(app: &App, socket: &std::path::Path, log_path: Option<&str>) {
     use fuse_protocol::Response;
 
     let state = match read_state_file() {
@@ -1018,6 +1029,21 @@ fn restart_server(app: &App, log_path: Option<&str>) {
             return ask_reset_anyway();
         }
     };
+    // Issue #60 step ④: identity before action — the state file must
+    // describe THIS stack (the socket we are talking to), not the
+    // last writer's.
+    if !state_file_matches_stack(&state, socket) {
+        eprintln!(
+            "The state file at {} describes ANOTHER stack (socket {}, \
+             mountpoint {}) — it was written by a different agentbox \
+             that shares this default path. Restart THAT agentbox, or \
+             remove the file if it is stale.",
+            fuse_protocol::state_file().display(),
+            state.socket,
+            state.mount_point
+        );
+        std::process::exit(EXIT_FAILURE);
+    }
 
     let status_info = match app.run_cli_command_raw(fuse_protocol::cmd::STATUS, "") {
         Ok((_, raw)) => serde_json::from_slice::<Response>(&raw)
@@ -1313,6 +1339,52 @@ fn completion_scripts_delegate_to_the_binary() {
 #[cfg(test)]
 #[cfg(test)]
 mod tests {
+
+    // ── #60 step ④: state-file identity ───────────────────────────
+
+    #[test]
+    fn state_file_names_a_matching_stack_when_sockets_agree() {
+        let state = ServerStateFile {
+            socket: "/tmp/fgk.sock".into(),
+            mount_point: "/tmp/fgk-mnt".into(),
+            ..minimal_state()
+        };
+        assert!(state_file_matches_stack(
+            &state,
+            std::path::Path::new("/tmp/fgk.sock")
+        ));
+    }
+
+    #[test]
+    fn state_file_of_a_foreign_stack_refuses() {
+        // The shared-default-path shape: the file was written by a
+        // DIFFERENT agentbox (its socket differs from ours).
+        let state = ServerStateFile {
+            socket: "/tmp/OTHER.sock".into(),
+            mount_point: "/tmp/fgk-mnt".into(),
+            ..minimal_state()
+        };
+        assert!(!state_file_matches_stack(
+            &state,
+            std::path::Path::new("/tmp/fgk.sock")
+        ));
+    }
+
+    fn minimal_state() -> ServerStateFile {
+        ServerStateFile {
+            version: CLIENT_VERSION.to_string(),
+            server_pid: 1,
+            server_binary: "/bin/fuse-server".into(),
+            mount_point: String::new(),
+            socket: String::new(),
+            log_level: "info".into(),
+            pending_timeout: 10,
+            runtime_wrapper: None,
+            oracle_socket: None,
+            env: Default::default(),
+            secrets: vec![],
+        }
+    }
 
     /// Issue #98's ORIGINAL shape (maintainer challenge): the recorded
     /// binary EXISTS but is the WRONG VINTAGE — the restart must not
