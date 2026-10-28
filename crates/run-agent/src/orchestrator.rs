@@ -409,18 +409,21 @@ const ARGV_PAIR: usize = 2;
 /// The flag and value positions inside an argv pair window.
 const ARGV_FLAG: usize = 0;
 const ARGV_VALUE: usize = 1;
+/// The process filesystem root and the cmdline path shape.
+const PROC_DIR: &str = "/proc";
+/// The cmdline path shape after the pid component.
+const PROC_CMDLINE_TAIL: &str = "/cmdline";
+/// Path separator + pid digit-budget for the capacity hint.
+const SEP_PATH: char = '/';
+const PID_DIGITS: usize = 8;
 
 /// Scan `/proc/*/cmdline` for daemons whose argv names `mount_point`
 /// under `--mount-point`, extracting their `--socket`/`--oracle-socket`.
 /// Unprivileged (world-readable cmdlines), same reads adoption does.
-// Necessity: argv pair indexing (windows(2), w[0]/w[1]) — positional
-// protocol of the kernel's NUL-separated cmdline format.
-#[allow(unknown_lints)]
-#[allow(inline_literal)]
 pub(crate) fn discover_mount_stack(mount_point: &std::path::Path) -> Vec<DiscoveredDaemon> {
     let mp = mount_point.to_string_lossy().to_string();
     let mut found = Vec::new();
-    let Ok(dir) = std::fs::read_dir("/proc") else {
+    let Ok(dir) = std::fs::read_dir(PROC_DIR) else {
         return found;
     };
     let own_pid = std::process::id();
@@ -438,7 +441,16 @@ pub(crate) fn discover_mount_stack(mount_point: &std::path::Path) -> Vec<Discove
         if pid == own_pid {
             continue;
         }
-        let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+        let Ok(raw) = std::fs::read({
+            let mut path = String::with_capacity(
+                PROC_DIR.len() + PID_DIGITS + PROC_CMDLINE_TAIL.len(),
+            );
+            path.push_str(PROC_DIR);
+            path.push(SEP_PATH);
+            path.push_str(&pid.to_string());
+            path.push_str(PROC_CMDLINE_TAIL);
+            path
+        }) else {
             continue;
         };
         let args: Vec<String> = raw
