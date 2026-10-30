@@ -437,6 +437,18 @@ pub struct CommandArgRule {
     pub uses_left: std::cell::Cell<Option<usize>>,
 }
 
+/// An arg-scoped stdout rule: matching `run_command` calls report
+/// this text (e.g. a `logs` tail, an `inspect` field) instead of the
+/// global `command_stdout`.
+pub struct CommandArgStdout {
+    /// Program name the rule applies to.
+    pub program: String,
+    /// Rule matches when any argument contains this substring.
+    pub arg_contains: String,
+    /// The stdout text matching calls report.
+    pub stdout: String,
+}
+
 /// In-memory mock of [`SystemIo`] for unit tests.
 #[derive(Default)]
 pub struct MockSystemIo {
@@ -456,6 +468,8 @@ pub struct MockSystemIo {
     /// argument contains `arg_contains`.  `remaining` counts down; when it
     /// hits zero the rule stops applying (0 = unlimited).
     pub command_arg_results: std::cell::RefCell<Vec<CommandArgRule>>,
+    /// Arg-scoped stdout rules (checked in order; first match wins).
+    pub command_arg_stdouts: std::cell::RefCell<Vec<CommandArgStdout>>,
     pub interactive_exit: i32,
     pub interactive_calls: std::cell::RefCell<Vec<(String, Vec<String>)>>,
     pub command_calls: std::cell::RefCell<Vec<(String, Vec<String>)>>,
@@ -567,6 +581,17 @@ impl MockSystemIo {
 
     /// Fail/succeed `run_command` only for calls to `program` where some
     /// argument contains `arg_contains` (unlimited matches).
+    /// Set stdout text for `run_command` calls to `program` where some
+    /// argument contains `arg_contains` (first rule wins).
+    pub fn with_command_stdout_when(mut self, program: &str, arg_contains: &str, stdout: &str) -> Self {
+        self.command_arg_stdouts.borrow_mut().push(CommandArgStdout {
+            program: program.to_string(),
+            arg_contains: arg_contains.to_string(),
+            stdout: stdout.to_string(),
+        });
+        self
+    }
+
     pub fn with_command_result_when(
         self,
         program: &str,
@@ -766,8 +791,19 @@ impl SystemIo for MockSystemIo {
                 self.created_dirs.borrow_mut().push(p);
             }
         }
+        // Arg-scoped stdout rules (first match wins) override the
+        // global stdout — lets one mock answer inspect fields AND log
+        // tails distinctly.
+        let stdout = {
+            let rules = self.command_arg_stdouts.borrow();
+            rules
+                .iter()
+                .find(|r| r.program == program && args.iter().any(|a| a.contains(&r.arg_contains)))
+                .map(|r| r.stdout.clone())
+                .unwrap_or_else(|| self.command_stdout.clone())
+        };
         Ok(CommandOutput {
-            stdout: self.command_stdout.clone(),
+            stdout,
             stderr: self.command_stderr.clone(),
             status,
         })

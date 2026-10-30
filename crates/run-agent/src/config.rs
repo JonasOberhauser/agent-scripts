@@ -144,8 +144,14 @@ const WORKDIR_FLAG: &str = "--workdir";
 const SECCOMP_FLAG: &str = "--security-opt";
 const PID_FLAG: &str = "--pid";
 const PID_HOST: &str = "host";
-const SLEEP_CMD: &str = "sleep";
-const SLEEP_INFINITY: &str = "infinity";
+/// The detached container's keep-alive: block forever without a
+/// stdin/TTY, POSIX-portable (busybox AND coreutils ship `tail`), and
+/// if ever absent it fails with the known `exec: tail: not found`
+/// shape (issue #118: GNU's `sleep infinity` died with busybox's
+/// opaque `invalid number 'infinity'`).
+const TAIL_CMD: &str = "tail";
+const FOLLOW_FLAG: &str = "-f";
+const DEV_NULL: &str = "/dev/null";
 const EXEC_CMD: &str = "exec";
 const TTY_INTERACTIVE: &str = "-it";
 const CHDIR_FLAG: &str = "-w";
@@ -396,8 +402,9 @@ pub fn build_create_args(config: &AgentConfig, devices: &[String]) -> Vec<String
     }
 
     args.push(config.image_name.clone());
-    args.push(SLEEP_CMD.into());
-    args.push(SLEEP_INFINITY.into());
+    args.push(TAIL_CMD.into());
+    args.push(FOLLOW_FLAG.into());
+    args.push(DEV_NULL.into());
 
     args
 }
