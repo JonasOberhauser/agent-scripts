@@ -151,6 +151,10 @@ const PID_HOST: &str = "host";
 /// opaque `invalid number 'infinity'`).
 const TAIL_CMD: &str = "tail";
 const FOLLOW_FLAG: &str = "-f";
+// Necessity: /dev/null IS the device's name (a path-shaped
+// external identifier — review on servyi/lints#16).
+#[allow(unknown_lints)]
+#[allow(inline_literal)]
 const DEV_NULL: &str = "/dev/null";
 const EXEC_CMD: &str = "exec";
 const TTY_INTERACTIVE: &str = "-it";
