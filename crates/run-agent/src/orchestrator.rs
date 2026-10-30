@@ -109,6 +109,17 @@ const DOCKER_INSPECT: &str = "inspect";
 const PODMAN_EXISTS: &str = "exists";
 const INSPECT_FMT_ID: &str = "-f";
 const INSPECT_FMT_TPL: &str = "{{.Id}}";
+/// Dead-on-arrival probes (issue #118): state, then logs.
+const FORMAT_STATE_RUNNING: &str = "-f={{.State.Running}}";
+const LOGS_CMD: &str = "logs";
+const LOG_TAIL_LINES: usize = 25;
+/// Log-line join separator.
+const NL: &str = "\n";
+// Necessity: the placeholder restates itself (a diagnostic word —
+// review on servyi/lints#16).
+#[allow(unknown_lints)]
+#[allow(inline_literal)]
+const EMPTY_LOGS: &str = "(empty logs)";
 /// Image verbs + flags.
 const VERB_PULL: &str = "pull";
 const VERB_BUILD: &str = "build";
@@ -363,6 +374,53 @@ fn ensure_mount_point<S: SystemIo>(
             ))
         }
     }
+}
+
+
+/// The keep-alive requirement, user-facing (config's build_create_args
+/// uses `tail -f /dev/null`; the message names the shape, not the
+/// flag spelling).
+const TAIL_KEEPALIVE: &str = "`tail -f /dev/null`";
+
+/// Issue #118: did the freshly created container die within moments?
+/// Returns the logs' tail (the CAUSE) when the state says exited;
+/// None when running (or when the probes themselves fail — the
+/// downstream flow will surface that with its own diagnostics).
+fn container_immediately_dead<S: SystemIo>(
+    io: &S,
+    wrapper: Option<&str>,
+    container_bin: &str,
+    container_name: &str,
+) -> Option<String> {
+    let state = run_with_wrapper(
+        io,
+        wrapper,
+        container_bin,
+        &[DOCKER_INSPECT, FORMAT_STATE_RUNNING, container_name],
+    )
+    .ok()?;
+    let stdout = state.stdout.trim().to_string();
+    if stdout == REPLY_TRUE {
+        return None; // alive — happy path
+    }
+    // Exited (or garbage): pull the logs and name the cause.
+    let logs = run_with_wrapper(io, wrapper, container_bin, &[LOGS_CMD, container_name])
+        .ok()?;
+    let tail: String = logs
+        .stdout
+        .lines()
+        .rev()
+        .take(LOG_TAIL_LINES)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join(NL);
+    Some(if tail.is_empty() {
+        EMPTY_LOGS.to_string()
+    } else {
+        tail
+    })
 }
 
 // ── #60: mountpoint-anchored stack discovery ──────────────────────
@@ -1123,6 +1181,25 @@ where
             let create_refs: Vec<&str> = create_args.iter().map(|s| s.as_str()).collect();
             match run_with_wrapper(io, wrapper, container_bin, &create_refs) {
                 Ok(o) if o.success() => {
+                    // Issue #118: a dead-on-arrival image (a keep-alive
+                    // the image lacks, a broken entrypoint) exits
+                    // within moments while `run -d` still reports
+                    // success — the old flow proceeded against a
+                    // corpse and failed far downstream with an opaque
+                    // `container state improper`.  One inspect names
+                    // it here; on the happy path it costs one call.
+                    if let Some(cause) =
+                        container_immediately_dead(io, wrapper, container_bin, &container_name)
+                    {
+                        return Err(format!(
+                            "the container exited immediately after creation — \
+                             the image cannot keep itself alive.\n  cause (container \
+                             logs): {cause}\n  The image must provide the keep-alive \
+                             ({TAIL_KEEPALIVE} is the requirement; a missing binary \
+                             shows as `exec: ...: not found`) and a usable shell for \
+                             the session."
+                        ));
+                    }
                     info!("Container created.");
                 }
                 Ok(o) => {
@@ -1743,6 +1820,46 @@ fn write_state_file<S: SystemIo>(
 #[allow(custom_parser)]
 mod tests {
 
+    // ── #118: dead-on-arrival detection ───────────────────────────
+
+    /// A RUNNING container is not dead — None, no logs pull.
+    #[test]
+    fn a_running_container_is_not_immediately_dead() {
+        let mock = MockSystemIo::new()
+            .with_command_stdout_when("podman", "{{.State.Running}}", "true\n");
+        assert!(container_immediately_dead(&mock, None, "podman", "agentbox-x").is_none());
+    }
+
+    /// An EXITED container names its cause from the logs tail — the
+    /// busybox shape reads as the sleep error, the bash-absent shape
+    /// as exec-not-found: whatever the logs say, verbatim.
+    #[test]
+    fn an_exited_container_names_its_cause_from_the_logs() {
+        let mock = MockSystemIo::new()
+            .with_command_stdout_when("podman", "{{.State.Running}}", "false\n")
+            .with_command_stdout_when(
+                "podman",
+                "logs",
+                "sleep: invalid number 'infinity'\n",
+            );
+        let cause = container_immediately_dead(&mock, None, "podman", "agentbox-x");
+        assert_eq!(
+            cause.as_deref(),
+            Some("sleep: invalid number 'infinity'"),
+            "the logs' cause, verbatim"
+        );
+    }
+
+    /// An exited container with EMPTY logs still reports (empty),
+    /// not a silent pass — the downstream must never see a corpse.
+    #[test]
+    fn an_exited_container_with_empty_logs_reports_empty() {
+        let mock = MockSystemIo::new()
+            .with_command_stdout_when("podman", "{{.State.Running}}", "false\n");
+        let cause = container_immediately_dead(&mock, None, "podman", "agentbox-x");
+        assert_eq!(cause.as_deref(), Some("(empty logs)"));
+    }
+
     #[test]
     fn controllers_sharing_one_socket_are_one_stack() {
         // An old and a respawned server (restart window), or a
@@ -2214,7 +2331,8 @@ mod tests {
         let mut mock = base_mock()
             .with_file("/home/user/secrets.yaml", b"DATA")
             .with_command_result_when("podman", "inspect", Some(1))
-            .with_command_result_when_n("podman", "exists", Some(1), 1);
+            .with_command_result_when_n("podman", "exists", Some(1), 1)
+            .with_command_stdout_when("podman", "{{.State.Running}}", "true\n");
         let mut cfg = test_config();
         cfg.auto_confirm = true;
         let result = run_agent(&mut mock, &cfg, &|_, _| Ok(String::new()), false);
@@ -2966,9 +3084,11 @@ mod tests {
     #[test]
     fn missing_container_is_created() {
         // inspect fails → the container does not exist → create it.
+        // The #118 liveness probe answers running.
         let mut mock = base_mock()
             .with_file("/home/user/secrets.yaml", b"DATA")
-            .with_command_result_when("podman", "inspect", Some(1));
+            .with_command_result_when("podman", "inspect", Some(1))
+            .with_command_stdout_when("podman", "{{.State.Running}}", "true\n");
         let cfg = test_config();
         let result = run_agent(&mut mock, &cfg, &|_, _| Ok(String::new()), false);
         assert!(result.is_ok(), "got: {:?}", result.err());
