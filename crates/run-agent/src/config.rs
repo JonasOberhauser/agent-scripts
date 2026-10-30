@@ -526,8 +526,16 @@ mod tests {
         assert_eq!(args[di + 1], "/dev/fuse");
         assert!(args.contains(&"-d".to_string()));
         assert!(!args.contains(&"--rm".to_string()), "persistent container should NOT use --rm");
-        assert!(args.contains(&"sleep".into()));
-        assert!(args.contains(&"infinity".into()));
+        // Issue #118: the keep-alive must be POSIX-portable (busybox
+        // AND GNU) and fail with a KNOWN shape — tail -f /dev/null,
+        // not GNU's `sleep infinity` (busybox: "invalid number").
+        assert!(args.contains(&"tail".into()));
+        assert!(args.contains(&"-f".into()));
+        assert!(args.contains(&"/dev/null".into()));
+        assert!(
+            !args.contains(&"infinity".into()),
+            "the GNU-only keep-alive must be gone"
+        );
         assert!(args.contains(&"myimg".into()));
         // Nested rootless podman: widened seccomp profile must be applied.
         let i = args
