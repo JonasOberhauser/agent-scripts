@@ -583,8 +583,13 @@ impl MockSystemIo {
     /// argument contains `arg_contains` (unlimited matches).
     /// Set stdout text for `run_command` calls to `program` where some
     /// argument contains `arg_contains` (first rule wins).
-    pub fn with_command_stdout_when(mut self, program: &str, arg_contains: &str, stdout: &str) -> Self {
-        self.command_arg_stdouts.borrow_mut().push(CommandArgStdout {
+    pub fn with_command_stdout_when(
+        mut self,
+        program: &str,
+        arg_contains: &str,
+        stdout: &str,
+    ) -> Self {
+        self.command_arg_stdouts.get_mut().push(CommandArgStdout {
             program: program.to_string(),
             arg_contains: arg_contains.to_string(),
             stdout: stdout.to_string(),
