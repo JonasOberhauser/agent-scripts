@@ -113,8 +113,12 @@ const INSPECT_FMT_TPL: &str = "{{.Id}}";
 const FORMAT_STATE_RUNNING: &str = "-f={{.State.Running}}";
 const LOGS_CMD: &str = "logs";
 const LOG_TAIL_LINES: usize = 25;
-/// Log-line join separator + the empty-logs placeholder.
+/// Log-line join separator.
 const NL: &str = "\n";
+// Necessity: the placeholder restates itself (a diagnostic word —
+// review on servyi/lints#16).
+#[allow(unknown_lints)]
+#[allow(inline_literal)]
 const EMPTY_LOGS: &str = "(empty logs)";
 /// Image verbs + flags.
 const VERB_PULL: &str = "pull";
@@ -411,7 +415,7 @@ fn container_immediately_dead<S: SystemIo>(
         .into_iter()
         .rev()
         .collect::<Vec<_>>()
-        .join("\n");
+        .join(NL);
     Some(if tail.is_empty() {
         EMPTY_LOGS.to_string()
     } else {
