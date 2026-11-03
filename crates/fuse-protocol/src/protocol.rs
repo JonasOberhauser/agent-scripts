@@ -356,7 +356,14 @@ pub enum Command {
     /// packages and live read budgets keep working; anything that
     /// would pend is refused on the spot. Persisted in the policy
     /// store — armed across restarts.
-    LockDown,
+    /// `off: true` DISARMS (issue #85: lockdown is a convenience
+    /// auto-rejector, not a one-way door — the first-class exit).
+    /// Additive and defaulted: the old wire `{type: "lockdown"}` is
+    /// the arm, exactly as before.
+    LockDown {
+        #[serde(default)]
+        off: bool,
+    },
     /// Request the server's protocol version.
     //
     // IMPORTANT: Do NOT change this variant's name or serde tag.
@@ -414,6 +421,19 @@ pub struct MapEntry {
 
 #[cfg(test)]
 mod tests {
+
+    /// Issue #85: the additive off flag — the OLD wire (no field)
+    /// still arms; the new field disarms.
+    #[test]
+    fn lockdown_off_field_is_additive() {
+        let old_wire = r#"{"type":"lock_down"}"#;
+        let c: super::Command = serde_json::from_str(old_wire).expect("old wire parses");
+        assert!(matches!(c, super::Command::LockDown { off: false }));
+
+        let new_wire = r#"{"type":"lock_down","off":true}"#;
+        let c: super::Command = serde_json::from_str(new_wire).expect("new wire parses");
+        assert!(matches!(c, super::Command::LockDown { off: true }));
+    }
 
     /// Issue #60 step ③: the additive mount_point field — an OLD
     /// server's reply (no field) parses to the empty default, never

@@ -39,7 +39,7 @@ pub fn print_response(resp: &Response, out: &mut dyn Console) {
         Response::Error { message } => out.print_error(message),
         Response::Status { secrets, lockdown, .. } => {
             if *lockdown {
-                out.print_line("lockdown: ON — new unauthorized access is refused");
+                out.print_line(LINE_LOCKDOWN_ON);
             }
             if secrets.is_empty() {
                 out.print_line("No secrets configured.");
@@ -319,8 +319,27 @@ fn parse_grant_forever(args: &str) -> Result<Command, String> {
     args.trim().parse::<u64>().map(|id| Command::GrantForever { id })
         .map_err(|_| usage!("grant-forever").into())
 }
-fn parse_lockdown(_: &str) -> Result<Command, String> {
-    Ok(Command::LockDown)
+/// The maintainers' sketch (issue #85): `lockdown` = on,
+/// `lockdown on`, `lockdown off` — the door gets its first-class exit.
+const LINE_LOCKDOWN_ON: &str =
+    "lockdown: ON — new unauthorized access is refused (lockdown off to disarm)";
+const MODE_ON: &str = "on";
+const MODE_OFF: &str = "off";
+
+fn lockdown_cli() -> Vec<clap::Arg> {
+    vec![clap::Arg::new(LOCKDOWN_MODE)
+        .required(false)
+        .value_parser([MODE_ON, MODE_OFF])]
+}
+
+fn parse_lockdown(args: &str) -> Result<Command, String> {
+    match args.trim() {
+        "" | "on" => Ok(Command::LockDown { off: false }),
+        "off" => Ok(Command::LockDown { off: true }),
+        other => Err(format!(
+            "lockdown: unknown mode {other:?} (use: lockdown [on|off])"
+        )),
+    }
 }
 fn parse_deny(args: &str) -> Result<Command, String> {
     args.trim().parse::<u64>().map(|id| Command::Deny { id })
@@ -338,12 +357,9 @@ fn offline_version(_args: &str, out: &mut dyn Console) -> Result<(), String> {
 
 // ── clap patterns (const-table-safe: fn items coerce in const) ──
 
-fn no_cli_args() -> Vec<clap::Arg> {
-    Vec::new()
-}
-
 /// clap arg ids/flags shared by the CLI builders below.
 const ARG_ID: &str = "id";
+const LOCKDOWN_MODE: &str = "mode";
 const ARG_NAME: &str = "name";
 const ARG_HASH: &str = "hash";
 const ARG_FILE: &str = "file";
@@ -420,21 +436,21 @@ const WIRE_ERROR_FIELD: &str = "__error__";
 #[allow(unknown_lints)] #[allow(inline_literal)] // help strings are user-facing prose by
                          // definition; fixture literals below likewise
 pub const COMMAND_TABLE: &[CommandSpec] = &[
-    CommandSpec { name: cmd::STATUS, help: "Show all secrets and access counts", parse: parse_status, complete: NO_COMPLETE, offline: None, cli_args: no_cli_args },
-    CommandSpec { name: cmd::MOUNTS, help: "List mounted secret files", parse: parse_mounts, complete: NO_COMPLETE, offline: None, cli_args: no_cli_args },
+    CommandSpec { name: cmd::STATUS, help: "Show all secrets and access counts", parse: parse_status, complete: NO_COMPLETE, offline: None, cli_args: lockdown_cli },
+    CommandSpec { name: cmd::MOUNTS, help: "List mounted secret files", parse: parse_mounts, complete: NO_COMPLETE, offline: None, cli_args: lockdown_cli },
     CommandSpec { name: cmd::RESET, help: "Reset access counter for one or all secrets", parse: parse_reset, complete: Completer::SecretNames { after_space: true }, offline: None, cli_args: reset_cli },
-    CommandSpec { name: cmd::RESET_ALL, help: "Reset all access counters", parse: parse_reset_all, complete: NO_COMPLETE, offline: None, cli_args: no_cli_args },
+    CommandSpec { name: cmd::RESET_ALL, help: "Reset all access counters", parse: parse_reset_all, complete: NO_COMPLETE, offline: None, cli_args: lockdown_cli },
     CommandSpec { name: cmd::ADD, help: "Add a new secret from a file", parse: parse_add, complete: NO_COMPLETE, offline: None, cli_args: add_cli },
     CommandSpec { name: cmd::REMOVE, help: "Remove a secret", parse: parse_remove, complete: Completer::SecretNames { after_space: true }, offline: None, cli_args: name_cli },
     CommandSpec { name: cmd::ROTATE, help: "Change the allowed binary hash", parse: parse_rotate, complete: Completer::SecretNames { after_space: false }, offline: None, cli_args: name_hash_cli },
-    CommandSpec { name: cmd::PENDING, help: "Show pending access requests", parse: parse_pending, complete: NO_COMPLETE, offline: None, cli_args: no_cli_args },
+    CommandSpec { name: cmd::PENDING, help: "Show pending access requests", parse: parse_pending, complete: NO_COMPLETE, offline: None, cli_args: lockdown_cli },
     CommandSpec { name: cmd::GRANT, help: "Grant a pending access request", parse: parse_grant, complete: Completer::PendingIds, offline: None, cli_args: id_cli },
     CommandSpec { name: cmd::GRANT_FOREVER, help: "Grant a pending access permanently (whitelists the observed package hash)", parse: parse_grant_forever, complete: Completer::PendingIds, offline: None, cli_args: id_cli },
     CommandSpec { name: cmd::DENY, help: "Deny a pending access request", parse: parse_deny, complete: Completer::PendingIds, offline: None, cli_args: id_cli },
-    CommandSpec { name: cmd::LOCKDOWN, help: "Lock in current grants; deny all future unauthorized access immediately (persisted)", parse: parse_lockdown, complete: NO_COMPLETE, offline: None, cli_args: no_cli_args },
-    CommandSpec { name: cmd::SHOW_MAP, help: "Show the outer -> anonymized container-view name map", parse: parse_show_map, complete: NO_COMPLETE, offline: None, cli_args: no_cli_args },
-    CommandSpec { name: cmd::VERSION, help: "Show server version", parse: parse_version, complete: NO_COMPLETE, offline: Some(offline_version), cli_args: no_cli_args },
-    CommandSpec { name: cmd::LOGPATH, help: "Show server log file path", parse: parse_logpath, complete: NO_COMPLETE, offline: None, cli_args: no_cli_args },
+    CommandSpec { name: cmd::LOCKDOWN, help: "Lock in current grants; deny all future unauthorized access immediately (persisted); the off mode disarms", parse: parse_lockdown, complete: NO_COMPLETE, offline: None, cli_args: lockdown_cli },
+    CommandSpec { name: cmd::SHOW_MAP, help: "Show the outer -> anonymized container-view name map", parse: parse_show_map, complete: NO_COMPLETE, offline: None, cli_args: lockdown_cli },
+    CommandSpec { name: cmd::VERSION, help: "Show server version", parse: parse_version, complete: NO_COMPLETE, offline: Some(offline_version), cli_args: lockdown_cli },
+    CommandSpec { name: cmd::LOGPATH, help: "Show server log file path", parse: parse_logpath, complete: NO_COMPLETE, offline: None, cli_args: lockdown_cli },
 ];
 
 pub fn client_protocols() -> Vec<Protocol> {
@@ -691,6 +707,17 @@ mod completer_mapping_tests {
 #[allow(unknown_lints)]
 #[allow(custom_parser)]
 mod tests {
+
+    /// Issue #85: the parse matrix for the maintainers' sketch —
+    /// bare `lockdown` arms; `lockdown on` arms; `lockdown off`
+    /// disarms; anything else is a usage error.
+    #[test]
+    fn lockdown_parse_matrix() {
+        assert!(matches!(parse_lockdown(""), Ok(Command::LockDown { off: false })));
+        assert!(matches!(parse_lockdown("on"), Ok(Command::LockDown { off: false })));
+        assert!(matches!(parse_lockdown("off"), Ok(Command::LockDown { off: true })));
+        assert!(parse_lockdown("sideways").is_err());
+    }
     use super::*;
 
     fn names(list: &[&str]) -> Vec<String> {

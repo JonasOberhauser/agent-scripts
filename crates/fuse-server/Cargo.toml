@@ -12,7 +12,6 @@ serde_json = { workspace = true }
 clap = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-fuser = "0.15"
 libc = "0.2"
 nix = { workspace = true }
 dashmap = "6"
