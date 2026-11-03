@@ -373,6 +373,19 @@ impl ServerState {
         };
 
         if !hash_ok && self.lockdown() {
+            // Issue #86 (ruling on #85: lockdown is a convenience
+            // auto-rejector, NOT a one-way door): deny on the spot —
+            // but LEAVE a pending carrying the observed hash, so
+            // grant-forever can act without disarming first. The
+            // pending lives the usual pend-timeout.
+            let _id = self.create_pending_with_hash_error(
+                name,
+                pid,
+                pid_hash,
+                None,
+                REASON_LOCKDOWN,
+                None,
+            );
             return ReadOutcome::DeniedLocked;
         }
         if hash_ok {
@@ -809,6 +822,84 @@ impl ServerState {
 #[cfg(test)]
 mod tests {
 
+    /// Issue #86, the full operator flow through the wire: under
+    /// lockdown the rogue read is denied BUT pends with its hash —
+    /// grant-forever on that pending works WITHOUT disarming, and
+    /// the retry reads.
+    #[test]
+    fn grant_forever_on_a_lockdown_pending_works_without_disarming() {
+        let s = std::sync::Arc::new(ServerState::new());
+        s.add("x", "/tmp/host/x", 1, "old-hash");
+        s.arm_lockdown();
+
+        // Rogue attempt: denied, pending created with the observed hash.
+        assert!(matches!(
+            s.attempt_read("x", 4242, Some("new-package"), 0, 1),
+            ReadOutcome::DeniedLocked
+        ));
+        let id = s
+            .pending
+            .iter()
+            .next()
+            .map(|e| e.value().id)
+            .expect("the pending exists");
+        assert!(
+            s.pending.iter().any(|e| e.value().pid_hash.as_deref() == Some("new-package")),
+            "the pending carries the observed hash"
+        );
+
+        // The operator grants forever — WITHOUT disarming.
+        std::thread::scope(|sc| {
+            sc.spawn(|| {
+                s.grant_pending_forever(id).expect("grant-forever works on the lockdown pending");
+            });
+        });
+        assert!(s.lockdown(), "lockdown stays armed throughout");
+
+        // The retry reads: the hash is whitelisted now.
+        assert_eq!(
+            s.attempt_read("x", 4242, Some("new-package"), 0, 1),
+            ReadOutcome::Granted,
+            "forever-them-later worked in-band"
+        );
+    }
+
+    /// Issue #86 (maintainer-requested failing case): under lockdown,
+    /// a denied attempt must LEAVE a pending — deny on the spot (the
+    /// convenience) but keep "forever them later" possible in-band,
+    /// without disarming first.
+    #[test]
+    fn lockdown_denies_but_still_pends_so_forever_remains_possible() {
+        let s = ServerState::new();
+        s.add("x", "/tmp/host/x", 1, "some-other-hash");
+        s.arm_lockdown();
+        assert!(s.lockdown(), "precondition: armed");
+
+        // A new unauthorized package attempts a read.
+        let outcome = s.attempt_read("x", 4242, Some("new-package-hash"), 0, 1);
+        assert!(
+            matches!(outcome, ReadOutcome::DeniedLocked),
+            "lockdown still DENIES on the spot (the convenience)"
+        );
+
+        // The #86 defect: no pending was created. Desired per the
+        // ruling: the attempt IS visible, so grant-forever can act.
+        let pending: Vec<_> = s
+            .pending
+            .iter()
+            .map(|e| e.value().clone())
+            .collect();
+        assert!(
+            !pending.is_empty(),
+            "the denied attempt must LEAVE a pending — the operator can \
+             forever the package WITHOUT disarming first (issue #86)"
+        );
+        assert!(
+            pending.iter().any(|p| p.pid == 4242),
+            "the pending names the attempting package"
+        );
+    }
+
     /// Issue #85 (maintainer ruling: lockdown is a convenience
     /// auto-rejector, NOT a one-way door): `disarm_lockdown` is the
     /// first-class exit — armed then disarmed, new access pends again,
@@ -871,9 +962,14 @@ mod tests {
             s.attempt_read("secrets.yaml", 3, Some("rogue-hash"), 0, 4),
             ReadOutcome::DeniedLocked
         );
-        assert!(
-            s.pending.is_empty(),
-            "lockdown must not create pendings — the ask is answered"
+        // Issue #86 (ruling on #85): the denial still answers on the
+        // spot, but a pending NAMING the package remains — forever-
+        // them-later works in-band. The old assertion (empty map)
+        // pinned the pre-ruling suppression contract.
+        assert_eq!(
+            s.pending.iter().next().map(|e| e.value().pid),
+            Some(3),
+            "the denied rogue attempt leaves a pending naming it"
         );
     }
 
