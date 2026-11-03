@@ -144,8 +144,18 @@ const WORKDIR_FLAG: &str = "--workdir";
 const SECCOMP_FLAG: &str = "--security-opt";
 const PID_FLAG: &str = "--pid";
 const PID_HOST: &str = "host";
-const SLEEP_CMD: &str = "sleep";
-const SLEEP_INFINITY: &str = "infinity";
+/// The detached container's keep-alive: block forever without a
+/// stdin/TTY, POSIX-portable (busybox AND coreutils ship `tail`), and
+/// if ever absent it fails with the known `exec: tail: not found`
+/// shape (issue #118: GNU's `sleep infinity` died with busybox's
+/// opaque `invalid number 'infinity'`).
+const TAIL_CMD: &str = "tail";
+const FOLLOW_FLAG: &str = "-f";
+// Necessity: /dev/null IS the device's name (a path-shaped
+// external identifier — review on servyi/lints#16).
+#[allow(unknown_lints)]
+#[allow(inline_literal)]
+const DEV_NULL: &str = "/dev/null";
 const EXEC_CMD: &str = "exec";
 const TTY_INTERACTIVE: &str = "-it";
 const CHDIR_FLAG: &str = "-w";
@@ -396,8 +406,9 @@ pub fn build_create_args(config: &AgentConfig, devices: &[String]) -> Vec<String
     }
 
     args.push(config.image_name.clone());
-    args.push(SLEEP_CMD.into());
-    args.push(SLEEP_INFINITY.into());
+    args.push(TAIL_CMD.into());
+    args.push(FOLLOW_FLAG.into());
+    args.push(DEV_NULL.into());
 
     args
 }
@@ -526,8 +537,16 @@ mod tests {
         assert_eq!(args[di + 1], "/dev/fuse");
         assert!(args.contains(&"-d".to_string()));
         assert!(!args.contains(&"--rm".to_string()), "persistent container should NOT use --rm");
-        assert!(args.contains(&"sleep".into()));
-        assert!(args.contains(&"infinity".into()));
+        // Issue #118: the keep-alive must be POSIX-portable (busybox
+        // AND GNU) and fail with a KNOWN shape — tail -f /dev/null,
+        // not GNU's `sleep infinity` (busybox: "invalid number").
+        assert!(args.contains(&"tail".into()));
+        assert!(args.contains(&"-f".into()));
+        assert!(args.contains(&"/dev/null".into()));
+        assert!(
+            !args.contains(&"infinity".into()),
+            "the GNU-only keep-alive must be gone"
+        );
         assert!(args.contains(&"myimg".into()));
         // Nested rootless podman: widened seccomp profile must be applied.
         let i = args
