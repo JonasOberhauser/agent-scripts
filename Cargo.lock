@@ -518,7 +518,6 @@ dependencies = [
  "clap",
  "dashmap",
  "fuse-protocol",
- "fuser",
  "gatekeeper-testkit",
  "libc",
  "nix 0.29.0",
