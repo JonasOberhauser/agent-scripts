@@ -373,6 +373,19 @@ impl ServerState {
         };
 
         if !hash_ok && self.lockdown() {
+            // Issue #86 (ruling on #85: lockdown is a convenience
+            // auto-rejector, NOT a one-way door): deny on the spot —
+            // but LEAVE a pending carrying the observed hash, so
+            // grant-forever can act without disarming first. The
+            // pending lives the usual pend-timeout.
+            let _id = self.create_pending_with_hash_error(
+                name,
+                pid,
+                pid_hash,
+                None,
+                REASON_LOCKDOWN,
+                None,
+            );
             return ReadOutcome::DeniedLocked;
         }
         if hash_ok {
