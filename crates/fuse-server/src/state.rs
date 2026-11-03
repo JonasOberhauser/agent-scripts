@@ -793,6 +793,21 @@ impl ServerState {
 
 #[cfg(test)]
 mod tests {
+
+    /// Issue #85 (maintainer ruling: lockdown is a convenience
+    /// auto-rejector, NOT a one-way door): `disarm_lockdown` is the
+    /// first-class exit — armed then disarmed, new access pends again,
+    /// and the state PERSISTS (a restart must not resurrect the door).
+    #[test]
+    fn lockdown_has_a_first_class_exit() {
+        let s = ServerState::new();
+        s.add("x", "/tmp/host/x", 1, "*");
+        s.arm_lockdown();
+        assert!(s.lockdown(), "armed");
+
+        s.disarm_lockdown();
+        assert!(!s.lockdown(), "disarmed — the exit exists in-band");
+    }
     use super::*;
 
     fn sample_state() -> ServerState {
