@@ -9,6 +9,7 @@ pub static SERVED_MOUNT_POINT: std::sync::OnceLock<String> = std::sync::OnceLock
 
 /// One-off lockdown prose (issue #66 reference).
 const MSG_LOCKDOWN_ARMED: &str = "lockdown armed (issue #66): current grants keep working; new unauthorized access is refused";
+const MSG_LOCKDOWN_DISARMED: &str = "lockdown DISARMED (issue #85): new unauthorized access pends for approval again";
 
 pub fn handle_command(cmd: Command, state: &ServerState, hub: &crate::oracle_service::OracleHub) -> Response {
     match cmd {
@@ -21,9 +22,16 @@ pub fn handle_command(cmd: Command, state: &ServerState, hub: &crate::oracle_ser
             }
         }
 
-        Command::LockDown => {
-            state.arm_lockdown();
-            tracing::info!("{MSG_LOCKDOWN_ARMED}");
+        Command::LockDown { off } => {
+            if off {
+                // Issue #85: the first-class exit (maintainer ruling:
+                // the door is convenience, not policy).
+                state.disarm_lockdown();
+                tracing::info!("{MSG_LOCKDOWN_DISARMED}");
+            } else {
+                state.arm_lockdown();
+                tracing::info!("{MSG_LOCKDOWN_ARMED}");
+            }
             Response::Ok
         }
         Command::Status => Response::Status {
@@ -152,6 +160,19 @@ fn register_secret(
 }
 #[cfg(test)]
 mod tests {
+
+    /// Issue #85 through the wire: `lockdown off` disarms — the
+    /// first-class exit (maintainer ruling).
+    #[test]
+    fn lockdown_off_disarms_through_the_command() {
+        let s = ServerState::new();
+        handle_command(Command::LockDown { off: false }, &s, &hub());
+        assert!(s.lockdown(), "armed via the wire");
+
+        let resp = handle_command(Command::LockDown { off: true }, &s, &hub());
+        assert_eq!(resp, Response::Ok);
+        assert!(!s.lockdown(), "disarmed via the wire — the exit exists");
+    }
 
     /// Issue #60 step ③: the status reply answers "what mountpoint
     /// are you controlling?" — from the once-per-process lock.

@@ -419,6 +419,21 @@ impl ServerState {
         crate::policy_store::persist_locked(self);
     }
 
+    /// Issue #85, the first-class exit (maintainer ruling: lockdown
+    /// is a convenience auto-rejector, not a one-way door): disarm and
+    /// persist — a restart must not resurrect the door.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the persist lock was poisoned by a panicking mutation.
+    pub fn disarm_lockdown(&self) {
+        let _pl = self.persist_lock
+                .lock()
+                .expect("persist lock: mutations never panic while holding it");
+        self.lockdown.store(false, Ordering::SeqCst);
+        crate::policy_store::persist_locked(self);
+    }
+
     /// Policy-store load applies the persisted lockdown (issue #66).
     pub fn set_lockdown_from_load(&self, armed: bool) {
         self.lockdown.store(armed, Ordering::SeqCst);
