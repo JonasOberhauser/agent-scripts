@@ -357,10 +357,6 @@ fn offline_version(_args: &str, out: &mut dyn Console) -> Result<(), String> {
 
 // ── clap patterns (const-table-safe: fn items coerce in const) ──
 
-fn no_cli_args() -> Vec<clap::Arg> {
-    Vec::new()
-}
-
 /// clap arg ids/flags shared by the CLI builders below.
 const ARG_ID: &str = "id";
 const LOCKDOWN_MODE: &str = "mode";
