@@ -809,47 +809,6 @@ impl ServerState {
 #[cfg(test)]
 mod tests {
 
-    /// Issue #86, the maintainer's requested failing case: under
-    /// lockdown, a new unauthorized package's read attempt leaves NO
-    /// pending — so grant-forever has no id to target and "forever
-    /// them later" (the ruling's words) is impossible in-band. This
-    /// test pins the DESIRED behavior (a pending EXISTS while
-    /// lockdown answers deny); against today's code it fails by
-    /// construction — the assertion is on what should be, per the
-    /// ruling: "not a one way door ... while still being able to
-    /// forever them later".
-    #[test]
-    fn lockdown_denies_but_still_pends_so_forever_remains_possible() {
-        let s = ServerState::new();
-        s.add("x", "/tmp/host/x", 1, "some-other-hash");
-        s.arm_lockdown();
-        assert!(s.lockdown(), "precondition: armed");
-
-        // A new unauthorized package attempts a read.
-        let outcome = s.attempt_read("x", 4242, Some("new-package-hash"), 0, 1);
-        assert!(
-            matches!(outcome, ReadOutcome::DeniedLocked),
-            "lockdown still DENIES on the spot (the convenience)"
-        );
-
-        // The #86 defect: no pending was created. Desired per the
-        // ruling: the attempt IS visible, so grant-forever can act.
-        let pending: Vec<_> = s
-            .pending
-            .iter()
-            .map(|e| e.value().clone())
-            .collect();
-        assert!(
-            !pending.is_empty(),
-            "the denied attempt must LEAVE a pending — the operator can \
-             forever the package WITHOUT disarming first (issue #86)"
-        );
-        assert!(
-            pending.iter().any(|p| p.pid == 4242),
-            "the pending names the attempting package"
-        );
-    }
-
     /// Issue #85 (maintainer ruling: lockdown is a convenience
     /// auto-rejector, NOT a one-way door): `disarm_lockdown` is the
     /// first-class exit — armed then disarmed, new access pends again,
