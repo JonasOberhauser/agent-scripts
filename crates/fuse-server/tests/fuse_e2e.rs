@@ -890,3 +890,112 @@ fn _once() {
     static O: OnceLock<()> = OnceLock::new();
     let _ = O.get_or_init(|| ());
 }
+
+// ── grant-forever on an EXPIRED pending (maintainer-directed on #141) ──
+
+/// The full expired flow: a hash-mismatch read pends, the pend RUNS
+/// OUT (the blocked reader gets EACCES), the entry stays as a
+/// remembered denial — and grant-forever on the EXPIRED entry still
+/// actually grants: the next read serves.
+#[test]
+fn e2e_grant_forever_on_an_expired_pending() {
+    if !fuse_available() { return; }
+    if !hashing_available() { return; }
+    let _g = serial();
+    let split = Split::new_with_hashd("exp-gf", &[("s", b"EXPIRED-FOREVER", "not_our_hash")]);
+
+    // The read pends (wrong package hash). Capture the id while live.
+    let p = split.path("s");
+    let reader = std::thread::spawn(move || std::fs::read(p));
+    let id = loop {
+        let out = split.client(&["pending"]);
+        if let Some(id) = first_pending_id(&write_out(&out)) {
+            break id;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+
+    // Let it RUN OUT: the blocked reader gets EACCES, the entry stays
+    // (hash-bearing remembered denial — issue #66).
+    let err = reader.join().unwrap().unwrap_err();
+    assert_eq!(
+        err.raw_os_error(),
+        Some(libc::EACCES),
+        "the pend expired on the reader"
+    );
+
+    // The remembered denial is still listed — and grant-forever on
+    // the EXPIRED entry must actually grant.
+    let out = split.client(&["pending"]);
+    assert!(
+        first_pending_id(&write_out(&out)).is_some(),
+        "the expired hash-bearing entry is still listed"
+    );
+    let out = split.client(&["grant-forever", &id.to_string()]);
+    assert!(
+        out.status.success(),
+        "grant-forever on the EXPIRED pending failed: {}",
+        write_out(&out)
+    );
+
+    // The proof: the next read by the same package SERVES.
+    assert_eq!(
+        std::fs::read(split.path("s"))
+            .unwrap_or_else(|e| panic!("post-forever read failed: {e}")),
+        b"EXPIRED-FOREVER"
+    );
+}
+
+/// The lockdown variant of the same question (#86/#141): under
+/// lockdown the read is denied on the spot but PENDS (no blocked
+/// reader); after the entry runs out, grant-forever still grants —
+/// and it works WITHOUT ever disarming.
+#[test]
+fn e2e_grant_forever_on_an_expired_lockdown_pending() {
+    if !fuse_available() { return; }
+    if !hashing_available() { return; }
+    let _g = serial();
+    let split = Split::new_with_hashd("exp-lock", &[("s", b"LOCKED-FOREVER", "not_our_hash")]);
+
+    // Arm lockdown through the WIRE (the #85 exit exists too — unused
+    // here: the whole point is forever WITHOUT disarming).
+    let out = split.client(&["lockdown"]);
+    assert!(out.status.success(), "lockdown armed: {}", write_out(&out));
+
+    // The rogue read: denied on the spot, but a pending names it.
+    let err = std::fs::read(split.path("s")).unwrap_err();
+    assert_eq!(err.raw_os_error(), Some(libc::EACCES), "lockdown denies");
+    let id = loop {
+        let out = split.client(&["pending"]);
+        if let Some(id) = first_pending_id(&write_out(&out)) {
+            break id;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+
+    // Let the entry run out (the harness pend-timeout is 5s).
+    std::thread::sleep(Duration::from_secs(6));
+
+    // Grant-forever on the EXPIRED lockdown pending, while STILL
+    // armed: must succeed.
+    let out = split.client(&["grant-forever", &id.to_string()]);
+    assert!(
+        out.status.success(),
+        "grant-forever on the expired lockdown pending failed: {}",
+        write_out(&out)
+    );
+
+    // Whitelisted packages keep working under lockdown (the #66
+    // contract): the read serves, no disarm ever happened.
+    assert_eq!(
+        std::fs::read(split.path("s"))
+            .unwrap_or_else(|e| panic!("post-forever read under lockdown failed: {e}")),
+        b"LOCKED-FOREVER"
+    );
+    let out = split.client(&["status"]);
+    assert!(
+        write_out(&out).contains("lockdown: ON"),
+        "lockdown stayed armed throughout: {}",
+        write_out(&out)
+    );
+}
