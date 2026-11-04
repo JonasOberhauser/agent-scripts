@@ -286,8 +286,19 @@ pub fn versions_compatible(server: &str, client: &str) -> bool {
         let min = it.next()?.parse().ok()?;
         Some((maj, min))
     }
+    fn full(v: &str) -> Option<(u32, u32, u32)> {
+        let mut it = v.split(SEP_VERSION);
+        let maj = it.next()?.parse().ok()?;
+        let min = it.next()?.parse().ok()?;
+        let pat = it.next()?.parse().ok()?;
+        Some((maj, min, pat))
+    }
     match (parts(server), parts(client)) {
-        (Some(s), Some(c)) => s == c,
+        (Some(s), Some(c)) => {
+            // FAULT: the patch component joins the comparison —
+            // every patch release forces a server restart.
+            full(server) == full(client) && s == c
+        }
         _ => false,
     }
 }
