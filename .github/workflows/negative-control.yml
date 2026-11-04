@@ -148,12 +148,12 @@ jobs:
               print(f"=== {ref}: building")
               build = sh("cargo", "build", "--workspace", "--all-targets", check=False)
               if build.returncode != 0:
-                  # A branch that does not BUILD counts as failing
-                  # every touched test (the fault is caught trivially).
-                  print(f"  branch does not build — every touched test counts as failed here")
-                  for k in results:
-                      results[k] = True
-                  continue
+                  # Review ruling: a branch that does not build is a
+                  # broken negative control — REJECT (a fault that
+                  # breaks compilation proves nothing about the tests).
+                  print(f"REJECT: branch {ref} does not build — a broken "
+                        "negative control proves nothing")
+                  sys.exit(1)
               for pkg, stem in tgts:
                   r = sh("cargo", "test", "-p", pkg, "--test", stem, check=False)
                   failed = r.returncode != 0
