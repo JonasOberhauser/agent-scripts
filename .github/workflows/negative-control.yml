@@ -1,0 +1,171 @@
+# The negative-control gate (#143): every test touched or added by a
+# PR must FAIL on at least one companion fault branch, proving the
+# test can actually fail (the fault-injection convention, enforced).
+#
+# PR message contract (opt-in per PR):
+#
+#     Negative Control:
+#     ```
+#     /branch/A
+#     /branch/B
+#     ```
+#
+# Rules (the issue, verbatim in spirit):
+#   1. The diff PR-head ↔ branch must be COMPLETELY outside tests —
+#      all test code 100% identical; any test diff rejects the PR.
+#   2. Every test file modified or ADDED by the PR (deletions exempt)
+#      must fail on at least one of those branches when run there.
+#   3. A touched test that passes on every branch rejects the PR.
+#
+# Scope note (v1): "tests" = files under any `tests/` directory (the
+# integration-test targets, where the convention's evidence has
+# lived). Faults may live anywhere else, including src. Unit tests
+# embedded in src files are covered by review, not by this gate —
+# a cfg(test)-region differ is not reliably scriptable.
+name: negative-control
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # the base..head and branch diffs need history
+
+      - name: Parse the Negative Control block
+        id: parse
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          python3 - <<'PY'
+          import json, os, subprocess, sys
+
+          pr = json.loads(subprocess.run(
+              ["gh", "api", f"repos/{os.environ['GITHUB_REPOSITORY']}/pulls/"
+               f"{os.environ['PR_NUMBER']}"],
+              check=True, capture_output=True, text=True).stdout)
+          body = pr.get("body") or ""
+
+          branches = []
+          in_block = False
+          seen_marker = False
+          for line in body.splitlines():
+              if not seen_marker:
+                  if "negative control" in line.lower() and ":" in line:
+                      seen_marker = True
+                  continue
+              stripped = line.strip()
+              if stripped.startswith("```"):
+                  in_block = not in_block
+                  continue
+              if in_block and stripped.startswith("/"):
+                  branches.append(stripped)
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"branches={json.dumps(branches)}\n")
+          print("negative-control branches:", branches or "(none — gate inactive)")
+          PY
+
+      - name: Gate — identical tests, every touched test fails somewhere
+        if: steps.parse.outputs.branches != '[]'
+        env:
+          BRANCHES: ${{ steps.parse.outputs.branches }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq pkg-config libfuse3-dev fuse3 >/dev/null
+          sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 "$USER" || true
+          podman system migrate || true
+          rustup toolchain install stable --profile minimal
+
+          python3 - <<'PY'
+          import json, os, subprocess, sys
+
+          branches = json.loads(os.environ["BRANCHES"])
+          base, head = os.environ["BASE_SHA"], os.environ["HEAD_SHA"]
+
+          def sh(*cmd, check=True):
+              return subprocess.run(cmd, capture_output=True, text=True, check=check)
+
+          # The PR's touched tests (added/modified; deletions exempt).
+          diff = sh("git", "diff", "--name-only", "--diff-filter=ACMR", base, head).stdout
+          touched = sorted(l for l in diff.splitlines() if "/tests/" in f"/{l}")
+
+          if not touched:
+              print("no touched test files — gate passes vacuously")
+              sys.exit(0)
+          print("touched tests:")
+          for t in touched:
+              print("  ", t)
+
+          # Rule 1: each branch's diff vs the PR head is entirely
+          # outside tests (test code 100% identical).
+          for b in branches:
+              ref = b[1:] if b.startswith("/") else b
+              fetch = sh("git", "fetch", "--depth=1", "origin", ref)
+              if fetch.returncode != 0:
+                  print(f"REJECT: branch {ref} not found"); sys.exit(1)
+              sha = sh("git", "rev-parse", f"origin/{ref}").stdout.strip()
+              d = sh("git", "diff", "--name-only", head, sha).stdout
+              test_diff = [l for l in d.splitlines() if "/tests/" in f"/{l}"]
+              if test_diff:
+                  print(f"REJECT: {ref} differs from the PR in test code:")
+                  for t in test_diff:
+                      print("  ", t)
+                  sys.exit(1)
+          print("rule 1 ok: every branch is test-identical to the PR head")
+
+          # Rule 2+3: run each touched test target on each branch;
+          # every touched test must fail somewhere.
+          def targets(files):
+              out = []
+              for f in files:
+                  parts = f.split("/tests/")
+                  if len(parts) == 2 and parts[0] and parts[1].endswith(".rs"):
+                      pkg_dir = parts[0].split("/")[-1]
+                      stem = parts[1][:-3]
+                      out.append((pkg_dir, stem))
+              return out
+
+          tgts = targets(touched)
+          if not tgts:
+              print("touched files map to no cargo test target — gate passes (review covers them)")
+              sys.exit(0)
+
+          results = {(pkg, stem): False for pkg, stem in tgts}  # failed-somewhere?
+          for b in branches:
+              ref = b[1:] if b.startswith("/") else b
+              sha = sh("git", "rev-parse", f"origin/{ref}").stdout.strip()
+              sh("git", "checkout", "-q", "--detach", sha)
+              print(f"=== {ref}: building")
+              build = sh("cargo", "build", "--workspace", "--all-targets", check=False)
+              if build.returncode != 0:
+                  # A branch that does not BUILD counts as failing
+                  # every touched test (the fault is caught trivially).
+                  print(f"  branch does not build — every touched test counts as failed here")
+                  for k in results:
+                      results[k] = True
+                  continue
+              for pkg, stem in tgts:
+                  r = sh("cargo", "test", "-p", pkg, "--test", stem, check=False)
+                  failed = r.returncode != 0
+                  print(f"  {pkg}/{stem}: {'FAIL (caught)' if failed else 'pass'}")
+                  if failed:
+                      results[(pkg, stem)] = True
+
+          missed = [f"{p}/tests/{s}.rs" for (p, s), caught in results.items() if not caught]
+          if missed:
+              print("REJECT: touched tests that pass on EVERY negative-control branch:")
+              for m in missed:
+                  print("  ", m)
+              sys.exit(1)
+          print("gate ok: every touched test fails on at least one branch")
+          PY
