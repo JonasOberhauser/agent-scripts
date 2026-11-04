@@ -57,11 +57,17 @@ jobs:
           in_block = False
           seen_marker = False
           for line in body.splitlines():
-              if not seen_marker:
-                  if "negative control" in line.lower() and ":" in line:
-                      seen_marker = True
-                  continue
               stripped = line.strip()
+              # A NEW marker resets any earlier block: PR bodies quote
+              # the contract (example blocks) — the LAST declaration
+              # is the real one.
+              if stripped.lower().startswith("negative control") and stripped.endswith(":"):
+                  seen_marker = True
+                  branches = []
+                  in_block = False
+                  continue
+              if not seen_marker:
+                  continue
               if stripped.startswith("```"):
                   in_block = not in_block
                   continue
@@ -110,7 +116,7 @@ jobs:
           # outside tests (test code 100% identical).
           for b in branches:
               ref = b[1:] if b.startswith("/") else b
-              fetch = sh("git", "fetch", "--depth=1", "origin", ref)
+              fetch = sh("git", "fetch", "--depth=1", "origin", ref, check=False)
               if fetch.returncode != 0:
                   print(f"REJECT: branch {ref} not found"); sys.exit(1)
               sha = sh("git", "rev-parse", f"origin/{ref}").stdout.strip()
