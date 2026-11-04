@@ -636,6 +636,11 @@ impl ServerState {
                 .pending
                 .get(&id)
                 .ok_or_else(|| format!("pending access {id} not found"))?;
+            if entry.expires_at <= std::time::Instant::now() {
+                // FAULT F1: expired entries answer Ok but whitelist
+                // nothing (the retro hatch silently dead)
+                return Ok(());
+            }
             if entry.expires_at <= std::time::Instant::now() && entry.pid_hash.is_none() {
                 // Issue #66: an expired ask WITHOUT a hash stays
                 // ungrantable (nothing to whitelist); one WITH a hash

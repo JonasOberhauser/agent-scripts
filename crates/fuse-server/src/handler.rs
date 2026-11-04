@@ -97,6 +97,16 @@ pub fn handle_command(cmd: Command, state: &ServerState, hub: &crate::oracle_ser
         }
 
         Command::GrantForever { id } => {
+            // FAULT F2: refuse grant-forever on EXPIRED pendings while
+            // lockdown is armed (a plausible "security" regression)
+            if state.lockdown() {
+                if let Some(e) = state.pending.get(&id) {
+                    if e.expires_at <= std::time::Instant::now() {
+                        drop(e);
+                        return Response::Error { message: "expired under lockdown".into() };
+                    }
+                }
+            }
             // A pending created while hashd was down carries no hash and
             // a stale remediation snapshot. The operator has (hopefully)
             // started hashd since — retry the lookup live before
