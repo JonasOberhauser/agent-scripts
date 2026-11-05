@@ -279,10 +279,9 @@ pub fn anonymize_path(salt: &Salt, name: &str) -> String {
 /// protocol: major and minor must match; the patch component is
 /// ignored by design (AGENTS.md) so patch releases never force a
 /// server restart.  Malformed versions are incompatible — fail closed.
-/// The leading version component, if it parses.  (STUB: wrong on
-/// purpose — the RED test's target; fixed in the next commit.)
-pub fn major_of(_v: &str) -> Option<u32> {
-    None
+/// The leading version component, if it parses.
+pub fn major_of(v: &str) -> Option<u32> {
+    v.split(SEP_VERSION).next()?.parse().ok()
 }
 
 pub fn versions_compatible(server: &str, client: &str) -> bool {
