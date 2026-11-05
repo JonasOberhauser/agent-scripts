@@ -7,5 +7,5 @@ use fuse_protocol::protocol::versions_compatible;
 
 #[test]
 fn t10_marker_resilience() {
-    assert!(!versions_compatible("9.9.9", "0.34.0"));
+    assert!(!versions_compatible("", "0.34.0"), "empty fails closed");
 }
