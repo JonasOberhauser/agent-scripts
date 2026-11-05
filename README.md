@@ -322,3 +322,4 @@ agents/
 ├── Dockerfile                 # agentbox container image
 └── run-agent.sh               # original bash version (kept for reference)
 ```
+<!-- gate-test T5: vacuous pass (no touched tests, declaration present) -->
