@@ -6,6 +6,6 @@
 use fuse_protocol::protocol::versions_compatible;
 
 #[test]
-fn s2_wrong_expectation() {
-    assert!(versions_compatible("0.34.0", "9.9.9"), "deliberately wrong");
+fn s2_corrected() {
+    assert!(!versions_compatible("0.34.0", "9.9.9"), "fixed the TEST, not the code");
 }
