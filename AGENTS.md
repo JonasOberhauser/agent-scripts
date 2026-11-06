@@ -265,8 +265,10 @@ Every test-only or test-adding PR must include a **fault-injection
 check (CI-enforced by the `negative-control` gate, #143: declare the
 fault branches in the PR body under a `Negative Control:` fenced
 block — the gate verifies the branches are test-identical to the PR
-and that every touched test FAILS on at least one of them)**: inject
-a production fault the OLD tests miss; the new tests
+and that every touched test FAILS on at least one of them; #156: a
+touched test that fails in its own LAST touching commit is its own
+negative control — the test-first RED commit satisfies the gate
+without branches)**: inject a production fault the OLD tests miss; the new tests
 must go red while every existing test stays green. Run it where the
 tests run (unit tier: locally; podman tiers: a draft fault-probe PR,
 closed with the CI evidence). Also verify the converse: new behavioral

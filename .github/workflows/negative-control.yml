@@ -10,12 +10,17 @@
 #     /branch/B
 #     ```
 #
-# Rules (the issue, verbatim in spirit):
+# Rules (the issues, verbatim in spirit):
 #   1. The diff PR-head ↔ branch must be COMPLETELY outside tests —
 #      all test code 100% identical; any test diff rejects the PR.
 #   2. Every test file modified or ADDED by the PR (deletions exempt)
 #      must fail on at least one of those branches when run there.
 #   3. A touched test that passes on every branch rejects the PR.
+#   4. (#156) Self-control: a touched test that FAILS in the LAST
+#      commit that touched it is its own negative control — no branch
+#      required for it. Only the last touching commit counts (a wrong
+#      failing test later fixed as a TEST does not count). A
+#      non-building own-commit proves nothing.
 #
 # Scope note (v1): "tests" = files under any `tests/` directory (the
 # integration-test targets, where the convention's evidence has
@@ -80,7 +85,6 @@ jobs:
           PY
 
       - name: Gate — identical tests, every touched test fails somewhere
-        if: steps.parse.outputs.branches != '[]'
         env:
           BRANCHES: ${{ steps.parse.outputs.branches }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
@@ -127,7 +131,10 @@ jobs:
                   for t in test_diff:
                       print("  ", t)
                   sys.exit(1)
-          print("rule 1 ok: every branch is test-identical to the PR head")
+          if branches:
+              print("rule 1 ok: every branch is test-identical to the PR head")
+          else:
+              print("no declared branches — self-control is the only path")
 
           # Rule 2+3: run each touched test target on each branch;
           # every touched test must fail somewhere.
@@ -146,7 +153,49 @@ jobs:
               print("touched files map to no cargo test target — gate passes (review covers them)")
               sys.exit(0)
 
-          results = {(pkg, stem): False for pkg, stem in tgts}  # failed-somewhere?
+          # Self-control (#156): a touched test that FAILS in the last
+          # commit that touched it is its own negative control — that
+          # commit is a preserved red proof (the test-first shape).
+          # ONLY the last touching commit counts: introduce-failing-
+          # test-then-fix-the-TEST does not (the last commit passes).
+          # A self-control commit that does not build proves nothing —
+          # fall back to the branches.
+          def last_touch(file):
+              out = sh("git", "rev-list", base + ".." + head, "--", file).stdout
+              shas = out.split()
+              return shas[0] if shas else None
+
+          self_caught = set()
+          for f in touched:
+              sha = last_touch(f)
+              if not sha:
+                  continue
+              t = targets([f])
+              if not t:
+                  continue
+              pkg, stem = t[0]
+              sh("git", "checkout", "-q", "--detach", sha)
+              build = sh("cargo", "build", "--workspace", "--all-targets", check=False)
+              if build.returncode != 0:
+                  print(f"  self-control {pkg}/{stem}: last-touch commit does not build — no proof, branches required")
+                  continue
+              r = sh("cargo", "test", "-p", pkg, "--test", stem, check=False)
+              if r.returncode != 0:
+                  print(f"  self-control {pkg}/{stem}: FAILS in its own last-touch commit — its own negative control")
+                  self_caught.add((pkg, stem))
+
+          sh("git", "checkout", "-q", head)
+          need_branches = [t for t in tgts if t not in self_caught]
+          if not need_branches:
+              print("gate ok: every touched test is its own negative control")
+              sys.exit(0)
+          if not branches:
+              print("REJECT: touched tests with neither self-control nor declared branches:")
+              for pkg, stem in need_branches:
+                  print(f"   {pkg}/tests/{stem}.rs")
+              sys.exit(1)
+
+          results = {(pkg, stem): False for pkg, stem in need_branches}  # failed-somewhere?
           for b in branches:
               ref = b[1:] if b.startswith("/") else b
               sha = sh("git", "rev-parse", f"origin/{ref}").stdout.strip()
