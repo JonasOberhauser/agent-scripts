@@ -117,20 +117,26 @@ jobs:
               print("  ", t)
 
           # Rule 1: each branch's diff vs the PR head is entirely
-          # outside tests (test code 100% identical).
+          # outside tests (test code 100% identical).  Every violation
+          # across every branch is collected and reported — one round
+          # of fixing, not one reject per push.
+          missing, test_diffs = [], []
           for b in branches:
               ref = b[1:] if b.startswith("/") else b
               fetch = sh("git", "fetch", "--depth=1", "origin", ref, check=False)
               if fetch.returncode != 0:
-                  print(f"REJECT: branch {ref} not found"); sys.exit(1)
+                  missing.append(ref)
+                  continue
               sha = sh("git", "rev-parse", f"origin/{ref}").stdout.strip()
               d = sh("git", "diff", "--name-only", head, sha).stdout
-              test_diff = [l for l in d.splitlines() if "/tests/" in f"/{l}"]
-              if test_diff:
-                  print(f"REJECT: {ref} differs from the PR in test code:")
-                  for t in test_diff:
-                      print("  ", t)
-                  sys.exit(1)
+              for t in (l for l in d.splitlines() if "/tests/" in f"/{l}"):
+                  test_diffs.append((ref, t))
+          for ref in missing:
+              print(f"REJECT: branch {ref} not found")
+          for ref, t in test_diffs:
+              print(f"REJECT: {ref} differs from the PR in test code: {t}")
+          if missing or test_diffs:
+              sys.exit(1)
           if branches:
               print("rule 1 ok: every branch is test-identical to the PR head")
           else:
@@ -196,6 +202,9 @@ jobs:
               sys.exit(1)
 
           results = {(pkg, stem): False for pkg, stem in need_branches}  # failed-somewhere?
+          broken = []  # branches that do not build — a broken negative
+          # control proves nothing, but the sweep CONTINUES so every
+          # broken branch and every coverage miss lands in one report.
           for b in branches:
               ref = b[1:] if b.startswith("/") else b
               sha = sh("git", "rev-parse", f"origin/{ref}").stdout.strip()
@@ -203,12 +212,8 @@ jobs:
               print(f"=== {ref}: building")
               build = sh("cargo", "build", "--workspace", "--all-targets", check=False)
               if build.returncode != 0:
-                  # Review ruling: a branch that does not build is a
-                  # broken negative control — REJECT (a fault that
-                  # breaks compilation proves nothing about the tests).
-                  print(f"REJECT: branch {ref} does not build — a broken "
-                        "negative control proves nothing")
-                  sys.exit(1)
+                  broken.append(ref)
+                  continue
               for pkg, stem in tgts:
                   r = sh("cargo", "test", "-p", pkg, "--test", stem, check=False)
                   failed = r.returncode != 0
@@ -217,10 +222,17 @@ jobs:
                       results[(pkg, stem)] = True
 
           missed = [f"{p}/tests/{s}.rs" for (p, s), caught in results.items() if not caught]
+          rejected = False
           if missed:
               print("REJECT: touched tests that pass on EVERY negative-control branch:")
               for m in missed:
                   print("  ", m)
+              rejected = True
+          for ref in broken:
+              print(f"REJECT: branch {ref} does not build — a broken "
+                    "negative control proves nothing")
+              rejected = True
+          if rejected:
               sys.exit(1)
           print("gate ok: every touched test fails on at least one branch")
           PY
