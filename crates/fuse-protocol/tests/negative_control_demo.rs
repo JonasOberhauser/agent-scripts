@@ -17,3 +17,5 @@ fn patch_differences_are_compatible() {
     assert!(versions_compatible("0.34.9", "0.34.0"), "either direction");
     assert!(!versions_compatible("0.34.0", "0.35.0"), "minor is the axis");
 }
+
+// gate-probe touch: the aggregation validation is the point of this draft
